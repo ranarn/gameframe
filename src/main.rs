@@ -1,8 +1,10 @@
 mod app;
+mod hotkeys;
 mod profile_store;
 mod region_calc;
 mod settings_ui;
 mod tray_ui;
+mod win32;
 
 fn main() {
     if let Err(e) = app::run() {
