@@ -1,5 +1,5 @@
 [package]
-name = "borderless-window-manager"
+name = "gameframe"
 version = "0.1.0"
 edition = "2024"
 
