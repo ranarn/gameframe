@@ -7,7 +7,7 @@
 
 /// A window-placement preset. `Custom` carries explicit absolute-screen-coordinate
 /// bounds; the other variants are computed relative to a given monitor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Preset {
     LeftHalf,
     RightHalf,
