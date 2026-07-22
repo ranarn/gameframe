@@ -60,13 +60,6 @@ impl TrayMenuIds {
             None
         }
     }
-
-    /// Whether a menu-click event's id represents the "Exit" item --
-    /// i.e. whether the caller's event loop should stop and let this
-    /// tray's resources drop, cleanly shutting the process down.
-    pub fn is_exit(&self, id: &MenuId) -> bool {
-        matches!(self.action_for(id), Some(TrayAction::Exit))
-    }
 }
 
 impl Default for TrayMenuIds {
@@ -131,7 +124,7 @@ impl Tray {
         menu.append(&MenuItem::with_id(
             ids.show_settings.clone(),
             "Show Settings",
-            false, // stubbed in this slice -- disabled until wired up
+            true, // opens the egui Settings window -- see `crate::settings_ui`
             None,
         ))
         .map_err(TrayUiError::Menu)?;
@@ -210,15 +203,5 @@ mod tests {
         let ids = TrayMenuIds::new();
 
         assert_eq!(ids.action_for(&MenuId::new("some-other-menu-item")), None);
-    }
-
-    #[test]
-    fn is_exit_is_true_only_for_the_exit_id() {
-        let ids = TrayMenuIds::new();
-
-        assert!(ids.is_exit(&MenuId::new(EXIT_ID)));
-        assert!(!ids.is_exit(&MenuId::new(SHOW_SETTINGS_ID)));
-        assert!(!ids.is_exit(&MenuId::new(APPLY_TO_WINDOW_ID)));
-        assert!(!ids.is_exit(&MenuId::new("unrelated-id")));
     }
 }

@@ -1,10 +1,6 @@
 //! Loads and saves GameFrame's config (presets + hotkey bindings) as TOML,
 //! under a config directory injected by the caller. This module never
 //! resolves `%APPDATA%` itself — the caller passes in the directory to use.
-//!
-//! `#[allow(dead_code)]`: this module has no consumers yet (no settings-UI or
-//! hotkey-wiring slice has landed) — see issue #3. Remove once it's wired up.
-#![allow(dead_code)]
 
 use crate::region_calc::Preset;
 use std::path::Path;

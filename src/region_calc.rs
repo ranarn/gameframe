@@ -1,9 +1,5 @@
 //! Pure arithmetic for resolving a window-placement [`Preset`] against a monitor's
 //! geometry into a concrete pixel [`Region`]. No OS calls, no I/O.
-//!
-//! `#[allow(dead_code)]`: this module has no consumers yet (no window-manipulation
-//! or settings-UI slice has landed) — see issue #2. Remove once it's wired up.
-#![allow(dead_code)]
 
 /// A window-placement preset. `Custom` carries explicit absolute-screen-coordinate
 /// bounds; the other variants are computed relative to a given monitor.
