@@ -1,17 +1,25 @@
 //! Window manipulation for the borderless-toggle mechanic: stripping/restoring
 //! a window's border/title bar, resizing/repositioning it, and disabling
-//! Windows 11's rounded-corner rendering while it's borderless.
+//! Windows 11's rounded-corner rendering while it's borderless. Also holds
+//! the independent taskbar-autohide mechanic: toggling the shell taskbar
+//! between always-visible and auto-hidden via `SHAppBarMessage`.
 //!
 //! Split the same way as [`crate::settings_ui`]:
 //! - Pure decision logic ([`strip_border_style`], [`plan_toggle`], [`active_preset`],
-//!   [`Win32Error::is_access_denied`], [`Win32Error::from_hresult`]) has no
+//!   [`Win32Error::is_access_denied`], [`Win32Error::from_hresult`],
+//!   [`toggle_taskbar_autohide_state`], `apply_autohide_state`) has no
 //!   `HWND`/OS dependency and is fully unit tested below.
 //! - The actual Win32 calls further down (`GetForegroundWindow`, `IsIconic`,
 //!   `SetWindowLongPtrW`, `SetWindowPos`, `DwmSetWindowAttribute`,
-//!   `ShellExecuteW`) are OS-facing -- they need a real foreground window to
-//!   manipulate, which a headless/CI sandbox cannot provide -- so they are NOT
+//!   `ShellExecuteW`, `FindWindowW`, `SHAppBarMessage`) are OS-facing -- they
+//!   need a real foreground window or a real shell taskbar to manipulate,
+//!   which a headless/CI sandbox cannot provide -- so they are NOT
 //!   exercised by this crate's automated tests. See the module's doc comment
 //!   in the issue writeup for what could/couldn't be verified.
+//!
+//! [`toggle_taskbar_autohide`] keeps its own [`TaskbarAutohideState`],
+//! completely separate from the borderless mechanic's [`RestoreState`] --
+//! the two toggles share no state.
 
 use crate::region_calc::{Preset, Region};
 
@@ -89,6 +97,50 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
+/// The current on/off state of the taskbar auto-hide toggle -- fully
+/// independent of [`RestoreState`]/the borderless toggle's state (see this
+/// module's doc comment): a distinct type with its own two-state flip, never
+/// read or written by the borderless-toggle code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskbarAutohideState {
+    #[default]
+    AlwaysVisible,
+    AutoHidden,
+}
+
+/// Decides the next taskbar-autohide state after a press of the bound
+/// hotkey: a simple two-state flip. Pure logic -- no OS call, no `HWND` --
+/// so it's unit testable in complete isolation from the live
+/// `SHAppBarMessage` call that applies it.
+pub fn toggle_taskbar_autohide_state(current: TaskbarAutohideState) -> TaskbarAutohideState {
+    match current {
+        TaskbarAutohideState::AlwaysVisible => TaskbarAutohideState::AutoHidden,
+        TaskbarAutohideState::AutoHidden => TaskbarAutohideState::AlwaysVisible,
+    }
+}
+
+/// Computes the new `APPBARDATA.lParam` value for
+/// `SHAppBarMessage(ABM_SETSTATE, ...)`, given the appbar's `current_flags`
+/// (as read via a prior `ABM_GETSTATE` call) and the desired
+/// [`TaskbarAutohideState`].
+///
+/// Per the Win32 `appbar`/`ABM_SETSTATE` documentation, `lParam` is "a
+/// combination of" `ABS_AUTOHIDE` and `ABS_ALWAYSONTOP` -- these are
+/// independent, combinable bits describing the appbar's FULL desired state,
+/// not a delta from whatever it currently is. Sending a hardcoded
+/// single-flag value (e.g. `ABS_AUTOHIDE` alone) would silently clear
+/// whichever of the two bits wasn't included -- in particular, it would
+/// clear the taskbar's always-on-top bit as an unintended side effect of
+/// enabling auto-hide. This function instead flips only the single bit being
+/// changed (auto-hide) and preserves every other bit (always-on-top) exactly
+/// as read from `current_flags`. Pure bit manipulation -- no OS call.
+fn apply_autohide_state(current_flags: u32, state: TaskbarAutohideState) -> u32 {
+    match state {
+        TaskbarAutohideState::AutoHidden => current_flags | ABS_AUTOHIDE,
+        TaskbarAutohideState::AlwaysVisible => current_flags & !ABS_AUTOHIDE,
+    }
+}
+
 /// Reasons a live Win32 window-manipulation call can fail.
 #[derive(Debug)]
 pub enum Win32Error {
@@ -104,6 +156,10 @@ pub enum Win32Error {
     /// be safely reinterpreted as a plain Win32/`GetLastError`-style error
     /// code) -- see [`Win32Error::from_hresult`].
     Hresult(i32),
+    /// `FindWindowW(L"Shell_TrayWnd", ...)` returned a null handle -- the
+    /// taskbar's own window couldn't be located, so the taskbar-autohide
+    /// toggle has nothing to send `SHAppBarMessage` to.
+    TaskbarNotFound,
 }
 
 impl Win32Error {
@@ -148,6 +204,7 @@ impl std::fmt::Display for Win32Error {
             Win32Error::WindowMinimized => write!(f, "foreground window is minimized"),
             Win32Error::Os(e) => write!(f, "Win32 window manipulation failed: {e}"),
             Win32Error::Hresult(hr) => write!(f, "Win32 window manipulation failed: HRESULT {:#010x}", *hr as u32),
+            Win32Error::TaskbarNotFound => write!(f, "could not find the taskbar window (Shell_TrayWnd)"),
         }
     }
 }
@@ -159,6 +216,7 @@ impl std::error::Error for Win32Error {
             Win32Error::WindowMinimized => None,
             Win32Error::Os(e) => Some(e),
             Win32Error::Hresult(_) => None,
+            Win32Error::TaskbarNotFound => None,
         }
     }
 }
@@ -167,10 +225,12 @@ use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
 };
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::Shell::{
+    ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage, ShellExecuteW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
-    SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
+    FindWindowW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, SetWindowLongPtrW, SetWindowPos,
+    GWL_STYLE, SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -369,6 +429,81 @@ pub fn toggle_borderless_on_foreground_window(
     Ok(())
 }
 
+/// Toggles taskbar auto-hide on/off: flips `*state` (via
+/// [`toggle_taskbar_autohide_state`]) and applies it to the real taskbar via
+/// `SHAppBarMessage(ABM_SETSTATE, ...)`.
+///
+/// Fully independent of [`toggle_borderless_on_foreground_window`]'s
+/// `RestoreState` -- `state` here is its own [`TaskbarAutohideState`], never
+/// shared with or derived from the borderless toggle's state, so either
+/// toggle works whether or not the other has been pressed yet in the same
+/// session.
+///
+/// OS-facing: locates the real taskbar window and sends it a real
+/// `SHAppBarMessage`. Not exercised by this crate's automated tests -- see
+/// module docs. `*state` is only updated after the OS call so a failure
+/// (e.g. the taskbar window can't be found) leaves the remembered state
+/// consistent with what was actually last applied.
+pub fn toggle_taskbar_autohide(state: &mut TaskbarAutohideState) -> Result<(), Win32Error> {
+    let next = toggle_taskbar_autohide_state(*state);
+    set_appbar_state(next)?;
+    *state = next;
+    Ok(())
+}
+
+/// Locates the taskbar's own window (class name `Shell_TrayWnd`, per the
+/// documented convention third-party appbar callers use to address the
+/// shell's taskbar itself), reads its CURRENT auto-hide/always-on-top state
+/// via `SHAppBarMessage(ABM_GETSTATE, ...)`, then sends
+/// `SHAppBarMessage(ABM_SETSTATE, ...)` with only the auto-hide bit flipped
+/// (via [`apply_autohide_state`]) -- preserving whatever the always-on-top
+/// bit currently is, since `ABM_SETSTATE`'s `lParam` is the appbar's FULL
+/// desired state, not a delta (see [`apply_autohide_state`]'s doc comment).
+///
+/// Per the Win32 `appbar`/`ABM_SETSTATE`/`ABM_GETSTATE` documentation, the
+/// appbar being addressed does not need to have been separately registered
+/// via `ABM_NEW` -- both messages accept any window handle in
+/// `APPBARDATA.hWnd`, and it's documented practice to pass the taskbar's own
+/// handle to query/set its auto-hide/always-on-top state directly. For
+/// `ABM_GETSTATE`, the current state is returned as `SHAppBarMessage`'s
+/// return value itself (not written into `APPBARDATA.lParam`).
+fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
+    let hwnd = find_taskbar_window()?;
+
+    let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
+    data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
+    data.hWnd = hwnd;
+
+    // Safety: `data` is a validly-sized, zero-initialized `APPBARDATA` with
+    // `cbSize`/`hWnd` populated per `SHAppBarMessage`'s documented
+    // `ABM_GETSTATE` contract; `SHAppBarMessage` takes only `dwMessage` and a
+    // pointer to `data`, both valid here. `ABM_GETSTATE` does not read
+    // `data.lParam`, so it's left zeroed.
+    let current_flags = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) } as u32;
+
+    data.lParam = apply_autohide_state(current_flags, state) as isize;
+
+    // Safety: same `data` pointer as above, now with `lParam` populated per
+    // `SHAppBarMessage`'s documented `ABM_SETSTATE` contract.
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut data);
+    }
+    Ok(())
+}
+
+/// Finds the taskbar's own window handle via `FindWindowW(L"Shell_TrayWnd", NULL)`.
+fn find_taskbar_window() -> Result<HWND, Win32Error> {
+    let class_name = encode_wide("Shell_TrayWnd");
+    // Safety: `class_name` is a valid, null-terminated UTF-16 buffer kept
+    // alive for the duration of this call; the window-name pointer is null,
+    // which `FindWindowW` documents as "match any window title".
+    let hwnd = unsafe { FindWindowW(class_name.as_ptr(), std::ptr::null()) };
+    if hwnd.is_null() {
+        return Err(Win32Error::TaskbarNotFound);
+    }
+    Ok(hwnd)
+}
+
 /// Re-launches the current executable elevated (UAC "runas" prompt),
 /// following `ShellExecuteW`'s documented `"runas"` verb contract.
 ///
@@ -415,6 +550,7 @@ fn encode_wide(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use crate::region_calc::Region;
+    use windows_sys::Win32::UI::Shell::ABS_ALWAYSONTOP;
 
     #[test]
     fn strip_border_style_removes_caption_and_thick_frame_bits() {
@@ -498,6 +634,77 @@ mod tests {
             ToggleAction::Restore(RestoreState { style: original_style, region: original_region })
         );
         assert_eq!(state_after_second, None);
+    }
+
+    #[test]
+    fn toggle_taskbar_autohide_state_flips_from_always_visible_to_auto_hidden() {
+        assert_eq!(
+            toggle_taskbar_autohide_state(TaskbarAutohideState::AlwaysVisible),
+            TaskbarAutohideState::AutoHidden
+        );
+    }
+
+    #[test]
+    fn toggle_taskbar_autohide_state_flips_from_auto_hidden_back_to_always_visible() {
+        assert_eq!(
+            toggle_taskbar_autohide_state(TaskbarAutohideState::AutoHidden),
+            TaskbarAutohideState::AlwaysVisible
+        );
+    }
+
+    #[test]
+    fn taskbar_autohide_state_default_is_always_visible() {
+        // Fresh install / first press starts from "always visible" -- the
+        // taskbar's normal, un-toggled state.
+        assert_eq!(TaskbarAutohideState::default(), TaskbarAutohideState::AlwaysVisible);
+    }
+
+    #[test]
+    fn pressing_the_taskbar_hotkey_twice_round_trips_back_to_always_visible() {
+        let state = TaskbarAutohideState::default();
+
+        let after_first = toggle_taskbar_autohide_state(state);
+        let after_second = toggle_taskbar_autohide_state(after_first);
+
+        assert_eq!(after_first, TaskbarAutohideState::AutoHidden);
+        assert_eq!(after_second, TaskbarAutohideState::AlwaysVisible);
+    }
+
+    #[test]
+    fn apply_autohide_state_sets_the_autohide_bit_when_no_bits_are_currently_set() {
+        assert_eq!(apply_autohide_state(0, TaskbarAutohideState::AutoHidden), ABS_AUTOHIDE);
+    }
+
+    #[test]
+    fn apply_autohide_state_preserves_the_always_on_top_bit_when_enabling_auto_hide() {
+        // ABM_SETSTATE's lParam is a *combination* of ABS_AUTOHIDE and
+        // ABS_ALWAYSONTOP describing the appbar's full desired state, not a
+        // delta -- so enabling auto-hide on a taskbar that currently has
+        // ABS_ALWAYSONTOP set must preserve that bit rather than silently
+        // clearing it.
+        let current_flags = ABS_ALWAYSONTOP;
+
+        let new_flags = apply_autohide_state(current_flags, TaskbarAutohideState::AutoHidden);
+
+        assert_eq!(new_flags, ABS_AUTOHIDE | ABS_ALWAYSONTOP);
+    }
+
+    #[test]
+    fn apply_autohide_state_clears_only_the_autohide_bit_when_restoring_always_visible() {
+        let current_flags = ABS_AUTOHIDE | ABS_ALWAYSONTOP;
+
+        let new_flags = apply_autohide_state(current_flags, TaskbarAutohideState::AlwaysVisible);
+
+        assert_eq!(new_flags, ABS_ALWAYSONTOP);
+    }
+
+    #[test]
+    fn apply_autohide_state_restoring_always_visible_does_not_add_an_always_on_top_bit_that_was_not_already_set() {
+        let current_flags = ABS_AUTOHIDE;
+
+        let new_flags = apply_autohide_state(current_flags, TaskbarAutohideState::AlwaysVisible);
+
+        assert_eq!(new_flags, 0);
     }
 
     #[test]
@@ -595,5 +802,20 @@ mod tests {
 
         assert_is_std_error(&err);
         assert_eq!(err.to_string(), "foreground window is minimized");
+    }
+
+    #[test]
+    fn win32_error_taskbar_not_found_is_not_access_denied() {
+        assert!(!Win32Error::TaskbarNotFound.is_access_denied());
+    }
+
+    #[test]
+    fn win32_error_taskbar_not_found_implements_display_and_std_error() {
+        fn assert_is_std_error<E: std::error::Error>(_: &E) {}
+
+        let err = Win32Error::TaskbarNotFound;
+
+        assert_is_std_error(&err);
+        assert_eq!(err.to_string(), "could not find the taskbar window (Shell_TrayWnd)");
     }
 }

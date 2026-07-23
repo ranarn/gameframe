@@ -14,13 +14,15 @@ use crate::profile_store::HotkeyBindings;
 use global_hotkey::hotkey::{HotKey, HotKeyParseError};
 use global_hotkey::GlobalHotKeyManager;
 
-/// Actions GameFrame can bind a global hotkey to. Only [`HotkeyAction::ToggleBorderless`]
-/// has a live mechanic wired up in this slice -- the taskbar-autohide toggle
-/// mechanic is issue #7's scope, so its binding is not resolved/registered
-/// here yet even though [`HotkeyBindings`] already stores it.
+/// Actions GameFrame can bind a global hotkey to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
     ToggleBorderless,
+    /// Toggles taskbar auto-hide on/off via `SHAppBarMessage` -- see
+    /// [`crate::win32::toggle_taskbar_autohide`]. Fully independent of
+    /// [`HotkeyAction::ToggleBorderless`]'s state; either can be pressed
+    /// without the other having been used first.
+    ToggleTaskbarAutohide,
 }
 
 /// A hotkey binding resolved from its stored string into the parsed
@@ -32,22 +34,29 @@ pub struct ResolvedBinding {
     pub hotkey: HotKey,
 }
 
-/// Resolves the borderless-toggle hotkey binding (if any) from `bindings`
-/// into a [`ResolvedBinding`].
+/// Resolves every bound hotkey (the borderless toggle and/or the taskbar
+/// auto-hide toggle -- either, both, or neither) from `bindings` into
+/// [`ResolvedBinding`]s.
 ///
 /// Free-text hotkey strings (as entered via Settings -- issue #5's Settings
 /// UI does no format validation) are parsed with `global_hotkey::hotkey::HotKey`'s
 /// own `FromStr` implementation, which already accepts the `"Ctrl+Alt+B"`-style
 /// syntax Settings stores (modifiers joined by `+`, main key last -- see the
-/// `global-hotkey` crate's own `hotkey` module docs). No unbound hotkey
-/// (`None`) resolves to an empty list rather than an error -- pressing keys
-/// on a fresh install where nothing is bound must not do anything (and can't
-/// crash, since nothing gets registered).
+/// `global-hotkey` crate's own `hotkey` module docs). An unbound hotkey
+/// (`None`) is simply skipped rather than erroring -- pressing keys on a
+/// fresh install where nothing is bound must not do anything (and can't
+/// crash, since nothing gets registered). The two bindings are resolved
+/// fully independently of each other -- either, both, or neither may be
+/// bound, in any combination.
 pub fn resolve_bindings(bindings: &HotkeyBindings) -> Result<Vec<ResolvedBinding>, HotKeyParseError> {
     let mut resolved = Vec::new();
     if let Some(raw) = &bindings.toggle_borderless {
         let hotkey: HotKey = raw.parse()?;
         resolved.push(ResolvedBinding { action: HotkeyAction::ToggleBorderless, hotkey });
+    }
+    if let Some(raw) = &bindings.toggle_taskbar_autohide {
+        let hotkey: HotKey = raw.parse()?;
+        resolved.push(ResolvedBinding { action: HotkeyAction::ToggleTaskbarAutohide, hotkey });
     }
     Ok(resolved)
 }
@@ -154,9 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bindings_ignores_the_taskbar_autohide_binding_in_this_slice() {
-        // toggle_taskbar_autohide's mechanic is issue #7's scope; resolving
-        // it here (with nothing reacting to it) would be dead weight.
+    fn resolve_bindings_parses_a_bound_toggle_taskbar_autohide_hotkey() {
         let bindings = HotkeyBindings {
             toggle_borderless: None,
             toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
@@ -164,7 +171,29 @@ mod tests {
 
         let resolved = resolve_bindings(&bindings).unwrap();
 
-        assert_eq!(resolved, vec![]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].action, HotkeyAction::ToggleTaskbarAutohide);
+        assert_eq!(resolved[0].hotkey, "Ctrl+Alt+T".parse::<HotKey>().unwrap());
+    }
+
+    #[test]
+    fn resolve_bindings_resolves_both_bindings_independently_when_both_are_bound() {
+        let bindings = HotkeyBindings {
+            toggle_borderless: Some("Ctrl+Alt+B".to_string()),
+            toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+        };
+
+        let resolved = resolve_bindings(&bindings).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved
+            .iter()
+            .any(|b| b.action == HotkeyAction::ToggleBorderless
+                && b.hotkey == "Ctrl+Alt+B".parse::<HotKey>().unwrap()));
+        assert!(resolved
+            .iter()
+            .any(|b| b.action == HotkeyAction::ToggleTaskbarAutohide
+                && b.hotkey == "Ctrl+Alt+T".parse::<HotKey>().unwrap()));
     }
 
     #[test]
@@ -193,6 +222,21 @@ mod tests {
         let bindings = vec![ResolvedBinding { action: HotkeyAction::ToggleBorderless, hotkey }];
 
         assert_eq!(action_for(&bindings, 999_999), None);
+    }
+
+    #[test]
+    fn action_for_dispatches_to_the_correct_action_when_both_hotkeys_are_bound() {
+        // Independence check: with both bound, pressing one hotkey's id must
+        // resolve to its own action only, never the other's, and vice versa.
+        let borderless_hotkey: HotKey = "Ctrl+Alt+B".parse().unwrap();
+        let taskbar_hotkey: HotKey = "Ctrl+Alt+T".parse().unwrap();
+        let bindings = vec![
+            ResolvedBinding { action: HotkeyAction::ToggleBorderless, hotkey: borderless_hotkey },
+            ResolvedBinding { action: HotkeyAction::ToggleTaskbarAutohide, hotkey: taskbar_hotkey },
+        ];
+
+        assert_eq!(action_for(&bindings, borderless_hotkey.id()), Some(HotkeyAction::ToggleBorderless));
+        assert_eq!(action_for(&bindings, taskbar_hotkey.id()), Some(HotkeyAction::ToggleTaskbarAutohide));
     }
 
     #[test]
