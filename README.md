@@ -1,16 +1,81 @@
 # GameFrame
 
-A Windows system-tray utility that makes a game/app window borderless and repositions it to a defined screen region, and toggles taskbar auto-hide via a global hotkey. Replaces two separate background tools (Windowed Borderless Gaming + a standalone Hide Taskbar utility) with one process.
-
-Status: early scaffold, not yet implemented.
+A Windows system-tray utility that makes a game/app window borderless and repositions it to a
+defined screen region, and toggles taskbar auto-hide via a global hotkey. Replaces two separate
+background tools (Windowed Borderless Gaming + a standalone Hide Taskbar utility) with one process.
 
 Full problem statement, research, and design decisions: [`Project Ideas/gameframe.md`](../Project%20Ideas/gameframe.md).
 
+## Status
+
+MVP complete. GameFrame runs as a tray-resident background process with:
+
+- **Tray icon** with a right-click menu: **Show Settings**, **Apply to Window** (a submenu listing
+  currently open, listable windows — picking one applies the active region preset to it), and
+  **Exit**.
+- **Global hotkeys**:
+  - Borderless toggle — strips the window border/titlebar from the current foreground window and
+    moves/resizes it to the active region preset; pressing it again restores the window's original
+    style and position.
+  - Taskbar auto-hide toggle — flips the Windows taskbar between always-visible and auto-hide.
+- **Settings window** (`egui`, opened on demand from the tray menu, not resident at idle) for
+  managing region presets (built-in presets plus custom presets with user-defined dimensions) and
+  binding the two global hotkeys.
+- **Config persistence** — presets and hotkey bindings are saved as TOML to
+  `%APPDATA%\GameFrame\config.toml` and reloaded on the next launch.
+
 ## Tech stack
 
-- Rust
-- `windows` crate — Win32 bindings (window manipulation, DWM, `SHAppBarMessage` for taskbar)
-- `tray-icon` + `muda` — system tray
-- `egui` — settings UI, lazily instantiated only while open (not resident at idle)
-- `global-hotkey` — hotkey bindings
-- TOML config in `%APPDATA%\GameFrame\`
+- Rust (edition 2024)
+- `windows-sys` — Win32 bindings (window manipulation, DWM, `SHAppBarMessage` for taskbar)
+- `tray-icon` + `muda` — system tray icon and menu
+- `egui` + `eframe` — Settings UI, lazily instantiated only while open (not resident at idle)
+- `global-hotkey` — global hotkey registration
+- `serde` + `toml` — config (de)serialization
+
+## Building and running
+
+Requires a Rust toolchain (edition 2024) targeting `x86_64-pc-windows-msvc`.
+
+```powershell
+# Debug run, for development
+cargo run
+
+# Run the test suite
+cargo test
+
+# Release build
+cargo build --release
+```
+
+The release build produces a single self-contained executable at
+`target\release\gameframe.exe` — no separate runtime DLLs are required (the CRT is statically
+linked via `.cargo\config.toml`; the binary depends only on standard Windows system DLLs already
+present on any Windows install). Just copy `gameframe.exe` wherever you want to run it from.
+
+The release profile (`[profile.release]` in `Cargo.toml`) is tuned for binary size
+(`opt-level = "z"`, LTO, single codegen unit, `panic = "abort"`, symbols stripped), since `egui`/
+`eframe`/`wgpu`/`winit` pull in a sizeable dependency tree. Note: `panic = "abort"` skips
+unwind-based `Drop` cleanup process-wide if the process ever panics unexpectedly — e.g.
+`tray-icon`'s Windows `Drop` impl that removes the tray icon on drop would not run in that case.
+This is a common, reasonable size-optimization trade-off, not a defect.
+
+### Measured results
+
+Measured on a Windows 11 development sandbox (not dedicated gaming hardware):
+
+- **Binary size**: `gameframe.exe` is ~8.25 MB (8,650,240 bytes) — under the 10 MB budget.
+- **Runtime DLLs**: none alongside the executable; `dumpbin /dependents` shows only standard
+  Windows system DLLs (`kernel32.dll`, `user32.dll`, `gdi32.dll`, `ole32.dll`, `shell32.dll`,
+  `dwmapi.dll`, `comctl32.dll`, `uxtheme.dll`, etc.) — no `VCRUNTIME140.dll` or other VC++
+  redistributable dependency, thanks to static CRT linking.
+- **Idle memory**: with only the tray icon and hotkey listeners active (no Settings window open),
+  steady-state working set was ~13.6 MB (14,299,136 bytes), measured via `Get-Process` a few
+  seconds after launch once memory stopped climbing. This is informational rather than a hard
+  gate, but it is **above** the ≤5 MB soft budget by roughly 8.6 MB — cause not yet identified.
+  Note that `src/app.rs::run()` only constructs the tray icon and registers hotkeys before entering
+  the message loop; `eframe`/the Settings window is not instantiated until the user clicks "Show
+  Settings," so GPU/windowing runtime state is not the explanation. The overage is more likely
+  attributable to the baseline Rust/CRT process footprint plus the `tray-icon` and `global-hotkey`
+  runtime dependencies, but that has not been confirmed by profiling. Re-measuring on real
+  end-user hardware, and profiling to pin down the actual source, is recommended.
