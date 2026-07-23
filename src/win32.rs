@@ -146,9 +146,12 @@ fn apply_autohide_state(current_flags: u32, state: TaskbarAutohideState) -> u32 
 pub enum Win32Error {
     /// `GetForegroundWindow` returned a null handle (no foreground window).
     NoForegroundWindow,
-    /// The foreground window is minimized (`IsIconic`), so its bounding
-    /// rectangle would be its off-screen minimized position (roughly
-    /// `(-32000, -32000)`) rather than a real, restorable region.
+    /// The window is minimized (`IsIconic`), so its bounding rectangle would
+    /// be its off-screen minimized position (roughly `(-32000, -32000)`)
+    /// rather than a real, restorable region. Returned by both
+    /// [`toggle_borderless_on_foreground_window`] (for the foreground window)
+    /// and [`apply_borderless_to_window`] (for an arbitrary tray-picked
+    /// window, which is very likely not the foreground window).
     WindowMinimized,
     /// A Win32 call failed; wraps the OS error from `GetLastError`.
     Os(std::io::Error),
@@ -201,7 +204,7 @@ impl std::fmt::Display for Win32Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Win32Error::NoForegroundWindow => write!(f, "no foreground window to manipulate"),
-            Win32Error::WindowMinimized => write!(f, "foreground window is minimized"),
+            Win32Error::WindowMinimized => write!(f, "window is minimized"),
             Win32Error::Os(e) => write!(f, "Win32 window manipulation failed: {e}"),
             Win32Error::Hresult(hr) => write!(f, "Win32 window manipulation failed: HRESULT {:#010x}", *hr as u32),
             Win32Error::TaskbarNotFound => write!(f, "could not find the taskbar window (Shell_TrayWnd)"),
@@ -229,8 +232,9 @@ use windows_sys::Win32::UI::Shell::{
     ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, SetWindowLongPtrW, SetWindowPos,
-    GWL_STYLE, SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
+    EnumWindows, FindWindowW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SET_WINDOW_POS_FLAGS,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -241,9 +245,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// first and a non-zero `GetLastError()` afterwards is the real failure
 /// signal.
 fn get_window_style(hwnd: HWND) -> Result<u32, Win32Error> {
-    // Safety: `hwnd` is a live handle obtained from `GetForegroundWindow`
-    // just before this call; `GetWindowLongPtrW` performs no writes and
-    // takes no pointers besides `hwnd` itself.
+    // Safety: `hwnd` is a live handle; `GetWindowLongPtrW` performs no writes
+    // and takes no pointers besides `hwnd` itself.
     let style = unsafe {
         windows_sys::Win32::Foundation::SetLastError(0);
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -353,6 +356,52 @@ fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
     set_corner_preference(hwnd, DWMWCP_DEFAULT)
 }
 
+/// Strips a window's border and moves/resizes it to `target_region`: the
+/// shared "make borderless" mutation shared by
+/// [`toggle_borderless_on_foreground_window`] (acting on
+/// `GetForegroundWindow()`'s result) and the tray menu's "Apply to Window"
+/// picker (acting on an explicit window the user chose, which may not be the
+/// foreground window at all -- see [`crate::app`]'s dispatch of a decoded
+/// window-item id via [`crate::tray_ui::decode_window_item_id`]). Reads
+/// `hwnd`'s current style itself (rather than taking a pre-computed one) so
+/// callers only need a target `HWND` and region -- neither caller needs to
+/// separately read/strip the style first.
+///
+/// Unlike [`toggle_borderless_on_foreground_window`], this performs a
+/// one-shot strip with no toggle/restore-state tracking: callers that need a
+/// remembered "undo" (the hotkey path) layer that on top themselves via
+/// [`plan_toggle`]/[`RestoreState`]; callers that don't (the tray-menu path)
+/// simply call this directly.
+///
+/// Mirrors [`toggle_borderless_on_foreground_window`]'s own minimized-window
+/// guard: a minimized window's `GetWindowRect` reports its off-screen
+/// minimized position (roughly `(-32000, -32000)`), not a real, restorable
+/// region, so applying a target region to it would move/resize it based on
+/// that bogus rect. `is_listable_window`'s picker filter only checks
+/// `IsWindowVisible` (which stays `TRUE` for minimized windows), so a
+/// minimized window can legitimately reach this function via the tray-menu
+/// path -- this guard is what keeps that path's OS-mutation behavior
+/// identical to the hotkey path's, per "the same underlying logic as the
+/// borderless hotkey" (issue #8's acceptance criteria), not just sharing the
+/// three-call mutation sequence.
+///
+/// OS-facing: acts on the real window identified by `hwnd`. Not exercised by
+/// this crate's automated tests -- see module docs.
+pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(), Win32Error> {
+    // Safety: `hwnd` is a live handle passed in by the caller; `IsIconic`
+    // performs no writes.
+    if unsafe { IsIconic(hwnd) } != 0 {
+        return Err(Win32Error::WindowMinimized);
+    }
+
+    let live_style = get_window_style(hwnd)?;
+    let new_style = strip_border_style(live_style);
+    set_window_style(hwnd, new_style)?;
+    set_window_region(hwnd, target_region)?;
+    disable_rounded_corners(hwnd)?;
+    Ok(())
+}
+
 /// Performs the borderless-toggle hotkey's full effect on the current
 /// foreground window: strips its border and moves it to `target_region` (if
 /// nothing is remembered), or restores it to exactly the style/region
@@ -393,7 +442,7 @@ pub fn toggle_borderless_on_foreground_window(
     let (action, next_state) = plan_toggle(*state, live_style, live_region, target_region);
 
     match action {
-        ToggleAction::MakeBorderless { new_style, region } => {
+        ToggleAction::MakeBorderless { region, .. } => {
             // Commit the new remembered state *before* attempting the
             // OS-mutating calls below. `next_state` here is `Some(restore)`
             // derived purely from `live_style`/`live_region`, already safely
@@ -404,10 +453,16 @@ pub fn toggle_borderless_on_foreground_window(
             // be lost. Committing early means the next press still restores
             // the window correctly instead of deriving a wrong "restore"
             // state from an already-partially-mutated window.
+            //
+            // The actual mutation is delegated to
+            // [`apply_borderless_to_window`] (shared with the tray-menu
+            // path) rather than repeating its three-call sequence here; it
+            // re-reads `hwnd`'s style itself, which is safe since nothing
+            // has mutated it between the `live_style` read above and here --
+            // the resulting stripped style is identical to plan_toggle's own
+            // `new_style` (ignored above via `..`).
             *state = next_state;
-            set_window_style(hwnd, new_style)?;
-            set_window_region(hwnd, region)?;
-            disable_rounded_corners(hwnd)?;
+            apply_borderless_to_window(hwnd, region)?;
         }
         ToggleAction::Restore(restore) => {
             // Do NOT commit `next_state` (always `None` here) until all three
@@ -544,6 +599,92 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
 /// format every wide (`*W`) Win32 API used here expects.
 fn encode_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Decides whether a window is worth offering in the tray menu's "Apply to
+/// Window" picker, given its title and `IsWindowVisible` result -- a window
+/// is listable if it's currently visible and has a non-blank title (an
+/// invisible or untitled window isn't something a user could sensibly pick
+/// by name). Pure logic -- no `HWND`/OS dependency -- so it's unit testable
+/// separately from the real `EnumWindows` callback ([`list_visible_windows`])
+/// that calls it.
+fn is_listable_window(title: &str, is_visible: bool) -> bool {
+    is_visible && !title.trim().is_empty()
+}
+
+/// Enumerates every currently-visible top-level window with a non-blank
+/// title (via [`is_listable_window`]), for the tray menu's "Apply to Window"
+/// picker ([`crate::tray_ui`]) to populate its submenu from. Returns a fresh
+/// snapshot on every call -- the tray menu re-calls this each time it wants
+/// its picker to reflect what's currently open (see `tray_ui`'s module docs
+/// for how/when it does so) rather than caching a snapshot.
+///
+/// OS-facing: walks the real top-level window list via `EnumWindows`. Not
+/// exercised by this crate's automated tests -- see module docs; the
+/// filtering decision itself ([`is_listable_window`]) is unit tested above
+/// in isolation from the live enumeration.
+pub fn list_visible_windows() -> Vec<(HWND, String)> {
+    let mut windows: Vec<(HWND, String)> = Vec::new();
+    // Safety: `windows` outlives this call (it's a local that isn't dropped
+    // until after `EnumWindows` returns); it's cast to a raw pointer solely
+    // to smuggle it through `EnumWindows`'s documented `LPARAM` userdata
+    // parameter, and `enum_windows_callback` below casts it back to the
+    // exact same type before dereferencing it.
+    unsafe {
+        EnumWindows(Some(enum_windows_callback), std::ptr::addr_of_mut!(windows) as isize);
+    }
+    windows
+}
+
+/// `EnumWindows`'s per-window callback: reads each candidate window's
+/// visibility/title and, if [`is_listable_window`] accepts it, appends it to
+/// the `Vec<(HWND, String)>` passed as `lparam` by [`list_visible_windows`].
+///
+/// Per `EnumWindows`'s documented contract, returning nonzero (`TRUE`)
+/// continues enumeration to the next window; this callback always does so --
+/// there's no early-exit condition for this use case (every top-level window
+/// needs to be considered).
+unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // Safety: `lparam` is exactly the pointer `list_visible_windows` passed
+    // in, valid for the duration of the `EnumWindows` call that is
+    // synchronously invoking this callback.
+    let windows = unsafe { &mut *(lparam as *mut Vec<(HWND, String)>) };
+
+    // Safety: `hwnd` is a live handle supplied by `EnumWindows` itself;
+    // `IsWindowVisible` performs no writes.
+    let is_visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    let title = window_text(hwnd);
+
+    if is_listable_window(&title, is_visible) {
+        windows.push((hwnd, title));
+    }
+
+    1 // TRUE: keep enumerating.
+}
+
+/// Reads a window's title via `GetWindowTextLengthW`/`GetWindowTextW`,
+/// returning an empty string if the window has no title (or either call
+/// fails) rather than propagating an error -- an untitled window is simply
+/// filtered out by [`is_listable_window`], not treated as a hard failure of
+/// the whole enumeration.
+fn window_text(hwnd: HWND) -> String {
+    // Safety: `hwnd` is a live handle; `GetWindowTextLengthW` performs no
+    // writes.
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return String::new();
+    }
+
+    let mut buffer = vec![0u16; len as usize + 1];
+    // Safety: `hwnd` is a live handle; `buffer` is a valid, correctly-sized
+    // (`len + 1`, matching `nMaxCount`) out-buffer for `GetWindowTextW` to
+    // write into, per its documented contract.
+    let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+
+    String::from_utf16_lossy(&buffer[..copied as usize])
 }
 
 #[cfg(test)]
@@ -801,12 +942,32 @@ mod tests {
         let err = Win32Error::WindowMinimized;
 
         assert_is_std_error(&err);
-        assert_eq!(err.to_string(), "foreground window is minimized");
+        assert_eq!(err.to_string(), "window is minimized");
     }
 
     #[test]
     fn win32_error_taskbar_not_found_is_not_access_denied() {
         assert!(!Win32Error::TaskbarNotFound.is_access_denied());
+    }
+
+    #[test]
+    fn is_listable_window_accepts_a_visible_window_with_a_non_empty_title() {
+        assert!(is_listable_window("Notepad", true));
+    }
+
+    #[test]
+    fn is_listable_window_rejects_an_invisible_window() {
+        assert!(!is_listable_window("Notepad", false));
+    }
+
+    #[test]
+    fn is_listable_window_rejects_a_visible_window_with_an_empty_title() {
+        assert!(!is_listable_window("", true));
+    }
+
+    #[test]
+    fn is_listable_window_rejects_a_visible_window_whose_title_is_only_whitespace() {
+        assert!(!is_listable_window("   ", true));
     }
 
     #[test]

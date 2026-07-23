@@ -8,9 +8,14 @@
 //! hotkey to toggling taskbar auto-hide via [`crate::win32`]. The two
 //! hotkey mechanics are fully independent -- each keeps its own toggle
 //! state (`toggle_state` / `taskbar_autohide_state` below), so either can be
-//! pressed without the other having been used first. "Apply to Window"
-//! remains a no-op -- it was never given a mechanic of its own; the tray
-//! menu item predates the hotkey-driven mechanics.
+//! pressed without the other having been used first. A click on one of the
+//! "Apply to Window" submenu's dynamically-listed windows (recognized via
+//! [`tray_ui::decode_window_item_id`], distinct from the three fixed
+//! top-level menu items) applies the active preset's borderless+reposition
+//! treatment to that specific window via
+//! [`win32::apply_borderless_to_window`] -- a one-shot action with no
+//! remembered restore state, unlike the hotkey path's `toggle_state` (see
+//! [`handle_apply_to_window`]).
 //!
 //! The message loop itself ([`run`]) is OS-facing (pumps real Win32
 //! messages) and is not exercised by this crate's automated tests, for
@@ -21,11 +26,13 @@ use crate::hotkeys::{Hotkeys, HotkeyAction};
 use crate::profile_store;
 use crate::region_calc::resolve_region;
 use crate::settings_ui::{self, primary_monitor_geometry};
-use crate::tray_ui::{Tray, TrayAction, TrayUiError};
+use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::win32::{self, RestoreState, TaskbarAutohideState};
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::menu::MenuEvent;
+use tray_icon::TrayIconEvent;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
 /// Starts GameFrame: shows only the tray icon (no window), registers the
@@ -70,7 +77,10 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
 /// [`MenuEvent::receiver`]; draining it after every dispatched message
 /// lets us react to a click without a separate polling thread. The same
 /// pattern applies to global hotkey presses, delivered on
-/// [`GlobalHotKeyEvent::receiver`] by the `global-hotkey` crate.
+/// [`GlobalHotKeyEvent::receiver`] by the `global-hotkey` crate, and to tray
+/// icon mouse interactions, delivered on [`TrayIconEvent::receiver`] by
+/// `tray-icon` -- the latter is what gates the "Apply to Window" submenu's
+/// live refresh (see the loop body below).
 fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
     // Remembers the foreground window's pre-toggle style/region across
     // presses of the borderless hotkey -- `None` means the window (if any)
@@ -97,7 +107,56 @@ fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
             DispatchMessageW(&msg);
         }
 
+        // Refreshes the "Apply to Window" submenu's item list only in
+        // response to an actual tray-icon mouse interaction (the mouse
+        // entering the icon, or a click on it), rather than unconditionally
+        // on every pumped message.
+        //
+        // `Enter` reliably arrives on its own dispatched `WM_MOUSEMOVE`
+        // message, strictly before the later `WM_RBUTTONUP` message that
+        // opens the context menu (a user must hover onto the tray icon
+        // before they can click it) -- so refreshing here, once per
+        // `Enter`, completes before the menu is ever shown. `Click` is
+        // included too as a defensive fallback (e.g. covers the case where
+        // this process only just started pumping messages while the cursor
+        // was already resting on the icon, so no `Enter` transition ever
+        // fires) even though, per `tray-icon`'s Windows backend, the menu is
+        // shown synchronously in the same `WM_RBUTTONUP` handler right after
+        // the `Click` event is enqueued -- refreshing on `Click` won't beat
+        // that particular menu display, but it does mean the very next
+        // open is guaranteed current.
+        //
+        // This replaces an earlier unconditional "refresh before every
+        // dispatched message" approach. The primary, certain reason: `tray-icon`
+        // sets a 15ms `WM_TIMER` while the mouse hovers over the icon, which
+        // would otherwise have driven a full `EnumWindows` + per-window
+        // `GetWindowTextW` + submenu rebuild (real Win32 syscalls) up to ~66
+        // times/second just from the cursor resting nearby -- needlessly
+        // expensive on this process's one and only message loop. A secondary,
+        // less certain consideration: per the documented `GetWindowTextW`
+        // contract, a same-process target window causes a `WM_GETTEXT` to be
+        // sent via `SendMessage` and can block if that window is stuck,
+        // whereas a cross-process target (the common case when enumerating
+        // the whole desktop) is documented to read the cached caption text
+        // directly instead, specifically so callers don't hang on an
+        // unresponsive foreign process -- so the practical hang risk here is
+        // narrower than "any hung window on the desktop" (more like "one of
+        // GameFrame's own windows getting stuck"), but still worth avoiding
+        // at no extra cost. No crate-native "menu about to show" event exists
+        // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
+        // comment).
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if matches!(event, TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }) {
+                tray.refresh_apply_to_window_menu();
+            }
+        }
+
         while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
+                handle_apply_to_window(config_dir, target_hwnd);
+                continue;
+            }
+
             match tray.ids().action_for(event.id()) {
                 Some(TrayAction::Exit) => {
                     // Returning here unwinds back to `run()`, which then
@@ -115,11 +174,6 @@ fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
                     if let Err(e) = open_settings(config_dir) {
                         eprintln!("failed to open Settings: {e}");
                     }
-                }
-                Some(TrayAction::ApplyToWindow) => {
-                    // No-op -- this tray menu item has never had a
-                    // mechanic of its own; the hotkey-driven toggle below
-                    // is what issue #6 actually wires up.
                 }
                 None => {}
             }
@@ -206,6 +260,54 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     }
 
     false
+}
+
+/// Reacts to a click on one of the "Apply to Window" submenu's
+/// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
+/// the active preset's region against the primary monitor (the same pattern
+/// as [`handle_toggle_borderless`]) and applies the borderless+reposition
+/// treatment to `target_hwnd` -- which may not be the foreground window at
+/// all, that's the whole point of this tray-menu path -- via
+/// [`win32::apply_borderless_to_window`].
+///
+/// A one-shot action, not a toggle: there is no remembered restore state for
+/// this path (see this module's doc comment for the scope decision), so
+/// selecting the same window again simply re-applies the same treatment
+/// rather than undoing it.
+///
+/// Reloads the config from disk on every click, for the same reason
+/// [`handle_toggle_borderless`] does.
+///
+/// Unlike [`handle_toggle_borderless`], a failure here (including an
+/// access-denied failure) is only logged, not retried via
+/// [`win32::relaunch_elevated`] -- reactive elevation for this path is out
+/// of scope for this slice.
+fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
+    let config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("apply to window: failed to load config: {e}");
+            return;
+        }
+    };
+
+    let Some(preset) = win32::active_preset(&config.presets) else {
+        eprintln!("apply to window: no presets configured");
+        return;
+    };
+
+    let monitor = primary_monitor_geometry();
+    let target_region = match resolve_region(preset, &monitor) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("apply to window: failed to resolve the active preset's region: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = win32::apply_borderless_to_window(target_hwnd, target_region) {
+        eprintln!("apply to window failed: {e}");
+    }
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips
