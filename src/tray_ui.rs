@@ -195,7 +195,7 @@ impl Tray {
         menu.append(&MenuItem::with_id(ids.exit.clone(), "Exit", true, None))
             .map_err(TrayUiError::Menu)?;
 
-        let icon = placeholder_icon().map_err(TrayUiError::Icon)?;
+        let icon = app_tray_icon().map_err(TrayUiError::Icon)?;
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -286,14 +286,12 @@ fn escape_menu_ampersand(title: &str) -> String {
     title.replace('&', "&&")
 }
 
-/// A small solid-color placeholder icon. A real designed icon asset is
-/// out of scope for this slice.
-fn placeholder_icon() -> Result<Icon, tray_icon::BadIcon> {
-    const SIZE: u32 = 16;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[0x2b, 0x6c, 0xb0, 0xff]);
-    }
+/// GameFrame's tray icon: the corner-bracket mark from [`gameframe::icon`],
+/// rendered at 32x32 so it stays crisp on high-DPI notification areas that
+/// display tray icons larger than the classic 16x16.
+fn app_tray_icon() -> Result<Icon, tray_icon::BadIcon> {
+    const SIZE: u32 = 32;
+    let rgba = gameframe::icon::mark_rgba(SIZE);
     Icon::from_rgba(rgba, SIZE, SIZE)
 }
 

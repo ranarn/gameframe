@@ -235,7 +235,8 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame Settings")
-            .with_inner_size([440.0, 520.0]),
+            .with_inner_size([440.0, 520.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
 
@@ -254,6 +255,14 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     }
 
     Ok(())
+}
+
+/// GameFrame's corner-bracket mark from [`gameframe::icon`], rendered at
+/// 256x256 as recommended by [`egui::IconData`]'s own doc comment, for the
+/// Settings window's title-bar/taskbar icon.
+fn window_icon() -> egui::IconData {
+    const SIZE: u32 = 256;
+    egui::IconData { rgba: gameframe::icon::mark_rgba(SIZE), width: SIZE, height: SIZE }
 }
 
 /// The live egui app backing the Settings window. Torn down entirely when

@@ -19,6 +19,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3.27.0"
 
 [profile.release]
@@ -27,3 +28,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[build-dependencies]
+winresource = "0.1.31"
