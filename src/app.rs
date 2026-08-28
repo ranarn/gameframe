@@ -44,7 +44,7 @@ pub fn run() -> Result<(), TrayUiError> {
     let config_dir = config_dir();
     let hotkeys = register_hotkeys(&config_dir);
 
-    run_event_loop(&tray, hotkeys.as_ref(), &config_dir);
+    run_event_loop(&tray, hotkeys, &config_dir);
     Ok(())
 }
 
@@ -81,7 +81,11 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
 /// icon mouse interactions, delivered on [`TrayIconEvent::receiver`] by
 /// `tray-icon` -- the latter is what gates the "Apply to Window" submenu's
 /// live refresh (see the loop body below).
-fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
+///
+/// `hotkeys` is owned (not borrowed) specifically so the `ShowSettings`
+/// branch below can reassign it with a freshly re-registered [`Hotkeys`]
+/// after the Settings window closes -- see that branch's comment.
+fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) {
     // Remembers the foreground window's pre-toggle style/region across
     // presses of the borderless hotkey -- `None` means the window (if any)
     // is currently in its normal bordered state; `Some` means the last
@@ -174,6 +178,20 @@ fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
                     if let Err(e) = open_settings(config_dir) {
                         eprintln!("failed to open Settings: {e}");
                     }
+
+                    // Settings may have changed the hotkey bindings on
+                    // disk (Save persists via `profile_store`) --
+                    // re-register from the freshly saved config so a
+                    // newly bound/changed/removed hotkey takes effect
+                    // immediately, without requiring a full app
+                    // restart. Assigning over `hotkeys` drops the old
+                    // `Hotkeys` first (its `Drop` impl destroys the old
+                    // `GlobalHotKeyManager`'s hidden window, which the OS
+                    // uses to automatically unregister every hotkey that
+                    // was bound to it) before the new one registers,
+                    // so there's no window where both the old and new
+                    // bindings are simultaneously held.
+                    hotkeys = register_hotkeys(config_dir);
                 }
                 None => {}
             }
@@ -191,7 +209,7 @@ fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
             // (nothing was registered, so no event can arrive for it
             // anyway) or resolves to no action for `event.id()` --
             // either way, nothing happens here and nothing panics.
-            let action = hotkeys.and_then(|h| h.action_for(event.id()));
+            let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
             match action {
                 Some(HotkeyAction::ToggleBorderless) => {
                     if handle_toggle_borderless(config_dir, &mut toggle_state) {
@@ -222,8 +240,10 @@ fn run_event_loop(tray: &Tray, hotkeys: Option<&Hotkeys>, config_dir: &Path) {
 /// across the whole run) so a preset added/edited via Settings since the
 /// last press is picked up immediately -- the trade-off is a small,
 /// infrequent disk read on a user-initiated action, which is cheap.
-/// Re-registering the hotkey binding itself if it's changed via Settings is
-/// out of scope for this slice; that takes a restart to pick up.
+/// The hotkey binding itself is re-registered separately, right after the
+/// Settings window closes -- see the `ShowSettings` branch in
+/// [`run_event_loop`] -- so a changed binding also takes effect without a
+/// restart.
 fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<RestoreState>) -> bool {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
@@ -338,5 +358,58 @@ fn config_dir() -> PathBuf {
     match std::env::var("APPDATA") {
         Ok(appdata) => PathBuf::from(appdata).join("GameFrame"),
         Err(_) => PathBuf::from("GameFrame"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hotkeys::resolve_bindings;
+    use global_hotkey::hotkey::HotKey;
+
+    /// Regression coverage for the bug where a hotkey bound via Settings
+    /// didn't take effect until a full app restart: `run_event_loop`'s
+    /// `ShowSettings` branch reacts to Settings closing by calling
+    /// [`register_hotkeys`] again, which reloads the config from disk and
+    /// resolves it into fresh bindings. This test exercises exactly that
+    /// reload-and-resolve chain -- load, simulate a Settings save that
+    /// changes a binding, reload -- and asserts the new binding is picked
+    /// up, i.e. a second read after a save is never stale.
+    ///
+    /// It deliberately stops short of calling [`register_hotkeys`] (or
+    /// [`Hotkeys::register`]) itself: those also drive a real
+    /// `GlobalHotKeyManager` OS registration, which -- per `crate::hotkeys`'s
+    /// module doc comment -- needs a live Win32 event loop and is not
+    /// exercised by this crate's automated tests, the same boundary that
+    /// already excludes `run_event_loop` and `Tray::new` from testing here.
+    /// Because of that boundary, this test cannot regression-guard the exact
+    /// call site of the fix (the `hotkeys = register_hotkeys(config_dir);`
+    /// line added to the `ShowSettings` branch) -- only a live message loop
+    /// could do that. What it does guard is the reload mechanism that call
+    /// site depends on: that reading the config a second time, after a
+    /// Settings-style save, surfaces the change rather than returning
+    /// stale/cached data.
+    #[test]
+    fn reloading_config_after_a_settings_style_save_resolves_the_newly_bound_hotkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+
+        // Fresh install: nothing bound yet.
+        let initial = profile_store::load(&config_dir).unwrap();
+        assert_eq!(resolve_bindings(&initial.hotkeys).unwrap(), vec![]);
+
+        // Simulates Settings persisting a newly bound hotkey on Save.
+        let mut updated = initial.clone();
+        updated.hotkeys.toggle_borderless = Some("F4".to_string());
+        profile_store::save(&config_dir, &updated).unwrap();
+
+        // Simulates the fix: reloading after Settings closes, instead of
+        // continuing to act on the config snapshot loaded at startup.
+        let reloaded = profile_store::load(&config_dir).unwrap();
+        let reloaded_resolved = resolve_bindings(&reloaded.hotkeys).unwrap();
+
+        assert_eq!(reloaded_resolved.len(), 1);
+        assert_eq!(reloaded_resolved[0].action, HotkeyAction::ToggleBorderless);
+        assert_eq!(reloaded_resolved[0].hotkey, "F4".parse::<HotKey>().unwrap());
     }
 }
