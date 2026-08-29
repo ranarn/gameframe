@@ -41,6 +41,18 @@ pub struct SettingsState {
     pub custom_width: String,
     pub custom_height: String,
     pub custom_region_error: Option<String>,
+    /// `Some(field)` while a press-to-bind capture is in progress for that
+    /// hotkey field (waiting for the next non-modifier key-down); `None`
+    /// otherwise. See [`Self::start_capture`]/[`Self::handle_key_event`].
+    pub capturing: Option<HotkeyField>,
+}
+
+/// Which of GameFrame's two hotkey fields a press-to-bind capture applies
+/// to. See [`SettingsState::capturing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyField {
+    ToggleBorderless,
+    ToggleTaskbarAutohide,
 }
 
 impl SettingsState {
@@ -57,6 +69,7 @@ impl SettingsState {
             custom_width: String::new(),
             custom_height: String::new(),
             custom_region_error: None,
+            capturing: None,
         }
     }
 
@@ -141,6 +154,56 @@ impl SettingsState {
             self.presets.remove(index);
         }
     }
+
+    /// Puts `field` into a listening state, waiting for the next key-down to
+    /// complete the capture (see [`Self::handle_key_event`]). Replaces any
+    /// capture already in progress for a different field.
+    pub fn start_capture(&mut self, field: HotkeyField) {
+        self.capturing = Some(field);
+    }
+
+    /// Feeds one key-down event (physical key plus concurrently-held
+    /// modifiers, straight from egui's `Event::Key`) to the in-progress
+    /// capture, if any. No-op if nothing is currently capturing.
+    ///
+    /// - `Escape` cancels the capture without changing the field's existing
+    ///   binding.
+    /// - A physical modifier key alone (Ctrl/Alt/Shift/Super) does not
+    ///   complete the capture -- capturing keeps listening for the main key.
+    /// - Any other key completes the capture: [`format_captured_hotkey`]
+    ///   converts it (with the held modifiers) to GameFrame's stored string
+    ///   convention and overwrites the target field's binding. A key with no
+    ///   name in that vocabulary is ignored, leaving the capture listening.
+    pub fn handle_key_event(&mut self, modifiers: egui::Modifiers, key: egui::Key) {
+        let Some(field) = self.capturing else {
+            return;
+        };
+
+        if key == egui::Key::Escape {
+            self.capturing = None;
+            return;
+        }
+
+        let Some(combo) = format_captured_hotkey(modifiers, key) else {
+            return;
+        };
+
+        match field {
+            HotkeyField::ToggleBorderless => self.toggle_borderless = combo,
+            HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide = combo,
+        }
+        self.capturing = None;
+    }
+
+    /// Unbinds `field` (clears its stored string back to empty, GameFrame's
+    /// existing "unbound" representation). The capture widget's replacement
+    /// for what deleting the text used to do in the old free-text field.
+    pub fn clear_hotkey(&mut self, field: HotkeyField) {
+        match field {
+            HotkeyField::ToggleBorderless => self.toggle_borderless.clear(),
+            HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide.clear(),
+        }
+    }
 }
 
 fn parse_field(name: &str, value: &str) -> Result<i32, String> {
@@ -159,6 +222,158 @@ fn preset_label(preset: &Preset) -> String {
             format!("Custom ({x}, {y}, {width}x{height})")
         }
     }
+}
+
+/// `true` for egui's eight physical modifier-key variants (Shift/Control/Alt/
+/// Super, left or right). A press of one of these alone must never complete
+/// a hotkey capture -- only combined with a subsequent non-modifier key.
+fn is_physical_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
+/// Maps a physical, non-modifier `egui::Key` to the name token GameFrame's
+/// stored hotkey strings use for it -- the same token `global_hotkey::hotkey::HotKey`'s
+/// `FromStr` (via `resolve_bindings`) already accepts, so no changes to the
+/// persistence/parsing layer are needed. Returns `None` for keys with no
+/// name in that vocabulary (the capture is then left listening rather than
+/// completing with an unparsable binding).
+fn key_display_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key;
+    Some(match key {
+        Key::A => "A",
+        Key::B => "B",
+        Key::C => "C",
+        Key::D => "D",
+        Key::E => "E",
+        Key::F => "F",
+        Key::G => "G",
+        Key::H => "H",
+        Key::I => "I",
+        Key::J => "J",
+        Key::K => "K",
+        Key::L => "L",
+        Key::M => "M",
+        Key::N => "N",
+        Key::O => "O",
+        Key::P => "P",
+        Key::Q => "Q",
+        Key::R => "R",
+        Key::S => "S",
+        Key::T => "T",
+        Key::U => "U",
+        Key::V => "V",
+        Key::W => "W",
+        Key::X => "X",
+        Key::Y => "Y",
+        Key::Z => "Z",
+        Key::Num0 => "0",
+        Key::Num1 => "1",
+        Key::Num2 => "2",
+        Key::Num3 => "3",
+        Key::Num4 => "4",
+        Key::Num5 => "5",
+        Key::Num6 => "6",
+        Key::Num7 => "7",
+        Key::Num8 => "8",
+        Key::Num9 => "9",
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F4 => "F4",
+        Key::F5 => "F5",
+        Key::F6 => "F6",
+        Key::F7 => "F7",
+        Key::F8 => "F8",
+        Key::F9 => "F9",
+        Key::F10 => "F10",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+        Key::F13 => "F13",
+        Key::F14 => "F14",
+        Key::F15 => "F15",
+        Key::F16 => "F16",
+        Key::F17 => "F17",
+        Key::F18 => "F18",
+        Key::F19 => "F19",
+        Key::F20 => "F20",
+        Key::F21 => "F21",
+        Key::F22 => "F22",
+        Key::F23 => "F23",
+        Key::F24 => "F24",
+        Key::ArrowDown => "Down",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::ArrowUp => "Up",
+        Key::Tab => "Tab",
+        Key::Backspace => "Backspace",
+        Key::Enter => "Enter",
+        Key::Space => "Space",
+        Key::Insert => "Insert",
+        Key::Delete => "Delete",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Minus => "Minus",
+        Key::Period => "Period",
+        Key::Quote => "Quote",
+        Key::Semicolon => "Semicolon",
+        Key::Slash => "Slash",
+        Key::Backslash => "Backslash",
+        Key::Equals => "Equal",
+        Key::Backtick => "Backquote",
+        Key::Comma => "Comma",
+        // Anything else (including `Escape`, handled separately as the
+        // capture-cancel key, and keys with no token in GameFrame's stored
+        // string vocabulary) is not representable -- leave the capture
+        // listening rather than complete it with an unparsable binding.
+        _ => return None,
+    })
+}
+
+/// Converts a captured key-down event (the held `modifiers` plus the
+/// physical, non-modifier `key` that completed the chord) into GameFrame's
+/// existing `"Ctrl+Alt+B"`-style stored hotkey string convention.
+///
+/// Deliberately NOT `HotKey::Display`, whose `into_string()` round-trips to
+/// a different, lowercase, spelled-out format (`"control+alt+keyb"`) that
+/// doesn't match what `profile_store`/`resolve_bindings` already expect --
+/// see `docs/research/hotkey-capture-widget.md`. Returns `None` if `key` is
+/// itself a physical modifier key (a modifier-only press never completes a
+/// capture) or has no known name in GameFrame's hotkey vocabulary.
+///
+/// Note: egui's `Modifiers` has no Windows/Super-key flag on this platform
+/// (`mac_cmd` is Mac-only, `command` mirrors `ctrl` on Windows) -- so a
+/// captured combo can only carry Ctrl/Alt/Shift, matching every binding
+/// GameFrame has ever stored to date.
+fn format_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<String> {
+    if is_physical_modifier_key(key) {
+        return None;
+    }
+    let name = key_display_name(key)?;
+
+    let mut combo = String::new();
+    if modifiers.ctrl {
+        combo.push_str("Ctrl+");
+    }
+    if modifiers.alt {
+        combo.push_str("Alt+");
+    }
+    if modifiers.shift {
+        combo.push_str("Shift+");
+    }
+    combo.push_str(name);
+    Some(combo)
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -273,6 +488,53 @@ struct SettingsApp {
     saved_config: Rc<RefCell<Option<Config>>>,
 }
 
+impl SettingsApp {
+    /// Renders one hotkey field's row: the current binding (or a listening
+    /// placeholder while a capture is in progress), a "Set hotkey"/"Cancel"
+    /// button, and a "Clear" button. While `field` is capturing, drains this
+    /// frame's key-down events into [`SettingsState::handle_key_event`] --
+    /// OS/GPU-facing (needs a live egui input frame), so not exercised by
+    /// this crate's automated tests; the capture-to-string conversion it
+    /// delegates to is tested in isolation above.
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, label: &str, field: HotkeyField) {
+        let is_capturing = self.state.capturing == Some(field);
+
+        ui.horizontal(|ui| {
+            ui.label(label);
+
+            if is_capturing {
+                ui.colored_label(egui::Color32::YELLOW, "Press a key... (Esc to cancel)");
+            } else {
+                let bound = match field {
+                    HotkeyField::ToggleBorderless => &self.state.toggle_borderless,
+                    HotkeyField::ToggleTaskbarAutohide => &self.state.toggle_taskbar_autohide,
+                };
+                ui.monospace(if bound.is_empty() { "Not bound" } else { bound.as_str() });
+            }
+
+            if ui.button(if is_capturing { "Cancel" } else { "Set hotkey" }).clicked() {
+                if is_capturing {
+                    self.state.capturing = None;
+                } else {
+                    self.state.start_capture(field);
+                }
+            }
+            if ui.button("Clear").clicked() {
+                self.state.clear_hotkey(field);
+            }
+        });
+
+        if is_capturing {
+            for event in ui.ctx().input(|i| i.events.clone()) {
+                if let egui::Event::Key { physical_key: Some(key), pressed: true, repeat: false, modifiers, .. } = event
+                {
+                    self.state.handle_key_event(modifiers, key);
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
@@ -319,14 +581,8 @@ impl eframe::App for SettingsApp {
 
             ui.separator();
             ui.heading("Global hotkeys");
-            ui.horizontal(|ui| {
-                ui.label("Toggle borderless:");
-                ui.text_edit_singleline(&mut self.state.toggle_borderless);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Toggle taskbar autohide:");
-                ui.text_edit_singleline(&mut self.state.toggle_taskbar_autohide);
-            });
+            self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
+            self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -346,6 +602,31 @@ impl eframe::App for SettingsApp {
 mod tests {
     use super::*;
     use crate::region_calc::RegionCalcError;
+
+    #[test]
+    fn format_captured_hotkey_with_modifiers_and_a_letter_key_uses_gameframes_stored_string_convention() {
+        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+
+        let formatted = format_captured_hotkey(modifiers, egui::Key::B);
+
+        assert_eq!(formatted, Some("Ctrl+Alt+B".to_string()));
+    }
+
+    #[test]
+    fn format_captured_hotkey_rejects_a_modifier_only_press_as_an_incomplete_capture() {
+        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+
+        let formatted = format_captured_hotkey(modifiers, egui::Key::ControlLeft);
+
+        assert_eq!(formatted, None);
+    }
+
+    #[test]
+    fn format_captured_hotkey_with_no_modifiers_is_just_the_key_name() {
+        let formatted = format_captured_hotkey(egui::Modifiers::NONE, egui::Key::T);
+
+        assert_eq!(formatted, Some("T".to_string()));
+    }
 
     fn test_monitor() -> MonitorGeometry {
         MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 }
@@ -536,6 +817,76 @@ mod tests {
         assert_eq!(state.custom_y, "");
         assert_eq!(state.custom_width, "");
         assert_eq!(state.custom_height, "");
+    }
+
+    #[test]
+    fn handle_key_event_while_capturing_a_field_sets_that_fields_binding_and_stops_listening() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        state.handle_key_event(modifiers, egui::Key::B);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn handle_key_event_targets_the_taskbar_autohide_field_when_that_field_is_capturing() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleTaskbarAutohide);
+
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::T);
+
+        assert_eq!(state.toggle_taskbar_autohide, "T");
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn handle_key_event_with_escape_cancels_the_capture_without_changing_the_existing_binding() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::Escape);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn handle_key_event_with_only_a_modifier_key_keeps_listening_without_completing_the_capture() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        state.handle_key_event(modifiers, egui::Key::ControlLeft);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleBorderless));
+    }
+
+    #[test]
+    fn handle_key_event_when_nothing_is_capturing_is_a_no_op() {
+        let mut state = SettingsState::from_config(&Config::default());
+
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::B);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn clear_hotkey_unbinds_the_given_field_without_touching_the_other_field() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.toggle_taskbar_autohide = "Ctrl+Alt+T".to_string();
+
+        state.clear_hotkey(HotkeyField::ToggleBorderless);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
     }
 
     #[test]
