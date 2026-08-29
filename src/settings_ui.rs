@@ -175,15 +175,24 @@ impl SettingsState {
         self.duplicate_hotkey_error = None;
     }
 
+    /// Ends the current capture (if any) without changing any hotkey binding.
+    /// The single reset point for `capturing`/`unsupported_key_pressed`/
+    /// `duplicate_hotkey_error` used by every cancellation path (Escape,
+    /// the "Cancel" button, and `clear_hotkey`'s same-field cancel) so the
+    /// three flags can't drift out of sync between call sites.
+    pub fn cancel_capture(&mut self) {
+        self.capturing = None;
+        self.unsupported_key_pressed = false;
+        self.duplicate_hotkey_error = None;
+    }
+
     pub fn handle_key_event(&mut self, modifiers: egui::Modifiers, key: egui::Key) {
         let Some(field) = self.capturing else {
             return;
         };
 
         if key == egui::Key::Escape {
-            self.capturing = None;
-            self.unsupported_key_pressed = false;
-            self.duplicate_hotkey_error = None;
+            self.cancel_capture();
             return;
         }
 
@@ -210,9 +219,7 @@ impl SettingsState {
             HotkeyField::ToggleBorderless => self.toggle_borderless = combo,
             HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide = combo,
         }
-        self.capturing = None;
-        self.unsupported_key_pressed = false;
-        self.duplicate_hotkey_error = None;
+        self.cancel_capture();
     }
 
     pub fn clear_hotkey(&mut self, field: HotkeyField) {
@@ -221,9 +228,7 @@ impl SettingsState {
             HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide.clear(),
         }
         if self.capturing == Some(field) {
-            self.capturing = None;
-            self.unsupported_key_pressed = false;
-            self.duplicate_hotkey_error = None;
+            self.cancel_capture();
         }
     }
 }
@@ -530,7 +535,7 @@ impl SettingsApp {
             let set_hotkey_response = ui.button(if is_capturing { "Cancel" } else { "Set hotkey" });
             if set_hotkey_response.clicked() {
                 if is_capturing {
-                    self.state.capturing = None;
+                    self.state.cancel_capture();
                 } else {
                     self.state.start_capture(field);
                     // Steal keyboard focus away from any other focused widget
@@ -927,6 +932,21 @@ mod tests {
         state.start_capture(HotkeyField::ToggleTaskbarAutohide);
 
         assert!(!state.unsupported_key_pressed);
+    }
+
+    #[test]
+    fn cancel_capture_resets_capturing_and_clears_unsupported_key_and_duplicate_error_flags() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+        state.unsupported_key_pressed = true;
+        state.duplicate_hotkey_error =
+            Some("Ctrl+Alt+B is already bound to the other hotkey".to_string());
+
+        state.cancel_capture();
+
+        assert_eq!(state.capturing, None);
+        assert!(!state.unsupported_key_pressed);
+        assert_eq!(state.duplicate_hotkey_error, None);
     }
 
     #[test]
