@@ -22,22 +22,26 @@ use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
 use crate::win32;
+use crate::zone_editor::PinnedEdges;
+use crate::zone_overlay;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
 /// The editable state backing the Settings window: the `Left`/`Right`
-/// depth-from-edge percentages, the single optional `Custom` preset, the two
-/// hotkey binding strings (empty = unbound), and the custom-region input
-/// fields plus any validation error from the last attempt to set one.
+/// depth-from-edge percentages, the single optional `Custom` preset, and the
+/// two hotkey binding strings (empty = unbound).
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
 /// The four base presets (`Left`, `Right`, `HalfLeft`, `HalfRight`) are
 /// always present and are never added/removed -- only `Left`/`Right`'s
 /// depth-from-edge is adjustable, edited in place. `Custom` is the single
-/// optional preset: setting it while one already exists replaces it, it is
-/// never appended to a list.
+/// optional preset: it is set/replaced entirely by the zone-editor overlay
+/// (see [`crate::zone_overlay::run_zone_editor_overlay`]), superseding the
+/// manual X/Y/width/height numeric entry this struct carried before issue
+/// #28 -- there is no scratch input state to hold here, `Custom` is written
+/// directly once the overlay reports a Save.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsState {
     pub left_depth_percent: u8,
@@ -45,11 +49,6 @@ pub struct SettingsState {
     pub custom: Option<CustomRegion>,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
-    pub custom_x: String,
-    pub custom_y: String,
-    pub custom_width: String,
-    pub custom_height: String,
-    pub custom_region_error: Option<String>,
     /// `Some(field)` while a press-to-bind capture is in progress for that
     /// hotkey field (waiting for the next non-modifier key-down); `None`
     /// otherwise. See [`Self::start_capture`]/[`Self::handle_key_event`].
@@ -78,9 +77,7 @@ pub enum HotkeyField {
 
 impl SettingsState {
     /// Builds the editable state from a loaded/default [`Config`]. Unbound
-    /// hotkeys (`None`) become empty strings; the custom-region input
-    /// fields always start blank (they're a scratch area for entering a
-    /// replacement, not a display of the current `Custom`'s coordinates).
+    /// hotkeys (`None`) become empty strings.
     pub fn from_config(config: &Config) -> Self {
         Self {
             left_depth_percent: config.presets.left_depth_percent,
@@ -88,11 +85,6 @@ impl SettingsState {
             custom: config.presets.custom,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
-            custom_x: String::new(),
-            custom_y: String::new(),
-            custom_width: String::new(),
-            custom_height: String::new(),
-            custom_region_error: None,
             capturing: None,
             unsupported_key_pressed: false,
             duplicate_hotkey_error: None,
@@ -121,54 +113,18 @@ impl SettingsState {
         }
     }
 
-    /// Parses the custom X/Y/width/height fields and validates the
-    /// resulting region against `monitor` via
-    /// [`crate::region_calc::resolve_region`]. On success, replaces
-    /// `self.custom` with the new value (there is at most one `Custom`, so
-    /// this always replaces rather than appends) and clears
-    /// `custom_region_error`. On failure (unparsable input, or a region
-    /// `resolve_region` rejects), leaves `self.custom` unchanged and sets
-    /// `custom_region_error` to a user-visible message instead.
-    pub fn set_custom_preset(&mut self, monitor: &MonitorGeometry) {
-        match self.parse_custom_preset(monitor) {
-            Ok(custom) => {
-                self.custom = Some(custom);
-                self.custom_region_error = None;
-                self.custom_x.clear();
-                self.custom_y.clear();
-                self.custom_width.clear();
-                self.custom_height.clear();
-            }
-            Err(message) => {
-                self.custom_region_error = Some(message);
-            }
-        }
+    /// Replaces the `Custom` preset entirely with `zone` -- the result of a
+    /// completed zone-editor overlay session
+    /// ([`crate::zone_overlay::run_zone_editor_overlay`] returning
+    /// `Ok(Some(region))`). There is at most one `Custom`, so this always
+    /// replaces rather than appends.
+    pub fn set_custom_preset(&mut self, zone: CustomRegion) {
+        self.custom = Some(zone);
     }
 
     /// Clears the `Custom` preset entirely (back to "none set").
     pub fn clear_custom_preset(&mut self) {
         self.custom = None;
-    }
-
-    fn parse_custom_preset(&self, monitor: &MonitorGeometry) -> Result<CustomRegion, String> {
-        let x = parse_field("X", &self.custom_x)?;
-        let y = parse_field("Y", &self.custom_y)?;
-        let width = parse_field("width", &self.custom_width)?;
-        let height = parse_field("height", &self.custom_height)?;
-
-        let preset = Preset::Custom { x, y, width, height };
-        let region = resolve_region(&preset, monitor).map_err(|e| e.to_string())?;
-
-        // `resolve_region` clamps an on-monitor-origin region that overflows the
-        // monitor's far edge instead of erroring (region_calc's own contract --
-        // see its module docs). settings_ui must not silently accept a clamped
-        // result that differs from what the user entered, so treat clamping as
-        // a rejection here rather than duplicating region_calc's math.
-        if region.width != width || region.height != height {
-            return Err("region extends beyond the monitor's bounds".to_string());
-        }
-
-        Ok(CustomRegion { x, y, width, height })
     }
 
     pub fn start_capture(&mut self, field: HotkeyField) {
@@ -233,10 +189,6 @@ impl SettingsState {
             self.cancel_capture();
         }
     }
-}
-
-fn parse_field(name: &str, value: &str) -> Result<i32, String> {
-    value.trim().parse::<i32>().map_err(|_| format!("{name} must be a whole number"))
 }
 
 /// A human-readable label for a preset, for use as a thumbnail's caption in
@@ -525,6 +477,22 @@ impl std::error::Error for SettingsUiError {
     }
 }
 
+/// What closed the Settings window: a completed Save (carrying the
+/// [`Config`] to persist), a Cancel/close-without-saving, or a request to
+/// open the zone-editor overlay for the Custom preset (carrying the current
+/// in-progress [`SettingsState`] so no other edits made in this session --
+/// depth sliders, hotkey bindings -- are lost while the overlay is open).
+///
+/// [`run_settings_window`] loops on this: `EditCustomZone` re-opens the
+/// Settings window (with the overlay's result folded back in) rather than
+/// ending the session, since opening the zone editor is not itself a
+/// decision to close Settings.
+enum SettingsExit {
+    Saved(Config),
+    Cancelled,
+    EditCustomZone(SettingsState),
+}
+
 /// Opens the Settings window, blocking until it's closed, then returns.
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
@@ -533,17 +501,49 @@ impl std::error::Error for SettingsUiError {
 /// returning. Closing the window any other way (the "Cancel" button, the
 /// window's own close button) discards the edits.
 ///
+/// Clicking "Edit Custom Zone" opens the zone-editor overlay
+/// ([`zone_overlay::run_zone_editor_overlay`]) *sequentially* rather than
+/// nesting it inside the Settings window's own event loop -- egui/winit
+/// don't support one native event loop starting another while it's still
+/// running. Concretely: the Settings window closes, the overlay runs to
+/// completion, its result (if any) is folded into the in-progress state,
+/// and Settings re-opens with that updated state -- the same
+/// close-then-reopen sequencing already used for "Show Settings" itself
+/// from the tray's message loop (see `app::run_event_loop`).
+///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
-/// this call and fully drops it before returning (the `eframe::run_native`
-/// call below owns the entire window/render lifecycle). Not exercised by
-/// this crate's automated tests -- see module docs.
+/// each iteration and fully drops it before the next (or before returning).
+/// Not exercised by this crate's automated tests -- see module docs.
 pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
-    let state = SettingsState::from_config(&config);
+    let mut state = SettingsState::from_config(&config);
     let monitor = primary_monitor_geometry();
 
-    let saved_config: Rc<RefCell<Option<Config>>> = Rc::new(RefCell::new(None));
-    let saved_config_for_app = Rc::clone(&saved_config);
+    loop {
+        match run_settings_frame(state, monitor)? {
+            SettingsExit::Saved(config) => {
+                return profile_store::save(config_dir, &config).map_err(SettingsUiError::Config);
+            }
+            SettingsExit::Cancelled => return Ok(()),
+            SettingsExit::EditCustomZone(mut latest_state) => {
+                match zone_overlay::run_zone_editor_overlay(latest_state.custom, PinnedEdges::NONE) {
+                    Ok(Some(zone)) => latest_state.set_custom_preset(zone),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
+                }
+                state = latest_state;
+            }
+        }
+    }
+}
+
+/// Runs a single Settings window session to completion (see
+/// [`run_settings_window`]'s doc comment for why this is a separate,
+/// re-enterable step rather than one `eframe::run_native` call for the
+/// whole function).
+fn run_settings_frame(state: SettingsState, monitor: MonitorGeometry) -> Result<SettingsExit, SettingsUiError> {
+    let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
+    let exit_for_app = Rc::clone(&exit);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -556,18 +556,15 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     eframe::run_native(
         "GameFrame Settings",
         native_options,
-        Box::new(move |_cc| {
-            Ok(Box::new(SettingsApp { state, monitor, saved_config: saved_config_for_app }))
-        }),
+        Box::new(move |_cc| Ok(Box::new(SettingsApp { state, monitor, exit: exit_for_app }))),
     )
     .map_err(SettingsUiError::Window)?;
 
-    let to_save = saved_config.borrow_mut().take();
-    if let Some(config) = to_save {
-        profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
-    }
-
-    Ok(())
+    // A close via the window's own close button (rather than Save/Cancel/Edit
+    // Custom Zone) leaves `exit` empty -- treat that the same as an explicit
+    // Cancel, matching this function's documented "discards the edits"
+    // contract for any non-Save close.
+    Ok(exit.borrow_mut().take().unwrap_or(SettingsExit::Cancelled))
 }
 
 /// GameFrame's corner-bracket mark from [`gameframe::icon`], rendered at
@@ -583,7 +580,7 @@ fn window_icon() -> egui::IconData {
 struct SettingsApp {
     state: SettingsState,
     monitor: MonitorGeometry,
-    saved_config: Rc<RefCell<Option<Config>>>,
+    exit: Rc<RefCell<Option<SettingsExit>>>,
 }
 
 impl SettingsApp {
@@ -721,22 +718,24 @@ impl eframe::App for SettingsApp {
             ).suffix("%"));
 
             ui.separator();
-            ui.label("Custom preset (X, Y, width, height):");
+            ui.label("Custom preset:");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.state.custom_x).desired_width(60.0));
-                ui.add(egui::TextEdit::singleline(&mut self.state.custom_y).desired_width(60.0));
-                ui.add(egui::TextEdit::singleline(&mut self.state.custom_width).desired_width(60.0));
-                ui.add(egui::TextEdit::singleline(&mut self.state.custom_height).desired_width(60.0));
-                if ui.button("Set").clicked() {
-                    self.state.set_custom_preset(&self.monitor);
+                match &self.state.custom {
+                    Some(zone) => {
+                        ui.monospace(format!("({}, {}, {}x{})", zone.x, zone.y, zone.width, zone.height));
+                    }
+                    None => {
+                        ui.label("Not set");
+                    }
+                }
+                if ui.button("Edit Custom Zone...").clicked() {
+                    *self.exit.borrow_mut() = Some(SettingsExit::EditCustomZone(self.state.clone()));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if self.state.custom.is_some() && ui.button("Clear").clicked() {
                     self.state.clear_custom_preset();
                 }
             });
-            if let Some(error) = &self.state.custom_region_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
 
             ui.separator();
             ui.heading("Global hotkeys");
@@ -746,10 +745,11 @@ impl eframe::App for SettingsApp {
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    *self.saved_config.borrow_mut() = Some(self.state.to_config());
+                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config()));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {
+                    *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
@@ -760,7 +760,6 @@ impl eframe::App for SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::region_calc::RegionCalcError;
 
     #[test]
     fn format_captured_hotkey_with_modifiers_and_a_letter_key_uses_gameframes_stored_string_convention() {
@@ -812,7 +811,6 @@ mod tests {
         assert_eq!(state.custom, None);
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "");
-        assert_eq!(state.custom_region_error, None);
     }
 
     #[test]
@@ -875,17 +873,11 @@ mod tests {
     }
 
     #[test]
-    fn set_custom_preset_with_a_valid_region_sets_it_and_clears_any_error() {
+    fn set_custom_preset_sets_the_zone_returned_by_the_zone_editor_overlay() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.custom_region_error = Some("stale error".to_string());
-        state.custom_x = "100".to_string();
-        state.custom_y = "50".to_string();
-        state.custom_width = "800".to_string();
-        state.custom_height = "600".to_string();
 
-        state.set_custom_preset(&test_monitor());
+        state.set_custom_preset(CustomRegion { x: 100, y: 50, width: 800, height: 600 });
 
-        assert_eq!(state.custom_region_error, None);
         assert_eq!(state.custom, Some(CustomRegion { x: 100, y: 50, width: 800, height: 600 }));
     }
 
@@ -893,94 +885,10 @@ mod tests {
     fn set_custom_preset_replaces_any_previously_set_custom_preset_rather_than_appending() {
         let mut state = SettingsState::from_config(&Config::default());
         state.custom = Some(CustomRegion { x: 0, y: 0, width: 100, height: 100 });
-        state.custom_x = "200".to_string();
-        state.custom_y = "200".to_string();
-        state.custom_width = "300".to_string();
-        state.custom_height = "300".to_string();
 
-        state.set_custom_preset(&test_monitor());
+        state.set_custom_preset(CustomRegion { x: 200, y: 200, width: 300, height: 300 });
 
         assert_eq!(state.custom, Some(CustomRegion { x: 200, y: 200, width: 300, height: 300 }));
-    }
-
-    #[test]
-    fn set_custom_preset_with_a_negative_position_is_rejected_with_a_visible_error() {
-        let mut state = SettingsState::from_config(&Config::default());
-        let original_custom = state.custom;
-        state.custom_x = "-10".to_string();
-        state.custom_y = "0".to_string();
-        state.custom_width = "800".to_string();
-        state.custom_height = "600".to_string();
-
-        state.set_custom_preset(&test_monitor());
-
-        assert_eq!(state.custom, original_custom);
-        assert_eq!(state.custom_region_error, Some(RegionCalcError::OutOfBounds.to_string()));
-    }
-
-    #[test]
-    fn set_custom_preset_with_a_zero_or_negative_dimension_is_rejected_with_a_visible_error() {
-        let mut state = SettingsState::from_config(&Config::default());
-        let original_custom = state.custom;
-        state.custom_x = "0".to_string();
-        state.custom_y = "0".to_string();
-        state.custom_width = "0".to_string();
-        state.custom_height = "600".to_string();
-
-        state.set_custom_preset(&test_monitor());
-
-        assert_eq!(state.custom, original_custom);
-        assert_eq!(state.custom_region_error, Some(RegionCalcError::InvalidDimensions.to_string()));
-    }
-
-    #[test]
-    fn set_custom_preset_that_would_be_clamped_by_resolve_region_is_rejected_with_a_visible_error() {
-        // On-monitor origin, but the entered width/height overflow the monitor's far
-        // edge -- region_calc::resolve_region would clamp this to a smaller region
-        // rather than erroring. settings_ui must treat that clamping as a rejection,
-        // not silently accept a region different from what the user entered.
-        let mut state = SettingsState::from_config(&Config::default());
-        let original_custom = state.custom;
-        state.custom_x = "1000".to_string();
-        state.custom_y = "900".to_string();
-        state.custom_width = "5000".to_string();
-        state.custom_height = "5000".to_string();
-
-        state.set_custom_preset(&test_monitor());
-
-        assert_eq!(state.custom, original_custom);
-        assert!(state.custom_region_error.is_some());
-    }
-
-    #[test]
-    fn set_custom_preset_with_non_numeric_input_is_rejected_with_a_visible_error() {
-        let mut state = SettingsState::from_config(&Config::default());
-        let original_custom = state.custom;
-        state.custom_x = "not-a-number".to_string();
-        state.custom_y = "0".to_string();
-        state.custom_width = "800".to_string();
-        state.custom_height = "600".to_string();
-
-        state.set_custom_preset(&test_monitor());
-
-        assert_eq!(state.custom, original_custom);
-        assert!(state.custom_region_error.is_some());
-    }
-
-    #[test]
-    fn set_custom_preset_with_a_valid_region_clears_the_input_fields_so_set_is_not_repeatable() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.custom_x = "100".to_string();
-        state.custom_y = "50".to_string();
-        state.custom_width = "800".to_string();
-        state.custom_height = "600".to_string();
-
-        state.set_custom_preset(&test_monitor());
-
-        assert_eq!(state.custom_x, "");
-        assert_eq!(state.custom_y, "");
-        assert_eq!(state.custom_width, "");
-        assert_eq!(state.custom_height, "");
     }
 
     #[test]
@@ -1262,11 +1170,7 @@ mod tests {
         // User edits and saves.
         state.toggle_borderless = "Ctrl+Alt+B".to_string();
         state.left_depth_percent = 25;
-        state.custom_x = "10".to_string();
-        state.custom_y = "10".to_string();
-        state.custom_width = "300".to_string();
-        state.custom_height = "200".to_string();
-        state.set_custom_preset(&test_monitor());
+        state.set_custom_preset(CustomRegion { x: 10, y: 10, width: 300, height: 200 });
         let to_persist = state.to_config();
         profile_store::save(&config_dir, &to_persist).unwrap();
 

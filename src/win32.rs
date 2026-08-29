@@ -131,6 +131,16 @@ pub fn toggle_taskbar_autohide_state(current: TaskbarAutohideState) -> TaskbarAu
     }
 }
 
+/// Decides what the zone editor should do to the taskbar on entering an
+/// editing session (issue #28's "zones may extend into the taskbar strip"
+/// requirement): always force it into auto-hide, regardless of `current` --
+/// but remember `current` verbatim so it can be restored exactly on
+/// Save/Cancel, mirroring [`plan_toggle`]'s remember-then-restore shape.
+/// Pure decision logic -- no OS call.
+pub fn plan_taskbar_force_on(current: TaskbarAutohideState) -> (TaskbarAutohideState, TaskbarAutohideState) {
+    (TaskbarAutohideState::AutoHidden, current)
+}
+
 /// Computes the new `APPBARDATA.lParam` value for
 /// `SHAppBarMessage(ABM_SETSTATE, ...)`, given the appbar's `current_flags`
 /// (as read via a prior `ABM_GETSTATE` call) and the desired
@@ -537,7 +547,39 @@ pub fn toggle_taskbar_autohide(state: &mut TaskbarAutohideState) -> Result<(), W
 /// return value itself (not written into `APPBARDATA.lParam`).
 fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
+    let current_flags = read_appbar_flags(hwnd);
+    write_appbar_state(hwnd, current_flags, state);
+    Ok(())
+}
 
+/// Sends the actual `SHAppBarMessage(ABM_SETSTATE, ...)` write, given a
+/// taskbar `hwnd` and its `current_flags` already read via
+/// [`read_appbar_flags`]. Split out from [`set_appbar_state`] so callers that
+/// already have both in hand (e.g. [`force_taskbar_autohide_on`], which reads
+/// them once to derive the state to force) don't have to pay for a redundant
+/// [`find_taskbar_window`] + [`read_appbar_flags`] round trip just to write.
+fn write_appbar_state(hwnd: HWND, current_flags: u32, state: TaskbarAutohideState) {
+    let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
+    data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
+    data.hWnd = hwnd;
+    data.lParam = apply_autohide_state(current_flags, state) as isize;
+
+    // Safety: `data` is a validly-sized, zero-initialized `APPBARDATA` with
+    // `cbSize`/`hWnd`/`lParam` populated per `SHAppBarMessage`'s documented
+    // `ABM_SETSTATE` contract; `SHAppBarMessage` takes only `dwMessage` and a
+    // pointer to `data`, both valid here.
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut data);
+    }
+}
+
+/// Reads the appbar's current `ABM_GETSTATE` flags (a combination of
+/// `ABS_AUTOHIDE`/`ABS_ALWAYSONTOP`) for the taskbar window `hwnd`. Shared
+/// by [`set_appbar_state`] (which needs the current flags to preserve the
+/// always-on-top bit -- see [`apply_autohide_state`]'s doc comment) and
+/// [`force_taskbar_autohide_on`] (which needs only the auto-hide bit, via
+/// [`state_from_flags`]).
+fn read_appbar_flags(hwnd: HWND) -> u32 {
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
     data.hWnd = hwnd;
@@ -547,16 +589,52 @@ fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
     // `ABM_GETSTATE` contract; `SHAppBarMessage` takes only `dwMessage` and a
     // pointer to `data`, both valid here. `ABM_GETSTATE` does not read
     // `data.lParam`, so it's left zeroed.
-    let current_flags = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) } as u32;
+    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+}
 
-    data.lParam = apply_autohide_state(current_flags, state) as isize;
-
-    // Safety: same `data` pointer as above, now with `lParam` populated per
-    // `SHAppBarMessage`'s documented `ABM_SETSTATE` contract.
-    unsafe {
-        SHAppBarMessage(ABM_SETSTATE, &mut data);
+/// Interprets `ABM_GETSTATE`'s raw flags (as read by [`read_appbar_flags`])
+/// as a [`TaskbarAutohideState`]. Used by [`force_taskbar_autohide_on`],
+/// which reads the taskbar's actual current auto-hide state directly from
+/// the OS (as opposed to whatever a caller's own [`TaskbarAutohideState`]
+/// variable happens to say -- that variable, e.g. `app::run_event_loop`'s
+/// `taskbar_autohide_state`, is local to a different call site and may not
+/// be in scope where the zone editor is launched from) without a separate
+/// [`find_taskbar_window`] + [`read_appbar_flags`] round trip of its own.
+fn state_from_flags(current_flags: u32) -> TaskbarAutohideState {
+    if current_flags & ABS_AUTOHIDE != 0 {
+        TaskbarAutohideState::AutoHidden
+    } else {
+        TaskbarAutohideState::AlwaysVisible
     }
-    Ok(())
+}
+
+/// Forces the taskbar into auto-hide for the duration of a zone-editor
+/// session (issue #28: a drawn zone may extend into the taskbar's screen
+/// strip), returning whatever state was actually current beforehand so the
+/// caller can restore it exactly via [`restore_taskbar_autohide`] once the
+/// session ends (Save or Cancel).
+///
+/// OS-facing: queries and sets the real taskbar's appbar state. Not
+/// exercised by this crate's automated tests -- see module docs. The
+/// decision of what to force/remember is pure and tested separately via
+/// [`plan_taskbar_force_on`].
+pub fn force_taskbar_autohide_on() -> Result<TaskbarAutohideState, Win32Error> {
+    // Resolves the taskbar window and reads its flags once, then reuses both
+    // for the write below -- avoids a redundant second `find_taskbar_window`
+    // + `read_appbar_flags` round trip that a naive query-then-set
+    // implementation would incur.
+    let hwnd = find_taskbar_window()?;
+    let current_flags = read_appbar_flags(hwnd);
+    let current = state_from_flags(current_flags);
+    let (to_apply, to_remember) = plan_taskbar_force_on(current);
+    write_appbar_state(hwnd, current_flags, to_apply);
+    Ok(to_remember)
+}
+
+/// Restores the taskbar to exactly the state remembered by a prior
+/// [`force_taskbar_autohide_on`] call.
+pub fn restore_taskbar_autohide(remembered: TaskbarAutohideState) -> Result<(), Win32Error> {
+    set_appbar_state(remembered)
 }
 
 /// Finds the taskbar's own window handle via `FindWindowW(L"Shell_TrayWnd", NULL)`.
@@ -862,6 +940,24 @@ mod tests {
         let new_flags = apply_autohide_state(current_flags, TaskbarAutohideState::AlwaysVisible);
 
         assert_eq!(new_flags, 0);
+    }
+
+    #[test]
+    fn plan_taskbar_force_on_always_forces_auto_hidden_regardless_of_current_state() {
+        let (to_apply, _) = plan_taskbar_force_on(TaskbarAutohideState::AlwaysVisible);
+        assert_eq!(to_apply, TaskbarAutohideState::AutoHidden);
+
+        let (to_apply, _) = plan_taskbar_force_on(TaskbarAutohideState::AutoHidden);
+        assert_eq!(to_apply, TaskbarAutohideState::AutoHidden);
+    }
+
+    #[test]
+    fn plan_taskbar_force_on_remembers_whatever_was_current_before_forcing() {
+        let (_, to_remember) = plan_taskbar_force_on(TaskbarAutohideState::AlwaysVisible);
+        assert_eq!(to_remember, TaskbarAutohideState::AlwaysVisible);
+
+        let (_, to_remember) = plan_taskbar_force_on(TaskbarAutohideState::AutoHidden);
+        assert_eq!(to_remember, TaskbarAutohideState::AutoHidden);
     }
 
     #[test]
