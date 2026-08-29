@@ -24,6 +24,7 @@ use crate::region_calc::{
 use crate::win32;
 use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -391,6 +392,144 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
     })
 }
 
+/// Maps a physical, non-modifier `egui::Key` to its `global_hotkey::hotkey::Code`
+/// counterpart (a `keyboard_types::Code` re-export) -- exactly the same
+/// vocabulary [`key_display_name`] accepts, so the two lookups never drift
+/// apart on which physical keys GameFrame's capture widget supports. See
+/// `docs/research/hotkey-capture-widget.md` section 3 for the egui-`Key`-vs-
+/// `Code` cross-reference this table is built from. Returns `None` for keys
+/// outside that vocabulary (including `Enter`/`Space`, excluded from
+/// `key_display_name` for the reason documented there).
+fn key_to_code(key: egui::Key) -> Option<Code> {
+    use egui::Key;
+    Some(match key {
+        Key::A => Code::KeyA,
+        Key::B => Code::KeyB,
+        Key::C => Code::KeyC,
+        Key::D => Code::KeyD,
+        Key::E => Code::KeyE,
+        Key::F => Code::KeyF,
+        Key::G => Code::KeyG,
+        Key::H => Code::KeyH,
+        Key::I => Code::KeyI,
+        Key::J => Code::KeyJ,
+        Key::K => Code::KeyK,
+        Key::L => Code::KeyL,
+        Key::M => Code::KeyM,
+        Key::N => Code::KeyN,
+        Key::O => Code::KeyO,
+        Key::P => Code::KeyP,
+        Key::Q => Code::KeyQ,
+        Key::R => Code::KeyR,
+        Key::S => Code::KeyS,
+        Key::T => Code::KeyT,
+        Key::U => Code::KeyU,
+        Key::V => Code::KeyV,
+        Key::W => Code::KeyW,
+        Key::X => Code::KeyX,
+        Key::Y => Code::KeyY,
+        Key::Z => Code::KeyZ,
+        Key::Num0 => Code::Digit0,
+        Key::Num1 => Code::Digit1,
+        Key::Num2 => Code::Digit2,
+        Key::Num3 => Code::Digit3,
+        Key::Num4 => Code::Digit4,
+        Key::Num5 => Code::Digit5,
+        Key::Num6 => Code::Digit6,
+        Key::Num7 => Code::Digit7,
+        Key::Num8 => Code::Digit8,
+        Key::Num9 => Code::Digit9,
+        Key::F1 => Code::F1,
+        Key::F2 => Code::F2,
+        Key::F3 => Code::F3,
+        Key::F4 => Code::F4,
+        Key::F5 => Code::F5,
+        Key::F6 => Code::F6,
+        Key::F7 => Code::F7,
+        Key::F8 => Code::F8,
+        Key::F9 => Code::F9,
+        Key::F10 => Code::F10,
+        Key::F11 => Code::F11,
+        Key::F12 => Code::F12,
+        Key::F13 => Code::F13,
+        Key::F14 => Code::F14,
+        Key::F15 => Code::F15,
+        Key::F16 => Code::F16,
+        Key::F17 => Code::F17,
+        Key::F18 => Code::F18,
+        Key::F19 => Code::F19,
+        Key::F20 => Code::F20,
+        Key::F21 => Code::F21,
+        Key::F22 => Code::F22,
+        Key::F23 => Code::F23,
+        Key::F24 => Code::F24,
+        Key::ArrowDown => Code::ArrowDown,
+        Key::ArrowLeft => Code::ArrowLeft,
+        Key::ArrowRight => Code::ArrowRight,
+        Key::ArrowUp => Code::ArrowUp,
+        Key::Tab => Code::Tab,
+        Key::Backspace => Code::Backspace,
+        Key::Insert => Code::Insert,
+        Key::Delete => Code::Delete,
+        Key::Home => Code::Home,
+        Key::End => Code::End,
+        Key::PageUp => Code::PageUp,
+        Key::PageDown => Code::PageDown,
+        Key::Minus => Code::Minus,
+        Key::Period => Code::Period,
+        Key::Quote => Code::Quote,
+        Key::Semicolon => Code::Semicolon,
+        Key::Slash => Code::Slash,
+        Key::Backslash => Code::Backslash,
+        Key::Equals => Code::Equal,
+        Key::Backtick => Code::Backquote,
+        Key::Comma => Code::Comma,
+        // Anything else has no `Code` counterpart in the vocabulary GameFrame
+        // supports -- see `key_display_name`'s matching fallback.
+        _ => return None,
+    })
+}
+
+/// Translates egui's held modifier flags into `global_hotkey::hotkey::Modifiers`.
+/// Only Ctrl/Alt/Shift are mapped -- per `format_captured_hotkey`'s existing
+/// doc comment, egui's `Modifiers` carries no distinct Windows/Super-key flag
+/// on this (Windows-only) platform, so no binding GameFrame has ever captured
+/// or stored could carry `Modifiers::SUPER`.
+fn modifiers_to_hotkey_modifiers(modifiers: egui::Modifiers) -> Modifiers {
+    let mut mods = Modifiers::empty();
+    if modifiers.ctrl {
+        mods |= Modifiers::CONTROL;
+    }
+    if modifiers.alt {
+        mods |= Modifiers::ALT;
+    }
+    if modifiers.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    mods
+}
+
+/// Constructs a `global_hotkey::hotkey::HotKey` directly from a captured
+/// chord (held `modifiers` plus the physical, non-modifier `key` that
+/// completed it) -- satisfying issue #29's acceptance criterion that the
+/// captured chord construct a `HotKey` via `HotKey::new(mods, code)` rather
+/// than solely through a later `FromStr` round-trip of the persisted string
+/// (that round-trip still happens separately, in `hotkeys::resolve_bindings`,
+/// on every app startup -- unavoidable since the persisted config is a plain
+/// string, not a living `HotKey`).
+///
+/// Returns `None` if `key` is itself a physical modifier key, or has no
+/// `Code` counterpart in GameFrame's supported vocabulary ([`key_to_code`])
+/// -- the same two cases [`format_captured_hotkey`] already leaves the
+/// capture listening for instead of completing.
+fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<HotKey> {
+    if is_physical_modifier_key(key) {
+        return None;
+    }
+    let code = key_to_code(key)?;
+    Some(HotKey::new(Some(modifiers_to_hotkey_modifiers(modifiers)), code))
+}
+
 /// Converts a captured key-down event (the held `modifiers` plus the
 /// physical, non-modifier `key` that completed the chord) into GameFrame's
 /// existing `"Ctrl+Alt+B"`-style stored hotkey string convention.
@@ -407,19 +546,22 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
 /// captured combo can only carry Ctrl/Alt/Shift, matching every binding
 /// GameFrame has ever stored to date.
 fn format_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<String> {
-    if is_physical_modifier_key(key) {
-        return None;
-    }
+    // Validate via a directly-constructed `HotKey` first (issue #29) -- a chord
+    // that can't build one (unrepresentable physical key) must not produce a
+    // stored string either. The modifier substrings below are then read back off
+    // that same constructed `HotKey`'s `mods`, not recomputed independently from
+    // `modifiers`, so the two can't drift apart.
+    let hotkey = build_captured_hotkey(modifiers, key)?;
     let name = key_display_name(key)?;
 
     let mut combo = String::new();
-    if modifiers.ctrl {
+    if hotkey.mods.contains(Modifiers::CONTROL) {
         combo.push_str("Ctrl+");
     }
-    if modifiers.alt {
+    if hotkey.mods.contains(Modifiers::ALT) {
         combo.push_str("Alt+");
     }
-    if modifiers.shift {
+    if hotkey.mods.contains(Modifiers::SHIFT) {
         combo.push_str("Shift+");
     }
     combo.push_str(name);
@@ -784,6 +926,53 @@ mod tests {
         let formatted = format_captured_hotkey(egui::Modifiers::NONE, egui::Key::T);
 
         assert_eq!(formatted, Some("T".to_string()));
+    }
+
+    #[test]
+    fn key_to_code_maps_a_letter_key_to_its_physical_code_counterpart() {
+        assert_eq!(key_to_code(egui::Key::B), Some(Code::KeyB));
+    }
+
+    #[test]
+    fn build_captured_hotkey_constructs_a_hotkey_directly_from_modifiers_and_physical_key() {
+        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+
+        let hotkey = build_captured_hotkey(modifiers, egui::Key::B);
+
+        assert_eq!(hotkey, Some(HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyB)));
+    }
+
+    #[test]
+    fn build_captured_hotkey_returns_none_for_a_physical_modifier_only_press() {
+        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+
+        let hotkey = build_captured_hotkey(modifiers, egui::Key::ControlLeft);
+
+        assert_eq!(hotkey, None);
+    }
+
+    #[test]
+    fn build_captured_hotkey_returns_none_for_a_key_outside_gameframes_hotkey_vocabulary() {
+        // `Copy` has no `Code` counterpart in `key_to_code`'s vocabulary, mirroring
+        // `key_display_name`'s rejection of the same key.
+        let hotkey = build_captured_hotkey(egui::Modifiers::NONE, egui::Key::Copy);
+
+        assert_eq!(hotkey, None);
+    }
+
+    #[test]
+    fn format_captured_hotkey_only_completes_a_capture_that_also_constructs_a_valid_hotkey() {
+        // Every key GameFrame's capture button can actually complete with must also
+        // successfully construct a `global_hotkey::hotkey::HotKey` -- issue #29's
+        // acceptance criterion -- and the two must describe the same chord (same
+        // modifiers, same physical key), not merely both succeed independently.
+        let modifiers = egui::Modifiers { ctrl: true, shift: true, ..egui::Modifiers::NONE };
+
+        let combo = format_captured_hotkey(modifiers, egui::Key::Q);
+        let hotkey = build_captured_hotkey(modifiers, egui::Key::Q);
+
+        assert_eq!(combo, Some("Ctrl+Shift+Q".to_string()));
+        assert_eq!(hotkey, Some(HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyQ)));
     }
 
     #[test]
