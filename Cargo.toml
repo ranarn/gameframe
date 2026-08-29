@@ -20,6 +20,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+log = "0.4"
 tempfile = "3.27.0"
 
 [profile.release]
