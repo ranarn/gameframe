@@ -1,9 +1,13 @@
-//! Lazily-instantiated egui Settings window: create/edit presets and assign
-//! GameFrame's two global hotkey bindings, persisted via [`crate::profile_store`].
+//! Lazily-instantiated egui Settings window: adjust the depth-from-edge of
+//! the `Left`/`Right` base presets, set/clear the single optional `Custom`
+//! preset, and assign GameFrame's two global hotkey bindings, persisted via
+//! [`crate::profile_store`].
 //!
 //! Split in two:
 //! - [`SettingsState`]: the editable view-model, plain data with no egui/OS
-//!   dependency, fully unit tested below.
+//!   dependency, fully unit tested below. [`preset_thumbnails`]/
+//!   [`normalize_region`] are pure helpers that turn that state into the data
+//!   a thumbnail painter needs, also fully unit tested.
 //! - [`SettingsApp`] / [`run_settings_window`]: the actual egui/eframe
 //!   window construction, rendering, and teardown. This is OS/GPU-facing --
 //!   it needs a live desktop/GPU context to open and render a window, and a
@@ -13,27 +17,32 @@
 //!   particular can only be confirmed by manual/usertest verification on a
 //!   real desktop session.
 
-use crate::profile_store::{self, Config, HotkeyBindings, ProfileStoreError};
-use crate::region_calc::{resolve_region, MonitorGeometry, Preset};
+use crate::profile_store::{self, Config, CustomRegion, HotkeyBindings, Presets, ProfileStoreError};
+use crate::region_calc::{
+    resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
+};
+use crate::win32;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-/// The editable state backing the Settings window: the preset list, the two
+/// The editable state backing the Settings window: the `Left`/`Right`
+/// depth-from-edge percentages, the single optional `Custom` preset, the two
 /// hotkey binding strings (empty = unbound), and the custom-region input
-/// fields plus any validation error from the last attempt to add one.
+/// fields plus any validation error from the last attempt to set one.
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
-/// Deliberate MVP design decision: there is no in-place field editing of an
-/// existing preset. "Editing" a preset means removing it ([`Self::remove_preset`])
-/// and adding a replacement ([`Self::add_custom_preset`] /
-/// [`Self::add_builtin_preset`]). This is intentional scope for this slice,
-/// not an oversight -- a future slice may add true in-place editing of an
-/// existing `Custom` preset's coordinates if that turns out to be needed.
+/// The four base presets (`Left`, `Right`, `HalfLeft`, `HalfRight`) are
+/// always present and are never added/removed -- only `Left`/`Right`'s
+/// depth-from-edge is adjustable, edited in place. `Custom` is the single
+/// optional preset: setting it while one already exists replaces it, it is
+/// never appended to a list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsState {
-    pub presets: Vec<Preset>,
+    pub left_depth_percent: u8,
+    pub right_depth_percent: u8,
+    pub custom: Option<CustomRegion>,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
     pub custom_x: String,
@@ -70,10 +79,13 @@ pub enum HotkeyField {
 impl SettingsState {
     /// Builds the editable state from a loaded/default [`Config`]. Unbound
     /// hotkeys (`None`) become empty strings; the custom-region input
-    /// fields always start blank.
+    /// fields always start blank (they're a scratch area for entering a
+    /// replacement, not a display of the current `Custom`'s coordinates).
     pub fn from_config(config: &Config) -> Self {
         Self {
-            presets: config.presets.clone(),
+            left_depth_percent: config.presets.left_depth_percent,
+            right_depth_percent: config.presets.right_depth_percent,
+            custom: config.presets.custom,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
             custom_x: String::new(),
@@ -87,11 +99,21 @@ impl SettingsState {
         }
     }
 
+    /// Builds the [`Presets`] to persist from the current depth percentages
+    /// and `Custom` value.
+    pub fn to_presets(&self) -> Presets {
+        Presets {
+            left_depth_percent: self.left_depth_percent,
+            right_depth_percent: self.right_depth_percent,
+            custom: self.custom,
+        }
+    }
+
     /// Builds the [`Config`] to persist. A blank (or whitespace-only) hotkey
     /// field is treated as unbound (`None`).
     pub fn to_config(&self) -> Config {
         Config {
-            presets: self.presets.clone(),
+            presets: self.to_presets(),
             hotkeys: HotkeyBindings {
                 toggle_borderless: non_empty(&self.toggle_borderless),
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
@@ -101,15 +123,16 @@ impl SettingsState {
 
     /// Parses the custom X/Y/width/height fields and validates the
     /// resulting region against `monitor` via
-    /// [`crate::region_calc::resolve_region`]. On success, appends the
-    /// `Preset::Custom` to `self.presets` and clears `custom_region_error`.
-    /// On failure (unparsable input, or a region `resolve_region` rejects),
-    /// leaves `self.presets` unchanged and sets `custom_region_error` to a
-    /// user-visible message instead.
-    pub fn add_custom_preset(&mut self, monitor: &MonitorGeometry) {
+    /// [`crate::region_calc::resolve_region`]. On success, replaces
+    /// `self.custom` with the new value (there is at most one `Custom`, so
+    /// this always replaces rather than appends) and clears
+    /// `custom_region_error`. On failure (unparsable input, or a region
+    /// `resolve_region` rejects), leaves `self.custom` unchanged and sets
+    /// `custom_region_error` to a user-visible message instead.
+    pub fn set_custom_preset(&mut self, monitor: &MonitorGeometry) {
         match self.parse_custom_preset(monitor) {
-            Ok(preset) => {
-                self.presets.push(preset);
+            Ok(custom) => {
+                self.custom = Some(custom);
                 self.custom_region_error = None;
                 self.custom_x.clear();
                 self.custom_y.clear();
@@ -122,7 +145,12 @@ impl SettingsState {
         }
     }
 
-    fn parse_custom_preset(&self, monitor: &MonitorGeometry) -> Result<Preset, String> {
+    /// Clears the `Custom` preset entirely (back to "none set").
+    pub fn clear_custom_preset(&mut self) {
+        self.custom = None;
+    }
+
+    fn parse_custom_preset(&self, monitor: &MonitorGeometry) -> Result<CustomRegion, String> {
         let x = parse_field("X", &self.custom_x)?;
         let y = parse_field("Y", &self.custom_y)?;
         let width = parse_field("width", &self.custom_width)?;
@@ -140,33 +168,7 @@ impl SettingsState {
             return Err("region extends beyond the monitor's bounds".to_string());
         }
 
-        Ok(preset)
-    }
-
-    /// Appends a built-in (non-custom) preset -- `LeftHalf`, `RightHalf`, or
-    /// `FullScreen` -- to the preset list. These never need region
-    /// validation (unlike `Custom`, they're always well-formed relative to
-    /// whatever monitor they're resolved against later).
-    ///
-    /// A builtin variant already present in the list is not appended again
-    /// (repeated clicks on e.g. "Add Left Half" are a no-op past the first),
-    /// since a builtin preset has no distinguishing data and a duplicate row
-    /// would just be visual clutter. `Custom` presets are never passed here
-    /// (see [`Self::add_custom_preset`]) and may legitimately have several
-    /// entries with different coordinates.
-    pub fn add_builtin_preset(&mut self, preset: Preset) {
-        if !self.presets.contains(&preset) {
-            self.presets.push(preset);
-        }
-    }
-
-    /// Removes the preset at `index`. Out-of-range indices are silently
-    /// ignored rather than panicking, since the index comes from UI state
-    /// that could in principle be stale by the time a click is processed.
-    pub fn remove_preset(&mut self, index: usize) {
-        if index < self.presets.len() {
-            self.presets.remove(index);
-        }
+        Ok(CustomRegion { x, y, width, height })
     }
 
     pub fn start_capture(&mut self, field: HotkeyField) {
@@ -237,18 +239,77 @@ fn parse_field(name: &str, value: &str) -> Result<i32, String> {
     value.trim().parse::<i32>().map_err(|_| format!("{name} must be a whole number"))
 }
 
-/// A human-readable label for a preset, for use in the Settings preset list
-/// UI -- deliberately not `Preset`'s `Debug` formatting, which is meant for
-/// diagnostics, not end-user display.
+/// A human-readable label for a preset, for use as a thumbnail's caption in
+/// the Settings preset UI -- deliberately not `Preset`'s `Debug` formatting,
+/// which is meant for diagnostics, not end-user display.
 fn preset_label(preset: &Preset) -> String {
     match preset {
-        Preset::LeftHalf => "Left Half".to_string(),
-        Preset::RightHalf => "Right Half".to_string(),
-        Preset::FullScreen => "Full Screen".to_string(),
+        Preset::Left { depth_percent } => format!("Left ({depth_percent}%)"),
+        Preset::Right { depth_percent } => format!("Right ({depth_percent}%)"),
+        Preset::HalfLeft => "Half Left".to_string(),
+        Preset::HalfRight => "Half Right".to_string(),
         Preset::Custom { x, y, width, height } => {
             format!("Custom ({x}, {y}, {width}x{height})")
         }
     }
+}
+
+/// A resolved [`Region`] expressed as proportions (`0.0..=1.0`) of the
+/// monitor it was resolved against, so a fixed-size thumbnail area can
+/// render it without knowing real monitor pixel dimensions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedRegion {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedRegion {
+    NormalizedRegion {
+        x: (region.x - monitor.x) as f32 / monitor.width as f32,
+        y: (region.y - monitor.y) as f32 / monitor.height as f32,
+        width: region.width as f32 / monitor.width as f32,
+        height: region.height as f32 / monitor.height as f32,
+    }
+}
+
+/// The graphical-thumbnail data for a single preset: a caption, its region
+/// normalized against `monitor` (if it resolved), whether it's the currently
+/// active preset, and -- if resolution failed -- an error to surface instead
+/// of silently omitting the preset from the row. Only `Custom` can fail to
+/// resolve (e.g. coordinates persisted while running on a different monitor
+/// configuration); the four base presets always resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresetThumbnail {
+    pub label: String,
+    pub region: Option<NormalizedRegion>,
+    pub is_active: bool,
+    pub error: Option<String>,
+}
+
+pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
+    let presets = state.to_presets();
+    let active = win32::active_preset(&presets);
+
+    presets
+        .all()
+        .into_iter()
+        .map(|preset| match resolve_region(&preset, monitor) {
+            Ok(region) => PresetThumbnail {
+                label: preset_label(&preset),
+                region: Some(normalize_region(&region, monitor)),
+                is_active: preset == active,
+                error: None,
+            },
+            Err(e) => PresetThumbnail {
+                label: preset_label(&preset),
+                region: None,
+                is_active: false,
+                error: Some(e.to_string()),
+            },
+        })
+        .collect()
 }
 
 /// `true` for egui's eight physical modifier-key variants (Shift/Control/Alt/
@@ -487,7 +548,7 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame Settings")
-            .with_inner_size([440.0, 520.0])
+            .with_inner_size([440.0, 560.0])
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -575,46 +636,102 @@ impl SettingsApp {
             }
         }
     }
+
+    /// Renders the graphical thumbnail row: one small monitor-outline
+    /// rectangle per preset (from [`preset_thumbnails`]), with the resolved
+    /// region highlighted inside it and the currently active preset called
+    /// out distinctly.
+    fn preset_thumbnails_row(&self, ui: &mut egui::Ui) {
+        const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(84.0, 48.0);
+        let active_color = egui::Color32::from_rgb(90, 170, 250);
+        let inactive_color = egui::Color32::from_rgb(120, 120, 120);
+
+        ui.horizontal_wrapped(|ui| {
+            for thumbnail in preset_thumbnails(&self.state, &self.monitor) {
+                ui.vertical(|ui| {
+                    let (outline_rect, _response) =
+                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_stroke(
+                        outline_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    match thumbnail.region {
+                        Some(region) => {
+                            let highlight_rect = egui::Rect::from_min_size(
+                                outline_rect.min
+                                    + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
+                                egui::vec2(region.width * THUMBNAIL_SIZE.x, region.height * THUMBNAIL_SIZE.y),
+                            );
+                            let color = if thumbnail.is_active { active_color } else { inactive_color };
+                            painter.rect_filled(highlight_rect, 0.0, color);
+                        }
+                        None => {
+                            // Unresolvable preset (only `Custom` can hit this --
+                            // e.g. coordinates persisted while running on a
+                            // different monitor configuration). Surface a visible
+                            // placeholder instead of silently dropping the entry.
+                            painter.line_segment(
+                                [outline_rect.left_top(), outline_rect.right_bottom()],
+                                egui::Stroke::new(1.5, egui::Color32::RED),
+                            );
+                            painter.line_segment(
+                                [outline_rect.right_top(), outline_rect.left_bottom()],
+                                egui::Stroke::new(1.5, egui::Color32::RED),
+                            );
+                        }
+                    }
+
+                    ui.label(&thumbnail.label);
+                    if thumbnail.is_active {
+                        ui.colored_label(active_color, "Active");
+                    }
+                    if let Some(error) = &thumbnail.error {
+                        ui.colored_label(egui::Color32::RED, format!("Unavailable: {error}"))
+                            .on_hover_text(
+                                "This preset's coordinates don't fit the current monitor. \
+                                 Re-set it under Custom below.",
+                            );
+                    }
+                });
+            }
+        });
+    }
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Presets");
-            let mut to_remove = None;
-            for (index, preset) in self.state.presets.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(preset_label(preset));
-                    if ui.small_button("Remove").clicked() {
-                        to_remove = Some(index);
-                    }
-                });
-            }
-            if let Some(index) = to_remove {
-                self.state.remove_preset(index);
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("Add Left Half").clicked() {
-                    self.state.add_builtin_preset(Preset::LeftHalf);
-                }
-                if ui.button("Add Right Half").clicked() {
-                    self.state.add_builtin_preset(Preset::RightHalf);
-                }
-                if ui.button("Add Full Screen").clicked() {
-                    self.state.add_builtin_preset(Preset::FullScreen);
-                }
-            });
+            self.preset_thumbnails_row(ui);
 
             ui.separator();
-            ui.label("Add custom preset (X, Y, width, height):");
+            ui.label("Left depth from edge:");
+            ui.add(egui::Slider::new(
+                &mut self.state.left_depth_percent,
+                MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
+            ).suffix("%"));
+            ui.label("Right depth from edge:");
+            ui.add(egui::Slider::new(
+                &mut self.state.right_depth_percent,
+                MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
+            ).suffix("%"));
+
+            ui.separator();
+            ui.label("Custom preset (X, Y, width, height):");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.state.custom_x).desired_width(60.0));
                 ui.add(egui::TextEdit::singleline(&mut self.state.custom_y).desired_width(60.0));
                 ui.add(egui::TextEdit::singleline(&mut self.state.custom_width).desired_width(60.0));
                 ui.add(egui::TextEdit::singleline(&mut self.state.custom_height).desired_width(60.0));
-                if ui.button("Add").clicked() {
-                    self.state.add_custom_preset(&self.monitor);
+                if ui.button("Set").clicked() {
+                    self.state.set_custom_preset(&self.monitor);
+                }
+                if self.state.custom.is_some() && ui.button("Clear").clicked() {
+                    self.state.clear_custom_preset();
                 }
             });
             if let Some(error) = &self.state.custom_region_error {
@@ -685,12 +802,14 @@ mod tests {
     }
 
     #[test]
-    fn from_config_of_a_fresh_default_config_shows_unbound_hotkeys_and_builtin_presets() {
+    fn from_config_of_a_fresh_default_config_shows_unbound_hotkeys_and_default_depth_presets() {
         let config = Config::default();
 
         let state = SettingsState::from_config(&config);
 
-        assert_eq!(state.presets, vec![Preset::LeftHalf, Preset::RightHalf, Preset::FullScreen]);
+        assert_eq!(state.left_depth_percent, config.presets.left_depth_percent);
+        assert_eq!(state.right_depth_percent, config.presets.right_depth_percent);
+        assert_eq!(state.custom, None);
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "");
         assert_eq!(state.custom_region_error, None);
@@ -699,7 +818,11 @@ mod tests {
     #[test]
     fn from_config_of_a_saved_config_shows_the_saved_hotkeys_and_presets() {
         let config = Config {
-            presets: vec![Preset::FullScreen, Preset::Custom { x: 10, y: 10, width: 200, height: 100 }],
+            presets: Presets {
+                left_depth_percent: 20,
+                right_depth_percent: 80,
+                custom: Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }),
+            },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
@@ -708,7 +831,9 @@ mod tests {
 
         let state = SettingsState::from_config(&config);
 
-        assert_eq!(state.presets, config.presets);
+        assert_eq!(state.left_depth_percent, 20);
+        assert_eq!(state.right_depth_percent, 80);
+        assert_eq!(state.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
     }
@@ -736,7 +861,21 @@ mod tests {
     }
 
     #[test]
-    fn add_custom_preset_with_a_valid_region_appends_it_and_clears_any_error() {
+    fn to_config_carries_the_current_depth_percentages_and_custom_preset() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.left_depth_percent = 15;
+        state.right_depth_percent = 85;
+        state.custom = Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 });
+
+        let config = state.to_config();
+
+        assert_eq!(config.presets.left_depth_percent, 15);
+        assert_eq!(config.presets.right_depth_percent, 85);
+        assert_eq!(config.presets.custom, Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }));
+    }
+
+    #[test]
+    fn set_custom_preset_with_a_valid_region_sets_it_and_clears_any_error() {
         let mut state = SettingsState::from_config(&Config::default());
         state.custom_region_error = Some("stale error".to_string());
         state.custom_x = "100".to_string();
@@ -744,131 +883,114 @@ mod tests {
         state.custom_width = "800".to_string();
         state.custom_height = "600".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
         assert_eq!(state.custom_region_error, None);
-        assert_eq!(
-            state.presets.last(),
-            Some(&Preset::Custom { x: 100, y: 50, width: 800, height: 600 })
-        );
+        assert_eq!(state.custom, Some(CustomRegion { x: 100, y: 50, width: 800, height: 600 }));
     }
 
     #[test]
-    fn add_custom_preset_with_a_negative_position_is_rejected_with_a_visible_error() {
+    fn set_custom_preset_replaces_any_previously_set_custom_preset_rather_than_appending() {
         let mut state = SettingsState::from_config(&Config::default());
-        let original_presets = state.presets.clone();
+        state.custom = Some(CustomRegion { x: 0, y: 0, width: 100, height: 100 });
+        state.custom_x = "200".to_string();
+        state.custom_y = "200".to_string();
+        state.custom_width = "300".to_string();
+        state.custom_height = "300".to_string();
+
+        state.set_custom_preset(&test_monitor());
+
+        assert_eq!(state.custom, Some(CustomRegion { x: 200, y: 200, width: 300, height: 300 }));
+    }
+
+    #[test]
+    fn set_custom_preset_with_a_negative_position_is_rejected_with_a_visible_error() {
+        let mut state = SettingsState::from_config(&Config::default());
+        let original_custom = state.custom;
         state.custom_x = "-10".to_string();
         state.custom_y = "0".to_string();
         state.custom_width = "800".to_string();
         state.custom_height = "600".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
-        assert_eq!(state.presets, original_presets);
+        assert_eq!(state.custom, original_custom);
         assert_eq!(state.custom_region_error, Some(RegionCalcError::OutOfBounds.to_string()));
     }
 
     #[test]
-    fn add_custom_preset_with_a_zero_or_negative_dimension_is_rejected_with_a_visible_error() {
+    fn set_custom_preset_with_a_zero_or_negative_dimension_is_rejected_with_a_visible_error() {
         let mut state = SettingsState::from_config(&Config::default());
-        let original_presets = state.presets.clone();
+        let original_custom = state.custom;
         state.custom_x = "0".to_string();
         state.custom_y = "0".to_string();
         state.custom_width = "0".to_string();
         state.custom_height = "600".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
-        assert_eq!(state.presets, original_presets);
+        assert_eq!(state.custom, original_custom);
         assert_eq!(state.custom_region_error, Some(RegionCalcError::InvalidDimensions.to_string()));
     }
 
     #[test]
-    fn add_custom_preset_that_would_be_clamped_by_resolve_region_is_rejected_with_a_visible_error() {
+    fn set_custom_preset_that_would_be_clamped_by_resolve_region_is_rejected_with_a_visible_error() {
         // On-monitor origin, but the entered width/height overflow the monitor's far
         // edge -- region_calc::resolve_region would clamp this to a smaller region
         // rather than erroring. settings_ui must treat that clamping as a rejection,
         // not silently accept a region different from what the user entered.
         let mut state = SettingsState::from_config(&Config::default());
-        let original_presets = state.presets.clone();
+        let original_custom = state.custom;
         state.custom_x = "1000".to_string();
         state.custom_y = "900".to_string();
         state.custom_width = "5000".to_string();
         state.custom_height = "5000".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
-        assert_eq!(state.presets, original_presets);
+        assert_eq!(state.custom, original_custom);
         assert!(state.custom_region_error.is_some());
     }
 
     #[test]
-    fn add_custom_preset_with_non_numeric_input_is_rejected_with_a_visible_error() {
+    fn set_custom_preset_with_non_numeric_input_is_rejected_with_a_visible_error() {
         let mut state = SettingsState::from_config(&Config::default());
-        let original_presets = state.presets.clone();
+        let original_custom = state.custom;
         state.custom_x = "not-a-number".to_string();
         state.custom_y = "0".to_string();
         state.custom_width = "800".to_string();
         state.custom_height = "600".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
-        assert_eq!(state.presets, original_presets);
+        assert_eq!(state.custom, original_custom);
         assert!(state.custom_region_error.is_some());
     }
 
     #[test]
-    fn add_builtin_preset_appends_a_not_yet_present_preset_without_touching_custom_region_fields() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.presets.clear();
-
-        state.add_builtin_preset(Preset::LeftHalf);
-
-        assert_eq!(state.presets, vec![Preset::LeftHalf]);
-    }
-
-    #[test]
-    fn add_builtin_preset_does_not_append_a_duplicate_of_a_builtin_variant_already_present() {
-        let mut state = SettingsState::from_config(&Config::default());
-
-        state.add_builtin_preset(Preset::LeftHalf);
-
-        assert_eq!(state.presets, vec![Preset::LeftHalf, Preset::RightHalf, Preset::FullScreen]);
-    }
-
-    #[test]
-    fn remove_preset_removes_the_entry_at_the_given_index() {
-        let mut state = SettingsState::from_config(&Config::default());
-
-        state.remove_preset(1);
-
-        assert_eq!(state.presets, vec![Preset::LeftHalf, Preset::FullScreen]);
-    }
-
-    #[test]
-    fn remove_preset_with_an_out_of_range_index_does_not_panic_or_change_the_list() {
-        let mut state = SettingsState::from_config(&Config::default());
-        let original = state.presets.clone();
-
-        state.remove_preset(99);
-
-        assert_eq!(state.presets, original);
-    }
-
-    #[test]
-    fn add_custom_preset_with_a_valid_region_clears_the_input_fields_so_add_is_not_repeatable() {
+    fn set_custom_preset_with_a_valid_region_clears_the_input_fields_so_set_is_not_repeatable() {
         let mut state = SettingsState::from_config(&Config::default());
         state.custom_x = "100".to_string();
         state.custom_y = "50".to_string();
         state.custom_width = "800".to_string();
         state.custom_height = "600".to_string();
 
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
 
         assert_eq!(state.custom_x, "");
         assert_eq!(state.custom_y, "");
         assert_eq!(state.custom_width, "");
         assert_eq!(state.custom_height, "");
+    }
+
+    #[test]
+    fn clear_custom_preset_removes_the_custom_preset() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.custom = Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 });
+
+        state.clear_custom_preset();
+
+        assert_eq!(state.custom, None);
     }
 
     #[test]
@@ -1038,13 +1160,93 @@ mod tests {
 
     #[test]
     fn preset_label_renders_human_readable_names_instead_of_debug_formatting() {
-        assert_eq!(preset_label(&Preset::LeftHalf), "Left Half");
-        assert_eq!(preset_label(&Preset::RightHalf), "Right Half");
-        assert_eq!(preset_label(&Preset::FullScreen), "Full Screen");
+        assert_eq!(preset_label(&Preset::Left { depth_percent: 40 }), "Left (40%)");
+        assert_eq!(preset_label(&Preset::Right { depth_percent: 60 }), "Right (60%)");
+        assert_eq!(preset_label(&Preset::HalfLeft), "Half Left");
+        assert_eq!(preset_label(&Preset::HalfRight), "Half Right");
         assert_eq!(
             preset_label(&Preset::Custom { x: 10, y: 20, width: 300, height: 400 }),
             "Custom (10, 20, 300x400)"
         );
+    }
+
+    #[test]
+    fn normalize_region_expresses_a_region_as_proportions_of_the_monitor() {
+        let monitor = test_monitor();
+        let region = Region { x: 960, y: 0, width: 960, height: 1080 };
+
+        let normalized = normalize_region(&region, &monitor);
+
+        assert_eq!(normalized, NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 });
+    }
+
+    #[test]
+    fn normalize_region_accounts_for_a_monitor_with_a_non_zero_origin() {
+        let monitor = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
+        let region = Region { x: -1280, y: 0, width: 1280, height: 1440 };
+
+        let normalized = normalize_region(&region, &monitor);
+
+        assert_eq!(normalized, NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 });
+    }
+
+    #[test]
+    fn preset_thumbnails_lists_only_the_four_base_presets_when_no_custom_is_set() {
+        let state = SettingsState::from_config(&Config::default());
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert_eq!(thumbnails.len(), 4);
+        assert_eq!(thumbnails[0].label, preset_label(&Preset::Left { depth_percent: state.left_depth_percent }));
+        assert_eq!(thumbnails[1].label, preset_label(&Preset::Right { depth_percent: state.right_depth_percent }));
+        assert_eq!(thumbnails[2].label, "Half Left");
+        assert_eq!(thumbnails[3].label, "Half Right");
+    }
+
+    #[test]
+    fn preset_thumbnails_appends_custom_when_one_is_set() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.custom = Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 });
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert_eq!(thumbnails.len(), 5);
+        assert_eq!(thumbnails[4].label, "Custom (10, 10, 200x100)");
+    }
+
+    #[test]
+    fn preset_thumbnails_surfaces_an_error_placeholder_instead_of_dropping_an_unresolvable_custom_preset() {
+        // Simulates a Custom preset persisted while GameFrame ran on a
+        // different (e.g. 4K) monitor: the stored coordinates lie entirely
+        // outside `test_monitor`'s bounds, so `resolve_region` returns
+        // `OutOfBounds`. The base presets always resolve, so only `Custom`
+        // can hit this path (see the doc comment on `preset_thumbnails`).
+        let mut state = SettingsState::from_config(&Config::default());
+        state.custom = Some(CustomRegion { x: 5000, y: 5000, width: 200, height: 100 });
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert_eq!(thumbnails.len(), 5, "an unresolvable preset must still be represented, not dropped");
+        let custom_thumbnail = &thumbnails[4];
+        assert_eq!(custom_thumbnail.label, "Custom (5000, 5000, 200x100)");
+        assert_eq!(custom_thumbnail.region, None, "an unresolvable preset has no drawable region");
+        assert!(custom_thumbnail.error.is_some(), "an unresolvable preset must surface an error");
+        assert!(!custom_thumbnail.is_active);
+    }
+
+    #[test]
+    fn preset_thumbnails_marks_only_the_active_preset() {
+        // Today's single global-preset mechanism (crate::win32::active_preset)
+        // always resolves to Left -- see that function's doc comment for why
+        // this issue doesn't change that MVP hack.
+        let state = SettingsState::from_config(&Config::default());
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert!(thumbnails[0].is_active, "Left should be marked active");
+        assert!(!thumbnails[1].is_active);
+        assert!(!thumbnails[2].is_active);
+        assert!(!thumbnails[3].is_active);
     }
 
     #[test]
@@ -1059,11 +1261,12 @@ mod tests {
 
         // User edits and saves.
         state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.left_depth_percent = 25;
         state.custom_x = "10".to_string();
         state.custom_y = "10".to_string();
         state.custom_width = "300".to_string();
         state.custom_height = "200".to_string();
-        state.add_custom_preset(&test_monitor());
+        state.set_custom_preset(&test_monitor());
         let to_persist = state.to_config();
         profile_store::save(&config_dir, &to_persist).unwrap();
 
@@ -1072,11 +1275,10 @@ mod tests {
         let reopened_state = SettingsState::from_config(&reloaded_config);
 
         assert_eq!(reopened_state.toggle_borderless, "Ctrl+Alt+B");
-        assert!(reopened_state.presets.contains(&Preset::Custom {
-            x: 10,
-            y: 10,
-            width: 300,
-            height: 200
-        }));
+        assert_eq!(reopened_state.left_depth_percent, 25);
+        assert_eq!(
+            reopened_state.custom,
+            Some(CustomRegion { x: 10, y: 10, width: 300, height: 200 })
+        );
     }
 }

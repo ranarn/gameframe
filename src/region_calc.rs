@@ -1,13 +1,29 @@
 //! Pure arithmetic for resolving a window-placement [`Preset`] against a monitor's
 //! geometry into a concrete pixel [`Region`]. No OS calls, no I/O.
 
-/// A window-placement preset. `Custom` carries explicit absolute-screen-coordinate
-/// bounds; the other variants are computed relative to a given monitor.
+/// The minimum depth-from-edge percentage a [`Preset::Left`]/[`Preset::Right`]
+/// may have. See [`resolve_region`] for how out-of-range values are handled.
+pub const MIN_DEPTH_PERCENT: u8 = 10;
+/// The maximum depth-from-edge percentage a [`Preset::Left`]/[`Preset::Right`]
+/// may have. See [`resolve_region`] for how out-of-range values are handled.
+pub const MAX_DEPTH_PERCENT: u8 = 90;
+
+/// A window-placement preset. Exactly five kinds exist: four base presets
+/// (`Left`, `Right`, `HalfLeft`, `HalfRight`) plus `Custom`. `Custom` carries
+/// explicit absolute-screen-coordinate bounds; the other variants are
+/// computed relative to a given monitor.
+///
+/// `Left`/`Right` anchor to their respective screen edge, full height, with
+/// an adjustable `depth_percent` (percentage of the monitor's width the
+/// region extends from that edge). `HalfLeft`/`HalfRight` are a structurally
+/// distinct pair, permanently fixed at 50% width -- not to be confused with
+/// `Left`/`Right` at a 50% depth-from-edge setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Preset {
-    LeftHalf,
-    RightHalf,
-    FullScreen,
+    Left { depth_percent: u8 },
+    Right { depth_percent: u8 },
+    HalfLeft,
+    HalfRight,
     Custom { x: i32, y: i32, width: i32, height: i32 },
 }
 
@@ -57,6 +73,18 @@ impl std::error::Error for RegionCalcError {}
 
 /// Resolves a [`Preset`] against a monitor's geometry into a concrete [`Region`].
 ///
+/// `Left`/`Right` compute their width as `depth_percent` percent of the
+/// monitor's width, anchored to the left/right edge respectively, full
+/// height. A `depth_percent` outside `[MIN_DEPTH_PERCENT, MAX_DEPTH_PERCENT]`
+/// is clamped into that range rather than rejected -- the same
+/// clamp-rather-than-reject spirit as `Custom`'s overflow handling below --
+/// since a stray out-of-range value (e.g. from a hand-edited config) should
+/// degrade gracefully rather than fail the whole resolution.
+///
+/// `HalfLeft`/`HalfRight` are permanently fixed at 50% width, full height --
+/// structurally distinct from `Left`/`Right` at a 50% depth-from-edge
+/// setting even though the resolved numbers coincide there.
+///
 /// `Custom` regions are given in absolute screen coordinates and are validated
 /// against the monitor's bounds (`[monitor.x, monitor.x + monitor.width)` and
 /// `[monitor.y, monitor.y + monitor.height)`, i.e. left/top-inclusive,
@@ -70,19 +98,15 @@ impl std::error::Error for RegionCalcError {}
 ///   fit within the monitor rather than rejected
 pub fn resolve_region(preset: &Preset, monitor: &MonitorGeometry) -> Result<Region, RegionCalcError> {
     match preset {
-        Preset::FullScreen => Ok(Region {
-            x: monitor.x,
-            y: monitor.y,
-            width: monitor.width,
-            height: monitor.height,
-        }),
-        Preset::LeftHalf => Ok(Region {
+        Preset::Left { depth_percent } => Ok(resolve_left(*depth_percent, monitor)),
+        Preset::Right { depth_percent } => Ok(resolve_right(*depth_percent, monitor)),
+        Preset::HalfLeft => Ok(Region {
             x: monitor.x,
             y: monitor.y,
             width: monitor.width / 2,
             height: monitor.height,
         }),
-        Preset::RightHalf => {
+        Preset::HalfRight => {
             let left_width = monitor.width / 2;
             Ok(Region {
                 x: monitor.x + left_width,
@@ -113,35 +137,97 @@ pub fn resolve_region(preset: &Preset, monitor: &MonitorGeometry) -> Result<Regi
     }
 }
 
+/// `width` for a `depth_percent`-wide region: `monitor.width * percent / 100`,
+/// computed in `i64` to avoid overflow for pathological monitor widths.
+fn depth_width(depth_percent: u8, monitor_width: i32) -> i32 {
+    let percent = depth_percent.clamp(MIN_DEPTH_PERCENT, MAX_DEPTH_PERCENT) as i64;
+    ((monitor_width as i64) * percent / 100) as i32
+}
+
+fn resolve_left(depth_percent: u8, monitor: &MonitorGeometry) -> Region {
+    let width = depth_width(depth_percent, monitor.width);
+    Region { x: monitor.x, y: monitor.y, width, height: monitor.height }
+}
+
+fn resolve_right(depth_percent: u8, monitor: &MonitorGeometry) -> Region {
+    let width = depth_width(depth_percent, monitor.width);
+    Region { x: monitor.x + (monitor.width - width), y: monitor.y, width, height: monitor.height }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn full_screen_resolves_to_entire_monitor() {
+    fn half_left_resolves_to_left_half_of_monitor() {
         let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
 
-        let region = resolve_region(&Preset::FullScreen, &monitor).unwrap();
-
-        assert_eq!(region, Region { x: 0, y: 0, width: 1920, height: 1080 });
-    }
-
-    #[test]
-    fn left_half_resolves_to_left_half_of_monitor() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-
-        let region = resolve_region(&Preset::LeftHalf, &monitor).unwrap();
+        let region = resolve_region(&Preset::HalfLeft, &monitor).unwrap();
 
         assert_eq!(region, Region { x: 0, y: 0, width: 960, height: 1080 });
     }
 
     #[test]
-    fn right_half_resolves_to_right_half_of_monitor() {
+    fn half_right_resolves_to_right_half_of_monitor() {
         let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
 
-        let region = resolve_region(&Preset::RightHalf, &monitor).unwrap();
+        let region = resolve_region(&Preset::HalfRight, &monitor).unwrap();
 
         assert_eq!(region, Region { x: 960, y: 0, width: 960, height: 1080 });
+    }
+
+    #[test]
+    fn left_at_ten_percent_depth_extends_a_tenth_of_the_monitor_width_from_the_left_edge() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Left { depth_percent: 10 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 0, y: 0, width: 192, height: 1080 });
+    }
+
+    #[test]
+    fn left_at_ninety_percent_depth_extends_ninety_percent_of_the_monitor_width_from_the_left_edge() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Left { depth_percent: 90 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 0, y: 0, width: 1728, height: 1080 });
+    }
+
+    #[test]
+    fn right_at_ten_percent_depth_extends_a_tenth_of_the_monitor_width_from_the_right_edge() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Right { depth_percent: 10 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 1728, y: 0, width: 192, height: 1080 });
+    }
+
+    #[test]
+    fn right_at_ninety_percent_depth_extends_ninety_percent_of_the_monitor_width_from_the_right_edge() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Right { depth_percent: 90 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 192, y: 0, width: 1728, height: 1080 });
+    }
+
+    #[test]
+    fn left_depth_below_the_minimum_is_clamped_to_ten_percent_rather_than_rejected() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Left { depth_percent: 1 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 0, y: 0, width: 192, height: 1080 });
+    }
+
+    #[test]
+    fn right_depth_above_the_maximum_is_clamped_to_ninety_percent_rather_than_rejected() {
+        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+
+        let region = resolve_region(&Preset::Right { depth_percent: 255 }, &monitor).unwrap();
+
+        assert_eq!(region, Region { x: 192, y: 0, width: 1728, height: 1080 });
     }
 
     #[test]
@@ -273,7 +359,7 @@ mod tests {
         assert_eq!(out_of_bounds.to_string(), "region origin lies outside the monitor's bounds");
     }
 
-    /// Table-driven coverage of all four preset variants across multiple monitor
+    /// Table-driven coverage of all five preset variants across multiple monitor
     /// resolutions (and, for the secondary monitor, a non-zero/negative origin
     /// to prove presets are computed relative to the monitor, not the screen
     /// origin).
@@ -284,9 +370,18 @@ mod tests {
             MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
 
         let cases = [
-            (primary_1080p, Preset::FullScreen, Region { x: 0, y: 0, width: 1920, height: 1080 }),
-            (primary_1080p, Preset::LeftHalf, Region { x: 0, y: 0, width: 960, height: 1080 }),
-            (primary_1080p, Preset::RightHalf, Region { x: 960, y: 0, width: 960, height: 1080 }),
+            (primary_1080p, Preset::HalfLeft, Region { x: 0, y: 0, width: 960, height: 1080 }),
+            (primary_1080p, Preset::HalfRight, Region { x: 960, y: 0, width: 960, height: 1080 }),
+            (
+                primary_1080p,
+                Preset::Left { depth_percent: 25 },
+                Region { x: 0, y: 0, width: 480, height: 1080 },
+            ),
+            (
+                primary_1080p,
+                Preset::Right { depth_percent: 25 },
+                Region { x: 1440, y: 0, width: 480, height: 1080 },
+            ),
             (
                 primary_1080p,
                 Preset::Custom { x: 10, y: 10, width: 200, height: 100 },
@@ -294,18 +389,23 @@ mod tests {
             ),
             (
                 secondary_1440p_left_of_primary,
-                Preset::FullScreen,
-                Region { x: -2560, y: 0, width: 2560, height: 1440 },
-            ),
-            (
-                secondary_1440p_left_of_primary,
-                Preset::LeftHalf,
+                Preset::HalfLeft,
                 Region { x: -2560, y: 0, width: 1280, height: 1440 },
             ),
             (
                 secondary_1440p_left_of_primary,
-                Preset::RightHalf,
+                Preset::HalfRight,
                 Region { x: -1280, y: 0, width: 1280, height: 1440 },
+            ),
+            (
+                secondary_1440p_left_of_primary,
+                Preset::Left { depth_percent: 10 },
+                Region { x: -2560, y: 0, width: 256, height: 1440 },
+            ),
+            (
+                secondary_1440p_left_of_primary,
+                Preset::Right { depth_percent: 90 },
+                Region { x: -2304, y: 0, width: 2304, height: 1440 },
             ),
             (
                 secondary_1440p_left_of_primary,

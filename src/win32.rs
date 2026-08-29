@@ -21,6 +21,7 @@
 //! completely separate from the borderless mechanic's [`RestoreState`] --
 //! the two toggles share no state.
 
+use crate::profile_store::Presets;
 use crate::region_calc::{Preset, Region};
 
 /// The style bits removed to strip a window's border for the borderless
@@ -83,14 +84,17 @@ pub fn plan_toggle(
     }
 }
 
-/// Resolves "the active preset" for the borderless-toggle hotkey: the first
-/// entry in the config's preset list.
+/// Resolves "the active preset" for the borderless-toggle hotkey: today's
+/// single global-preset mechanism, which always resolves to `Left`.
 ///
 /// MVP scope decision (see issue #6): there is no per-hotkey preset-selection
-/// UI yet, so the first preset in the list is treated as "the" active preset
-/// for this hotkey. Returns `None` if the list is empty.
-pub fn active_preset(presets: &[Preset]) -> Option<&Preset> {
-    presets.first()
+/// UI yet, so `Left` is treated as "the" active preset for this hotkey.
+/// Untouched by the preset-fixed-structure reshape (issue #26) beyond
+/// adapting its signature to the new `Presets` shape -- resolving this hack
+/// properly belongs to per-game preset assignment (issue #31); see
+/// `docs/adr/0001-preset-fixed-structure-no-migration.md`.
+pub fn active_preset(presets: &Presets) -> Preset {
+    presets.left()
 }
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -849,17 +853,10 @@ mod tests {
     }
 
     #[test]
-    fn active_preset_returns_the_first_preset_in_the_list() {
-        let presets = vec![Preset::RightHalf, Preset::LeftHalf, Preset::FullScreen];
+    fn active_preset_resolves_to_left() {
+        let presets = Presets { left_depth_percent: 30, right_depth_percent: 70, custom: None };
 
-        assert_eq!(active_preset(&presets), Some(&Preset::RightHalf));
-    }
-
-    #[test]
-    fn active_preset_of_an_empty_list_is_none() {
-        let presets: Vec<Preset> = vec![];
-
-        assert_eq!(active_preset(&presets), None);
+        assert_eq!(active_preset(&presets), Preset::Left { depth_percent: 30 });
     }
 
     #[test]

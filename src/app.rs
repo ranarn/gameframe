@@ -253,13 +253,10 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
         }
     };
 
-    let Some(preset) = win32::active_preset(&config.presets) else {
-        eprintln!("borderless toggle: no presets configured");
-        return false;
-    };
+    let preset = win32::active_preset(&config.presets);
 
     let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(preset, &monitor) {
+    let target_region = match resolve_region(&preset, &monitor) {
         Ok(region) => region,
         Err(e) => {
             eprintln!("borderless toggle: failed to resolve the active preset's region: {e}");
@@ -311,13 +308,10 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         }
     };
 
-    let Some(preset) = win32::active_preset(&config.presets) else {
-        eprintln!("apply to window: no presets configured");
-        return;
-    };
+    let preset = win32::active_preset(&config.presets);
 
     let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(preset, &monitor) {
+    let target_region = match resolve_region(&preset, &monitor) {
         Ok(region) => region,
         Err(e) => {
             eprintln!("apply to window: failed to resolve the active preset's region: {e}");
