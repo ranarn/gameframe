@@ -274,6 +274,11 @@ fn is_physical_modifier_key(key: egui::Key) -> bool {
 /// persistence/parsing layer are needed. Returns `None` for keys with no
 /// name in that vocabulary (the capture is then left listening rather than
 /// completing with an unparsable binding).
+///
+/// `Enter` and `Space` are deliberately excluded from this vocabulary even
+/// though `global_hotkey`/`resolve_bindings` support them -- see the comment
+/// at their removed match arms below for why they can never actually be
+/// captured via the "Set hotkey" button.
 fn key_display_name(key: egui::Key) -> Option<&'static str> {
     use egui::Key;
     Some(match key {
@@ -343,8 +348,13 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
         Key::ArrowUp => "Up",
         Key::Tab => "Tab",
         Key::Backspace => "Backspace",
-        Key::Enter => "Enter",
-        Key::Space => "Space",
+        // Enter and Space are deliberately excluded: `hotkey_row` calls
+        // `request_focus()` on the "Set hotkey"/"Cancel" button while capturing,
+        // and egui treats Enter/Space as a click (`Response::clicked()`, via
+        // `Flags::FAKE_PRIMARY_CLICKED`) on that focused widget before the raw
+        // `Event::Key` for Enter/Space ever reaches `handle_key_event`. That makes
+        // them impossible to actually capture as a bindable main key, so they're
+        // left out of this vocabulary rather than advertised as a broken promise.
         Key::Insert => "Insert",
         Key::Delete => "Delete",
         Key::Home => "Home",
@@ -658,6 +668,16 @@ mod tests {
         let formatted = format_captured_hotkey(egui::Modifiers::NONE, egui::Key::T);
 
         assert_eq!(formatted, Some("T".to_string()));
+    }
+
+    #[test]
+    fn key_display_name_excludes_enter_and_space_because_they_are_unbindable_via_the_capture_button() {
+        // Enter/Space are consumed as a click on the focused "Set hotkey"/"Cancel"
+        // button before the raw `Event::Key` ever reaches `handle_key_event`, so
+        // they can never actually complete a capture -- see the doc comment on
+        // `key_display_name`.
+        assert_eq!(key_display_name(egui::Key::Enter), None);
+        assert_eq!(key_display_name(egui::Key::Space), None);
     }
 
     fn test_monitor() -> MonitorGeometry {
