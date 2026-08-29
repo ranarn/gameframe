@@ -218,6 +218,22 @@ pub struct NormalizedRegion {
     pub height: f32,
 }
 
+/// The Settings window's fixed inner size, shared between the
+/// `ViewportBuilder`'s `.with_inner_size(...)` call and
+/// [`centered_window_position`] so the two never drift apart.
+const SETTINGS_WINDOW_SIZE: [f32; 2] = [440.0, 560.0];
+
+/// Computes the top-left position that centers a window of `window_size` on
+/// `monitor`. Pure arithmetic, no OS dependency -- mirrors the
+/// `region_calc::resolve_region` / `zone_editor::normalize` pure/OS-facing
+/// split.
+fn centered_window_position(monitor: &MonitorGeometry, window_size: [f32; 2]) -> [f32; 2] {
+    [
+        monitor.x as f32 + (monitor.width as f32 - window_size[0]) / 2.0,
+        monitor.y as f32 + (monitor.height as f32 - window_size[1]) / 2.0,
+    ]
+}
+
 fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedRegion {
     NormalizedRegion {
         x: (region.x - monitor.x) as f32 / monitor.width as f32,
@@ -687,10 +703,18 @@ fn run_settings_frame(state: SettingsState, monitor: MonitorGeometry) -> Result<
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
 
+    // `.with_position(...)` here only ever takes effect on a genuine
+    // first-ever launch (no saved `WindowSettings` yet). Once eframe has
+    // persisted a position, `egui_winit::WindowSettings::initialize_viewport_builder`
+    // unconditionally calls `.with_position(...)` again with the *restored*
+    // position, so this default is always overridden on subsequent launches
+    // -- it never fights with the position/size/maximized/fullscreen
+    // restore that eframe's own persistence machinery already handles.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame Settings")
-            .with_inner_size([440.0, 560.0])
+            .with_inner_size(SETTINGS_WINDOW_SIZE)
+            .with_position(centered_window_position(&monitor, SETTINGS_WINDOW_SIZE))
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -1285,6 +1309,24 @@ mod tests {
         let normalized = normalize_region(&region, &monitor);
 
         assert_eq!(normalized, NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 });
+    }
+
+    #[test]
+    fn centered_window_position_centers_a_window_within_the_monitor() {
+        let monitor = test_monitor();
+
+        let position = centered_window_position(&monitor, SETTINGS_WINDOW_SIZE);
+
+        assert_eq!(position, [740.0, 260.0]);
+    }
+
+    #[test]
+    fn centered_window_position_accounts_for_a_monitor_with_a_non_zero_origin() {
+        let monitor = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
+
+        let position = centered_window_position(&monitor, SETTINGS_WINDOW_SIZE);
+
+        assert_eq!(position, [-1500.0, 440.0]);
     }
 
     #[test]
