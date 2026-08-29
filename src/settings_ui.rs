@@ -45,6 +45,18 @@ pub struct SettingsState {
     /// hotkey field (waiting for the next non-modifier key-down); `None`
     /// otherwise. See [`Self::start_capture`]/[`Self::handle_key_event`].
     pub capturing: Option<HotkeyField>,
+    /// `true` immediately after a key press during capture was ignored
+    /// because it has no name in GameFrame's hotkey vocabulary (see
+    /// [`key_display_name`]) -- lets the UI show a transient "key not
+    /// supported" hint instead of silently doing nothing. Reset whenever a
+    /// new capture starts or the current one ends (completed or cancelled).
+    pub unsupported_key_pressed: bool,
+    /// `Some(message)` immediately after a capture would complete with the
+    /// same combo already bound to the *other* hotkey field -- lets the UI
+    /// surface an "already bound" error instead of silently accepting a
+    /// binding that would later fail at `Hotkeys::register`. Reset whenever
+    /// a new capture starts or the current one ends.
+    pub duplicate_hotkey_error: Option<String>,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -70,6 +82,8 @@ impl SettingsState {
             custom_height: String::new(),
             custom_region_error: None,
             capturing: None,
+            unsupported_key_pressed: false,
+            duplicate_hotkey_error: None,
         }
     }
 
@@ -155,25 +169,12 @@ impl SettingsState {
         }
     }
 
-    /// Puts `field` into a listening state, waiting for the next key-down to
-    /// complete the capture (see [`Self::handle_key_event`]). Replaces any
-    /// capture already in progress for a different field.
     pub fn start_capture(&mut self, field: HotkeyField) {
         self.capturing = Some(field);
+        self.unsupported_key_pressed = false;
+        self.duplicate_hotkey_error = None;
     }
 
-    /// Feeds one key-down event (physical key plus concurrently-held
-    /// modifiers, straight from egui's `Event::Key`) to the in-progress
-    /// capture, if any. No-op if nothing is currently capturing.
-    ///
-    /// - `Escape` cancels the capture without changing the field's existing
-    ///   binding.
-    /// - A physical modifier key alone (Ctrl/Alt/Shift/Super) does not
-    ///   complete the capture -- capturing keeps listening for the main key.
-    /// - Any other key completes the capture: [`format_captured_hotkey`]
-    ///   converts it (with the held modifiers) to GameFrame's stored string
-    ///   convention and overwrites the target field's binding. A key with no
-    ///   name in that vocabulary is ignored, leaving the capture listening.
     pub fn handle_key_event(&mut self, modifiers: egui::Modifiers, key: egui::Key) {
         let Some(field) = self.capturing else {
             return;
@@ -181,27 +182,48 @@ impl SettingsState {
 
         if key == egui::Key::Escape {
             self.capturing = None;
+            self.unsupported_key_pressed = false;
+            self.duplicate_hotkey_error = None;
             return;
         }
 
         let Some(combo) = format_captured_hotkey(modifiers, key) else {
+            // A physical-modifier-only press stays silently listening (expected,
+            // not an error); anything else is a genuinely unmapped key.
+            if !is_physical_modifier_key(key) {
+                self.unsupported_key_pressed = true;
+            }
             return;
         };
+
+        let other_binding = match field {
+            HotkeyField::ToggleBorderless => &self.toggle_taskbar_autohide,
+            HotkeyField::ToggleTaskbarAutohide => &self.toggle_borderless,
+        };
+        if !other_binding.is_empty() && *other_binding == combo {
+            self.duplicate_hotkey_error =
+                Some(format!("{combo} is already bound to the other hotkey"));
+            return;
+        }
 
         match field {
             HotkeyField::ToggleBorderless => self.toggle_borderless = combo,
             HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide = combo,
         }
         self.capturing = None;
+        self.unsupported_key_pressed = false;
+        self.duplicate_hotkey_error = None;
     }
 
-    /// Unbinds `field` (clears its stored string back to empty, GameFrame's
-    /// existing "unbound" representation). The capture widget's replacement
-    /// for what deleting the text used to do in the old free-text field.
     pub fn clear_hotkey(&mut self, field: HotkeyField) {
         match field {
             HotkeyField::ToggleBorderless => self.toggle_borderless.clear(),
             HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide.clear(),
+        }
+        if self.capturing == Some(field) {
+            self.capturing = None;
+            self.unsupported_key_pressed = false;
+            self.duplicate_hotkey_error = None;
         }
     }
 }
@@ -489,13 +511,6 @@ struct SettingsApp {
 }
 
 impl SettingsApp {
-    /// Renders one hotkey field's row: the current binding (or a listening
-    /// placeholder while a capture is in progress), a "Set hotkey"/"Cancel"
-    /// button, and a "Clear" button. While `field` is capturing, drains this
-    /// frame's key-down events into [`SettingsState::handle_key_event`] --
-    /// OS/GPU-facing (needs a live egui input frame), so not exercised by
-    /// this crate's automated tests; the capture-to-string conversion it
-    /// delegates to is tested in isolation above.
     fn hotkey_row(&mut self, ui: &mut egui::Ui, label: &str, field: HotkeyField) {
         let is_capturing = self.state.capturing == Some(field);
 
@@ -512,11 +527,16 @@ impl SettingsApp {
                 ui.monospace(if bound.is_empty() { "Not bound" } else { bound.as_str() });
             }
 
-            if ui.button(if is_capturing { "Cancel" } else { "Set hotkey" }).clicked() {
+            let set_hotkey_response = ui.button(if is_capturing { "Cancel" } else { "Set hotkey" });
+            if set_hotkey_response.clicked() {
                 if is_capturing {
                     self.state.capturing = None;
                 } else {
                     self.state.start_capture(field);
+                    // Steal keyboard focus away from any other focused widget
+                    // (e.g. a custom-preset TextEdit) so the captured key-down
+                    // isn't also delivered to it as an Event::Text.
+                    set_hotkey_response.request_focus();
                 }
             }
             if ui.button("Clear").clicked() {
@@ -525,6 +545,13 @@ impl SettingsApp {
         });
 
         if is_capturing {
+            if self.state.unsupported_key_pressed {
+                ui.colored_label(egui::Color32::RED, "That key isn't supported -- try another.");
+            }
+            if let Some(error) = &self.state.duplicate_hotkey_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+
             for event in ui.ctx().input(|i| i.events.clone()) {
                 if let egui::Event::Key { physical_key: Some(key), pressed: true, repeat: false, modifiers, .. } = event
                 {
@@ -868,6 +895,19 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_event_with_an_unmapped_key_keeps_listening_and_flags_it_as_unsupported() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        // `Copy` has no entry in `key_display_name`'s vocabulary.
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::Copy);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleBorderless));
+        assert!(state.unsupported_key_pressed);
+    }
+
+    #[test]
     fn handle_key_event_when_nothing_is_capturing_is_a_no_op() {
         let mut state = SettingsState::from_config(&Config::default());
 
@@ -875,6 +915,18 @@ mod tests {
 
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn start_capture_clears_a_stale_unsupported_key_flag_from_a_previous_capture() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::Copy);
+        assert!(state.unsupported_key_pressed);
+
+        state.start_capture(HotkeyField::ToggleTaskbarAutohide);
+
+        assert!(!state.unsupported_key_pressed);
     }
 
     #[test]
@@ -887,6 +939,61 @@ mod tests {
 
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
+    }
+
+    #[test]
+    fn handle_key_event_rejects_a_combo_already_bound_to_the_other_field() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_taskbar_autohide = "Ctrl+Alt+B".to_string();
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        state.handle_key_event(modifiers, egui::Key::B);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleBorderless));
+        assert!(state.duplicate_hotkey_error.is_some());
+    }
+
+    #[test]
+    fn handle_key_event_completing_a_capture_clears_a_stale_duplicate_error() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_taskbar_autohide = "Ctrl+Alt+B".to_string();
+        state.start_capture(HotkeyField::ToggleBorderless);
+        state.handle_key_event(
+            egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE },
+            egui::Key::B,
+        );
+        assert!(state.duplicate_hotkey_error.is_some());
+
+        state.handle_key_event(egui::Modifiers::NONE, egui::Key::T);
+
+        assert_eq!(state.toggle_borderless, "T");
+        assert_eq!(state.duplicate_hotkey_error, None);
+    }
+
+    #[test]
+    fn clear_hotkey_also_cancels_an_in_progress_capture_for_that_same_field() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.clear_hotkey(HotkeyField::ToggleBorderless);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn clear_hotkey_does_not_cancel_a_capture_in_progress_for_the_other_field() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.start_capture(HotkeyField::ToggleTaskbarAutohide);
+
+        state.clear_hotkey(HotkeyField::ToggleBorderless);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleTaskbarAutohide));
     }
 
     #[test]
