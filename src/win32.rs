@@ -2,20 +2,28 @@
 //! a window's border/title bar, resizing/repositioning it, and disabling
 //! Windows 11's rounded-corner rendering while it's borderless. Also holds
 //! the independent taskbar-autohide mechanic: toggling the shell taskbar
-//! between always-visible and auto-hidden via `SHAppBarMessage`.
+//! between always-visible and auto-hidden via `SHAppBarMessage`. Also owns
+//! the "Apply to Window" picker's `EnumWindows` call
+//! ([`list_visible_windows`]/`enum_windows_callback`), which calls into
+//! [`crate::window_filter`] for the actual two-layer game-window
+//! filtering/ranking decision logic (see
+//! `docs/research/game-window-filtering.md` for the full rationale).
 //!
 //! Split the same way as [`crate::settings_ui`]:
 //! - Pure decision logic ([`strip_border_style`], [`plan_toggle`], [`active_preset`],
 //!   [`Win32Error::is_access_denied`], [`Win32Error::from_hresult`],
 //!   [`toggle_taskbar_autohide_state`], `apply_autohide_state`) has no
-//!   `HWND`/OS dependency and is fully unit tested below.
+//!   `HWND`/OS dependency and is fully unit tested below. [`crate::window_filter`]
+//!   follows the identical pure/OS-facing split for the window-filtering/ranking
+//!   logic.
 //! - The actual Win32 calls further down (`GetForegroundWindow`, `IsIconic`,
 //!   `SetWindowLongPtrW`, `SetWindowPos`, `DwmSetWindowAttribute`,
-//!   `ShellExecuteW`, `FindWindowW`, `SHAppBarMessage`) are OS-facing -- they
-//!   need a real foreground window or a real shell taskbar to manipulate,
-//!   which a headless/CI sandbox cannot provide -- so they are NOT
-//!   exercised by this crate's automated tests. See the module's doc comment
-//!   in the issue writeup for what could/couldn't be verified.
+//!   `ShellExecuteW`, `FindWindowW`, `SHAppBarMessage`, `EnumWindows`) are
+//!   OS-facing -- they need a real foreground window, a real shell taskbar, or
+//!   a real running process to query, which a headless/CI sandbox cannot
+//!   provide -- so they are NOT exercised by this crate's automated tests. See
+//!   the module's doc comment in the issue writeup for what could/couldn't be
+//!   verified.
 //!
 //! [`toggle_taskbar_autohide`] keeps its own [`TaskbarAutohideState`],
 //! completely separate from the borderless mechanic's [`RestoreState`] --
@@ -228,6 +236,7 @@ impl std::error::Error for Win32Error {
     }
 }
 
+use crate::window_filter::{self, WindowRank};
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
@@ -238,7 +247,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SET_WINDOW_POS_FLAGS,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -605,62 +614,65 @@ fn encode_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Decides whether a window is worth offering in the tray menu's "Apply to
-/// Window" picker, given its title and `IsWindowVisible` result -- a window
-/// is listable if it's currently visible and has a non-blank title (an
-/// invisible or untitled window isn't something a user could sensibly pick
-/// by name). Pure logic -- no `HWND`/OS dependency -- so it's unit testable
-/// separately from the real `EnumWindows` callback ([`list_visible_windows`])
-/// that calls it.
-fn is_listable_window(title: &str, is_visible: bool) -> bool {
-    is_visible && !title.trim().is_empty()
+/// Per-`EnumWindows`-call userdata smuggled through `EnumWindows`'s `LPARAM`
+/// parameter: the listable windows gathered so far, plus a per-PID
+/// process-level-signal memoization cache (see
+/// [`window_filter::rank_window_for_hwnd`]) so a process owning multiple
+/// top-level listable windows only pays for one launcher-match/graphics-
+/// module gather instead of one per window -- the window-class signal is
+/// deliberately excluded from this cache since it's a per-window, not
+/// per-process, property.
+struct EnumWindowsState {
+    windows: Vec<(HWND, String, WindowRank)>,
+    rank_cache: std::collections::HashMap<u32, window_filter::ProcessRankSignals>,
 }
 
-/// Enumerates every currently-visible top-level window with a non-blank
-/// title (via [`is_listable_window`]), for the tray menu's "Apply to Window"
-/// picker ([`crate::tray_ui`]) to populate its submenu from. Returns a fresh
-/// snapshot on every call -- the tray menu re-calls this each time it wants
-/// its picker to reflect what's currently open (see `tray_ui`'s module docs
-/// for how/when it does so) rather than caching a snapshot.
-///
-/// OS-facing: walks the real top-level window list via `EnumWindows`. Not
-/// exercised by this crate's automated tests -- see module docs; the
-/// filtering decision itself ([`is_listable_window`]) is unit tested above
-/// in isolation from the live enumeration.
 pub fn list_visible_windows() -> Vec<(HWND, String)> {
-    let mut windows: Vec<(HWND, String)> = Vec::new();
-    // Safety: `windows` outlives this call (it's a local that isn't dropped
+    let mut state = EnumWindowsState { windows: Vec::new(), rank_cache: std::collections::HashMap::new() };
+    // Safety: `state` outlives this call (it's a local that isn't dropped
     // until after `EnumWindows` returns); it's cast to a raw pointer solely
     // to smuggle it through `EnumWindows`'s documented `LPARAM` userdata
     // parameter, and `enum_windows_callback` below casts it back to the
     // exact same type before dereferencing it.
     unsafe {
-        EnumWindows(Some(enum_windows_callback), std::ptr::addr_of_mut!(windows) as isize);
+        EnumWindows(Some(enum_windows_callback), std::ptr::addr_of_mut!(state) as isize);
     }
-    windows
+    // Layer 2 (see `docs/research/game-window-filtering.md`): a stable sort
+    // by descending `WindowRank` surfaces likely games first in the picker,
+    // without ever removing a window ranked `WindowRank::Unknown` -- ranking
+    // only ever reorders, it never filters. `Vec::sort_by` is a stable sort,
+    // so windows that tie on rank keep the relative order `EnumWindows`
+    // produced them in (roughly Z-order).
+    state.windows.sort_by(|a, b| b.2.cmp(&a.2));
+    state.windows.into_iter().map(|(hwnd, title, _rank)| (hwnd, title)).collect()
 }
 
-/// `EnumWindows`'s per-window callback: reads each candidate window's
-/// visibility/title and, if [`is_listable_window`] accepts it, appends it to
-/// the `Vec<(HWND, String)>` passed as `lparam` by [`list_visible_windows`].
-///
-/// Per `EnumWindows`'s documented contract, returning nonzero (`TRUE`)
-/// continues enumeration to the next window; this callback always does so --
-/// there's no early-exit condition for this use case (every top-level window
-/// needs to be considered).
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i32 {
     // Safety: `lparam` is exactly the pointer `list_visible_windows` passed
     // in, valid for the duration of the `EnumWindows` call that is
     // synchronously invoking this callback.
-    let windows = unsafe { &mut *(lparam as *mut Vec<(HWND, String)>) };
+    let state = unsafe { &mut *(lparam as *mut EnumWindowsState) };
 
     // Safety: `hwnd` is a live handle supplied by `EnumWindows` itself;
     // `IsWindowVisible` performs no writes.
     let is_visible = unsafe { IsWindowVisible(hwnd) } != 0;
     let title = window_text(hwnd);
+    let is_cloaked = window_filter::is_window_cloaked(hwnd);
+    let ex_style = window_filter::window_ex_style(hwnd);
+    let has_tool_window_style = ex_style & WS_EX_TOOLWINDOW != 0;
+    let has_app_window_style = ex_style & WS_EX_APPWINDOW != 0;
+    let is_representative_window = window_filter::is_root_owner_or_last_active_popup(hwnd);
 
-    if is_listable_window(&title, is_visible) {
-        windows.push((hwnd, title));
+    if window_filter::is_listable_window(
+        &title,
+        is_visible,
+        is_cloaked,
+        is_representative_window,
+        has_tool_window_style,
+        has_app_window_style,
+    ) {
+        let rank = window_filter::rank_window_for_hwnd(hwnd, &mut state.rank_cache);
+        state.windows.push((hwnd, title, rank));
     }
 
     1 // TRUE: keep enumerating.
@@ -948,26 +960,6 @@ mod tests {
     }
 
     #[test]
-    fn is_listable_window_accepts_a_visible_window_with_a_non_empty_title() {
-        assert!(is_listable_window("Notepad", true));
-    }
-
-    #[test]
-    fn is_listable_window_rejects_an_invisible_window() {
-        assert!(!is_listable_window("Notepad", false));
-    }
-
-    #[test]
-    fn is_listable_window_rejects_a_visible_window_with_an_empty_title() {
-        assert!(!is_listable_window("", true));
-    }
-
-    #[test]
-    fn is_listable_window_rejects_a_visible_window_whose_title_is_only_whitespace() {
-        assert!(!is_listable_window("   ", true));
-    }
-
-    #[test]
     fn win32_error_taskbar_not_found_implements_display_and_std_error() {
         fn assert_is_std_error<E: std::error::Error>(_: &E) {}
 
@@ -976,4 +968,5 @@ mod tests {
         assert_is_std_error(&err);
         assert_eq!(err.to_string(), "could not find the taskbar window (Shell_TrayWnd)");
     }
+
 }

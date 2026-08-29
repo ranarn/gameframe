@@ -5,6 +5,7 @@ mod region_calc;
 mod settings_ui;
 mod tray_ui;
 mod win32;
+mod window_filter;
 
 fn main() {
     if let Err(e) = app::run() {
