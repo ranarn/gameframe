@@ -29,13 +29,27 @@ The overlay's live, in-progress region while the user is drawing or resizing it.
 _Avoid_: using "Zone" and "Custom preset" interchangeably — a Zone is the editing-time state, the Custom preset is what gets persisted.
 
 **Active preset**:
-The preset currently assigned to a given game. Displaying it is this context's concern; the assignment mechanism (which preset a game is bound to) belongs to per-game management, not the preset data model itself.
+The preset currently assigned to a given **tracked game** — stored as a reference to one of the five preset kinds, never a copy, so editing a base preset or replacing the Custom preset immediately changes what every game assigned to it applies.
+
+**Tracked game**:
+A process, identified by its **executable path**, that has been added to GameFrame's per-game list. Added by picking it from the "Apply to Window" picker — the same action also applies its active preset immediately — and persists across sessions; picking an already-tracked game again does not create a duplicate entry.
+_Avoid_: "game" alone for a window that merely looks like a game but hasn't been added to this list yet.
+
+**Executable path**:
+A tracked game's identity — the full path to its running process's executable. Two windows belonging to processes with the same executable path are the same tracked game.
+
+**Auto-apply**:
+A per-tracked-game setting: whether this game's active preset should be applied the moment the game launches, versus only on demand via the hotkey or tray menu. Defaults to on for a newly-added tracked game.
+
+**Per-game taskbar auto-hide**:
+A per-tracked-game setting: whether applying this game's active preset should also hide the Windows taskbar. Defaults to on for a newly-added tracked game. Distinct from the manual, global taskbar auto-hide toggle, which is unrelated to any tracked game.
 
 ## Relationships
 
 - The preset set holds exactly one of each **base preset** (**Left**, **Right**, **HalfLeft**, **HalfRight**) plus at most one **Custom preset** — not a free-form list.
 - A **Zone**, once saved via the overlay, becomes the **Custom preset**.
-- Each game is assigned exactly one **active preset** (base or Custom).
+- Each **tracked game** is assigned exactly one **active preset** (base or Custom), plus its own **auto-apply** and **per-game taskbar auto-hide** settings.
+- Applying a preset to a window whose process is not a **tracked game** does nothing — there is no untracked fallback.
 
 ## Flagged ambiguities
 
