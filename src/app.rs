@@ -11,11 +11,21 @@
 //! pressed without the other having been used first. A click on one of the
 //! "Apply to Window" submenu's dynamically-listed windows (recognized via
 //! [`tray_ui::decode_window_item_id`], distinct from the three fixed
-//! top-level menu items) applies the active preset's borderless+reposition
-//! treatment to that specific window via
+//! top-level menu items) resolves that window's owning process against the
+//! tracked-games list (adding it, with this issue's new-tracked-game
+//! defaults, if not already tracked -- see
+//! [`crate::profile_store::upsert_tracked_game`]) and applies its assigned
+//! preset's borderless+reposition treatment to that specific window via
 //! [`win32::apply_borderless_to_window`] -- a one-shot action with no
 //! remembered restore state, unlike the hotkey path's `toggle_state` (see
 //! [`handle_apply_to_window`]).
+//!
+//! A third trigger requires no user action at all: [`crate::launch_watcher`]
+//! registers a `SetWinEventHook` on the same message loop and, on every
+//! foreground-window change, delegates to [`handle_auto_apply_launch`] --
+//! which applies a tracked game's preset the moment it becomes the
+//! foreground window, but only if that game's `auto_apply` flag is on (see
+//! [`resolve_auto_apply`]).
 //!
 //! The message loop itself ([`run`]) is OS-facing (pumps real Win32
 //! messages) and is not exercised by this crate's automated tests, for
@@ -23,11 +33,13 @@
 //! thread message queue that a headless/CI sandbox can't provide.
 
 use crate::hotkeys::{Hotkeys, HotkeyAction};
+use crate::launch_watcher;
 use crate::profile_store;
-use crate::region_calc::resolve_region;
+use crate::region_calc::{resolve_region, Region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::win32::{self, RestoreState, TaskbarAutohideState};
+use crate::window_filter;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::menu::MenuEvent;
@@ -35,16 +47,22 @@ use tray_icon::TrayIconEvent;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
-/// Starts GameFrame: shows only the tray icon (no window), registers the
-/// bound global hotkeys, and blocks, pumping the Windows message loop both
-/// the tray icon and the hotkeys need, until "Exit" is selected. Returns
-/// once the tray icon (and its hidden window) has been cleanly torn down.
 pub fn run() -> Result<(), TrayUiError> {
     let tray = Tray::new()?;
     let config_dir = config_dir();
     let hotkeys = register_hotkeys(&config_dir);
 
+    // Registered before entering `run_event_loop`'s `GetMessageW` pump --
+    // see `crate::launch_watcher`'s module docs for why registration must
+    // happen on this thread, before that loop starts.
+    let launch_watcher_hook = launch_watcher::register(&config_dir);
+
     run_event_loop(&tray, hotkeys, &config_dir);
+
+    if let Some(hook) = launch_watcher_hook {
+        launch_watcher::unregister(hook);
+    }
+
     Ok(())
 }
 
@@ -91,6 +109,12 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
     // is currently in its normal bordered state; `Some` means the last
     // press stripped it and this is what a second press should restore.
     let mut toggle_state: Option<RestoreState> = None;
+
+    // Remembers which window `toggle_state` was stripped from, in lockstep
+    // with `toggle_state` itself -- lets `handle_toggle_borderless` refuse a
+    // restore press if a *different* window now has focus (see
+    // `should_allow_restore`; HIGH review finding, issue #31 iteration 3).
+    let mut stripped_hwnd: Option<HWND> = None;
 
     // Remembers the taskbar auto-hide toggle's on/off state across presses
     // of its own hotkey -- fully independent of `toggle_state` above (see
@@ -212,7 +236,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
             let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
             match action {
                 Some(HotkeyAction::ToggleBorderless) => {
-                    if handle_toggle_borderless(config_dir, &mut toggle_state) {
+                    if handle_toggle_borderless(config_dir, &mut toggle_state, &mut stripped_hwnd) {
                         // GameFrame relaunched itself elevated to complete a
                         // manipulation that failed for lack of permissions;
                         // this (unelevated) instance's job is done.
@@ -228,23 +252,162 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
     }
 }
 
-/// Reacts to a press of the borderless-toggle hotkey: resolves the active
-/// preset's region against the primary monitor and applies (or reverts)
-/// the border-strip via [`win32::toggle_borderless_on_foreground_window`].
+/// Resolves the tracked game (if any) whose executable path is `exe_path`,
+/// and its assigned preset resolved against `config.presets` -- the shared
+/// decision logic behind both [`handle_toggle_borderless`]'s and
+/// [`handle_apply_to_window`]'s "resolve against tracked games" rule.
+///
+/// Returns `None` in either of two cases, both treated identically by
+/// callers (log and do nothing, no fallback):
+/// - no tracked game matches `exe_path` (an untracked process); or
+/// - one does, but its assigned preset can't currently be resolved (e.g. it
+///   was assigned `Custom`, and `Custom` was since cleared -- see
+///   [`crate::profile_store::Presets::resolve`]'s doc comment).
+///
+/// Pure -- no OS call -- so it's unit testable in complete isolation from
+/// the live foreground-window/tray-hwnd resolution that supplies `exe_path`.
+fn resolve_tracked_apply(
+    config: &profile_store::Config,
+    exe_path: &std::path::Path,
+) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
+    let game = profile_store::find_tracked_game(&config.tracked_games, exe_path)?.clone();
+    let preset = config.presets.resolve(game.preset)?;
+    Some((game, preset))
+}
+
+/// Like [`resolve_tracked_apply`], but additionally requires the tracked
+/// game's `auto_apply` flag to be on -- the extra gate this issue's
+/// launch-detection trigger (`crate::launch_watcher`) applies that the
+/// hotkey/tray "manual" apply paths deliberately do not (per issue #31's
+/// design: `auto_apply` only governs whether a launch is auto-applied
+/// without a hotkey press, not whether a manual hotkey/tray press works).
+///
+/// Returns `None` for exactly the same two cases [`resolve_tracked_apply`]
+/// does (no match; matched but the assigned preset can't currently be
+/// resolved), plus a third: matched, preset resolves, but `auto_apply` is
+/// off.
+///
+/// Pure -- no OS call -- so it's unit testable in complete isolation from
+/// the real WinEvent hook registration/callback (`crate::launch_watcher`)
+/// that supplies `exe_path`.
+pub(crate) fn resolve_auto_apply(
+    config: &profile_store::Config,
+    exe_path: &std::path::Path,
+) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
+    let (game, preset) = resolve_tracked_apply(config, exe_path)?;
+    if !game.auto_apply {
+        return None;
+    }
+    Some((game, preset))
+}
+
+/// Decides whether [`handle_toggle_borderless`]'s tracked-game gate should
+/// block this hotkey press outright, given whether the press is a pending
+/// *restore* (`is_restoring`, i.e. `toggle_state.is_some()` -- see
+/// [`win32::plan_toggle`], which derives the same strip-vs-restore decision
+/// from that same remembered state) and whether the foreground window's
+/// process currently resolves to a tracked game with a resolvable preset
+/// (`tracked`, i.e. `resolve_tracked_apply(..).is_some()`).
+///
+/// Only the strip direction is gated on tracked-game membership: an
+/// untracked foreground window blocks an initial strip, but never blocks a
+/// pending restore purely because the *current* foreground window is
+/// untracked. This is a deliberate judgment call (see the MEDIUM review
+/// finding on issue #31) -- gating both directions uniformly would
+/// permanently orphan a currently-stripped window in its borderless state
+/// for the rest of the running session if its tracked game were removed via
+/// Settings (or its assigned preset's `Custom` region cleared) in between
+/// the strip press and the restore press, since nothing else in the app can
+/// restore it once the remembered `RestoreState` game is no longer
+/// resolvable. `plan_toggle`'s `Restore` arm doesn't need a resolved
+/// preset/region at all, so there is no correctness reason to require one
+/// here.
+///
+/// This function alone is *not* sufficient to greenlight a restore, though:
+/// per the HIGH review finding on issue #31 iteration 3, a restore must
+/// additionally only proceed against the *same* window that was originally
+/// stripped -- see the separate, HWND-identity-based [`should_allow_restore`],
+/// which [`handle_toggle_borderless`] also consults before calling
+/// [`win32::toggle_borderless_on_foreground_window`] on the restore path.
+///
+/// Pure -- no OS call -- so it's unit testable in complete isolation.
+fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
+    !is_restoring && !tracked
+}
+
+/// Decides whether a pending restore (`stripped`, the `HWND` that was
+/// stripped by the last successful strip press, remembered alongside
+/// `toggle_state`) may be applied to the window that currently has focus
+/// (`current`, from [`win32::foreground_window`]).
+///
+/// Restoring blindly applies the previously-stripped window's saved
+/// style/region to *whatever* `GetForegroundWindow()` currently returns --
+/// if the user alt-tabbed away to a different window (Chrome, Explorer,
+/// another tracked game) in between the strip and restore presses, applying
+/// the restore there would corrupt that unrelated window's position/style
+/// while permanently orphaning the original window in its stripped state
+/// (fixes the HIGH review finding on issue #31 iteration 3, introduced by
+/// [`should_block_untracked_toggle`]'s iteration-2 fix unconditionally
+/// allowing every pending restore through regardless of which window is now
+/// focused).
+///
+/// Only returns `true` when both `current` and `stripped` are `Some` and
+/// equal -- a `None` foreground window, no remembered stripped window, or a
+/// mismatch between the two all refuse the restore.
+///
+/// Pure -- no OS call, just an `HWND` comparison -- so it's unit testable in
+/// complete isolation.
+fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
+    current.is_some() && current == stripped
+}
+
+/// Reacts to a press of the borderless-toggle hotkey: resolves the
+/// foreground window's owning process against the tracked-games list (see
+/// [`resolve_tracked_apply`]) and, if it's tracked (or a restore is already
+/// pending for *this same window* -- see below), applies (or reverts) the
+/// border-strip via [`win32::toggle_borderless_on_foreground_window`], then,
+/// on a successful strip only, sets the tracked game's taskbar-auto-hide
+/// value absolutely (see
+/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`).
+///
+/// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
+/// the *strip* direction: an untracked foreground window blocks an initial
+/// strip (per this issue's acceptance criteria and `CONTEXT.md`'s "Applying
+/// a preset to a window whose process is not a tracked game does nothing"),
+/// but never blocks a pending *restore* purely because the untracked window
+/// happens to be the one now in the foreground -- see that function's doc
+/// comment for the full reasoning.
+///
+/// A pending restore is additionally gated on window identity via
+/// [`should_allow_restore`]: `stripped_hwnd` remembers which window
+/// `toggle_state` was stripped from, and a restore press only proceeds if
+/// the current foreground window (`fg_hwnd`) is that same window. If the
+/// user alt-tabbed to a different window in between the strip and restore
+/// presses, this press is refused outright -- logged, `toggle_state`/
+/// `stripped_hwnd` left untouched -- rather than applying the original
+/// game's saved style/region to whatever window now happens to have focus
+/// (HIGH review finding, issue #31 iteration 3). The user can still complete
+/// the correct restore later by refocusing the originally-stripped window.
+///
+/// Taskbar auto-hide is set only on the strip direction, not on restore:
+/// using the same fixed per-game boolean on both directions would leave the
+/// taskbar auto-hidden after a full strip+restore cycle instead of it coming
+/// back, for the common `taskbar_autohide: true` default (MEDIUM review
+/// finding, issue #31 iteration 3).
 ///
 /// Returns `true` if GameFrame just relaunched itself elevated and this
 /// process should exit (see [`win32::relaunch_elevated`]); `false` in every
 /// other case (success, or a non-elevation failure that was just logged).
 ///
 /// Reloads the config from disk on every press (rather than caching it
-/// across the whole run) so a preset added/edited via Settings since the
-/// last press is picked up immediately -- the trade-off is a small,
-/// infrequent disk read on a user-initiated action, which is cheap.
+/// across the whole run) so a preset/assignment added/edited via Settings
+/// since the last press is picked up immediately -- the trade-off is a
+/// small, infrequent disk read on a user-initiated action, which is cheap.
 /// The hotkey binding itself is re-registered separately, right after the
 /// Settings window closes -- see the `ShowSettings` branch in
 /// [`run_event_loop`] -- so a changed binding also takes effect without a
 /// restart.
-fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<RestoreState>) -> bool {
+fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<RestoreState>, stripped_hwnd: &mut Option<HWND>) -> bool {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
@@ -253,19 +416,77 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
         }
     };
 
-    let Some(preset) = win32::active_preset(&config.presets) else {
-        eprintln!("borderless toggle: no presets configured");
-        return false;
-    };
+    // Whether this press is about to restore (a `RestoreState` is already
+    // remembered from a prior strip) or strip (nothing remembered yet) --
+    // see `should_block_untracked_toggle`'s doc comment for why only the
+    // strip direction is gated on tracked-game membership below.
+    let is_restoring = toggle_state.is_some();
 
-    let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(preset, &monitor) {
-        Ok(region) => region,
-        Err(e) => {
-            eprintln!("borderless toggle: failed to resolve the active preset's region: {e}");
+    // Resolved once and reused both for the tracked-game lookup below and
+    // for the restore-direction identity check (`should_allow_restore`) --
+    // see `win32::foreground_window`'s doc comment for why this replaces a
+    // second, separate `GetForegroundWindow()` call.
+    let fg_hwnd = win32::foreground_window();
+
+    if is_restoring {
+        if !should_allow_restore(fg_hwnd, *stripped_hwnd) {
+            eprintln!(
+                "borderless toggle: a pending restore exists for a different window; ignoring press until that window is focused again"
+            );
+            // Deliberately do NOT clear `toggle_state`/`stripped_hwnd` here --
+            // the user can still complete the correct restore later by
+            // refocusing the originally-stripped window (HIGH review finding,
+            // issue #31 iteration 3).
             return false;
         }
+    }
+
+    let tracked = fg_hwnd
+        .and_then(window_filter::exe_path_for_window)
+        .and_then(|exe_path| resolve_tracked_apply(&config, &exe_path));
+
+    if should_block_untracked_toggle(is_restoring, tracked.is_some()) {
+        eprintln!(
+            "borderless toggle: foreground window's process is not a tracked game (or its assigned preset is unavailable); ignoring"
+        );
+        return false;
+    }
+
+    let target_region = match &tracked {
+        Some((tracked_game, preset)) => {
+            let monitor = primary_monitor_geometry();
+            match resolve_region(preset, &monitor) {
+                Ok(region) => region,
+                Err(e) => {
+                    eprintln!("borderless toggle: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+                    return false;
+                }
+            }
+        }
+        // Only reachable while restoring -- the gate above already returned
+        // for the strip direction when `tracked` is `None`. `plan_toggle`'s
+        // `Restore` arm never reads `target_region`, so this placeholder
+        // value is inert.
+        None => Region { x: 0, y: 0, width: 0, height: 0 },
     };
+
+    // Commit `stripped_hwnd` for the strip direction *before* attempting the
+    // OS-mutating call below, mirroring `win32.rs`'s own "commit early"
+    // pattern for `toggle_state` in its `MakeBorderless` arm (see that arm's
+    // doc comment: "Commit the new remembered state *before* attempting the
+    // OS-mutating calls below"). Without this, a partial failure inside
+    // `toggle_borderless_on_foreground_window` would leave `toggle_state`
+    // committed (as designed, by that function itself) but `stripped_hwnd`
+    // unchanged -- a desync where `is_restoring` reads `true` on the next
+    // press but `should_allow_restore` refuses it forever, since
+    // `stripped_hwnd` never got recorded (HIGH review finding, issue #31
+    // iteration 4). The restore direction is not committed early: a failed
+    // restore should still leave `stripped_hwnd` in place so a retry can
+    // succeed, mirroring `win32.rs`'s own `Restore` arm, which only clears
+    // `toggle_state` after all three restore calls succeed.
+    if !is_restoring {
+        *stripped_hwnd = fg_hwnd;
+    }
 
     if let Err(e) = win32::toggle_borderless_on_foreground_window(toggle_state, target_region) {
         if e.is_access_denied() {
@@ -277,6 +498,29 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
         } else {
             eprintln!("borderless toggle failed: {e}");
         }
+        return false;
+    }
+
+    // Mirror `toggle_state`'s own transition for `stripped_hwnd` on success:
+    // the strip direction was already committed above (before the call); a
+    // successful restore (only reachable here when `should_allow_restore`
+    // already confirmed `fg_hwnd == *stripped_hwnd`) clears it now.
+    if is_restoring {
+        *stripped_hwnd = None;
+    }
+
+    // Only set taskbar auto-hide on the strip direction -- setting it again
+    // on restore (using the same fixed per-game boolean) would leave the
+    // taskbar auto-hidden after the user exits borderless/game mode instead
+    // of it coming back, for the common `taskbar_autohide: true` default
+    // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
+    // about the strip/apply action, not the restore/undo action.
+    if !is_restoring {
+        if let Some((tracked_game, _)) = &tracked {
+            if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+                eprintln!("borderless toggle: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+            }
+        }
     }
 
     false
@@ -284,11 +528,22 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 
 /// Reacts to a click on one of the "Apply to Window" submenu's
 /// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
-/// the active preset's region against the primary monitor (the same pattern
-/// as [`handle_toggle_borderless`]) and applies the borderless+reposition
-/// treatment to `target_hwnd` -- which may not be the foreground window at
-/// all, that's the whole point of this tray-menu path -- via
-/// [`win32::apply_borderless_to_window`].
+/// `target_hwnd`'s owning process's executable path, looks it up (or adds it,
+/// with this issue's new-tracked-game defaults -- preset `Right`, auto-apply
+/// on, taskbar-auto-hide on) in the tracked-games list via
+/// [`profile_store::upsert_tracked_game`], persists that list update
+/// immediately (even if a later step below fails), then applies the
+/// resolved preset's borderless+reposition treatment to `target_hwnd` --
+/// which may not be the foreground window at all, that's the whole point of
+/// this tray-menu path -- via [`win32::apply_borderless_to_window`], and,
+/// only once that border-apply succeeds, sets the tracked game's
+/// taskbar-auto-hide value absolutely (see
+/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`). A
+/// border-apply failure (e.g. the target window is minimized) returns early
+/// without touching the taskbar at all -- mirroring
+/// [`handle_toggle_borderless`]'s equivalent gating -- since forcing the
+/// taskbar into auto-hide for a window that was never actually stripped
+/// would contradict ADR 0002's whole rationale for coupling the two.
 ///
 /// A one-shot action, not a toggle: there is no remembered restore state for
 /// this path (see this module's doc comment for the scope decision), so
@@ -303,7 +558,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// [`win32::relaunch_elevated`] -- reactive elevation for this path is out
 /// of scope for this slice.
 fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
-    let config = match profile_store::load(config_dir) {
+    let mut config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("apply to window: failed to load config: {e}");
@@ -311,22 +566,108 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         }
     };
 
-    let Some(preset) = win32::active_preset(&config.presets) else {
-        eprintln!("apply to window: no presets configured");
+    let Some(exe_path) = window_filter::exe_path_for_window(target_hwnd) else {
+        eprintln!("apply to window: could not resolve the target window's executable path");
+        return;
+    };
+
+    let display_name = win32::window_text(target_hwnd);
+    let index = profile_store::upsert_tracked_game(&mut config.tracked_games, exe_path, display_name);
+    let tracked_game = config.tracked_games[index].clone();
+
+    // Persist the (possibly newly-added) tracked game immediately, before
+    // attempting the region/border/taskbar steps below -- so a downstream
+    // failure (e.g. an unresolvable preset, or the window manipulation
+    // itself failing) never costs the user the "this window is now tracked"
+    // outcome that "Apply to Window" is documented to guarantee.
+    if let Err(e) = profile_store::save(config_dir, &config) {
+        eprintln!("apply to window: failed to save tracked game {}: {e}", tracked_game.display_name);
+    }
+
+    let Some(preset) = config.presets.resolve(tracked_game.preset) else {
+        eprintln!("apply to window: {}'s assigned preset is unavailable; ignoring", tracked_game.display_name);
         return;
     };
 
     let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(preset, &monitor) {
+    let target_region = match resolve_region(&preset, &monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("apply to window: failed to resolve the active preset's region: {e}");
+            eprintln!("apply to window: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
             return;
         }
     };
 
     if let Err(e) = win32::apply_borderless_to_window(target_hwnd, target_region) {
         eprintln!("apply to window failed: {e}");
+        return;
+    }
+
+    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+        eprintln!("apply to window: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+    }
+}
+
+/// Reacts to a [`crate::launch_watcher`]-detected foreground-window change:
+/// resolves `hwnd`'s owning process's executable path and, only if it
+/// matches a tracked game with auto-apply on (see [`resolve_auto_apply`]),
+/// applies that game's assigned preset's borderless+reposition treatment to
+/// `hwnd` via [`win32::apply_borderless_to_window`], then, only once that
+/// succeeds, sets the tracked game's taskbar-auto-hide value absolutely --
+/// exactly mirroring [`handle_apply_to_window`]'s one-shot apply shape
+/// (including its border-apply-must-succeed-first gate on the taskbar step,
+/// per issue #31's HIGH review fix) and [`win32::apply_borderless_to_window`]
+/// itself, rather than the hotkey path's toggle/restore mechanism -- a
+/// launch-detected apply has no "undo" concept, since there's nothing to
+/// restore from (the game just started).
+///
+/// Unlike [`handle_apply_to_window`], this never adds a new tracked game or
+/// persists the config: a game must already be tracked, with auto-apply on,
+/// to reach an actual apply here at all (see [`resolve_auto_apply`]'s doc
+/// comment), so there is no upsert/save step.
+///
+/// Reloads the config from disk on every foreground-change event, matching
+/// [`handle_toggle_borderless`]/[`handle_apply_to_window`]'s own "reload
+/// from disk on every trigger" convention.
+///
+/// OS-facing (resolves a real `HWND`'s owning process and applies real
+/// window/taskbar mutations) -- not exercised by this crate's automated
+/// tests, per this crate's established convention (manual usertest only).
+/// [`resolve_auto_apply`] above is the pure decision this function
+/// delegates to, and is what's actually unit tested.
+pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
+    let config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("launch detection: failed to load config: {e}");
+            return;
+        }
+    };
+
+    let Some(exe_path) = window_filter::exe_path_for_window(hwnd) else {
+        return;
+    };
+
+    let Some((tracked_game, preset)) = resolve_auto_apply(&config, &exe_path) else {
+        return;
+    };
+
+    let monitor = primary_monitor_geometry();
+    let target_region = match resolve_region(&preset, &monitor) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("launch detection: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+            return;
+        }
+    };
+
+    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
+        eprintln!("launch detection: failed to apply borderless treatment to {}: {e}", tracked_game.display_name);
+        return;
+    }
+
+    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+        eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
 
@@ -365,7 +706,152 @@ fn config_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::hotkeys::resolve_bindings;
+    use crate::profile_store::{Config, PresetKind, TrackedGame};
+    use crate::region_calc::Preset;
     use global_hotkey::hotkey::HotKey;
+    use std::path::PathBuf;
+
+    #[test]
+    fn should_block_untracked_toggle_blocks_an_untracked_strip() {
+        assert!(should_block_untracked_toggle(false, false));
+    }
+
+    #[test]
+    fn should_block_untracked_toggle_allows_a_tracked_strip() {
+        assert!(!should_block_untracked_toggle(false, true));
+    }
+
+    #[test]
+    fn should_block_untracked_toggle_allows_an_untracked_restore() {
+        // A pending restore (a `RestoreState` already remembered from a
+        // prior strip) must always be allowed to complete, even if the game
+        // is no longer tracked (e.g. removed via Settings mid-session) --
+        // otherwise the window is permanently orphaned in its stripped
+        // state for the rest of the run (MEDIUM review finding, issue #31).
+        assert!(!should_block_untracked_toggle(true, false));
+    }
+
+    #[test]
+    fn should_block_untracked_toggle_allows_a_tracked_restore() {
+        assert!(!should_block_untracked_toggle(true, true));
+    }
+
+    #[test]
+    fn should_allow_restore_when_the_foreground_window_matches_the_stripped_window() {
+        let hwnd = 1usize as HWND;
+        assert!(should_allow_restore(Some(hwnd), Some(hwnd)));
+    }
+
+    #[test]
+    fn should_allow_restore_refuses_when_a_different_window_is_now_focused() {
+        // Alt-tab from a stripped game to any other window (issue #31,
+        // iteration-3 HIGH fix) must never let the pending restore apply to
+        // the newly-focused window.
+        let stripped = 1usize as HWND;
+        let other = 2usize as HWND;
+        assert!(!should_allow_restore(Some(other), Some(stripped)));
+    }
+
+    #[test]
+    fn should_allow_restore_refuses_when_there_is_no_foreground_window() {
+        let stripped = 1usize as HWND;
+        assert!(!should_allow_restore(None, Some(stripped)));
+    }
+
+    #[test]
+    fn should_allow_restore_refuses_when_nothing_was_ever_stripped() {
+        let hwnd = 1usize as HWND;
+        assert!(!should_allow_restore(Some(hwnd), None));
+    }
+
+    #[test]
+    fn resolve_tracked_apply_returns_none_for_an_untracked_executable_path() {
+        let config = Config::default();
+
+        let result = resolve_tracked_apply(&config, &PathBuf::from("C:\\Games\\thing.exe"));
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_tracked_apply_resolves_a_tracked_games_assigned_preset() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        config.tracked_games.push(TrackedGame::new_default(exe_path.clone(), "Thing".to_string()));
+
+        let (game, preset) = resolve_tracked_apply(&config, &exe_path).expect("expected a tracked game match");
+
+        assert_eq!(game.display_name, "Thing");
+        assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+    }
+
+    #[test]
+    fn resolve_auto_apply_resolves_when_matched_and_auto_apply_is_on() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        assert!(game.auto_apply);
+        config.tracked_games.push(game);
+
+        let (game, preset) = resolve_auto_apply(&config, &exe_path).expect("expected a resolved auto-apply match");
+
+        assert_eq!(game.display_name, "Thing");
+        assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_when_auto_apply_is_off() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.auto_apply = false;
+        config.tracked_games.push(game);
+
+        let result = resolve_auto_apply(&config, &exe_path);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_for_an_untracked_executable_path() {
+        let config = Config::default();
+
+        let result = resolve_auto_apply(&config, &PathBuf::from("C:\\Games\\thing.exe"));
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.preset = PresetKind::Custom;
+        assert!(game.auto_apply);
+        config.tracked_games.push(game);
+        assert_eq!(config.presets.custom, None);
+
+        let result = resolve_auto_apply(&config, &exe_path);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_tracked_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
+        // A game assigned to Custom after Custom was since cleared/replaced
+        // with None -- treated the same as "untracked" for this one apply,
+        // not a silent fallback to a different preset.
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.preset = PresetKind::Custom;
+        config.tracked_games.push(game);
+        assert_eq!(config.presets.custom, None);
+
+        let result = resolve_tracked_apply(&config, &exe_path);
+
+        assert!(result.is_none());
+    }
 
     /// Regression coverage for the bug where a hotkey bound via Settings
     /// didn't take effect until a full app restart: `run_event_loop`'s
