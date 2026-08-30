@@ -289,6 +289,35 @@ fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize])))
 }
 
+/// Resolves the executable path of the process that owns `hwnd`, via
+/// `GetWindowThreadProcessId` + [`process_exe_path`]. Shared plumbing for
+/// both the borderless-hotkey path's foreground-window resolution
+/// ([`crate::win32::foreground_window_exe_path`], which is just
+/// `exe_path_for_window(GetForegroundWindow())`) and the tray's "Apply to
+/// Window" path's explicit-`hwnd` resolution -- so the PID/exe-path
+/// resolution glue lives in one place rather than being duplicated at both
+/// call sites.
+///
+/// Returns `None` if `GetWindowThreadProcessId` can't resolve a PID for
+/// `hwnd`, or if [`process_exe_path`] itself fails (see its own doc comment)
+/// -- either way, treated as "no exe-path signal available", never as a hard
+/// error.
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs.
+pub(crate) fn exe_path_for_window(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut pid: u32 = 0;
+    // Safety: `hwnd` is a live handle; `&mut pid` is a valid out-pointer for
+    // `GetWindowThreadProcessId`'s documented contract.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return None;
+    }
+    process_exe_path(pid)
+}
+
 /// Enumerates a process's currently-loaded module names via
 /// `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)` +
 /// `Module32FirstW`/`Module32NextW`. `TH32CS_SNAPMODULE32` is OR'd in

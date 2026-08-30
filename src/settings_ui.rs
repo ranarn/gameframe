@@ -17,11 +17,12 @@
 //!   particular can only be confirmed by manual/usertest verification on a
 //!   real desktop session.
 
-use crate::profile_store::{self, Config, CustomRegion, HotkeyBindings, Presets, ProfileStoreError};
+use crate::profile_store::{
+    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TrackedGame,
+};
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
-use crate::win32;
 use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -66,6 +67,11 @@ pub struct SettingsState {
     /// binding that would later fail at `Hotkeys::register`. Reset whenever
     /// a new capture starts or the current one ends.
     pub duplicate_hotkey_error: Option<String>,
+    /// The tracked-games list, editable in place by the Settings "Games"
+    /// section (preset/auto-apply/taskbar-auto-hide per row, and immediate
+    /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
+    /// entries are added.
+    pub tracked_games: Vec<TrackedGame>,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -89,6 +95,7 @@ impl SettingsState {
             capturing: None,
             unsupported_key_pressed: false,
             duplicate_hotkey_error: None,
+            tracked_games: config.tracked_games.clone(),
         }
     }
 
@@ -111,6 +118,7 @@ impl SettingsState {
                 toggle_borderless: non_empty(&self.toggle_borderless),
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
             },
+            tracked_games: self.tracked_games.clone(),
         }
     }
 
@@ -181,6 +189,13 @@ impl SettingsState {
         self.cancel_capture();
     }
 
+    /// Removes the tracked game at `index` immediately, with no confirmation
+    /// -- matching this module's existing immediate-no-confirm pattern (see
+    /// [`Self::clear_hotkey`]/[`Self::clear_custom_preset`]).
+    pub fn remove_tracked_game(&mut self, index: usize) {
+        self.tracked_games.remove(index);
+    }
+
     pub fn clear_hotkey(&mut self, field: HotkeyField) {
         match field {
             HotkeyField::ToggleBorderless => self.toggle_borderless.clear(),
@@ -204,6 +219,19 @@ fn preset_label(preset: &Preset) -> String {
         Preset::Custom { x, y, width, height } => {
             format!("Custom ({x}, {y}, {width}x{height})")
         }
+    }
+}
+
+/// A human-readable label for a [`PresetKind`] reference, for use in the
+/// Games section's per-tracked-game preset dropdown -- deliberately not
+/// `PresetKind`'s `Debug` formatting, matching [`preset_label`]'s rationale.
+fn preset_kind_label(kind: PresetKind) -> &'static str {
+    match kind {
+        PresetKind::Left => "Left",
+        PresetKind::Right => "Right",
+        PresetKind::HalfLeft => "Half Left",
+        PresetKind::HalfRight => "Half Right",
+        PresetKind::Custom => "Custom",
     }
 }
 
@@ -244,22 +272,48 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 }
 
 /// The graphical-thumbnail data for a single preset: a caption, its region
-/// normalized against `monitor` (if it resolved), whether it's the currently
-/// active preset, and -- if resolution failed -- an error to surface instead
-/// of silently omitting the preset from the row. Only `Custom` can fail to
-/// resolve (e.g. coordinates persisted while running on a different monitor
-/// configuration); the four base presets always resolve.
+/// normalized against `monitor` (if it resolved), and -- if resolution
+/// failed -- an error to surface instead of silently omitting the preset
+/// from the row. Only `Custom` can fail to resolve (e.g. coordinates
+/// persisted while running on a different monitor configuration); the four
+/// base presets always resolve.
+///
+/// No longer tracks "is this the active preset" (issue #6's MVP
+/// single-global-preset mechanism, `win32::active_preset`, was removed by
+/// issue #31's per-game preset assignment -- see
+/// `docs/adr/0001-preset-fixed-structure-no-migration.md`'s consequence
+/// note): a preset's "active" status is now per-tracked-game, not global, so
+/// it has no meaning in this shared five-preset row anymore.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresetThumbnail {
     pub label: String,
     pub region: Option<NormalizedRegion>,
-    pub is_active: bool,
     pub error: Option<String>,
+}
+
+/// Returns why `kind` currently can't be resolved to a concrete, drawable
+/// region against `presets`/`monitor` (`Some(message)`), or `None` if it
+/// resolves fine. Used by the Settings "Games" section to surface feedback
+/// next to a tracked game's preset dropdown when its assignment is
+/// currently unresolvable -- e.g. assigned `Custom` while no `Custom`
+/// preset exists (`Presets::resolve` returns `None`; see
+/// `profile_store::Presets::resolve`'s doc comment), or one exists but its
+/// stored coordinates don't fit `monitor` (mirrors [`preset_thumbnails`]'s
+/// per-preset error path, just keyed off a [`PresetKind`] reference rather
+/// than an already-materialized [`Preset`]).
+pub fn preset_kind_unavailable_reason(
+    kind: PresetKind,
+    presets: &Presets,
+    monitor: &MonitorGeometry,
+) -> Option<String> {
+    match presets.resolve(kind) {
+        None => Some("no Custom region is set".to_string()),
+        Some(preset) => resolve_region(&preset, monitor).err().map(|e| e.to_string()),
+    }
 }
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
     let presets = state.to_presets();
-    let active = win32::active_preset(&presets);
 
     presets
         .all()
@@ -268,13 +322,11 @@ pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Ve
             Ok(region) => PresetThumbnail {
                 label: preset_label(&preset),
                 region: Some(normalize_region(&region, monitor)),
-                is_active: preset == active,
                 error: None,
             },
             Err(e) => PresetThumbnail {
                 label: preset_label(&preset),
                 region: None,
-                is_active: false,
                 error: Some(e.to_string()),
             },
         })
@@ -800,14 +852,69 @@ impl SettingsApp {
         }
     }
 
+    /// Renders the "Games" section: one row per tracked game with its
+    /// display name, a preset dropdown (the five [`PresetKind`] variants),
+    /// a taskbar-auto-hide checkbox, an auto-apply checkbox, and an
+    /// immediate no-confirmation "Remove" button (see
+    /// [`SettingsState::remove_tracked_game`]). A row whose assigned preset
+    /// currently can't be resolved (see [`preset_kind_unavailable_reason`])
+    /// shows a red "Unavailable" label next to the dropdown, mirroring the
+    /// preset-thumbnail row's existing error-surfacing pattern rather than
+    /// silently leaving the user to guess why nothing applies.
+    ///
+    /// Removal is deferred until after the loop (rather than mutating
+    /// `self.state.tracked_games` while iterating it) to avoid mutating the
+    /// `Vec` out from under `iter_mut`'s in-progress borrow.
+    fn games_section(&mut self, ui: &mut egui::Ui) {
+        if self.state.tracked_games.is_empty() {
+            ui.label("No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.");
+            return;
+        }
+
+        let presets = self.state.to_presets();
+        let monitor = self.monitor;
+        let mut to_remove: Option<usize> = None;
+        let last_index = self.state.tracked_games.len() - 1;
+        for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(&game.display_name);
+
+                egui::ComboBox::from_id_salt(("tracked_game_preset", index))
+                    .selected_text(preset_kind_label(game.preset))
+                    .show_ui(ui, |ui| {
+                        for kind in PresetKind::ALL {
+                            ui.selectable_value(&mut game.preset, kind, preset_kind_label(kind));
+                        }
+                    });
+
+                if let Some(reason) = preset_kind_unavailable_reason(game.preset, &presets, &monitor) {
+                    ui.colored_label(egui::Color32::RED, format!("Unavailable: {reason}"));
+                }
+
+                ui.checkbox(&mut game.taskbar_autohide, "Taskbar auto-hide");
+                ui.checkbox(&mut game.auto_apply, "Auto-apply");
+
+                if ui.button("Remove").clicked() {
+                    to_remove = Some(index);
+                }
+            });
+
+            if index != last_index {
+                ui.separator();
+            }
+        }
+
+        if let Some(index) = to_remove {
+            self.state.remove_tracked_game(index);
+        }
+    }
+
     /// Renders the graphical thumbnail row: one small monitor-outline
     /// rectangle per preset (from [`preset_thumbnails`]), with the resolved
-    /// region highlighted inside it and the currently active preset called
-    /// out distinctly.
+    /// region highlighted inside it.
     fn preset_thumbnails_row(&self, ui: &mut egui::Ui) {
         const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(84.0, 48.0);
-        let active_color = egui::Color32::from_rgb(90, 170, 250);
-        let inactive_color = egui::Color32::from_rgb(120, 120, 120);
+        let fill_color = egui::Color32::from_rgb(90, 170, 250);
 
         ui.horizontal_wrapped(|ui| {
             for thumbnail in preset_thumbnails(&self.state, &self.monitor) {
@@ -829,8 +936,7 @@ impl SettingsApp {
                                     + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
                                 egui::vec2(region.width * THUMBNAIL_SIZE.x, region.height * THUMBNAIL_SIZE.y),
                             );
-                            let color = if thumbnail.is_active { active_color } else { inactive_color };
-                            painter.rect_filled(highlight_rect, 0.0, color);
+                            painter.rect_filled(highlight_rect, 0.0, fill_color);
                         }
                         None => {
                             // Unresolvable preset (only `Custom` can hit this --
@@ -849,9 +955,6 @@ impl SettingsApp {
                     }
 
                     ui.label(&thumbnail.label);
-                    if thumbnail.is_active {
-                        ui.colored_label(active_color, "Active");
-                    }
                     if let Some(error) = &thumbnail.error {
                         ui.colored_label(egui::Color32::RED, format!("Unavailable: {error}"))
                             .on_hover_text(
@@ -907,6 +1010,10 @@ impl eframe::App for SettingsApp {
             ui.heading("Global hotkeys");
             self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
             self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+
+            ui.separator();
+            ui.heading("Games");
+            self.games_section(ui);
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -1038,6 +1145,7 @@ mod tests {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
+            tracked_games: Vec::new(),
         };
 
         let state = SettingsState::from_config(&config);
@@ -1059,6 +1167,54 @@ mod tests {
 
         assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
         assert_eq!(config.hotkeys.toggle_taskbar_autohide, Some("Ctrl+Alt+D".to_string()));
+    }
+
+    #[test]
+    fn from_config_carries_the_tracked_games_list_through() {
+        let mut config = Config::default();
+        config.tracked_games.push(TrackedGame::new_default(
+            std::path::PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+        ));
+
+        let state = SettingsState::from_config(&config);
+
+        assert_eq!(state.tracked_games, config.tracked_games);
+    }
+
+    #[test]
+    fn to_config_carries_edited_tracked_games_through() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.tracked_games.push(TrackedGame::new_default(
+            std::path::PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+        ));
+        state.tracked_games[0].preset = PresetKind::HalfRight;
+        state.tracked_games[0].auto_apply = false;
+
+        let config = state.to_config();
+
+        assert_eq!(config.tracked_games.len(), 1);
+        assert_eq!(config.tracked_games[0].preset, PresetKind::HalfRight);
+        assert!(!config.tracked_games[0].auto_apply);
+    }
+
+    #[test]
+    fn remove_tracked_game_removes_the_entry_at_the_given_index_without_confirmation() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.tracked_games.push(TrackedGame::new_default(
+            std::path::PathBuf::from("C:\\Games\\a.exe"),
+            "A".to_string(),
+        ));
+        state.tracked_games.push(TrackedGame::new_default(
+            std::path::PathBuf::from("C:\\Games\\b.exe"),
+            "B".to_string(),
+        ));
+
+        state.remove_tracked_game(0);
+
+        assert_eq!(state.tracked_games.len(), 1);
+        assert_eq!(state.tracked_games[0].display_name, "B");
     }
 
     #[test]
@@ -1292,6 +1448,15 @@ mod tests {
     }
 
     #[test]
+    fn preset_kind_label_renders_human_readable_names_for_every_kind() {
+        assert_eq!(preset_kind_label(PresetKind::Left), "Left");
+        assert_eq!(preset_kind_label(PresetKind::Right), "Right");
+        assert_eq!(preset_kind_label(PresetKind::HalfLeft), "Half Left");
+        assert_eq!(preset_kind_label(PresetKind::HalfRight), "Half Right");
+        assert_eq!(preset_kind_label(PresetKind::Custom), "Custom");
+    }
+
+    #[test]
     fn normalize_region_expresses_a_region_as_proportions_of_the_monitor() {
         let monitor = test_monitor();
         let region = Region { x: 960, y: 0, width: 960, height: 1080 };
@@ -1370,22 +1535,35 @@ mod tests {
         assert_eq!(custom_thumbnail.label, "Custom (5000, 5000, 200x100)");
         assert_eq!(custom_thumbnail.region, None, "an unresolvable preset has no drawable region");
         assert!(custom_thumbnail.error.is_some(), "an unresolvable preset must surface an error");
-        assert!(!custom_thumbnail.is_active);
     }
 
     #[test]
-    fn preset_thumbnails_marks_only_the_active_preset() {
-        // Today's single global-preset mechanism (crate::win32::active_preset)
-        // always resolves to Left -- see that function's doc comment for why
-        // this issue doesn't change that MVP hack.
-        let state = SettingsState::from_config(&Config::default());
+    fn preset_kind_unavailable_reason_is_none_for_a_base_preset() {
+        let presets = Presets::default();
 
-        let thumbnails = preset_thumbnails(&state, &test_monitor());
+        let reason = preset_kind_unavailable_reason(PresetKind::Right, &presets, &test_monitor());
 
-        assert!(thumbnails[0].is_active, "Left should be marked active");
-        assert!(!thumbnails[1].is_active);
-        assert!(!thumbnails[2].is_active);
-        assert!(!thumbnails[3].is_active);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn preset_kind_unavailable_reason_flags_custom_when_no_custom_preset_is_set() {
+        let presets = Presets::default();
+        assert_eq!(presets.custom, None);
+
+        let reason = preset_kind_unavailable_reason(PresetKind::Custom, &presets, &test_monitor());
+
+        assert!(reason.is_some(), "Custom with no region set must be flagged as unavailable");
+    }
+
+    #[test]
+    fn preset_kind_unavailable_reason_flags_custom_when_its_region_does_not_fit_the_monitor() {
+        let mut presets = Presets::default();
+        presets.custom = Some(CustomRegion { x: 5000, y: 5000, width: 200, height: 100 });
+
+        let reason = preset_kind_unavailable_reason(PresetKind::Custom, &presets, &test_monitor());
+
+        assert!(reason.is_some(), "an out-of-bounds Custom region must be flagged as unavailable");
     }
 
     #[test]

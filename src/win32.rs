@@ -10,7 +10,7 @@
 //! `docs/research/game-window-filtering.md` for the full rationale).
 //!
 //! Split the same way as [`crate::settings_ui`]:
-//! - Pure decision logic ([`strip_border_style`], [`plan_toggle`], [`active_preset`],
+//! - Pure decision logic ([`strip_border_style`], [`plan_toggle`],
 //!   [`Win32Error::is_access_denied`], [`Win32Error::from_hresult`],
 //!   [`toggle_taskbar_autohide_state`], `apply_autohide_state`) has no
 //!   `HWND`/OS dependency and is fully unit tested below. [`crate::window_filter`]
@@ -29,8 +29,7 @@
 //! completely separate from the borderless mechanic's [`RestoreState`] --
 //! the two toggles share no state.
 
-use crate::profile_store::Presets;
-use crate::region_calc::{Preset, Region};
+use crate::region_calc::Region;
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
@@ -92,19 +91,6 @@ pub fn plan_toggle(
     }
 }
 
-/// Resolves "the active preset" for the borderless-toggle hotkey: today's
-/// single global-preset mechanism, which always resolves to `Left`.
-///
-/// MVP scope decision (see issue #6): there is no per-hotkey preset-selection
-/// UI yet, so `Left` is treated as "the" active preset for this hotkey.
-/// Untouched by the preset-fixed-structure reshape (issue #26) beyond
-/// adapting its signature to the new `Presets` shape -- resolving this hack
-/// properly belongs to per-game preset assignment (issue #31); see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md`.
-pub fn active_preset(presets: &Presets) -> Preset {
-    presets.left()
-}
-
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
@@ -128,6 +114,18 @@ pub fn toggle_taskbar_autohide_state(current: TaskbarAutohideState) -> TaskbarAu
     match current {
         TaskbarAutohideState::AlwaysVisible => TaskbarAutohideState::AutoHidden,
         TaskbarAutohideState::AutoHidden => TaskbarAutohideState::AlwaysVisible,
+    }
+}
+
+/// Converts a plain `bool` (a [`crate::profile_store::TrackedGame`]'s
+/// `taskbar_autohide` field) into a [`TaskbarAutohideState`] -- the
+/// interpretation [`set_taskbar_autohide_absolute`] applies. Pure logic --
+/// no OS call.
+fn taskbar_autohide_state_from_bool(auto_hide: bool) -> TaskbarAutohideState {
+    if auto_hide {
+        TaskbarAutohideState::AutoHidden
+    } else {
+        TaskbarAutohideState::AlwaysVisible
     }
 }
 
@@ -507,6 +505,67 @@ pub fn toggle_borderless_on_foreground_window(
     Ok(())
 }
 
+/// Resolves the current foreground window's `HWND`, via `GetForegroundWindow()`.
+///
+/// Returns `None` if there is no foreground window. Shared by
+/// [`foreground_window_exe_path`] (exe-path resolution for the tracked-game
+/// lookup) and, per the issue #31 HIGH review fix, by
+/// [`crate::app::handle_toggle_borderless`] directly -- it needs the raw
+/// `HWND` itself (not just its exe path) to remember *which* window a strip
+/// was applied to, so a later restore press can be refused if a different
+/// window is now focused (see `crate::app`'s `stripped_hwnd`/
+/// `should_allow_restore`).
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs.
+pub fn foreground_window() -> Option<HWND> {
+    // Safety: `GetForegroundWindow` takes no arguments and performs no
+    // writes; its result is null-checked immediately below before any other
+    // call uses it.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
+}
+
+/// Resolves the current foreground window's owning process's executable
+/// path, via [`foreground_window`] + [`window_filter::exe_path_for_window`].
+///
+/// Lets a caller (namely [`crate::app::handle_toggle_borderless`]) decide
+/// whether the foreground window belongs to a tracked game *before*
+/// deciding whether to proceed at all -- [`toggle_borderless_on_foreground_window`]
+/// resolves `GetForegroundWindow()` internally and never surfaces the
+/// resolved `HWND` to its caller, so this calls [`foreground_window`]
+/// separately rather than sharing a single resolved `HWND` across both; the
+/// two calls are expected to resolve to the same window in practice
+/// (nothing user-driven runs between them), but even if focus somehow
+/// changed between the two calls, the worst case is a stale tracked-game
+/// lookup for this one hotkey press -- not a crash or a wrong window being
+/// mutated, since the actual mutation still resolves its own `HWND`
+/// independently.
+///
+/// Returns `None` if there is no foreground window, or if the exe path
+/// can't be resolved (see [`window_filter::exe_path_for_window`]) -- both
+/// treated identically by callers as "no tracked-game lookup possible for
+/// this press".
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs.
+///
+/// Currently has no internal caller: [`crate::app::handle_toggle_borderless`]
+/// resolves [`foreground_window`] once and passes that same `HWND` into
+/// [`window_filter::exe_path_for_window`] directly, to avoid a second,
+/// redundant `GetForegroundWindow()` call (see the HIGH review fix on issue
+/// #31 iteration 3). Kept as a small standalone convenience wrapper for any
+/// future caller that only needs the exe path and doesn't care about the
+/// `HWND` itself.
+#[allow(dead_code)]
+pub fn foreground_window_exe_path() -> Option<std::path::PathBuf> {
+    window_filter::exe_path_for_window(foreground_window()?)
+}
+
 /// Toggles taskbar auto-hide on/off: flips `*state` (via
 /// [`toggle_taskbar_autohide_state`]) and applies it to the real taskbar via
 /// `SHAppBarMessage(ABM_SETSTATE, ...)`.
@@ -527,6 +586,25 @@ pub fn toggle_taskbar_autohide(state: &mut TaskbarAutohideState) -> Result<(), W
     set_appbar_state(next)?;
     *state = next;
     Ok(())
+}
+
+/// Sets the taskbar's auto-hide state to exactly `auto_hide` (an absolute
+/// set, not a toggle) -- the primitive the hotkey/tray apply paths call with
+/// a tracked game's `taskbar_autohide` field whenever they apply that game's
+/// preset (see `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`).
+///
+/// Deliberately independent of [`toggle_taskbar_autohide`]/`state` above:
+/// this never reads or writes a caller-tracked [`TaskbarAutohideState`]
+/// variable, so it can't drift out of sync with (or be confused for) the
+/// existing global taskbar-autohide hotkey's own toggle mechanic, which ADR
+/// 0002 explicitly keeps untouched and independent.
+///
+/// OS-facing: locates the real taskbar window and sends it a real
+/// `SHAppBarMessage`. Not exercised by this crate's automated tests -- see
+/// module docs; the `bool` -> [`TaskbarAutohideState`] interpretation itself
+/// is pure and unit tested via [`taskbar_autohide_state_from_bool`].
+pub fn set_taskbar_autohide_absolute(auto_hide: bool) -> Result<(), Win32Error> {
+    set_appbar_state(taskbar_autohide_state_from_bool(auto_hide))
 }
 
 /// Locates the taskbar's own window (class name `Shell_TrayWnd`, per the
@@ -761,7 +839,7 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i3
 /// fails) rather than propagating an error -- an untitled window is simply
 /// filtered out by [`is_listable_window`], not treated as a hard failure of
 /// the whole enumeration.
-fn window_text(hwnd: HWND) -> String {
+pub(crate) fn window_text(hwnd: HWND) -> String {
     // Safety: `hwnd` is a live handle; `GetWindowTextLengthW` performs no
     // writes.
     let len = unsafe { GetWindowTextLengthW(hwnd) };
@@ -961,10 +1039,13 @@ mod tests {
     }
 
     #[test]
-    fn active_preset_resolves_to_left() {
-        let presets = Presets { left_depth_percent: 30, right_depth_percent: 70, custom: None };
+    fn taskbar_autohide_state_from_bool_true_maps_to_auto_hidden() {
+        assert_eq!(taskbar_autohide_state_from_bool(true), TaskbarAutohideState::AutoHidden);
+    }
 
-        assert_eq!(active_preset(&presets), Preset::Left { depth_percent: 30 });
+    #[test]
+    fn taskbar_autohide_state_from_bool_false_maps_to_always_visible() {
+        assert_eq!(taskbar_autohide_state_from_bool(false), TaskbarAutohideState::AlwaysVisible);
     }
 
     #[test]
