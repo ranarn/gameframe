@@ -1,5 +1,6 @@
 mod app;
 mod hotkeys;
+mod launch_watcher;
 mod profile_store;
 mod region_calc;
 mod settings_ui;

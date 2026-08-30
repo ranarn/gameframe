@@ -20,12 +20,20 @@
 //! remembered restore state, unlike the hotkey path's `toggle_state` (see
 //! [`handle_apply_to_window`]).
 //!
+//! A third trigger requires no user action at all: [`crate::launch_watcher`]
+//! registers a `SetWinEventHook` on the same message loop and, on every
+//! foreground-window change, delegates to [`handle_auto_apply_launch`] --
+//! which applies a tracked game's preset the moment it becomes the
+//! foreground window, but only if that game's `auto_apply` flag is on (see
+//! [`resolve_auto_apply`]).
+//!
 //! The message loop itself ([`run`]) is OS-facing (pumps real Win32
 //! messages) and is not exercised by this crate's automated tests, for
 //! the same reason [`crate::tray_ui::Tray::new`] isn't: it needs a live
 //! thread message queue that a headless/CI sandbox can't provide.
 
 use crate::hotkeys::{Hotkeys, HotkeyAction};
+use crate::launch_watcher;
 use crate::profile_store;
 use crate::region_calc::{resolve_region, Region};
 use crate::settings_ui::{self, primary_monitor_geometry};
@@ -39,16 +47,22 @@ use tray_icon::TrayIconEvent;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
-/// Starts GameFrame: shows only the tray icon (no window), registers the
-/// bound global hotkeys, and blocks, pumping the Windows message loop both
-/// the tray icon and the hotkeys need, until "Exit" is selected. Returns
-/// once the tray icon (and its hidden window) has been cleanly torn down.
 pub fn run() -> Result<(), TrayUiError> {
     let tray = Tray::new()?;
     let config_dir = config_dir();
     let hotkeys = register_hotkeys(&config_dir);
 
+    // Registered before entering `run_event_loop`'s `GetMessageW` pump --
+    // see `crate::launch_watcher`'s module docs for why registration must
+    // happen on this thread, before that loop starts.
+    let launch_watcher_hook = launch_watcher::register(&config_dir);
+
     run_event_loop(&tray, hotkeys, &config_dir);
+
+    if let Some(hook) = launch_watcher_hook {
+        launch_watcher::unregister(hook);
+    }
+
     Ok(())
 }
 
@@ -258,6 +272,32 @@ fn resolve_tracked_apply(
 ) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
     let game = profile_store::find_tracked_game(&config.tracked_games, exe_path)?.clone();
     let preset = config.presets.resolve(game.preset)?;
+    Some((game, preset))
+}
+
+/// Like [`resolve_tracked_apply`], but additionally requires the tracked
+/// game's `auto_apply` flag to be on -- the extra gate this issue's
+/// launch-detection trigger (`crate::launch_watcher`) applies that the
+/// hotkey/tray "manual" apply paths deliberately do not (per issue #31's
+/// design: `auto_apply` only governs whether a launch is auto-applied
+/// without a hotkey press, not whether a manual hotkey/tray press works).
+///
+/// Returns `None` for exactly the same two cases [`resolve_tracked_apply`]
+/// does (no match; matched but the assigned preset can't currently be
+/// resolved), plus a third: matched, preset resolves, but `auto_apply` is
+/// off.
+///
+/// Pure -- no OS call -- so it's unit testable in complete isolation from
+/// the real WinEvent hook registration/callback (`crate::launch_watcher`)
+/// that supplies `exe_path`.
+pub(crate) fn resolve_auto_apply(
+    config: &profile_store::Config,
+    exe_path: &std::path::Path,
+) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
+    let (game, preset) = resolve_tracked_apply(config, exe_path)?;
+    if !game.auto_apply {
+        return None;
+    }
     Some((game, preset))
 }
 
@@ -568,6 +608,69 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     }
 }
 
+/// Reacts to a [`crate::launch_watcher`]-detected foreground-window change:
+/// resolves `hwnd`'s owning process's executable path and, only if it
+/// matches a tracked game with auto-apply on (see [`resolve_auto_apply`]),
+/// applies that game's assigned preset's borderless+reposition treatment to
+/// `hwnd` via [`win32::apply_borderless_to_window`], then, only once that
+/// succeeds, sets the tracked game's taskbar-auto-hide value absolutely --
+/// exactly mirroring [`handle_apply_to_window`]'s one-shot apply shape
+/// (including its border-apply-must-succeed-first gate on the taskbar step,
+/// per issue #31's HIGH review fix) and [`win32::apply_borderless_to_window`]
+/// itself, rather than the hotkey path's toggle/restore mechanism -- a
+/// launch-detected apply has no "undo" concept, since there's nothing to
+/// restore from (the game just started).
+///
+/// Unlike [`handle_apply_to_window`], this never adds a new tracked game or
+/// persists the config: a game must already be tracked, with auto-apply on,
+/// to reach an actual apply here at all (see [`resolve_auto_apply`]'s doc
+/// comment), so there is no upsert/save step.
+///
+/// Reloads the config from disk on every foreground-change event, matching
+/// [`handle_toggle_borderless`]/[`handle_apply_to_window`]'s own "reload
+/// from disk on every trigger" convention.
+///
+/// OS-facing (resolves a real `HWND`'s owning process and applies real
+/// window/taskbar mutations) -- not exercised by this crate's automated
+/// tests, per this crate's established convention (manual usertest only).
+/// [`resolve_auto_apply`] above is the pure decision this function
+/// delegates to, and is what's actually unit tested.
+pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
+    let config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("launch detection: failed to load config: {e}");
+            return;
+        }
+    };
+
+    let Some(exe_path) = window_filter::exe_path_for_window(hwnd) else {
+        return;
+    };
+
+    let Some((tracked_game, preset)) = resolve_auto_apply(&config, &exe_path) else {
+        return;
+    };
+
+    let monitor = primary_monitor_geometry();
+    let target_region = match resolve_region(&preset, &monitor) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("launch detection: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+            return;
+        }
+    };
+
+    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
+        eprintln!("launch detection: failed to apply borderless treatment to {}: {e}", tracked_game.display_name);
+        return;
+    }
+
+    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+        eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+    }
+}
+
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips
 /// `taskbar_autohide_state` and applies it via
 /// [`win32::toggle_taskbar_autohide`]. A failure (e.g. the taskbar window
@@ -680,6 +783,57 @@ mod tests {
 
         assert_eq!(game.display_name, "Thing");
         assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+    }
+
+    #[test]
+    fn resolve_auto_apply_resolves_when_matched_and_auto_apply_is_on() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        assert!(game.auto_apply);
+        config.tracked_games.push(game);
+
+        let (game, preset) = resolve_auto_apply(&config, &exe_path).expect("expected a resolved auto-apply match");
+
+        assert_eq!(game.display_name, "Thing");
+        assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_when_auto_apply_is_off() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.auto_apply = false;
+        config.tracked_games.push(game);
+
+        let result = resolve_auto_apply(&config, &exe_path);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_for_an_untracked_executable_path() {
+        let config = Config::default();
+
+        let result = resolve_auto_apply(&config, &PathBuf::from("C:\\Games\\thing.exe"));
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
+        let mut config = Config::default();
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.preset = PresetKind::Custom;
+        assert!(game.auto_apply);
+        config.tracked_games.push(game);
+        assert_eq!(config.presets.custom, None);
+
+        let result = resolve_auto_apply(&config, &exe_path);
+
+        assert!(result.is_none());
     }
 
     #[test]
