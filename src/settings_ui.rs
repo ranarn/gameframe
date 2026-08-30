@@ -23,6 +23,7 @@ use crate::profile_store::{
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
+use crate::win32;
 use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -310,6 +311,102 @@ pub fn preset_kind_unavailable_reason(
         None => Some("no Custom region is set".to_string()),
         Some(preset) => resolve_region(&preset, monitor).err().map(|e| e.to_string()),
     }
+}
+
+/// The non-blocking status-line message shown for a tracked game whose live
+/// re-apply attempt (issue #33) failed -- e.g. the window couldn't be
+/// repositioned because of an access-denied error. Its setting still saved
+/// normally; the message just explains that the change will take effect the
+/// next time the game launches, or the hotkey/tray-apply is used, instead of
+/// immediately.
+///
+/// Pure string formatting -- no OS dependency -- so it's unit tested in
+/// complete isolation from the live re-apply attempt that decides whether to
+/// show it.
+fn live_apply_failure_message(display_name: &str) -> String {
+    format!("couldn't reposition {display_name} live -- will apply on next launch")
+}
+
+/// Attempts issue #33's live re-apply for a single tracked game already
+/// resolved to `preset`, via [`win32::resolve_running_window`] +
+/// [`win32::live_reapply_running_window`]. Returns `Some(message)` only when
+/// an attempt was actually made and failed (the game was running, but
+/// repositioning it hit an OS-level error, e.g. a resolvable window but an
+/// unresolvable/inapplicable region) -- a game that isn't currently running
+/// is silently skipped (`None`) *before* its preset's region is even
+/// resolved, per this issue's acceptance criteria: its setting still saved
+/// normally and will apply on its next launch/hotkey/tray-apply. This
+/// ordering matters -- see the inline comment below -- a not-running game
+/// must never surface a region-resolution error as a live-apply failure.
+///
+/// OS-facing (delegates to [`win32::resolve_running_window`]/
+/// [`win32::live_reapply_running_window`], which perform the real toolhelp
+/// snapshot/window enumeration/repositioning) -- not exercised by this
+/// crate's automated tests, per this crate's established convention;
+/// [`live_apply_failure_message`] above is the pure decision this delegates
+/// to for its one testable piece (the message text).
+fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &MonitorGeometry) -> Option<String> {
+    // Not-running must always short-circuit before region resolution is even
+    // attempted: a saved Custom zone that no longer fits the current monitor
+    // would otherwise surface a spurious failure message for a game that was
+    // never actually running (issue #33's iteration-3 review fix).
+    let hwnd = win32::resolve_running_window(&game.exe_path)?;
+
+    let region = match resolve_region(preset, monitor) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("live re-apply: failed to resolve {}'s preset region: {e}", game.display_name);
+            return Some(live_apply_failure_message(&game.display_name));
+        }
+    };
+
+    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, region) {
+        win32::LiveApplyOutcome::Applied => None,
+        win32::LiveApplyOutcome::Failed(e) => {
+            eprintln!("live re-apply failed for {}: {e}", game.display_name);
+            Some(live_apply_failure_message(&game.display_name))
+        }
+    }
+}
+
+/// Issue #33's trigger 1 (reassigning a single tracked game's preset
+/// dropdown): live re-applies just `game`'s newly-assigned preset, resolved
+/// against the current `presets`. Returns an empty list (no status line) if
+/// the assignment currently can't be resolved at all (e.g. assigned `Custom`
+/// while none is set -- already surfaced by the row's own "Unavailable"
+/// label, so a live-apply attempt would be redundant) or if the single
+/// attempt made didn't fail.
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs.
+fn live_reapply_single_game(game: &TrackedGame, presets: &Presets, monitor: &MonitorGeometry) -> Vec<String> {
+    let Some(preset) = presets.resolve(game.preset) else {
+        return Vec::new();
+    };
+    live_reapply_tracked_game(game, &preset, monitor).into_iter().collect()
+}
+
+/// Issue #33's trigger 2/3 (a base preset's depth slider settling, or a
+/// Custom zone save): live re-applies `kind`'s newly-committed value to
+/// every currently-affected tracked game in `games` (see
+/// [`profile_store::tracked_games_using_preset`]). Returns one status-line
+/// message per game whose live re-apply attempt failed -- an empty list if
+/// every affected game either isn't running or was repositioned
+/// successfully, and also if `kind` itself can't currently be resolved
+/// (`Custom` with none set -- can't happen for the `Custom`-save call site
+/// itself, since that only fires right after a successful `set_custom_preset`,
+/// but is still handled defensively here for `Left`/`Right`'s sake, which
+/// always resolve).
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs; [`profile_store::tracked_games_using_preset`] (the cascade
+/// selection) is the pure decision this delegates to, and is what's actually
+/// unit tested.
+fn live_reapply_cascade(games: &[&TrackedGame], presets: &Presets, kind: PresetKind, monitor: &MonitorGeometry) -> Vec<String> {
+    let Some(preset) = presets.resolve(kind) else {
+        return Vec::new();
+    };
+    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor)).collect()
 }
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
@@ -690,17 +787,25 @@ impl std::error::Error for SettingsUiError {
 /// What closed the Settings window: a completed Save (carrying the
 /// [`Config`] to persist), a Cancel/close-without-saving, or a request to
 /// open the zone-editor overlay for the Custom preset (carrying the current
-/// in-progress [`SettingsState`] so no other edits made in this session --
-/// depth sliders, hotkey bindings -- are lost while the overlay is open).
+/// in-progress [`SettingsState`], plus this session's current pending
+/// live-re-apply status messages -- issue #33's
+/// [`SettingsApp::pending_status_messages`] -- so neither is lost while the
+/// overlay is open).
 ///
 /// [`run_settings_window`] loops on this: `EditCustomZone` re-opens the
-/// Settings window (with the overlay's result folded back in) rather than
-/// ending the session, since opening the zone editor is not itself a
-/// decision to close Settings.
+/// Settings window (with the overlay's result, and the carried-forward
+/// status messages, folded back in) rather than ending the session, since
+/// opening the zone editor is not itself a decision to close Settings.
 enum SettingsExit {
     Saved(Config),
     Cancelled,
-    EditCustomZone(SettingsState),
+    /// Carries the in-progress [`SettingsState`] plus this session's current
+    /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`],
+    /// issue #33) -- so a message surfaced by a slider/dropdown commit made
+    /// just before "Edit Custom Zone..." was clicked isn't lost when this
+    /// session's `SettingsApp` is torn down; [`run_settings_window`] carries
+    /// it forward as the next session's initial status messages.
+    EditCustomZone(SettingsState, Vec<String>),
 }
 
 /// Opens the Settings window, blocking until it's closed, then returns.
@@ -721,6 +826,16 @@ enum SettingsExit {
 /// close-then-reopen sequencing already used for "Show Settings" itself
 /// from the tray's message loop (see `app::run_event_loop`).
 ///
+/// Also threads issue #33's non-blocking live-re-apply status messages
+/// across that same close-then-reopen boundary: `status_messages` starts
+/// empty, is replaced wholesale by whatever [`SettingsExit::EditCustomZone`]
+/// carried out of the just-closed session (either its untouched
+/// carried-forward messages, or a fresh set if the overlay's save fired
+/// trigger 3's cascade), and is handed to the next [`run_settings_frame`]
+/// call as its `initial_status_messages` -- so a status line surfaced right
+/// before "Edit Custom Zone..." was clicked survives the round trip through
+/// the overlay instead of vanishing with the torn-down `SettingsApp`.
+///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
 /// each iteration and fully drops it before the next (or before returning).
 /// Not exercised by this crate's automated tests -- see module docs.
@@ -728,16 +843,29 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let mut state = SettingsState::from_config(&config);
     let monitor = primary_monitor_geometry();
+    let mut status_messages: Vec<String> = Vec::new();
 
     loop {
-        match run_settings_frame(state, monitor)? {
+        match run_settings_frame(state, monitor, status_messages)? {
             SettingsExit::Saved(config) => {
                 return profile_store::save(config_dir, &config).map_err(SettingsUiError::Config);
             }
             SettingsExit::Cancelled => return Ok(()),
-            SettingsExit::EditCustomZone(mut latest_state) => {
+            SettingsExit::EditCustomZone(mut latest_state, latest_status_messages) => {
+                // Carried forward as-is unless the overlay actually commits a
+                // new zone below (trigger 3 only fires on an accepted save,
+                // per this issue's "commit only" rule) -- cancelling/failing
+                // to open the overlay is not itself a commit, so whatever
+                // status messages were already showing must survive it.
+                status_messages = latest_status_messages;
                 match zone_overlay::run_zone_editor_overlay(latest_state.custom, PinnedEdges::NONE) {
-                    Ok(Some(zone)) => latest_state.set_custom_preset(zone),
+                    Ok(Some(zone)) => {
+                        latest_state.set_custom_preset(zone);
+                        let affected =
+                            profile_store::tracked_games_using_preset(&latest_state.tracked_games, PresetKind::Custom);
+                        status_messages =
+                            live_reapply_cascade(&affected, &latest_state.to_presets(), PresetKind::Custom, &monitor);
+                    }
                     Ok(None) => {}
                     Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
                 }
@@ -751,7 +879,20 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
 /// [`run_settings_window`]'s doc comment for why this is a separate,
 /// re-enterable step rather than one `eframe::run_native` call for the
 /// whole function).
-fn run_settings_frame(state: SettingsState, monitor: MonitorGeometry) -> Result<SettingsExit, SettingsUiError> {
+///
+/// `initial_status_messages` seeds the new [`SettingsApp`]'s
+/// [`SettingsApp::pending_status_messages`] (issue #33) -- carried over from
+/// the previous session's [`SettingsExit::EditCustomZone`], or empty on the
+/// very first call from [`run_settings_window`]. Any close other than an
+/// explicit Save, Cancel, or "Edit Custom Zone..." click -- concretely, the
+/// window's own close button -- is treated as [`SettingsExit::Cancelled`]:
+/// this function's documented "discards the edits" contract for any
+/// non-Save close.
+fn run_settings_frame(
+    state: SettingsState,
+    monitor: MonitorGeometry,
+    initial_status_messages: Vec<String>,
+) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
 
@@ -774,7 +915,14 @@ fn run_settings_frame(state: SettingsState, monitor: MonitorGeometry) -> Result<
     eframe::run_native(
         "GameFrame Settings",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(SettingsApp { state, monitor, exit: exit_for_app }))),
+        Box::new(move |_cc| {
+            Ok(Box::new(SettingsApp {
+                state,
+                monitor,
+                exit: exit_for_app,
+                pending_status_messages: initial_status_messages,
+            }))
+        }),
     )
     .map_err(SettingsUiError::Window)?;
 
@@ -795,10 +943,26 @@ fn window_icon() -> egui::IconData {
 
 /// The live egui app backing the Settings window. Torn down entirely when
 /// [`run_settings_window`] returns -- nothing here outlives that call.
+///
+/// Also owns issue #33's transient live-re-apply status messages
+/// ([`pending_status_messages`](SettingsApp::pending_status_messages)),
+/// which -- unlike `state` -- deliberately don't survive a
+/// [`SettingsExit::EditCustomZone`] round trip unchanged: they're carried
+/// forward by [`run_settings_window`] as plain `Vec<String>` data, not as
+/// part of this struct, since this struct itself is fully torn down and
+/// reconstructed by [`run_settings_frame`] on each session.
 struct SettingsApp {
     state: SettingsState,
     monitor: MonitorGeometry,
     exit: Rc<RefCell<Option<SettingsExit>>>,
+    /// Zero or more non-blocking status messages from the most recent
+    /// commit-triggered live re-apply attempt (issue #33) -- e.g.
+    /// [`live_apply_failure_message`] for a tracked game whose window
+    /// couldn't be repositioned. Purely transient UI feedback: not part of
+    /// [`SettingsState`] (never round-trips through `to_config`/persist),
+    /// and replaced wholesale -- not accumulated -- on each new
+    /// commit-triggered attempt, per this issue's acceptance criteria.
+    pending_status_messages: Vec<String>,
 }
 
 impl SettingsApp {
@@ -865,6 +1029,15 @@ impl SettingsApp {
     /// Removal is deferred until after the loop (rather than mutating
     /// `self.state.tracked_games` while iterating it) to avoid mutating the
     /// `Vec` out from under `iter_mut`'s in-progress borrow.
+    ///
+    /// Also implements issue #33's trigger 1: reassigning a row's preset
+    /// dropdown is a live-re-apply commit point for *that game alone*. The
+    /// changed game is captured (not acted on inline) so the actual
+    /// [`live_reapply_single_game`] call happens once, after the loop, past
+    /// `self.state.tracked_games.iter_mut()`'s borrow -- and so
+    /// [`SettingsApp::pending_status_messages`] is replaced wholesale with
+    /// that single attempt's result, per this issue's "replace, don't
+    /// accumulate" rule.
     fn games_section(&mut self, ui: &mut egui::Ui) {
         if self.state.tracked_games.is_empty() {
             ui.label("No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.");
@@ -874,11 +1047,17 @@ impl SettingsApp {
         let presets = self.state.to_presets();
         let monitor = self.monitor;
         let mut to_remove: Option<usize> = None;
+        // Issue #33 trigger 1: reassigning a single game's preset dropdown
+        // live re-applies just that game, using its *new* preset -- captured
+        // here (rather than acted on inline) so the live-apply attempt runs
+        // once, after `self.state.tracked_games`'s mutable borrow below ends.
+        let mut committed_single_game: Option<TrackedGame> = None;
         let last_index = self.state.tracked_games.len() - 1;
         for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(&game.display_name);
 
+                let previous_preset = game.preset;
                 egui::ComboBox::from_id_salt(("tracked_game_preset", index))
                     .selected_text(preset_kind_label(game.preset))
                     .show_ui(ui, |ui| {
@@ -886,6 +1065,9 @@ impl SettingsApp {
                             ui.selectable_value(&mut game.preset, kind, preset_kind_label(kind));
                         }
                     });
+                if game.preset != previous_preset {
+                    committed_single_game = Some(game.clone());
+                }
 
                 if let Some(reason) = preset_kind_unavailable_reason(game.preset, &presets, &monitor) {
                     ui.colored_label(egui::Color32::RED, format!("Unavailable: {reason}"));
@@ -906,6 +1088,10 @@ impl SettingsApp {
 
         if let Some(index) = to_remove {
             self.state.remove_tracked_game(index);
+        }
+
+        if let Some(game) = committed_single_game {
+            self.pending_status_messages = live_reapply_single_game(&game, &presets, &monitor);
         }
     }
 
@@ -971,20 +1157,47 @@ impl SettingsApp {
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
+            // Issue #33's non-blocking status line(s): zero or more messages
+            // from the most recent commit-triggered live re-apply attempt.
+            // Rendered near the top so they're visible without scrolling
+            // regardless of which commit point (dropdown/slider/zone-save)
+            // produced them.
+            if !self.pending_status_messages.is_empty() {
+                for message in &self.pending_status_messages {
+                    ui.colored_label(egui::Color32::YELLOW, message);
+                }
+                ui.separator();
+            }
+
             ui.heading("Presets");
             self.preset_thumbnails_row(ui);
 
             ui.separator();
             ui.label("Left depth from edge:");
-            ui.add(egui::Slider::new(
+            let left_depth_response = ui.add(egui::Slider::new(
                 &mut self.state.left_depth_percent,
                 MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
             ).suffix("%"));
+            // Issue #33 trigger 2: fires once the slider settles (release,
+            // not every intermediate drag frame) -- see `drag_stopped`'s doc
+            // comment on why a keyboard-only (arrow-key) edit doesn't also
+            // reach this branch, a known minor gap noted in this issue's
+            // summary rather than worked around.
+            if left_depth_response.drag_stopped() {
+                let presets = self.state.to_presets();
+                let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Left);
+                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor);
+            }
             ui.label("Right depth from edge:");
-            ui.add(egui::Slider::new(
+            let right_depth_response = ui.add(egui::Slider::new(
                 &mut self.state.right_depth_percent,
                 MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
             ).suffix("%"));
+            if right_depth_response.drag_stopped() {
+                let presets = self.state.to_presets();
+                let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Right);
+                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor);
+            }
 
             ui.separator();
             ui.label("Custom preset:");
@@ -998,7 +1211,10 @@ impl eframe::App for SettingsApp {
                     }
                 }
                 if ui.button("Edit Custom Zone...").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::EditCustomZone(self.state.clone()));
+                    *self.exit.borrow_mut() = Some(SettingsExit::EditCustomZone(
+                        self.state.clone(),
+                        self.pending_status_messages.clone(),
+                    ));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if self.state.custom.is_some() && ui.button("Clear").clicked() {
@@ -1033,6 +1249,13 @@ impl eframe::App for SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_apply_failure_message_names_the_game_and_explains_the_fallback() {
+        let message = live_apply_failure_message("Thing");
+
+        assert_eq!(message, "couldn't reposition Thing live -- will apply on next launch");
+    }
 
     #[test]
     fn format_captured_hotkey_with_modifiers_and_a_letter_key_uses_gameframes_stored_string_convention() {

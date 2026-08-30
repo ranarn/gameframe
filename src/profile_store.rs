@@ -211,6 +211,19 @@ pub fn find_tracked_game<'a>(games: &'a [TrackedGame], exe_path: &Path) -> Optio
     games.iter().find(|g| g.exe_path == exe_path)
 }
 
+/// Selects every tracked game currently assigned to `kind` -- the
+/// cascade-selection decision behind issue #33's live re-apply: editing a
+/// *shared* value (a base preset's depth-from-edge, or the Custom zone)
+/// affects every tracked game assigned to that preset, unlike reassigning a
+/// single game's own dropdown, which only affects that one game.
+///
+/// Pure -- no OS/I-O dependency -- so it's unit testable in complete
+/// isolation from the live-window resolution/apply step that consumes this
+/// selection.
+pub fn tracked_games_using_preset(tracked_games: &[TrackedGame], kind: PresetKind) -> Vec<&TrackedGame> {
+    tracked_games.iter().filter(|g| g.preset == kind).collect()
+}
+
 /// GameFrame's persisted config: the preset set, the two global hotkey
 /// bindings, and the per-game tracked-games list.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -608,6 +621,54 @@ mod tests {
         let found = find_tracked_game(&games, std::path::Path::new("C:\\Games\\thing.exe"));
 
         assert_eq!(found.map(|g| g.display_name.as_str()), Some("Thing"));
+    }
+
+    #[test]
+    fn tracked_games_using_preset_returns_empty_for_an_empty_list() {
+        let games: Vec<TrackedGame> = Vec::new();
+
+        let matches = tracked_games_using_preset(&games, PresetKind::Left);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn tracked_games_using_preset_returns_empty_when_no_game_uses_the_preset() {
+        let mut game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        game.preset = PresetKind::Right;
+        let games = vec![game];
+
+        let matches = tracked_games_using_preset(&games, PresetKind::Left);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn tracked_games_using_preset_returns_the_single_matching_game() {
+        let mut game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        game.preset = PresetKind::Left;
+        let games = vec![game];
+
+        let matches = tracked_games_using_preset(&games, PresetKind::Left);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].display_name, "Thing");
+    }
+
+    #[test]
+    fn tracked_games_using_preset_returns_every_matching_game_and_none_else() {
+        let mut a = TrackedGame::new_default(PathBuf::from("C:\\Games\\a.exe"), "A".to_string());
+        a.preset = PresetKind::Custom;
+        let mut b = TrackedGame::new_default(PathBuf::from("C:\\Games\\b.exe"), "B".to_string());
+        b.preset = PresetKind::Left;
+        let mut c = TrackedGame::new_default(PathBuf::from("C:\\Games\\c.exe"), "C".to_string());
+        c.preset = PresetKind::Custom;
+        let games = vec![a, b, c];
+
+        let matches = tracked_games_using_preset(&games, PresetKind::Custom);
+
+        let names: Vec<&str> = matches.iter().map(|g| g.display_name.as_str()).collect();
+        assert_eq!(names, vec!["A", "C"]);
     }
 
     #[test]

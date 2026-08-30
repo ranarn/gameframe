@@ -42,9 +42,45 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// exclude a window, as opposed to Layer 2's ranking-only signals (see
 /// [`rank_window`]) which never hide a window.
 ///
-/// A window is listable if:
-/// - it's currently visible with a non-blank title (an invisible or untitled
-///   window isn't something a user could sensibly pick by name);
+/// A window is listable if it has a non-blank title (an invisible or
+/// untitled window isn't something a user could sensibly pick by name) and
+/// is otherwise [`is_canonical_window`] -- see that function for the shared
+/// Layer 1 boolean formula (visible, not cloaked, root-owner/last-active-
+/// popup collapsing, tool-window exclusion, app-window override).
+///
+/// Pure logic -- no `HWND`/OS dependency -- so it's unit testable separately
+/// from the real `EnumWindows` callback (`crate::win32::list_visible_windows`)
+/// that calls it; the OS-facing signals themselves are gathered by
+/// [`is_window_cloaked`], [`is_root_owner_or_last_active_popup`], and
+/// [`window_ex_style`].
+pub(crate) fn is_listable_window(
+    title: &str,
+    is_visible: bool,
+    is_cloaked: bool,
+    is_root_owner_or_last_active_popup: bool,
+    has_tool_window_style: bool,
+    has_app_window_style: bool,
+) -> bool {
+    !title.trim().is_empty()
+        && is_canonical_window(
+            is_visible,
+            is_cloaked,
+            is_root_owner_or_last_active_popup,
+            has_tool_window_style,
+            has_app_window_style,
+        )
+}
+
+/// The Layer 1 canonical-window boolean formula shared by [`is_listable_window`]
+/// (the tray menu's "Apply to Window" picker, which additionally requires a
+/// non-blank title on top -- see that function) and
+/// `crate::win32::enum_windows_for_pid_callback` (issue #33's PID-scoped
+/// window resolution, which doesn't need a human-readable title -- it's
+/// machine-driven, matching an already-known process rather than being
+/// picked by name).
+///
+/// A window is canonical if:
+/// - it's currently visible;
 /// - it isn't cloaked (`DWMWA_CLOAKED` -- DWM-hidden windows, e.g. a
 ///   suspended UWP/Store-app window on another virtual desktop, that still
 ///   report `IsWindowVisible() == TRUE` with a stale title; see the Old New
@@ -60,13 +96,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// the owner-chain/tool-window rules above, per the documented Extended
 /// Window Styles semantics.
 ///
-/// Pure logic -- no `HWND`/OS dependency -- so it's unit testable separately
-/// from the real `EnumWindows` callback (`crate::win32::list_visible_windows`)
-/// that calls it; the OS-facing signals themselves are gathered by
-/// [`is_window_cloaked`], [`is_root_owner_or_last_active_popup`], and
-/// [`window_ex_style`].
-pub(crate) fn is_listable_window(
-    title: &str,
+/// Pure logic -- no `HWND`/OS dependency -- extracted so both call sites'
+/// Layer 1 rules stay a single source of truth instead of two independently
+/// maintained copies (issue #33's iteration-3 review fix: the PID-scoped
+/// callback had re-implemented this formula inline, minus the title check,
+/// with no test coverage of its own for the duplicate).
+pub(crate) fn is_canonical_window(
     is_visible: bool,
     is_cloaked: bool,
     is_root_owner_or_last_active_popup: bool,
@@ -74,7 +109,6 @@ pub(crate) fn is_listable_window(
     has_app_window_style: bool,
 ) -> bool {
     is_visible
-        && !title.trim().is_empty()
         && !is_cloaked
         && (has_app_window_style || (is_root_owner_or_last_active_popup && !has_tool_window_style))
 }
@@ -264,7 +298,12 @@ fn window_class_name(hwnd: HWND) -> String {
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs; the decision that consumes this value ([`matches_known_install`]) is
 /// unit tested in isolation.
-fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
+///
+/// `pub(crate)` (rather than private) since issue #33's PID<->HWND
+/// resolution (`crate::win32::find_pid_by_exe_path`) also calls this
+/// directly, to confirm a toolhelp snapshot's cheap file-name pre-filter
+/// match with a full-path comparison before accepting a PID.
+pub(crate) fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
     // Safety: `pid` is a plain integer; `OpenProcess` takes no pointers.
     let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
