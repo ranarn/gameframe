@@ -129,7 +129,11 @@ pub enum SessionOutcome {
 impl AppState {
     /// Starts a fresh editing session with nothing drawn yet.
     pub fn new(monitor: Monitor) -> Self {
-        Self { monitor, editor: EditorState::Empty, last_message: "ready".to_string() }
+        Self {
+            monitor,
+            editor: EditorState::Empty,
+            last_message: "Click and drag to draw a zone".to_string(),
+        }
     }
 
     /// Starts an editing session pre-loaded with an existing zone (e.g. the
@@ -298,6 +302,12 @@ mod tests {
     fn new_state_machine_starts_empty() {
         let state = AppState::new(monitor());
         assert_eq!(state.editor, EditorState::Empty);
+    }
+
+    #[test]
+    fn new_state_shows_draw_instruction_before_any_drag_starts() {
+        let state = AppState::new(monitor());
+        assert_eq!(state.last_message, "Click and drag to draw a zone");
     }
 
     #[test]

@@ -314,38 +314,57 @@ impl OverlayApp {
 
     /// The overlay's own modal Save/Cancel controls (issue #28: "fully
     /// modal for its editing session with its own Save/Cancel controls").
-    /// "Save" is disabled outside `Placed` rather than silently rejected,
-    /// since there's no separate settings window backdrop to surface a
-    /// rejection message against here.
     fn control_panel(&mut self, ctx: &egui::Context) {
+        // "Save" is disabled outside `Placed` rather than silently rejected,
+        // since there's no separate settings window backdrop to surface a
+        // rejection message against here.
         let can_save = matches!(self.state.editor, EditorState::Placed { .. });
 
+        // issue #39: buttons enlarged/color-coded and moved further down
+        // from the top edge, and the hint label enlarged/centered, so the
+        // controls are impossible to miss against the darkened overlay.
         egui::Area::new(egui::Id::new("zone-editor-controls"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
                     .corner_radius(6.0)
-                    .inner_margin(10.0)
+                    .inner_margin(16.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                            let save_button =
+                                control_button("Save", egui::Color32::from_rgb(34, 160, 60));
+                            if ui.add_enabled(can_save, save_button).clicked() {
                                 if let Some(outcome) = self.state.apply(Action::Save) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
                             }
-                            if ui.button("Cancel").clicked() {
+                            let cancel_button =
+                                control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
+                            if ui.add(cancel_button).clicked() {
                                 if let Some(outcome) = self.state.apply(Action::Cancel) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
                             }
                         });
-                        ui.label(
-                            egui::RichText::new(&self.state.last_message).color(egui::Color32::LIGHT_GRAY).small(),
-                        );
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(&self.state.last_message)
+                                    .color(egui::Color32::LIGHT_GRAY)
+                                    .size(16.0),
+                            );
+                        });
                     });
             });
     }
+}
+
+/// Builds a Save/Cancel control button with the enlarged size and
+/// color-coded fill used by the zone editor's control panel (issue #39).
+fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text).size(22.0).color(egui::Color32::WHITE))
+        .fill(fill)
+        .min_size(egui::vec2(140.0, 56.0))
 }
 
 fn rect_from_points(a: Point, b: Point) -> egui::Rect {
