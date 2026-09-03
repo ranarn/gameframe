@@ -529,7 +529,8 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// Reacts to a click on one of the "Apply to Window" submenu's
 /// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
 /// `target_hwnd`'s owning process's executable path, looks it up (or adds it,
-/// with this issue's new-tracked-game defaults -- preset `Right`, auto-apply
+/// with the current `Presets::default_for_new_games` preset -- see
+/// `CONTEXT.md`'s "Default preset (for new tracked games)" -- auto-apply
 /// on, taskbar-auto-hide on) in the tracked-games list via
 /// [`profile_store::upsert_tracked_game`], persists that list update
 /// immediately (even if a later step below fails), then applies the
@@ -572,7 +573,12 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     };
 
     let display_name = win32::window_text(target_hwnd);
-    let index = profile_store::upsert_tracked_game(&mut config.tracked_games, exe_path, display_name);
+    let index = profile_store::upsert_tracked_game(
+        &mut config.tracked_games,
+        exe_path,
+        display_name,
+        config.presets.default_for_new_games,
+    );
     let tracked_game = config.tracked_games[index].clone();
 
     // Persist the (possibly newly-added) tracked game immediately, before
@@ -777,7 +783,11 @@ mod tests {
     fn resolve_tracked_apply_resolves_a_tracked_games_assigned_preset() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        config.tracked_games.push(TrackedGame::new_default(exe_path.clone(), "Thing".to_string()));
+        config.tracked_games.push(TrackedGame::new_default(
+            exe_path.clone(),
+            "Thing".to_string(),
+            config.presets.default_for_new_games,
+        ));
 
         let (game, preset) = resolve_tracked_apply(&config, &exe_path).expect("expected a tracked game match");
 
@@ -789,7 +799,7 @@ mod tests {
     fn resolve_auto_apply_resolves_when_matched_and_auto_apply_is_on() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         assert!(game.auto_apply);
         config.tracked_games.push(game);
 
@@ -803,7 +813,8 @@ mod tests {
     fn resolve_auto_apply_returns_none_when_auto_apply_is_off() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.auto_apply = false;
         config.tracked_games.push(game);
 
@@ -825,7 +836,8 @@ mod tests {
     fn resolve_auto_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.preset = PresetKind::Custom;
         assert!(game.auto_apply);
         config.tracked_games.push(game);
@@ -843,7 +855,8 @@ mod tests {
         // not a silent fallback to a different preset.
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.preset = PresetKind::Custom;
         config.tracked_games.push(game);
         assert_eq!(config.presets.custom, None);

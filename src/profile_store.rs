@@ -47,6 +47,22 @@ pub struct Presets {
     pub left_depth_percent: u8,
     pub right_depth_percent: u8,
     pub custom: Option<CustomRegion>,
+    /// The preset kind assigned to a newly-tracked game (see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)") -- distinct
+    /// from a tracked game's own "Active preset", which this field never
+    /// changes once assigned. `#[serde(default = "default_preset_kind_for_new_games")]`
+    /// resolves to `Right` for configs written before this field existed,
+    /// matching the previously hardcoded behavior in `TrackedGame::new_default`.
+    #[serde(default = "default_preset_kind_for_new_games")]
+    pub default_for_new_games: PresetKind,
+}
+
+/// The `default_for_new_games` value used both as [`Presets`]'s
+/// `Default` and as the serde fallback for configs predating this field --
+/// `Right`, matching the previously hardcoded behavior of
+/// `TrackedGame::new_default`.
+fn default_preset_kind_for_new_games() -> PresetKind {
+    PresetKind::Right
 }
 
 impl Default for Presets {
@@ -55,6 +71,7 @@ impl Default for Presets {
             left_depth_percent: DEFAULT_DEPTH_PERCENT,
             right_depth_percent: DEFAULT_DEPTH_PERCENT,
             custom: None,
+            default_for_new_games: default_preset_kind_for_new_games(),
         }
     }
 }
@@ -162,12 +179,15 @@ pub struct TrackedGame {
 
 impl TrackedGame {
     /// Builds a freshly-added tracked game with this issue's specified
-    /// defaults: preset `Right`, auto-apply on, taskbar-auto-hide on.
-    pub fn new_default(exe_path: PathBuf, display_name: String) -> Self {
+    /// defaults: preset `default_preset` (the live
+    /// `Presets::default_for_new_games` at the time of adding -- see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)"), auto-apply
+    /// on, taskbar-auto-hide on.
+    pub fn new_default(exe_path: PathBuf, display_name: String, default_preset: PresetKind) -> Self {
         TrackedGame {
             exe_path,
             display_name,
-            preset: PresetKind::Right,
+            preset: default_preset,
             auto_apply: true,
             taskbar_autohide: true,
         }
@@ -175,11 +195,17 @@ impl TrackedGame {
 }
 
 /// Finds a tracked game whose `exe_path` matches, or appends a fresh
-/// default-configured one ([`TrackedGame::new_default`]) if none matched --
-/// the identity/dedupe rule behind the "Apply to Window" add flow (a game is
-/// identified solely by its executable path; picking an already-tracked
-/// game again must not create a duplicate entry, nor reset its existing
-/// assignment/settings, nor overwrite its captured `display_name`).
+/// default-configured one ([`TrackedGame::new_default`], seeded with
+/// `default_preset`) if none matched -- the identity/dedupe rule behind the
+/// "Apply to Window" add flow (a game is identified solely by its executable
+/// path; picking an already-tracked game again must not create a duplicate
+/// entry, nor reset its existing assignment/settings, nor overwrite its
+/// captured `display_name`).
+///
+/// `default_preset` is the caller's current `Presets::default_for_new_games`
+/// at the time of adding (see `CONTEXT.md`'s "Default preset (for new
+/// tracked games)") -- only used when appending a new entry; it is never
+/// applied to an existing match.
 ///
 /// Returns the index of the matched-or-inserted entry in `games` so the
 /// caller can read back whichever one now applies. Pure -- no OS/I-O
@@ -192,11 +218,16 @@ impl TrackedGame {
 /// a live process, which returns a consistent casing run-to-run, so two
 /// differently-cased paths for the *same* game are not expected in
 /// practice.
-pub fn upsert_tracked_game(games: &mut Vec<TrackedGame>, exe_path: PathBuf, display_name: String) -> usize {
+pub fn upsert_tracked_game(
+    games: &mut Vec<TrackedGame>,
+    exe_path: PathBuf,
+    display_name: String,
+    default_preset: PresetKind,
+) -> usize {
     if let Some(pos) = games.iter().position(|g| g.exe_path == exe_path) {
         return pos;
     }
-    games.push(TrackedGame::new_default(exe_path, display_name));
+    games.push(TrackedGame::new_default(exe_path, display_name, default_preset));
     games.len() - 1
 }
 
@@ -345,6 +376,7 @@ mod tests {
                     left_depth_percent: DEFAULT_DEPTH_PERCENT,
                     right_depth_percent: DEFAULT_DEPTH_PERCENT,
                     custom: None,
+                    default_for_new_games: PresetKind::Right,
                 },
                 hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None },
                 tracked_games: Vec::new(),
@@ -362,6 +394,7 @@ mod tests {
                 left_depth_percent: 30,
                 right_depth_percent: 70,
                 custom: Some(CustomRegion { x: 1, y: 2, width: 300, height: 400 }),
+                default_for_new_games: PresetKind::HalfLeft,
             },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
@@ -458,6 +491,37 @@ mod tests {
     }
 
     #[test]
+    fn load_of_a_current_shape_config_file_missing_only_the_default_for_new_games_key_still_deserializes() {
+        // A config saved before this issue's `default_for_new_games` field
+        // was added -- `#[serde(default = "default_preset_kind_for_new_games")]`
+        // exists specifically so this still deserializes (rather than
+        // resetting to defaults), resolving to `Right` to match the
+        // previously hardcoded `TrackedGame::new_default` behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let toml_missing_default_for_new_games = r#"
+            [presets]
+            left_depth_percent = 40
+            right_depth_percent = 60
+            custom = { x = 10, y = 10, width = 200, height = 100 }
+
+            [hotkeys]
+            toggle_borderless = "Ctrl+Alt+B"
+            toggle_taskbar_autohide = "Ctrl+Alt+T"
+        "#;
+        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_missing_default_for_new_games).unwrap();
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(
+            config.presets.default_for_new_games,
+            PresetKind::Right,
+            "a missing default_for_new_games key must default to Right, not error"
+        );
+    }
+
+    #[test]
     fn saving_a_changed_config_overwrites_the_previous_file_contents() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
@@ -509,6 +573,7 @@ mod tests {
             left_depth_percent: 20,
             right_depth_percent: 80,
             custom: Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }),
+            default_for_new_games: PresetKind::Right,
         };
 
         let all = presets.all();
@@ -527,7 +592,12 @@ mod tests {
 
     #[test]
     fn presets_resolve_returns_the_matching_preset_for_each_base_kind() {
-        let presets = Presets { left_depth_percent: 20, right_depth_percent: 80, custom: None };
+        let presets = Presets {
+            left_depth_percent: 20,
+            right_depth_percent: 80,
+            custom: None,
+            default_for_new_games: PresetKind::Right,
+        };
 
         assert_eq!(presets.resolve(PresetKind::Left), Some(Preset::Left { depth_percent: 20 }));
         assert_eq!(presets.resolve(PresetKind::Right), Some(Preset::Right { depth_percent: 80 }));
@@ -541,6 +611,7 @@ mod tests {
             left_depth_percent: 20,
             right_depth_percent: 80,
             custom: Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }),
+            default_for_new_games: PresetKind::Right,
         };
 
         assert_eq!(presets.resolve(PresetKind::Custom), Some(Preset::Custom { x: 1, y: 2, width: 3, height: 4 }));
@@ -551,14 +622,23 @@ mod tests {
         // A game assigned to Custom after Custom was since cleared/replaced
         // with None -- callers must treat this the same as "untracked" for
         // that one apply, not silently fall back to a different preset.
-        let presets = Presets { left_depth_percent: 20, right_depth_percent: 80, custom: None };
+        let presets = Presets {
+            left_depth_percent: 20,
+            right_depth_percent: 80,
+            custom: None,
+            default_for_new_games: PresetKind::Right,
+        };
 
         assert_eq!(presets.resolve(PresetKind::Custom), None);
     }
 
     #[test]
-    fn tracked_game_new_default_uses_right_preset_auto_apply_and_taskbar_autohide_on() {
-        let game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+    fn tracked_game_new_default_uses_the_given_default_preset_auto_apply_and_taskbar_autohide_on() {
+        let game = TrackedGame::new_default(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            PresetKind::Right,
+        );
 
         assert_eq!(game.exe_path, PathBuf::from("C:\\Games\\thing.exe"));
         assert_eq!(game.display_name, "Thing");
@@ -568,10 +648,29 @@ mod tests {
     }
 
     #[test]
+    fn tracked_game_new_default_uses_whichever_default_preset_it_is_given() {
+        // Confirms the assigned preset tracks the passed-in parameter, not a
+        // hardcoded kind -- see CONTEXT.md's "Default preset (for new
+        // tracked games)".
+        let game = TrackedGame::new_default(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            PresetKind::HalfLeft,
+        );
+
+        assert_eq!(game.preset, PresetKind::HalfLeft);
+    }
+
+    #[test]
     fn upsert_tracked_game_appends_a_new_default_entry_when_no_existing_match() {
         let mut games: Vec<TrackedGame> = Vec::new();
 
-        let index = upsert_tracked_game(&mut games, PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        let index = upsert_tracked_game(
+            &mut games,
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            PresetKind::Right,
+        );
 
         assert_eq!(index, 0);
         assert_eq!(games.len(), 1);
@@ -580,10 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn upsert_tracked_game_appends_a_new_entry_using_whichever_default_preset_it_is_given() {
+        // A newly-tracked game (e.g. via "Apply to Window") must be seeded
+        // from the caller's current `Presets::default_for_new_games`, not a
+        // hardcoded kind -- see CONTEXT.md's "Default preset (for new
+        // tracked games)".
+        let mut games: Vec<TrackedGame> = Vec::new();
+
+        let index = upsert_tracked_game(
+            &mut games,
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            PresetKind::HalfRight,
+        );
+
+        assert_eq!(index, 0);
+        assert_eq!(games[0].preset, PresetKind::HalfRight);
+    }
+
+    #[test]
     fn upsert_tracked_game_reuses_the_existing_entry_for_a_matching_executable_path() {
         let mut games = vec![TrackedGame::new_default(
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            PresetKind::Right,
         )];
         games[0].preset = PresetKind::Custom;
         games[0].auto_apply = false;
@@ -593,6 +712,7 @@ mod tests {
             &mut games,
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing (different window title)".to_string(),
+            PresetKind::Right,
         );
 
         assert_eq!(index, 0);
@@ -616,7 +736,11 @@ mod tests {
 
     #[test]
     fn find_tracked_game_returns_the_matching_entry() {
-        let games = vec![TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string())];
+        let games = vec![TrackedGame::new_default(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            PresetKind::Right,
+        )];
 
         let found = find_tracked_game(&games, std::path::Path::new("C:\\Games\\thing.exe"));
 
@@ -634,7 +758,8 @@ mod tests {
 
     #[test]
     fn tracked_games_using_preset_returns_empty_when_no_game_uses_the_preset() {
-        let mut game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string(), PresetKind::Right);
         game.preset = PresetKind::Right;
         let games = vec![game];
 
@@ -645,7 +770,8 @@ mod tests {
 
     #[test]
     fn tracked_games_using_preset_returns_the_single_matching_game() {
-        let mut game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string(), PresetKind::Right);
         game.preset = PresetKind::Left;
         let games = vec![game];
 
@@ -657,11 +783,14 @@ mod tests {
 
     #[test]
     fn tracked_games_using_preset_returns_every_matching_game_and_none_else() {
-        let mut a = TrackedGame::new_default(PathBuf::from("C:\\Games\\a.exe"), "A".to_string());
+        let mut a =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\a.exe"), "A".to_string(), PresetKind::Right);
         a.preset = PresetKind::Custom;
-        let mut b = TrackedGame::new_default(PathBuf::from("C:\\Games\\b.exe"), "B".to_string());
+        let mut b =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\b.exe"), "B".to_string(), PresetKind::Right);
         b.preset = PresetKind::Left;
-        let mut c = TrackedGame::new_default(PathBuf::from("C:\\Games\\c.exe"), "C".to_string());
+        let mut c =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\c.exe"), "C".to_string(), PresetKind::Right);
         c.preset = PresetKind::Custom;
         let games = vec![a, b, c];
 

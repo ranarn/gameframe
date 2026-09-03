@@ -31,6 +31,10 @@ _Avoid_: using "Zone" and "Custom preset" interchangeably — a Zone is the edit
 **Active preset**:
 The preset currently assigned to a given **tracked game** — stored as a reference to one of the five preset kinds, never a copy, so editing a base preset or replacing the Custom preset immediately changes what every game assigned to it applies.
 
+**Default preset (for new tracked games)**:
+The single preset kind that will be assigned to the next game added as a **tracked game**, set by clicking its thumbnail in Settings' preset row (highlighted there to show the current choice) and persisted to config. Distinct from **Active preset**: changing the default never changes any already-tracked game's existing assignment — it only determines what a *future* newly-tracked game starts with.
+_Avoid_: confusing this with **Active preset** — the default is a single global setting that seeds a new tracked game's initial Active preset; after that, the two are unrelated.
+
 **Tracked game**:
 A process, identified by its **executable path**, that has been added to GameFrame's per-game list. Added by picking it from the "Apply to Window" picker — the same action also applies its active preset immediately — and persists across sessions; picking an already-tracked game again does not create a duplicate entry.
 _Avoid_: "game" alone for a window that merely looks like a game but hasn't been added to this list yet.
@@ -50,6 +54,7 @@ A per-tracked-game setting: whether applying this game's active preset should al
 - A **Zone**, once saved via the overlay, becomes the **Custom preset**.
 - Each **tracked game** is assigned exactly one **active preset** (base or Custom), plus its own **auto-apply** and **per-game taskbar auto-hide** settings.
 - Applying a preset to a window whose process is not a **tracked game** does nothing — there is no untracked fallback.
+- A newly-added **tracked game**'s initial **active preset** is seeded from the current **default preset (for new tracked games)** — a one-time copy at add-time, not a live reference, so a later change to the default never retroactively changes that game's assignment.
 
 ## Flagged ambiguities
 

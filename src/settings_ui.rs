@@ -50,6 +50,12 @@ pub struct SettingsState {
     pub left_depth_percent: u8,
     pub right_depth_percent: u8,
     pub custom: Option<CustomRegion>,
+    /// The preset kind assigned to a newly-tracked game -- see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)", kept fully
+    /// separate from a tracked game's own "Active preset": changing this
+    /// never touches any already-tracked game's existing `preset` field.
+    /// Set by clicking a thumbnail in [`SettingsApp::preset_thumbnails_row`].
+    pub default_for_new_games: PresetKind,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
     /// `Some(field)` while a press-to-bind capture is in progress for that
@@ -91,6 +97,7 @@ impl SettingsState {
             left_depth_percent: config.presets.left_depth_percent,
             right_depth_percent: config.presets.right_depth_percent,
             custom: config.presets.custom,
+            default_for_new_games: config.presets.default_for_new_games,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
             capturing: None,
@@ -107,6 +114,7 @@ impl SettingsState {
             left_depth_percent: self.left_depth_percent,
             right_depth_percent: self.right_depth_percent,
             custom: self.custom,
+            default_for_new_games: self.default_for_new_games,
         }
     }
 
@@ -135,6 +143,14 @@ impl SettingsState {
     /// Clears the `Custom` preset entirely (back to "none set").
     pub fn clear_custom_preset(&mut self) {
         self.custom = None;
+    }
+
+    /// Sets `kind` as the new default preset assigned to future
+    /// newly-tracked games -- see `CONTEXT.md`'s "Default preset (for new
+    /// tracked games)". Never touches any already-tracked game's existing
+    /// `preset` assignment (that's "Active preset", a separate concept).
+    pub fn set_default_for_new_games(&mut self, kind: PresetKind) {
+        self.default_for_new_games = kind;
     }
 
     pub fn start_capture(&mut self, field: HotkeyField) {
@@ -279,17 +295,25 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 /// persisted while running on a different monitor configuration); the four
 /// base presets always resolve.
 ///
-/// No longer tracks "is this the active preset" (issue #6's MVP
-/// single-global-preset mechanism, `win32::active_preset`, was removed by
-/// issue #31's per-game preset assignment -- see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md`'s consequence
-/// note): a preset's "active" status is now per-tracked-game, not global, so
-/// it has no meaning in this shared five-preset row anymore.
+/// Also carries `kind` and `is_default` (issue #36) so the thumbnail row
+/// can wire up "click to set as the default preset for new tracked games"
+/// and highlight whichever one currently is -- a concept kept fully
+/// separate from a tracked game's own "Active preset" (see `CONTEXT.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresetThumbnail {
+    /// Which of the five preset kinds this thumbnail represents -- lets the
+    /// click handler and the default-highlight both key off a stable
+    /// reference rather than parsing `label` back apart.
+    pub kind: PresetKind,
     pub label: String,
     pub region: Option<NormalizedRegion>,
     pub error: Option<String>,
+    /// `true` only for the thumbnail matching the current
+    /// `SettingsState::default_for_new_games` (see `CONTEXT.md`'s "Default
+    /// preset (for new tracked games)") -- the row renders exactly one
+    /// thumbnail with this flag set, distinct from any other per-thumbnail
+    /// state (hover, the `error` placeholder above).
+    pub is_default: bool,
 }
 
 /// Returns why `kind` currently can't be resolved to a concrete, drawable
@@ -411,21 +435,33 @@ fn live_reapply_cascade(games: &[&TrackedGame], presets: &Presets, kind: PresetK
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
     let presets = state.to_presets();
+    // Fixed presentation order matching `Presets::all`'s (the four base
+    // presets, then `Custom` if present) -- `zip` naturally truncates to
+    // `presets.all()`'s length when `Custom` is absent.
+    let kinds = [PresetKind::Left, PresetKind::Right, PresetKind::HalfLeft, PresetKind::HalfRight, PresetKind::Custom];
 
     presets
         .all()
         .into_iter()
-        .map(|preset| match resolve_region(&preset, monitor) {
-            Ok(region) => PresetThumbnail {
-                label: preset_label(&preset),
-                region: Some(normalize_region(&region, monitor)),
-                error: None,
-            },
-            Err(e) => PresetThumbnail {
-                label: preset_label(&preset),
-                region: None,
-                error: Some(e.to_string()),
-            },
+        .zip(kinds)
+        .map(|(preset, kind)| {
+            let is_default = kind == state.default_for_new_games;
+            match resolve_region(&preset, monitor) {
+                Ok(region) => PresetThumbnail {
+                    kind,
+                    label: preset_label(&preset),
+                    region: Some(normalize_region(&region, monitor)),
+                    error: None,
+                    is_default,
+                },
+                Err(e) => PresetThumbnail {
+                    kind,
+                    label: preset_label(&preset),
+                    region: None,
+                    error: Some(e.to_string()),
+                    is_default,
+                },
+            }
         })
         .collect()
 }
@@ -1098,20 +1134,46 @@ impl SettingsApp {
     /// Renders the graphical thumbnail row: one small monitor-outline
     /// rectangle per preset (from [`preset_thumbnails`]), with the resolved
     /// region highlighted inside it.
-    fn preset_thumbnails_row(&self, ui: &mut egui::Ui) {
+    ///
+    /// Each thumbnail is clickable (issue #36): clicking one sets it as the
+    /// new default preset for future newly-tracked games (see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)" -- kept
+    /// fully separate from any tracked game's own "Active preset", so this
+    /// never touches an already-tracked game's existing assignment). The
+    /// thumbnail matching the current default renders with a distinct
+    /// gold outline, layered independently of the unrelated "unresolvable
+    /// preset" red-X placeholder below so the two states never collide.
+    fn preset_thumbnails_row(&mut self, ui: &mut egui::Ui) {
         const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(84.0, 48.0);
+        const DEFAULT_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 0);
         let fill_color = egui::Color32::from_rgb(90, 170, 250);
+
+        let mut newly_clicked_default: Option<PresetKind> = None;
 
         ui.horizontal_wrapped(|ui| {
             for thumbnail in preset_thumbnails(&self.state, &self.monitor) {
                 ui.vertical(|ui| {
-                    let (outline_rect, _response) =
-                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
+                    let (outline_rect, response) =
+                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::click());
+                    if response.clicked() {
+                        newly_clicked_default = Some(thumbnail.kind);
+                    }
+                    response.on_hover_text(if thumbnail.is_default {
+                        "Default preset for newly-tracked games"
+                    } else {
+                        "Click to set as the default preset for newly-tracked games"
+                    });
+
                     let painter = ui.painter();
+                    let (outline_color, outline_width) = if thumbnail.is_default {
+                        (DEFAULT_OUTLINE_COLOR, 3.0)
+                    } else {
+                        (egui::Color32::DARK_GRAY, 1.0)
+                    };
                     painter.rect_stroke(
                         outline_rect,
                         2.0,
-                        egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        egui::Stroke::new(outline_width, outline_color),
                         egui::StrokeKind::Outside,
                     );
 
@@ -1151,6 +1213,10 @@ impl SettingsApp {
                 });
             }
         });
+
+        if let Some(kind) = newly_clicked_default {
+            self.state.set_default_for_new_games(kind);
+        }
     }
 }
 
@@ -1363,6 +1429,7 @@ mod tests {
                 left_depth_percent: 20,
                 right_depth_percent: 80,
                 custom: Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }),
+                default_for_new_games: PresetKind::HalfLeft,
             },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
@@ -1376,6 +1443,7 @@ mod tests {
         assert_eq!(state.left_depth_percent, 20);
         assert_eq!(state.right_depth_percent, 80);
         assert_eq!(state.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
+        assert_eq!(state.default_for_new_games, PresetKind::HalfLeft);
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
     }
@@ -1398,6 +1466,7 @@ mod tests {
         config.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            config.presets.default_for_new_games,
         ));
 
         let state = SettingsState::from_config(&config);
@@ -1411,6 +1480,7 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            PresetKind::Right,
         ));
         state.tracked_games[0].preset = PresetKind::HalfRight;
         state.tracked_games[0].auto_apply = false;
@@ -1428,10 +1498,12 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\a.exe"),
             "A".to_string(),
+            PresetKind::Right,
         ));
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\b.exe"),
             "B".to_string(),
+            PresetKind::Right,
         ));
 
         state.remove_tracked_game(0);
@@ -1462,6 +1534,17 @@ mod tests {
         assert_eq!(config.presets.left_depth_percent, 15);
         assert_eq!(config.presets.right_depth_percent, 85);
         assert_eq!(config.presets.custom, Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }));
+    }
+
+    #[test]
+    fn to_config_carries_the_current_default_for_new_games() {
+        let mut state = SettingsState::from_config(&Config::default());
+
+        state.set_default_for_new_games(PresetKind::HalfLeft);
+
+        let config = state.to_config();
+
+        assert_eq!(config.presets.default_for_new_games, PresetKind::HalfLeft);
     }
 
     #[test]
@@ -1728,6 +1811,23 @@ mod tests {
         assert_eq!(thumbnails[1].label, preset_label(&Preset::Right { depth_percent: state.right_depth_percent }));
         assert_eq!(thumbnails[2].label, "Half Left");
         assert_eq!(thumbnails[3].label, "Half Right");
+    }
+
+    #[test]
+    fn preset_thumbnails_marks_only_the_current_default_for_new_games_thumbnail_as_default() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.default_for_new_games = PresetKind::HalfLeft;
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert_eq!(thumbnails[0].kind, PresetKind::Left);
+        assert_eq!(thumbnails[1].kind, PresetKind::Right);
+        assert_eq!(thumbnails[2].kind, PresetKind::HalfLeft);
+        assert_eq!(thumbnails[3].kind, PresetKind::HalfRight);
+        assert!(!thumbnails[0].is_default);
+        assert!(!thumbnails[1].is_default);
+        assert!(thumbnails[2].is_default, "Half Left is the current default and must be marked as such");
+        assert!(!thumbnails[3].is_default);
     }
 
     #[test]
