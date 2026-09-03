@@ -5,18 +5,14 @@ GameFrame positions game windows into predefined screen regions via hotkeys or p
 ## Language
 
 **Preset**:
-A named window-placement region that can be applied to a target window. Exactly five kinds exist: four **base presets** and at most one **Custom** preset.
+A named window-placement region that can be applied to a target window. Exactly three kinds exist: two **base presets** and at most one **Custom** preset.
 _Avoid_: Profile, Layout
 
 **Base preset**:
-One of the four presets (**Left**, **Right**, **HalfLeft**, **HalfRight**) that always exist in the preset set and cannot be deleted. Their adjustable values (where present) are edited in place, never by removing and re-adding.
+One of the two presets (**Left**, **Right**) that always exist in the preset set and cannot be deleted. Their adjustable **depth-from-edge** is edited in place, never by removing and re-adding.
 
 **Left / Right**:
 A base preset anchored to the screen's left/right edge, full height, with an adjustable **depth-from-edge**.
-
-**HalfLeft / HalfRight**:
-A base preset anchored to the screen's left/right edge, full height, permanently fixed at 50% width — not adjustable.
-_Avoid_: confusing these with Left/Right at a 50% depth-from-edge setting; HalfLeft/HalfRight are a structurally distinct, non-adjustable pair.
 
 **Depth-from-edge**:
 The percentage (10%-90%) of screen width a **Left** or **Right** preset extends from its anchored screen edge. Stored as a percentage and resolved against the target monitor's geometry at apply-time, not baked into absolute pixels.
@@ -29,7 +25,7 @@ The overlay's live, in-progress region while the user is drawing or resizing it.
 _Avoid_: using "Zone" and "Custom preset" interchangeably — a Zone is the editing-time state, the Custom preset is what gets persisted.
 
 **Active preset**:
-The preset currently assigned to a given **tracked game** — stored as a reference to one of the five preset kinds, never a copy, so editing a base preset or replacing the Custom preset immediately changes what every game assigned to it applies.
+The preset currently assigned to a given **tracked game** — stored as a reference to one of the three preset kinds, never a copy, so editing a base preset or replacing the Custom preset immediately changes what every game assigned to it applies.
 
 **Default preset (for new tracked games)**:
 The single preset kind that will be assigned to the next game added as a **tracked game**, set by clicking its thumbnail in Settings' preset row (highlighted there to show the current choice) and persisted to config. Distinct from **Active preset**: changing the default never changes any already-tracked game's existing assignment — it only determines what a *future* newly-tracked game starts with.
@@ -50,7 +46,7 @@ A per-tracked-game setting: whether applying this game's active preset should al
 
 ## Relationships
 
-- The preset set holds exactly one of each **base preset** (**Left**, **Right**, **HalfLeft**, **HalfRight**) plus at most one **Custom preset** — not a free-form list.
+- The preset set holds exactly one of each **base preset** (**Left**, **Right**) plus at most one **Custom preset** — not a free-form list.
 - A **Zone**, once saved via the overlay, becomes the **Custom preset**.
 - Each **tracked game** is assigned exactly one **active preset** (base or Custom), plus its own **auto-apply** and **per-game taskbar auto-hide** settings.
 - Applying a preset to a window whose process is not a **tracked game** does nothing — there is no untracked fallback.

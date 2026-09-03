@@ -27,7 +27,7 @@ pub const DEFAULT_DEPTH_PERCENT: u8 = 50;
 /// preset. Kept as a plain struct (rather than reusing `Preset::Custom`
 /// directly) so [`Presets`] can express "at most one Custom" as
 /// `Option<CustomRegion>` without also having to guard against a `Custom`
-/// value smuggling in a `Left`/`Right`/`HalfLeft`/`HalfRight` variant.
+/// value smuggling in a `Left`/`Right` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CustomRegion {
     pub x: i32,
@@ -36,12 +36,11 @@ pub struct CustomRegion {
     pub height: i32,
 }
 
-/// GameFrame's preset set: exactly one of each of the four base presets
-/// (`Left`, `Right`, `HalfLeft`, `HalfRight` -- `HalfLeft`/`HalfRight` carry
-/// no adjustable data so they need no field of their own) plus at most one
-/// `Custom`. This makes "always four base presets, at most one Custom, none
-/// of them individually removable" a type-level invariant instead of a
-/// UI-only or runtime-checked rule -- see `docs/adr/0001-preset-fixed-structure-no-migration.md`.
+/// GameFrame's preset set: exactly one of each of the two base presets
+/// (`Left`, `Right`) plus at most one `Custom`. This makes "always two base
+/// presets, at most one Custom, neither base preset individually removable"
+/// a type-level invariant instead of a UI-only or runtime-checked rule --
+/// see `docs/adr/0001-preset-fixed-structure-no-migration.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Presets {
     pub left_depth_percent: u8,
@@ -76,7 +75,7 @@ impl Default for Presets {
     }
 }
 
-/// A reference to one of GameFrame's five preset kinds -- never a copy of a
+/// A reference to one of GameFrame's three preset kinds -- never a copy of a
 /// preset's data. A [`TrackedGame`]'s assigned preset is stored as one of
 /// these (see [`CONTEXT.md`](../CONTEXT.md)'s "Active preset"), resolved
 /// against the live [`Presets`] set at apply-time via [`Presets::resolve`],
@@ -86,16 +85,13 @@ impl Default for Presets {
 pub enum PresetKind {
     Left,
     Right,
-    HalfLeft,
-    HalfRight,
     Custom,
 }
 
 impl PresetKind {
-    /// All five preset kinds, in the same fixed presentation order as
+    /// All three preset kinds, in the same fixed presentation order as
     /// [`Presets::all`].
-    pub const ALL: [PresetKind; 5] =
-        [PresetKind::Left, PresetKind::Right, PresetKind::HalfLeft, PresetKind::HalfRight, PresetKind::Custom];
+    pub const ALL: [PresetKind; 3] = [PresetKind::Left, PresetKind::Right, PresetKind::Custom];
 }
 
 impl Presets {
@@ -107,22 +103,14 @@ impl Presets {
         Preset::Right { depth_percent: self.right_depth_percent }
     }
 
-    pub fn half_left(&self) -> Preset {
-        Preset::HalfLeft
-    }
-
-    pub fn half_right(&self) -> Preset {
-        Preset::HalfRight
-    }
-
     pub fn custom(&self) -> Option<Preset> {
         self.custom.map(|c| Preset::Custom { x: c.x, y: c.y, width: c.width, height: c.height })
     }
 
     /// All presets currently in the set, in a fixed presentation order (the
-    /// four base presets, then `Custom` if present).
+    /// two base presets, then `Custom` if present).
     pub fn all(&self) -> Vec<Preset> {
-        let mut presets = vec![self.left(), self.right(), self.half_left(), self.half_right()];
+        let mut presets = vec![self.left(), self.right()];
         if let Some(custom) = self.custom() {
             presets.push(custom);
         }
@@ -142,8 +130,6 @@ impl Presets {
         match kind {
             PresetKind::Left => Some(self.left()),
             PresetKind::Right => Some(self.right()),
-            PresetKind::HalfLeft => Some(self.half_left()),
-            PresetKind::HalfRight => Some(self.half_right()),
             PresetKind::Custom => self.custom(),
         }
     }
@@ -394,7 +380,7 @@ mod tests {
                 left_depth_percent: 30,
                 right_depth_percent: 70,
                 custom: Some(CustomRegion { x: 1, y: 2, width: 300, height: 400 }),
-                default_for_new_games: PresetKind::HalfLeft,
+                default_for_new_games: PresetKind::Custom,
             },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
@@ -522,6 +508,44 @@ mod tests {
     }
 
     #[test]
+    fn load_of_a_config_file_with_a_tracked_game_referencing_a_removed_preset_kind_resets_to_defaults() {
+        // Issue #37: HalfLeft/HalfRight were removed from `PresetKind`. Per
+        // ADR 0001's "no migration" stance, a config file with a tracked
+        // game still referencing one of those removed kinds no longer
+        // deserializes at all -- it is discarded and replaced with defaults,
+        // the same as any other schema mismatch.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let toml_referencing_a_removed_preset_kind = r#"
+            [presets]
+            left_depth_percent = 40
+            right_depth_percent = 60
+            default_for_new_games = "Right"
+
+            [hotkeys]
+            toggle_borderless = "Ctrl+Alt+B"
+            toggle_taskbar_autohide = "Ctrl+Alt+T"
+
+            [[tracked_games]]
+            exe_path = "C:\\Games\\thing.exe"
+            display_name = "Thing"
+            preset = "HalfLeft"
+            auto_apply = true
+            taskbar_autohide = true
+        "#;
+        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_referencing_a_removed_preset_kind).unwrap();
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(config, Config::default());
+        // The reset is also persisted, so the next load doesn't need to
+        // rediscover the same incompatible file.
+        let reloaded = load(&config_dir).unwrap();
+        assert_eq!(reloaded, Config::default());
+    }
+
+    #[test]
     fn saving_a_changed_config_overwrites_the_previous_file_contents() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
@@ -551,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn presets_all_lists_the_four_base_presets_in_fixed_order_with_no_custom_by_default() {
+    fn presets_all_lists_the_two_base_presets_in_fixed_order_with_no_custom_by_default() {
         let presets = Presets::default();
 
         let all = presets.all();
@@ -561,8 +585,6 @@ mod tests {
             vec![
                 Preset::Left { depth_percent: DEFAULT_DEPTH_PERCENT },
                 Preset::Right { depth_percent: DEFAULT_DEPTH_PERCENT },
-                Preset::HalfLeft,
-                Preset::HalfRight,
             ]
         );
     }
@@ -583,8 +605,6 @@ mod tests {
             vec![
                 Preset::Left { depth_percent: 20 },
                 Preset::Right { depth_percent: 80 },
-                Preset::HalfLeft,
-                Preset::HalfRight,
                 Preset::Custom { x: 1, y: 2, width: 3, height: 4 },
             ]
         );
@@ -601,8 +621,6 @@ mod tests {
 
         assert_eq!(presets.resolve(PresetKind::Left), Some(Preset::Left { depth_percent: 20 }));
         assert_eq!(presets.resolve(PresetKind::Right), Some(Preset::Right { depth_percent: 80 }));
-        assert_eq!(presets.resolve(PresetKind::HalfLeft), Some(Preset::HalfLeft));
-        assert_eq!(presets.resolve(PresetKind::HalfRight), Some(Preset::HalfRight));
     }
 
     #[test]
@@ -655,10 +673,10 @@ mod tests {
         let game = TrackedGame::new_default(
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
-            PresetKind::HalfLeft,
+            PresetKind::Custom,
         );
 
-        assert_eq!(game.preset, PresetKind::HalfLeft);
+        assert_eq!(game.preset, PresetKind::Custom);
     }
 
     #[test]
@@ -690,11 +708,11 @@ mod tests {
             &mut games,
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
-            PresetKind::HalfRight,
+            PresetKind::Custom,
         );
 
         assert_eq!(index, 0);
-        assert_eq!(games[0].preset, PresetKind::HalfRight);
+        assert_eq!(games[0].preset, PresetKind::Custom);
     }
 
     #[test]
@@ -813,7 +831,7 @@ mod tests {
         written.tracked_games.push(TrackedGame {
             exe_path: PathBuf::from("C:\\Games\\thing.exe"),
             display_name: "Thing".to_string(),
-            preset: PresetKind::HalfLeft,
+            preset: PresetKind::Custom,
             auto_apply: false,
             taskbar_autohide: true,
         });

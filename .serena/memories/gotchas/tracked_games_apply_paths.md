@@ -5,9 +5,20 @@ Replaces the old `win32::active_preset()` "first preset in the list" MVP hack
 (auto-apply on launch) and #33 (live re-apply on edit), both of which build
 directly on this model.
 
+**Superseded detail (issue #37):** `PresetKind` no longer has five variants --
+`HalfLeft`/`HalfRight` were removed entirely, leaving exactly three:
+`Left`, `Right`, `Custom`. Every "five preset kinds"/"four base presets"
+reference below (and `Presets::half_left`/`half_right`, which no longer
+exist) describes the pre-#37 shape; `PresetKind::ALL` is now a 3-element
+array. `region_calc::Preset` lost the same two variants. See `CONTEXT.md`
+and `docs/adr/0001-preset-fixed-structure-no-migration.md` for the current
+three-kind structure -- ADR 0001's "no migration" stance was extended to
+cover this removal too (a stored config referencing a removed `PresetKind`
+resets to defaults on load, same as any other schema mismatch).
+
 ### Data model (`src/profile_store.rs`)
-- `PresetKind` enum (`Left`/`Right`/`HalfLeft`/`HalfRight`/`Custom`) -- a
-  *reference* to one of the five preset kinds, never a copy of preset data.
+- `PresetKind` enum (`Left`/`Right`/`Custom`, post-#37) -- a
+  *reference* to one of the preset kinds, never a copy of preset data.
   `PresetKind::ALL` is the fixed presentation-order array (used by the
   Settings dropdown).
 - `Presets::resolve(&self, kind: PresetKind) -> Option<Preset>` resolves a

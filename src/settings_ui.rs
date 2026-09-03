@@ -37,9 +37,9 @@ use std::rc::Rc;
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
-/// The four base presets (`Left`, `Right`, `HalfLeft`, `HalfRight`) are
-/// always present and are never added/removed -- only `Left`/`Right`'s
-/// depth-from-edge is adjustable, edited in place. `Custom` is the single
+/// The two base presets (`Left`, `Right`) are always present and are never
+/// added/removed -- only their depth-from-edge is adjustable, edited in
+/// place. `Custom` is the single
 /// optional preset: it is set/replaced entirely by the zone-editor overlay
 /// (see [`crate::zone_overlay::run_zone_editor_overlay`]), superseding the
 /// manual X/Y/width/height numeric entry this struct carried before issue
@@ -231,8 +231,6 @@ fn preset_label(preset: &Preset) -> String {
     match preset {
         Preset::Left { depth_percent } => format!("Left ({depth_percent}%)"),
         Preset::Right { depth_percent } => format!("Right ({depth_percent}%)"),
-        Preset::HalfLeft => "Half Left".to_string(),
-        Preset::HalfRight => "Half Right".to_string(),
         Preset::Custom { x, y, width, height } => {
             format!("Custom ({x}, {y}, {width}x{height})")
         }
@@ -246,8 +244,6 @@ fn preset_kind_label(kind: PresetKind) -> &'static str {
     match kind {
         PresetKind::Left => "Left",
         PresetKind::Right => "Right",
-        PresetKind::HalfLeft => "Half Left",
-        PresetKind::HalfRight => "Half Right",
         PresetKind::Custom => "Custom",
     }
 }
@@ -292,7 +288,7 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 /// normalized against `monitor` (if it resolved), and -- if resolution
 /// failed -- an error to surface instead of silently omitting the preset
 /// from the row. Only `Custom` can fail to resolve (e.g. coordinates
-/// persisted while running on a different monitor configuration); the four
+/// persisted while running on a different monitor configuration); the two
 /// base presets always resolve.
 ///
 /// Also carries `kind` and `is_default` (issue #36) so the thumbnail row
@@ -301,7 +297,7 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 /// separate from a tracked game's own "Active preset" (see `CONTEXT.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresetThumbnail {
-    /// Which of the five preset kinds this thumbnail represents -- lets the
+    /// Which preset kind this thumbnail represents -- lets the
     /// click handler and the default-highlight both key off a stable
     /// reference rather than parsing `label` back apart.
     pub kind: PresetKind,
@@ -435,10 +431,10 @@ fn live_reapply_cascade(games: &[&TrackedGame], presets: &Presets, kind: PresetK
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
     let presets = state.to_presets();
-    // Fixed presentation order matching `Presets::all`'s (the four base
+    // Fixed presentation order matching `Presets::all`'s (the two base
     // presets, then `Custom` if present) -- `zip` naturally truncates to
     // `presets.all()`'s length when `Custom` is absent.
-    let kinds = [PresetKind::Left, PresetKind::Right, PresetKind::HalfLeft, PresetKind::HalfRight, PresetKind::Custom];
+    let kinds = [PresetKind::Left, PresetKind::Right, PresetKind::Custom];
 
     presets
         .all()
@@ -1053,7 +1049,7 @@ impl SettingsApp {
     }
 
     /// Renders the "Games" section: one row per tracked game with its
-    /// display name, a preset dropdown (the five [`PresetKind`] variants),
+    /// display name, a preset dropdown (the three [`PresetKind`] variants),
     /// a taskbar-auto-hide checkbox, an auto-apply checkbox, and an
     /// immediate no-confirmation "Remove" button (see
     /// [`SettingsState::remove_tracked_game`]). A row whose assigned preset
@@ -1429,7 +1425,7 @@ mod tests {
                 left_depth_percent: 20,
                 right_depth_percent: 80,
                 custom: Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }),
-                default_for_new_games: PresetKind::HalfLeft,
+                default_for_new_games: PresetKind::Custom,
             },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
@@ -1443,7 +1439,7 @@ mod tests {
         assert_eq!(state.left_depth_percent, 20);
         assert_eq!(state.right_depth_percent, 80);
         assert_eq!(state.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
-        assert_eq!(state.default_for_new_games, PresetKind::HalfLeft);
+        assert_eq!(state.default_for_new_games, PresetKind::Custom);
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
     }
@@ -1482,13 +1478,13 @@ mod tests {
             "Thing".to_string(),
             PresetKind::Right,
         ));
-        state.tracked_games[0].preset = PresetKind::HalfRight;
+        state.tracked_games[0].preset = PresetKind::Custom;
         state.tracked_games[0].auto_apply = false;
 
         let config = state.to_config();
 
         assert_eq!(config.tracked_games.len(), 1);
-        assert_eq!(config.tracked_games[0].preset, PresetKind::HalfRight);
+        assert_eq!(config.tracked_games[0].preset, PresetKind::Custom);
         assert!(!config.tracked_games[0].auto_apply);
     }
 
@@ -1540,11 +1536,11 @@ mod tests {
     fn to_config_carries_the_current_default_for_new_games() {
         let mut state = SettingsState::from_config(&Config::default());
 
-        state.set_default_for_new_games(PresetKind::HalfLeft);
+        state.set_default_for_new_games(PresetKind::Custom);
 
         let config = state.to_config();
 
-        assert_eq!(config.presets.default_for_new_games, PresetKind::HalfLeft);
+        assert_eq!(config.presets.default_for_new_games, PresetKind::Custom);
     }
 
     #[test]
@@ -1745,8 +1741,6 @@ mod tests {
     fn preset_label_renders_human_readable_names_instead_of_debug_formatting() {
         assert_eq!(preset_label(&Preset::Left { depth_percent: 40 }), "Left (40%)");
         assert_eq!(preset_label(&Preset::Right { depth_percent: 60 }), "Right (60%)");
-        assert_eq!(preset_label(&Preset::HalfLeft), "Half Left");
-        assert_eq!(preset_label(&Preset::HalfRight), "Half Right");
         assert_eq!(
             preset_label(&Preset::Custom { x: 10, y: 20, width: 300, height: 400 }),
             "Custom (10, 20, 300x400)"
@@ -1757,8 +1751,6 @@ mod tests {
     fn preset_kind_label_renders_human_readable_names_for_every_kind() {
         assert_eq!(preset_kind_label(PresetKind::Left), "Left");
         assert_eq!(preset_kind_label(PresetKind::Right), "Right");
-        assert_eq!(preset_kind_label(PresetKind::HalfLeft), "Half Left");
-        assert_eq!(preset_kind_label(PresetKind::HalfRight), "Half Right");
         assert_eq!(preset_kind_label(PresetKind::Custom), "Custom");
     }
 
@@ -1801,33 +1793,27 @@ mod tests {
     }
 
     #[test]
-    fn preset_thumbnails_lists_only_the_four_base_presets_when_no_custom_is_set() {
+    fn preset_thumbnails_lists_only_the_two_base_presets_when_no_custom_is_set() {
         let state = SettingsState::from_config(&Config::default());
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 4);
+        assert_eq!(thumbnails.len(), 2);
         assert_eq!(thumbnails[0].label, preset_label(&Preset::Left { depth_percent: state.left_depth_percent }));
         assert_eq!(thumbnails[1].label, preset_label(&Preset::Right { depth_percent: state.right_depth_percent }));
-        assert_eq!(thumbnails[2].label, "Half Left");
-        assert_eq!(thumbnails[3].label, "Half Right");
     }
 
     #[test]
     fn preset_thumbnails_marks_only_the_current_default_for_new_games_thumbnail_as_default() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.default_for_new_games = PresetKind::HalfLeft;
+        state.default_for_new_games = PresetKind::Right;
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
         assert_eq!(thumbnails[0].kind, PresetKind::Left);
         assert_eq!(thumbnails[1].kind, PresetKind::Right);
-        assert_eq!(thumbnails[2].kind, PresetKind::HalfLeft);
-        assert_eq!(thumbnails[3].kind, PresetKind::HalfRight);
         assert!(!thumbnails[0].is_default);
-        assert!(!thumbnails[1].is_default);
-        assert!(thumbnails[2].is_default, "Half Left is the current default and must be marked as such");
-        assert!(!thumbnails[3].is_default);
+        assert!(thumbnails[1].is_default, "Right is the current default and must be marked as such");
     }
 
     #[test]
@@ -1837,8 +1823,8 @@ mod tests {
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 5);
-        assert_eq!(thumbnails[4].label, "Custom (10, 10, 200x100)");
+        assert_eq!(thumbnails.len(), 3);
+        assert_eq!(thumbnails[2].label, "Custom (10, 10, 200x100)");
     }
 
     #[test]
@@ -1853,8 +1839,8 @@ mod tests {
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 5, "an unresolvable preset must still be represented, not dropped");
-        let custom_thumbnail = &thumbnails[4];
+        assert_eq!(thumbnails.len(), 3, "an unresolvable preset must still be represented, not dropped");
+        let custom_thumbnail = &thumbnails[2];
         assert_eq!(custom_thumbnail.label, "Custom (5000, 5000, 200x100)");
         assert_eq!(custom_thumbnail.region, None, "an unresolvable preset has no drawable region");
         assert!(custom_thumbnail.error.is_some(), "an unresolvable preset must surface an error");
