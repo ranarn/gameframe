@@ -29,6 +29,17 @@
 //! foreground window, but only if that game's `auto_apply` flag is on (see
 //! [`resolve_auto_apply`]).
 //!
+//! Issue #43 adds automatic taskbar restore, with no hotkey press required:
+//! every apply-path call site above that hides the taskbar for a specific
+//! window now arms [`win32::set_taskbar_hide_absolute_armed`]'s remembered
+//! restore for that window (see `win32::ARMED_TASKBAR_RESTORE`'s doc
+//! comment). [`crate::launch_watcher`] registers a second `SetWinEventHook`
+//! scoped to `EVENT_OBJECT_DESTROY` and restores the taskbar automatically
+//! when the armed window closes; [`run`] additionally checks the same armed
+//! state and restores it before returning, covering the case where the
+//! user quits GameFrame via the tray "Exit" item while a hide is still in
+//! effect.
+//!
 //! The message loop itself ([`run`]) is OS-facing (pumps real Win32
 //! messages) and is not exercised by this crate's automated tests, for
 //! the same reason [`crate::tray_ui::Tray::new`] isn't: it needs a live
@@ -59,9 +70,31 @@ pub fn run() -> Result<(), TrayUiError> {
     // happen on this thread, before that loop starts.
     let launch_watcher_hook = launch_watcher::register(&config_dir);
 
+    // Issue #43: a second, separate hook scoped to exactly
+    // `EVENT_OBJECT_DESTROY`, rather than widening the foreground-change
+    // hook's event range -- see `crate::launch_watcher`'s module docs for
+    // why. Registered on this same thread for the same reason as
+    // `launch_watcher_hook` above.
+    let taskbar_restore_watcher_hook = launch_watcher::register_taskbar_restore_watcher();
+
     run_event_loop(&tray, hotkeys, &config_dir);
 
+    // Issue #43: if a preset-apply's taskbar hide is still armed when the
+    // user quits via the tray "Exit" item, restore it now -- before `tray`
+    // is dropped below (which just removes the tray icon; it has no bearing
+    // on the taskbar) and before the process actually exits, so the desktop
+    // is never left with the taskbar hidden and no running GameFrame
+    // instance left to bring it back.
+    if let Some(restore) = win32::take_any_armed_taskbar_restore() {
+        if let Err(e) = win32::restore_taskbar(restore) {
+            eprintln!("failed to restore taskbar on exit: {e}");
+        }
+    }
+
     if let Some(hook) = launch_watcher_hook {
+        launch_watcher::unregister(hook);
+    }
+    if let Some(hook) = taskbar_restore_watcher_hook {
         launch_watcher::unregister(hook);
     }
 
@@ -520,9 +553,15 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // of it coming back, for the common `taskbar_autohide: true` default
     // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
     // about the strip/apply action, not the restore/undo action.
+    //
+    // Uses `set_taskbar_hide_absolute_armed` rather than the plain
+    // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
+    // later automatically restores the taskbar with no hotkey press
+    // required. `fg_hwnd` is guaranteed `Some` here: `tracked` was only
+    // resolved (in the strip direction) from `fg_hwnd` itself above.
     if !is_restoring {
-        if let Some((tracked_game, _)) = &tracked {
-            if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
+        if let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd) {
+            if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
                 eprintln!("borderless toggle: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
             }
         }
@@ -614,7 +653,10 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
+    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
+    // automatically restores the taskbar with no hotkey press required.
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(target_hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("apply to window: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
@@ -677,7 +719,10 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
+    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
+    // automatically restores the taskbar with no hotkey press required.
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
