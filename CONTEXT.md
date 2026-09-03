@@ -44,6 +44,9 @@ A per-tracked-game setting: whether this game's active preset should be applied 
 **Per-game taskbar auto-hide**:
 A per-tracked-game setting: whether applying this game's active preset should also hide the Windows taskbar. Defaults to on for a newly-added tracked game. Distinct from the manual, global taskbar auto-hide toggle, which is unrelated to any tracked game.
 
+**Taskbar hide mode**:
+A global setting (`TaskbarHideMode`, config field `taskbar_hide_mode`) choosing *which technique* is used whenever the taskbar is hidden: **FullyHidden** (the default — the taskbar stays hidden with no hover-reveal, via `ShowWindow`) or **HoverReveal** (Windows' native auto-hide, which reappears on mouse hover near the screen edge, via the appbar auto-hide mechanism). This is a third axis, orthogonal to both **Per-game taskbar auto-hide** and the manual global taskbar auto-hide toggle — both of those decide *whether* the taskbar gets hidden; this setting decides *how* it's hidden once that decision is made.
+
 ## Relationships
 
 - The preset set holds exactly one of each **base preset** (**Left**, **Right**) plus at most one **Custom preset** — not a free-form list.

@@ -18,7 +18,7 @@
 //!   real desktop session.
 
 use crate::profile_store::{
-    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TrackedGame,
+    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TaskbarHideMode, TrackedGame,
 };
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
@@ -80,6 +80,12 @@ pub struct SettingsState {
     /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
     /// entries are added.
     pub tracked_games: Vec<TrackedGame>,
+    /// Which technique GameFrame uses to hide the taskbar whenever any call
+    /// site hides it (issue #42) -- `FullyHidden` (new default, no
+    /// hover-reveal) or `HoverReveal` (today's pre-#42 native
+    /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
+    /// the global hotkeys in the Settings window.
+    pub taskbar_hide_mode: TaskbarHideMode,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -105,6 +111,7 @@ impl SettingsState {
             unsupported_key_pressed: false,
             duplicate_hotkey_error: None,
             tracked_games: config.tracked_games.clone(),
+            taskbar_hide_mode: config.taskbar_hide_mode,
         }
     }
 
@@ -129,6 +136,7 @@ impl SettingsState {
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
             },
             tracked_games: self.tracked_games.clone(),
+            taskbar_hide_mode: self.taskbar_hide_mode,
         }
     }
 
@@ -387,7 +395,12 @@ fn live_apply_failure_message(display_name: &str) -> String {
 /// crate's automated tests, per this crate's established convention;
 /// [`live_apply_failure_message`] above is the pure decision this delegates
 /// to for its one testable piece (the message text).
-fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &MonitorGeometry) -> Option<String> {
+fn live_reapply_tracked_game(
+    game: &TrackedGame,
+    preset: &Preset,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Option<String> {
     // Not-running must always short-circuit before region resolution is even
     // attempted: a saved Custom zone that no longer fits the current monitor
     // would otherwise surface a spurious failure message for a game that was
@@ -402,7 +415,7 @@ fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &Moni
         }
     };
 
-    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, region) {
+    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, taskbar_hide_mode, region) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
             eprintln!("live re-apply failed for {}: {e}", game.display_name);
@@ -421,11 +434,16 @@ fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &Moni
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
-fn live_reapply_single_game(game: &TrackedGame, presets: &Presets, monitor: &MonitorGeometry) -> Vec<String> {
+fn live_reapply_single_game(
+    game: &TrackedGame,
+    presets: &Presets,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Vec<String> {
     let Some(preset) = presets.resolve(game.preset) else {
         return Vec::new();
     };
-    live_reapply_tracked_game(game, &preset, monitor).into_iter().collect()
+    live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode).into_iter().collect()
 }
 
 /// Issue #33's trigger 2/3 (a base preset's depth slider settling, or a
@@ -444,11 +462,17 @@ fn live_reapply_single_game(game: &TrackedGame, presets: &Presets, monitor: &Mon
 /// docs; [`profile_store::tracked_games_using_preset`] (the cascade
 /// selection) is the pure decision this delegates to, and is what's actually
 /// unit tested.
-fn live_reapply_cascade(games: &[&TrackedGame], presets: &Presets, kind: PresetKind, monitor: &MonitorGeometry) -> Vec<String> {
+fn live_reapply_cascade(
+    games: &[&TrackedGame],
+    presets: &Presets,
+    kind: PresetKind,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Vec<String> {
     let Some(preset) = presets.resolve(kind) else {
         return Vec::new();
     };
-    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor)).collect()
+    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode)).collect()
 }
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
@@ -920,13 +944,22 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 // to open the overlay is not itself a commit, so whatever
                 // status messages were already showing must survive it.
                 status_messages = latest_status_messages;
-                match zone_overlay::run_zone_editor_overlay(latest_state.custom, PinnedEdges::NONE) {
+                match zone_overlay::run_zone_editor_overlay(
+                    latest_state.custom,
+                    PinnedEdges::NONE,
+                    latest_state.taskbar_hide_mode,
+                ) {
                     Ok(Some(zone)) => {
                         latest_state.set_custom_preset(zone);
                         let affected =
                             profile_store::tracked_games_using_preset(&latest_state.tracked_games, PresetKind::Custom);
-                        status_messages =
-                            live_reapply_cascade(&affected, &latest_state.to_presets(), PresetKind::Custom, &monitor);
+                        status_messages = live_reapply_cascade(
+                            &affected,
+                            &latest_state.to_presets(),
+                            PresetKind::Custom,
+                            &monitor,
+                            latest_state.taskbar_hide_mode,
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
@@ -1162,7 +1195,8 @@ impl SettingsApp {
         }
 
         if let Some(game) = committed_single_game {
-            self.pending_status_messages = live_reapply_single_game(&game, &presets, &monitor);
+            self.pending_status_messages =
+                live_reapply_single_game(&game, &presets, &monitor, self.state.taskbar_hide_mode);
         }
     }
 
@@ -1333,7 +1367,8 @@ impl eframe::App for SettingsApp {
             if left_depth_response.drag_stopped() {
                 let presets = self.state.to_presets();
                 let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Left);
-                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor);
+                self.pending_status_messages =
+                    live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor, self.state.taskbar_hide_mode);
             }
             ui.label("Right depth from edge:");
             let right_depth_response = ui.add(egui::Slider::new(
@@ -1343,7 +1378,8 @@ impl eframe::App for SettingsApp {
             if right_depth_response.drag_stopped() {
                 let presets = self.state.to_presets();
                 let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Right);
-                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor);
+                self.pending_status_messages =
+                    live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor, self.state.taskbar_hide_mode);
             }
 
             ui.separator();
@@ -1381,6 +1417,19 @@ impl eframe::App for SettingsApp {
             // one-frame window where physical Ctrl+Escape still reaches
             // Windows' Start-menu shortcut (issue #40 MEDIUM review finding).
             self.sync_keyboard_hook();
+
+            ui.separator();
+            ui.heading("Taskbar hiding");
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::FullyHidden,
+                "Fully hidden (no hover-reveal)",
+            );
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::HoverReveal,
+                "Hover to reveal (classic Windows behavior)",
+            );
 
             ui.separator();
             ui.heading("Games");
@@ -1509,6 +1558,7 @@ mod tests {
         assert_eq!(state.custom, None);
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "");
+        assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
     }
 
     #[test]
@@ -1525,6 +1575,7 @@ mod tests {
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
             tracked_games: Vec::new(),
+            taskbar_hide_mode: TaskbarHideMode::HoverReveal,
         };
 
         let state = SettingsState::from_config(&config);
@@ -1535,6 +1586,17 @@ mod tests {
         assert_eq!(state.default_for_new_games, PresetKind::Custom);
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
+        assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
+    }
+
+    #[test]
+    fn to_config_round_trips_the_taskbar_hide_mode() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.taskbar_hide_mode = TaskbarHideMode::HoverReveal;
+
+        let config = state.to_config();
+
+        assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
     }
 
     #[test]

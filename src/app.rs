@@ -5,10 +5,12 @@
 //! window ([`crate::settings_ui`]), a press of the bound borderless hotkey
 //! ([`crate::hotkeys`]) to stripping/restoring the foreground window's
 //! border via [`crate::win32`], and a press of the bound taskbar-autohide
-//! hotkey to toggling taskbar auto-hide via [`crate::win32`]. The two
-//! hotkey mechanics are fully independent -- each keeps its own toggle
-//! state (`toggle_state` / `taskbar_autohide_state` below), so either can be
-//! pressed without the other having been used first. A click on one of the
+//! hotkey to toggling the taskbar hidden/visible (mode-aware as of issue
+//! #42 -- see [`crate::profile_store::TaskbarHideMode`]) via
+//! [`crate::win32`]. The two hotkey mechanics are fully independent -- each
+//! keeps its own toggle state (`toggle_state` / `taskbar_hide_state`
+//! below), so either can be pressed without the other having been used
+//! first. A click on one of the
 //! "Apply to Window" submenu's dynamically-listed windows (recognized via
 //! [`tray_ui::decode_window_item_id`], distinct from the three fixed
 //! top-level menu items) resolves that window's owning process against the
@@ -38,7 +40,7 @@ use crate::profile_store;
 use crate::region_calc::{resolve_region, Region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
-use crate::win32::{self, RestoreState, TaskbarAutohideState};
+use crate::win32::{self, RestoreState};
 use crate::window_filter;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
@@ -118,10 +120,13 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
 
     // Remembers the taskbar auto-hide toggle's on/off state across presses
     // of its own hotkey -- fully independent of `toggle_state` above (see
-    // `win32::TaskbarAutohideState`'s doc comment): neither toggle reads or
+    // `win32::TaskbarHideRestore`'s doc comment): neither toggle reads or
     // writes the other's state, so either hotkey works whether or not the
-    // other has been pressed yet in this session.
-    let mut taskbar_autohide_state = TaskbarAutohideState::default();
+    // other has been pressed yet in this session. `None` means the taskbar
+    // is currently visible; `Some(restore)` means the last press hid it and
+    // records which technique was used, so the next press restores it
+    // correctly even if `taskbar_hide_mode` changed in between.
+    let mut taskbar_hide_state: Option<win32::TaskbarHideRestore> = None;
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
@@ -244,7 +249,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     }
                 }
                 Some(HotkeyAction::ToggleTaskbarAutohide) => {
-                    handle_toggle_taskbar_autohide(&mut taskbar_autohide_state);
+                    handle_toggle_taskbar_autohide(config_dir, &mut taskbar_hide_state);
                 }
                 None => {}
             }
@@ -517,7 +522,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // about the strip/apply action, not the restore/undo action.
     if !is_restoring {
         if let Some((tracked_game, _)) = &tracked {
-            if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+            if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
                 eprintln!("borderless toggle: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
             }
         }
@@ -609,7 +614,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+    if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("apply to window: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
@@ -672,20 +677,40 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+    if let Err(e) = win32::set_taskbar_hide_absolute(tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips
-/// `taskbar_autohide_state` and applies it via
-/// [`win32::toggle_taskbar_autohide`]. A failure (e.g. the taskbar window
-/// couldn't be located) is logged rather than crashing, matching
-/// [`handle_toggle_borderless`]'s error-handling pattern -- unlike that
-/// mechanic, this one never needs elevation (`SHAppBarMessage` on the
-/// taskbar doesn't require it), so there's no relaunch-elevated path here.
-fn handle_toggle_taskbar_autohide(taskbar_autohide_state: &mut TaskbarAutohideState) {
-    if let Err(e) = win32::toggle_taskbar_autohide(taskbar_autohide_state) {
+/// `taskbar_hide_state` between visible (`None`) and hidden
+/// (`Some(restore)`) via [`win32::toggle_taskbar_hide`]. Per issue #42's
+/// out-of-scope note, this hotkey's own on/off toggle *concept* is
+/// unchanged from before that issue -- only its "on" direction is now
+/// mode-aware, going through whichever technique `config.taskbar_hide_mode`
+/// selects (see [`win32::TaskbarHideRestore`]'s doc comment for why the
+/// remembered state must record which technique was used, not just a flag,
+/// so a later restore is correct even if the mode setting changes in
+/// between). A failure (e.g. the taskbar window couldn't be located) is
+/// logged rather than crashing, matching [`handle_toggle_borderless`]'s
+/// error-handling pattern -- unlike that mechanic, this one never needs
+/// elevation (`SHAppBarMessage`/`ShowWindow` on the taskbar doesn't require
+/// it), so there's no relaunch-elevated path here.
+///
+/// Reloads the config from disk on every press, matching
+/// [`handle_toggle_borderless`]'s own "reload from disk on every trigger"
+/// convention -- so a mode change made via Settings since the last press is
+/// picked up immediately.
+fn handle_toggle_taskbar_autohide(config_dir: &Path, taskbar_hide_state: &mut Option<win32::TaskbarHideRestore>) {
+    let mode = match profile_store::load(config_dir) {
+        Ok(config) => config.taskbar_hide_mode,
+        Err(e) => {
+            eprintln!("taskbar auto-hide toggle: failed to load config: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = win32::toggle_taskbar_hide(taskbar_hide_state, mode) {
         eprintln!("taskbar auto-hide toggle failed: {e}");
     }
 }

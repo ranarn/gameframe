@@ -18,8 +18,9 @@ use global_hotkey::GlobalHotKeyManager;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
     ToggleBorderless,
-    /// Toggles taskbar auto-hide on/off via `SHAppBarMessage` -- see
-    /// [`crate::win32::toggle_taskbar_autohide`]. Fully independent of
+    /// Toggles the taskbar hidden/visible, using whichever technique
+    /// [`crate::profile_store::TaskbarHideMode`] currently selects -- see
+    /// [`crate::win32::toggle_taskbar_hide`]. Fully independent of
     /// [`HotkeyAction::ToggleBorderless`]'s state; either can be pressed
     /// without the other having been used first.
     ToggleTaskbarAutohide,

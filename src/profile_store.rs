@@ -241,6 +241,29 @@ pub fn tracked_games_using_preset(tracked_games: &[TrackedGame], kind: PresetKin
     tracked_games.iter().filter(|g| g.preset == kind).collect()
 }
 
+/// Which technique GameFrame uses to hide the taskbar (issue #42) -- applies
+/// wherever a call site hides the taskbar (the borderless-toggle strip
+/// direction, the tray "Apply to Window"/launch-detection apply paths, the
+/// manual taskbar-autohide-toggle hotkey, and the zone-editor overlay's
+/// force-on session), via `win32::plan_taskbar_hide`/`win32::hide_taskbar`.
+///
+/// `#[default]` is `FullyHidden` -- this issue's new default -- so
+/// `#[serde(default)]` on [`Config::taskbar_hide_mode`] resolves a config
+/// file written before this field existed to `FullyHidden` rather than
+/// erroring, mirroring [`Config::tracked_games`]'s own backward-compat
+/// pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TaskbarHideMode {
+    /// The taskbar is hidden via `ShowWindow(Shell_TrayWnd, SW_HIDE)` and
+    /// stays hidden -- no Windows-native hover-near-the-edge reveal.
+    #[default]
+    FullyHidden,
+    /// The taskbar is hidden via the native `SHAppBarMessage`/`ABS_AUTOHIDE`
+    /// mechanism -- today's pre-#42 behavior, preserved unchanged: hovering
+    /// the mouse near the screen edge reveals it.
+    HoverReveal,
+}
+
 /// GameFrame's persisted config: the preset set, the two global hotkey
 /// bindings, and the per-game tracked-games list.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -249,13 +272,21 @@ pub struct Config {
     pub hotkeys: HotkeyBindings,
     #[serde(default)]
     pub tracked_games: Vec<TrackedGame>,
+    #[serde(default)]
+    pub taskbar_hide_mode: TaskbarHideMode,
 }
 
 impl Default for Config {
     /// The starter config written on first run: default-depth Left/Right, no
-    /// Custom, both hotkeys unbound, and no tracked games yet.
+    /// Custom, both hotkeys unbound, no tracked games yet, and the taskbar
+    /// hidden fully (no hover-reveal) once a preset is applied.
     fn default() -> Self {
-        Config { presets: Presets::default(), hotkeys: HotkeyBindings::default(), tracked_games: Vec::new() }
+        Config {
+            presets: Presets::default(),
+            hotkeys: HotkeyBindings::default(),
+            tracked_games: Vec::new(),
+            taskbar_hide_mode: TaskbarHideMode::default(),
+        }
     }
 }
 
@@ -366,6 +397,7 @@ mod tests {
                 },
                 hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None },
                 tracked_games: Vec::new(),
+                taskbar_hide_mode: TaskbarHideMode::FullyHidden,
             }
         );
         assert!(config_dir.join(CONFIG_FILE_NAME).exists());
@@ -387,6 +419,7 @@ mod tests {
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
             tracked_games: Vec::new(),
+            taskbar_hide_mode: TaskbarHideMode::HoverReveal,
         };
         save(&config_dir, &written).unwrap();
 
@@ -474,6 +507,41 @@ mod tests {
         assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
         assert_eq!(config.hotkeys.toggle_taskbar_autohide, Some("Ctrl+Alt+T".to_string()));
         assert_eq!(config.tracked_games, Vec::new(), "a missing tracked_games key must default to empty, not error");
+    }
+
+    #[test]
+    fn load_of_a_config_file_missing_the_taskbar_hide_mode_key_defaults_to_fully_hidden() {
+        // Issue #42 added `taskbar_hide_mode` after `tracked_games` (#31) --
+        // a config saved between those two landing has every key except this
+        // new one. `#[serde(default)]` on `Config::taskbar_hide_mode` (which
+        // resolves via `TaskbarHideMode`'s `#[default]` variant) exists
+        // specifically so this loads as `FullyHidden` -- issue #42's new
+        // default -- rather than resetting the whole config or erroring.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let toml_missing_taskbar_hide_mode = r#"
+            [presets]
+            left_depth_percent = 40
+            right_depth_percent = 60
+            custom = { x = 10, y = 10, width = 200, height = 100 }
+
+            [hotkeys]
+            toggle_borderless = "Ctrl+Alt+B"
+            toggle_taskbar_autohide = "Ctrl+Alt+T"
+
+            tracked_games = []
+        "#;
+        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_missing_taskbar_hide_mode).unwrap();
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(config.presets.left_depth_percent, 40);
+        assert_eq!(
+            config.taskbar_hide_mode,
+            TaskbarHideMode::FullyHidden,
+            "a missing taskbar_hide_mode key must default to FullyHidden, not error"
+        );
     }
 
     #[test]

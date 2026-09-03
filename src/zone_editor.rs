@@ -8,11 +8,10 @@
 //!   `height`, all `i32`) so [`AppState::apply`]'s `Save` output plugs
 //!   directly into `Presets.custom` with no conversion step.
 //! - Drops the prototype's simulated `TaskbarState` entirely -- the real
-//!   taskbar-autohide force-on/restore-previous mechanism lives in
-//!   [`crate::win32`] (`force_taskbar_autohide_on`/`restore_taskbar_autohide`)
-//!   and is driven by the OS-facing overlay window
-//!   ([`crate::zone_overlay`]) around the editing session, not modeled as
-//!   part of this pure state machine.
+//!   mode-aware taskbar-hide/restore mechanism lives in [`crate::win32`]
+//!   (`hide_taskbar`/`restore_taskbar`) and is driven by the OS-facing
+//!   overlay window ([`crate::zone_overlay`]) around the editing session,
+//!   not modeled as part of this pure state machine.
 //!
 //! No window/OS dependency here -- fully unit tested below.
 
