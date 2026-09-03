@@ -23,6 +23,7 @@ use crate::profile_store::{
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
+use crate::keyboard_hook;
 use crate::win32;
 use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
@@ -175,7 +176,7 @@ impl SettingsState {
             return;
         };
 
-        if key == egui::Key::Escape {
+        if key == egui::Key::Escape && modifiers.is_none() {
             self.cancel_capture();
             return;
         }
@@ -211,6 +212,27 @@ impl SettingsState {
     /// [`Self::clear_hotkey`]/[`Self::clear_custom_preset`]).
     pub fn remove_tracked_game(&mut self, index: usize) {
         self.tracked_games.remove(index);
+    }
+
+    /// Completes the current capture (if any) directly with "Ctrl+Escape"
+    /// when `ctrl_escape_suppressed` is `true` -- the direct-completion path
+    /// needed because `keyboard_hook::keyboard_hook_proc` swallows the
+    /// physical Ctrl+Escape combination before it can ever arrive as a
+    /// normal `egui::Event::Key` for [`Self::handle_key_event`] to observe
+    /// (issue #40's CRITICAL review finding). A no-op when
+    /// `ctrl_escape_suppressed` is `false`, or when nothing is currently
+    /// capturing.
+    ///
+    /// Deliberately reuses [`Self::handle_key_event`]'s existing, already-
+    /// tested Ctrl+Escape formatting/duplicate-check logic rather than
+    /// duplicating it -- takes the already-polled flag as a plain `bool`
+    /// (see [`crate::keyboard_hook::take_suppressed_ctrl_escape`]) so this
+    /// stays pure and unit-testable without a real OS-level hook; only the
+    /// polling call itself is OS-facing.
+    pub fn complete_capture_with_ctrl_escape_if_suppressed(&mut self, ctrl_escape_suppressed: bool) {
+        if ctrl_escape_suppressed {
+            self.handle_key_event(egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE }, egui::Key::Escape);
+        }
     }
 
     pub fn clear_hotkey(&mut self, field: HotkeyField) {
@@ -581,10 +603,14 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
         Key::Equals => "Equal",
         Key::Backtick => "Backquote",
         Key::Comma => "Comma",
-        // Anything else (including `Escape`, handled separately as the
-        // capture-cancel key, and keys with no token in GameFrame's stored
-        // string vocabulary) is not representable -- leave the capture
-        // listening rather than complete it with an unparsable binding.
+        // `Escape` is bindable as a main key ONLY when combined with a held
+        // modifier (e.g. `Ctrl+Escape`) -- a bare, unmodified Escape press is
+        // intercepted earlier by `handle_key_event`'s cancel-capture check
+        // (see issue #40) and never reaches this function at all.
+        Key::Escape => "Escape",
+        // Anything else (keys with no token in GameFrame's stored string
+        // vocabulary) is not representable -- leave the capture listening
+        // rather than complete it with an unparsable binding.
         _ => return None,
     })
 }
@@ -681,6 +707,10 @@ fn key_to_code(key: egui::Key) -> Option<Code> {
         Key::Equals => Code::Equal,
         Key::Backtick => Code::Backquote,
         Key::Comma => Code::Comma,
+        // See `key_display_name`'s matching `Escape` arm -- only reachable
+        // here when a modifier was held (an unmodified Escape cancels the
+        // capture before `format_captured_hotkey` is ever called).
+        Key::Escape => Code::Escape,
         // Anything else has no `Code` counterpart in the vocabulary GameFrame
         // supports -- see `key_display_name`'s matching fallback.
         _ => return None,
@@ -953,6 +983,7 @@ fn run_settings_frame(
                 monitor,
                 exit: exit_for_app,
                 pending_status_messages: initial_status_messages,
+                keyboard_hook: None,
             }))
         }),
     )
@@ -995,6 +1026,14 @@ struct SettingsApp {
     /// and replaced wholesale -- not accumulated -- on each new
     /// commit-triggered attempt, per this issue's acceptance criteria.
     pending_status_messages: Vec<String>,
+    /// `Some(guard)` while `state.capturing` is `Some` (kept in sync each
+    /// frame by [`Self::sync_keyboard_hook`]) -- suppresses the physical
+    /// Ctrl+Escape combination so Windows doesn't steal it for the Start
+    /// menu while a hotkey capture is listening (issue #40). `None`
+    /// otherwise; dropping it (either via that sync, or via `SettingsApp`
+    /// itself being torn down when the Settings window closes) uninstalls
+    /// the hook, per [`keyboard_hook::KeyboardHookGuard`]'s RAII contract.
+    keyboard_hook: Option<keyboard_hook::KeyboardHookGuard>,
 }
 
 impl SettingsApp {
@@ -1214,10 +1253,56 @@ impl SettingsApp {
             self.state.set_default_for_new_games(kind);
         }
     }
+
+    /// Installs/uninstalls [`Self::keyboard_hook`] to track `state.capturing`'s
+    /// `Some`/`None` transitions: installed the moment a capture starts,
+    /// uninstalled the moment it ends for any reason (successful capture,
+    /// explicit cancel/Escape) via the guard's `Drop`. Called from
+    /// [`eframe::App::ui`] -- both once at the very top of the frame, and
+    /// again immediately after [`Self::hotkey_row`] runs (see the call site's
+    /// comment for why: closes the one-frame install gap between a "Set
+    /// hotkey" click and the hook actually going live, an issue #40 review
+    /// finding). A no-op most calls, since it only ever acts when presence
+    /// (`Option::is_some`) disagrees with `capturing`, not on every call a
+    /// capture happens to still be active.
+    ///
+    /// While a capture is active, also polls
+    /// [`keyboard_hook::take_suppressed_ctrl_escape`] and completes the
+    /// capture directly when it reports the hook just swallowed a physical
+    /// Ctrl+Escape press -- see
+    /// [`SettingsState::complete_capture_with_ctrl_escape_if_suppressed`]'s
+    /// doc comment for why that combo can never arrive as a normal
+    /// `egui::Event::Key` (issue #40's CRITICAL review finding).
+    ///
+    /// Doesn't need to separately cover the Settings window closing while
+    /// still capturing -- that path is instead covered by `keyboard_hook`
+    /// simply being a field of `SettingsApp` itself: when the window
+    /// closes, the whole struct (and this field with it) drops regardless
+    /// of what state it was left in, uninstalling the hook exactly the
+    /// same way.
+    fn sync_keyboard_hook(&mut self) {
+        if self.state.capturing.is_some() {
+            if self.keyboard_hook.is_none() {
+                self.keyboard_hook = keyboard_hook::KeyboardHookGuard::install();
+                // Known, intentional tradeoff (issue #40, not fixed -- out of
+                // scope): if `install()` returns `None` (e.g. some
+                // restricted/sandboxed environment), this branch retries
+                // every call for the rest of the capture session, since
+                // `self.keyboard_hook` stays `None`. Harmless but wasteful;
+                // would need a separate "already tried and failed" flag to
+                // avoid, not required by this issue's acceptance criteria.
+            }
+            self.state.complete_capture_with_ctrl_escape_if_suppressed(keyboard_hook::take_suppressed_ctrl_escape());
+        } else {
+            self.keyboard_hook = None;
+        }
+    }
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.sync_keyboard_hook();
+
         egui::CentralPanel::default().show(ui, |ui| {
             // Issue #33's non-blocking status line(s): zero or more messages
             // from the most recent commit-triggered live re-apply attempt.
@@ -1288,6 +1373,14 @@ impl eframe::App for SettingsApp {
             ui.heading("Global hotkeys");
             self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
             self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+            // Re-sync immediately after both hotkey rows: a "Set hotkey" click
+            // just above sets `state.capturing = Some(..)` within this same
+            // `ui()` call, but the sync at the top of this function already
+            // ran against the *old* `None` state. Without this second call the
+            // hook wouldn't install until the following frame, leaving a
+            // one-frame window where physical Ctrl+Escape still reaches
+            // Windows' Start-menu shortcut (issue #40 MEDIUM review finding).
+            self.sync_keyboard_hook();
 
             ui.separator();
             ui.heading("Games");
@@ -1605,6 +1698,54 @@ mod tests {
         state.handle_key_event(egui::Modifiers::NONE, egui::Key::Escape);
 
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_records_the_combo_when_the_hook_swallowed_it() {
+        // Mirrors `keyboard_hook::keyboard_hook_proc`'s CRITICAL fix: the hook
+        // swallows the physical Ctrl+Escape press before it can ever arrive as
+        // an `egui::Event::Key`, so this is the only path that can complete
+        // the capture for that specific combo.
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(true);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Escape");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_the_hook_did_not_swallow_anything() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(false);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleBorderless));
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_nothing_is_capturing() {
+        let mut state = SettingsState::from_config(&Config::default());
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(true);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn handle_key_event_with_ctrl_escape_records_the_combo_instead_of_cancelling() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        state.handle_key_event(modifiers, egui::Key::Escape);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Escape");
         assert_eq!(state.capturing, None);
     }
 
