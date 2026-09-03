@@ -5,10 +5,12 @@
 //! window ([`crate::settings_ui`]), a press of the bound borderless hotkey
 //! ([`crate::hotkeys`]) to stripping/restoring the foreground window's
 //! border via [`crate::win32`], and a press of the bound taskbar-autohide
-//! hotkey to toggling taskbar auto-hide via [`crate::win32`]. The two
-//! hotkey mechanics are fully independent -- each keeps its own toggle
-//! state (`toggle_state` / `taskbar_autohide_state` below), so either can be
-//! pressed without the other having been used first. A click on one of the
+//! hotkey to toggling the taskbar hidden/visible (mode-aware as of issue
+//! #42 -- see [`crate::profile_store::TaskbarHideMode`]) via
+//! [`crate::win32`]. The two hotkey mechanics are fully independent -- each
+//! keeps its own toggle state (`toggle_state` / `taskbar_hide_state`
+//! below), so either can be pressed without the other having been used
+//! first. A click on one of the
 //! "Apply to Window" submenu's dynamically-listed windows (recognized via
 //! [`tray_ui::decode_window_item_id`], distinct from the three fixed
 //! top-level menu items) resolves that window's owning process against the
@@ -27,6 +29,17 @@
 //! foreground window, but only if that game's `auto_apply` flag is on (see
 //! [`resolve_auto_apply`]).
 //!
+//! Issue #43 adds automatic taskbar restore, with no hotkey press required:
+//! every apply-path call site above that hides the taskbar for a specific
+//! window now arms [`win32::set_taskbar_hide_absolute_armed`]'s remembered
+//! restore for that window (see `win32::ARMED_TASKBAR_RESTORE`'s doc
+//! comment). [`crate::launch_watcher`] registers a second `SetWinEventHook`
+//! scoped to `EVENT_OBJECT_DESTROY` and restores the taskbar automatically
+//! when the armed window closes; [`run`] additionally checks the same armed
+//! state and restores it before returning, covering the case where the
+//! user quits GameFrame via the tray "Exit" item while a hide is still in
+//! effect.
+//!
 //! The message loop itself ([`run`]) is OS-facing (pumps real Win32
 //! messages) and is not exercised by this crate's automated tests, for
 //! the same reason [`crate::tray_ui::Tray::new`] isn't: it needs a live
@@ -38,7 +51,7 @@ use crate::profile_store;
 use crate::region_calc::{resolve_region, Region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
-use crate::win32::{self, RestoreState, TaskbarAutohideState};
+use crate::win32::{self, RestoreState};
 use crate::window_filter;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
@@ -57,9 +70,31 @@ pub fn run() -> Result<(), TrayUiError> {
     // happen on this thread, before that loop starts.
     let launch_watcher_hook = launch_watcher::register(&config_dir);
 
+    // Issue #43: a second, separate hook scoped to exactly
+    // `EVENT_OBJECT_DESTROY`, rather than widening the foreground-change
+    // hook's event range -- see `crate::launch_watcher`'s module docs for
+    // why. Registered on this same thread for the same reason as
+    // `launch_watcher_hook` above.
+    let taskbar_restore_watcher_hook = launch_watcher::register_taskbar_restore_watcher();
+
     run_event_loop(&tray, hotkeys, &config_dir);
 
+    // Issue #43: if a preset-apply's taskbar hide is still armed when the
+    // user quits via the tray "Exit" item, restore it now -- before `tray`
+    // is dropped below (which just removes the tray icon; it has no bearing
+    // on the taskbar) and before the process actually exits, so the desktop
+    // is never left with the taskbar hidden and no running GameFrame
+    // instance left to bring it back.
+    if let Some(restore) = win32::take_any_armed_taskbar_restore() {
+        if let Err(e) = win32::restore_taskbar(restore) {
+            eprintln!("failed to restore taskbar on exit: {e}");
+        }
+    }
+
     if let Some(hook) = launch_watcher_hook {
+        launch_watcher::unregister(hook);
+    }
+    if let Some(hook) = taskbar_restore_watcher_hook {
         launch_watcher::unregister(hook);
     }
 
@@ -118,10 +153,13 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
 
     // Remembers the taskbar auto-hide toggle's on/off state across presses
     // of its own hotkey -- fully independent of `toggle_state` above (see
-    // `win32::TaskbarAutohideState`'s doc comment): neither toggle reads or
+    // `win32::TaskbarHideRestore`'s doc comment): neither toggle reads or
     // writes the other's state, so either hotkey works whether or not the
-    // other has been pressed yet in this session.
-    let mut taskbar_autohide_state = TaskbarAutohideState::default();
+    // other has been pressed yet in this session. `None` means the taskbar
+    // is currently visible; `Some(restore)` means the last press hid it and
+    // records which technique was used, so the next press restores it
+    // correctly even if `taskbar_hide_mode` changed in between.
+    let mut taskbar_hide_state: Option<win32::TaskbarHideRestore> = None;
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
@@ -244,7 +282,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     }
                 }
                 Some(HotkeyAction::ToggleTaskbarAutohide) => {
-                    handle_toggle_taskbar_autohide(&mut taskbar_autohide_state);
+                    handle_toggle_taskbar_autohide(config_dir, &mut taskbar_hide_state);
                 }
                 None => {}
             }
@@ -515,9 +553,15 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // of it coming back, for the common `taskbar_autohide: true` default
     // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
     // about the strip/apply action, not the restore/undo action.
+    //
+    // Uses `set_taskbar_hide_absolute_armed` rather than the plain
+    // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
+    // later automatically restores the taskbar with no hotkey press
+    // required. `fg_hwnd` is guaranteed `Some` here: `tracked` was only
+    // resolved (in the strip direction) from `fg_hwnd` itself above.
     if !is_restoring {
-        if let Some((tracked_game, _)) = &tracked {
-            if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+        if let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd) {
+            if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
                 eprintln!("borderless toggle: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
             }
         }
@@ -529,7 +573,8 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// Reacts to a click on one of the "Apply to Window" submenu's
 /// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
 /// `target_hwnd`'s owning process's executable path, looks it up (or adds it,
-/// with this issue's new-tracked-game defaults -- preset `Right`, auto-apply
+/// with the current `Presets::default_for_new_games` preset -- see
+/// `CONTEXT.md`'s "Default preset (for new tracked games)" -- auto-apply
 /// on, taskbar-auto-hide on) in the tracked-games list via
 /// [`profile_store::upsert_tracked_game`], persists that list update
 /// immediately (even if a later step below fails), then applies the
@@ -572,7 +617,12 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     };
 
     let display_name = win32::window_text(target_hwnd);
-    let index = profile_store::upsert_tracked_game(&mut config.tracked_games, exe_path, display_name);
+    let index = profile_store::upsert_tracked_game(
+        &mut config.tracked_games,
+        exe_path,
+        display_name,
+        config.presets.default_for_new_games,
+    );
     let tracked_game = config.tracked_games[index].clone();
 
     // Persist the (possibly newly-added) tracked game immediately, before
@@ -603,7 +653,10 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
+    // automatically restores the taskbar with no hotkey press required.
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(target_hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("apply to window: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
@@ -666,20 +719,43 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         return;
     }
 
-    if let Err(e) = win32::set_taskbar_autohide_absolute(tracked_game.taskbar_autohide) {
+    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
+    // automatically restores the taskbar with no hotkey press required.
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
     }
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips
-/// `taskbar_autohide_state` and applies it via
-/// [`win32::toggle_taskbar_autohide`]. A failure (e.g. the taskbar window
-/// couldn't be located) is logged rather than crashing, matching
-/// [`handle_toggle_borderless`]'s error-handling pattern -- unlike that
-/// mechanic, this one never needs elevation (`SHAppBarMessage` on the
-/// taskbar doesn't require it), so there's no relaunch-elevated path here.
-fn handle_toggle_taskbar_autohide(taskbar_autohide_state: &mut TaskbarAutohideState) {
-    if let Err(e) = win32::toggle_taskbar_autohide(taskbar_autohide_state) {
+/// `taskbar_hide_state` between visible (`None`) and hidden
+/// (`Some(restore)`) via [`win32::toggle_taskbar_hide`]. Per issue #42's
+/// out-of-scope note, this hotkey's own on/off toggle *concept* is
+/// unchanged from before that issue -- only its "on" direction is now
+/// mode-aware, going through whichever technique `config.taskbar_hide_mode`
+/// selects (see [`win32::TaskbarHideRestore`]'s doc comment for why the
+/// remembered state must record which technique was used, not just a flag,
+/// so a later restore is correct even if the mode setting changes in
+/// between). A failure (e.g. the taskbar window couldn't be located) is
+/// logged rather than crashing, matching [`handle_toggle_borderless`]'s
+/// error-handling pattern -- unlike that mechanic, this one never needs
+/// elevation (`SHAppBarMessage`/`ShowWindow` on the taskbar doesn't require
+/// it), so there's no relaunch-elevated path here.
+///
+/// Reloads the config from disk on every press, matching
+/// [`handle_toggle_borderless`]'s own "reload from disk on every trigger"
+/// convention -- so a mode change made via Settings since the last press is
+/// picked up immediately.
+fn handle_toggle_taskbar_autohide(config_dir: &Path, taskbar_hide_state: &mut Option<win32::TaskbarHideRestore>) {
+    let mode = match profile_store::load(config_dir) {
+        Ok(config) => config.taskbar_hide_mode,
+        Err(e) => {
+            eprintln!("taskbar auto-hide toggle: failed to load config: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = win32::toggle_taskbar_hide(taskbar_hide_state, mode) {
         eprintln!("taskbar auto-hide toggle failed: {e}");
     }
 }
@@ -777,7 +853,11 @@ mod tests {
     fn resolve_tracked_apply_resolves_a_tracked_games_assigned_preset() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        config.tracked_games.push(TrackedGame::new_default(exe_path.clone(), "Thing".to_string()));
+        config.tracked_games.push(TrackedGame::new_default(
+            exe_path.clone(),
+            "Thing".to_string(),
+            config.presets.default_for_new_games,
+        ));
 
         let (game, preset) = resolve_tracked_apply(&config, &exe_path).expect("expected a tracked game match");
 
@@ -789,7 +869,7 @@ mod tests {
     fn resolve_auto_apply_resolves_when_matched_and_auto_apply_is_on() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         assert!(game.auto_apply);
         config.tracked_games.push(game);
 
@@ -803,7 +883,8 @@ mod tests {
     fn resolve_auto_apply_returns_none_when_auto_apply_is_off() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.auto_apply = false;
         config.tracked_games.push(game);
 
@@ -825,7 +906,8 @@ mod tests {
     fn resolve_auto_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.preset = PresetKind::Custom;
         assert!(game.auto_apply);
         config.tracked_games.push(game);
@@ -843,7 +925,8 @@ mod tests {
         // not a silent fallback to a different preset.
         let mut config = Config::default();
         let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        let mut game =
+            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
         game.preset = PresetKind::Custom;
         config.tracked_games.push(game);
         assert_eq!(config.presets.custom, None);

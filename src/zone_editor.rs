@@ -8,11 +8,10 @@
 //!   `height`, all `i32`) so [`AppState::apply`]'s `Save` output plugs
 //!   directly into `Presets.custom` with no conversion step.
 //! - Drops the prototype's simulated `TaskbarState` entirely -- the real
-//!   taskbar-autohide force-on/restore-previous mechanism lives in
-//!   [`crate::win32`] (`force_taskbar_autohide_on`/`restore_taskbar_autohide`)
-//!   and is driven by the OS-facing overlay window
-//!   ([`crate::zone_overlay`]) around the editing session, not modeled as
-//!   part of this pure state machine.
+//!   mode-aware taskbar-hide/restore mechanism lives in [`crate::win32`]
+//!   (`hide_taskbar`/`restore_taskbar`) and is driven by the OS-facing
+//!   overlay window ([`crate::zone_overlay`]) around the editing session,
+//!   not modeled as part of this pure state machine.
 //!
 //! No window/OS dependency here -- fully unit tested below.
 
@@ -129,7 +128,11 @@ pub enum SessionOutcome {
 impl AppState {
     /// Starts a fresh editing session with nothing drawn yet.
     pub fn new(monitor: Monitor) -> Self {
-        Self { monitor, editor: EditorState::Empty, last_message: "ready".to_string() }
+        Self {
+            monitor,
+            editor: EditorState::Empty,
+            last_message: "Click and drag to draw a zone".to_string(),
+        }
     }
 
     /// Starts an editing session pre-loaded with an existing zone (e.g. the
@@ -298,6 +301,12 @@ mod tests {
     fn new_state_machine_starts_empty() {
         let state = AppState::new(monitor());
         assert_eq!(state.editor, EditorState::Empty);
+    }
+
+    #[test]
+    fn new_state_shows_draw_instruction_before_any_drag_starts() {
+        let state = AppState::new(monitor());
+        assert_eq!(state.last_message, "Click and drag to draw a zone");
     }
 
     #[test]

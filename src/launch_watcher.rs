@@ -63,12 +63,49 @@
 //! delegates to ([`crate::app::resolve_auto_apply`], via
 //! [`crate::app::handle_auto_apply_launch`]) is the pure, unit-tested part
 //! -- see that function's own doc comment and tests in `crate::app::tests`.
+//!
+//! # Taskbar auto-restore on window close (issue #43)
+//!
+//! [`register_taskbar_restore_watcher`] registers a **second**,
+//! independent `SetWinEventHook` scoped to exactly `EVENT_OBJECT_DESTROY`,
+//! rather than widening [`register`]'s existing `EVENT_SYSTEM_FOREGROUND`
+//! hook's event range to also cover it: `EVENT_OBJECT_DESTROY` (`0x8001`)
+//! sits far away from `EVENT_SYSTEM_FOREGROUND` (`0x0003`) in the WinEvent
+//! constant space, and `SetWinEventHook`'s `eventMin`/`eventMax` pair
+//! delivers every event *in that whole numeric range*, not just the two
+//! endpoints -- widening would flood the callback with a large number of
+//! unrelated events it would then have to filter, extra dispatch overhead
+//! this feature's own acceptance criteria explicitly rule out ("no
+//! measurable added CPU cost" for an unrelated window closing). A second,
+//! narrowly-scoped hook (mirroring [`register`]'s own single-event
+//! `hEventMin == hEventMax` range) avoids that entirely.
+//!
+//! Unlike `EVENT_SYSTEM_FOREGROUND` (already scoped to real top-level
+//! windows per [`win_event_callback`]'s own doc comment),
+//! `EVENT_OBJECT_DESTROY` fires for many kinds of UI objects being
+//! destroyed, not just top-level windows -- per the constant's documented
+//! semantics, [`window_destroy_callback`] additionally checks `idObject ==
+//! OBJID_WINDOW` and `idChild == CHILDID_SELF`, the standard filter for "a
+//! real top-level window itself was destroyed" (as opposed to one of its
+//! child UI objects).
+//!
+//! The callback delegates the actual "does this closed window match
+//! whatever's currently armed" decision, and the restore itself, to
+//! [`crate::win32::take_armed_taskbar_restore_for_window`]/
+//! [`crate::win32::restore_taskbar`] -- see those functions' doc comments,
+//! and `crate::win32`'s private `ARMED_TASKBAR_RESTORE` static, for the
+//! armed-state design (including why an unrelated window's destroy event
+//! is a cheap
+//! no-op: a mutex lock plus one pointer comparison, no OS call at all,
+//! unless a restore is actually due).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows_sys::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+};
 
 /// The config directory the callback reloads the config from on every
 /// foreground-change event -- set once, from [`register`], before the hook
@@ -127,6 +164,91 @@ pub fn unregister(hook: HWINEVENTHOOK) {
     // in `register` and hasn't already been unhooked.
     unsafe {
         UnhookWinEvent(hook);
+    }
+}
+
+
+/// Registers the `EVENT_OBJECT_DESTROY` WinEvent hook on the calling
+/// thread -- issue #43's auto-restore-on-close watcher. Must be called
+/// before that thread enters its `GetMessageW` pump, same requirement (and
+/// same reasoning) as [`register`]; [`crate::app::run`] calls this
+/// alongside [`register`], both before [`crate::app::run_event_loop`].
+///
+/// Returns `None` if `SetWinEventHook` fails, treated as non-fatal by the
+/// caller -- same "hotkey/hook registration failure doesn't stop the app
+/// from starting" pattern as [`register`] and
+/// [`crate::app::register_hotkeys`]: GameFrame still starts, just without
+/// automatic taskbar restore on window close (the manual hotkey-restore
+/// path, and the tray-Exit check in [`crate::app::run`], remain available
+/// regardless).
+///
+/// A second, independent hook rather than widening [`register`]'s own
+/// range -- see this module's doc comment ("Taskbar auto-restore on window
+/// close") for why.
+///
+/// OS-facing: registers a real Win32 hook. Not exercised by this crate's
+/// automated tests -- see module docs.
+pub fn register_taskbar_restore_watcher() -> Option<HWINEVENTHOOK> {
+    // Safety: `window_destroy_callback` matches the required `WINEVENTPROC`
+    // signature exactly; `idProcess = 0, idThread = 0` scopes to every
+    // process/thread on the desktop, same as `register` above -- the
+    // window that will eventually close isn't known at registration time.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_DESTROY,
+            std::ptr::null_mut(),
+            Some(window_destroy_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+
+    if hook.is_null() { None } else { Some(hook) }
+}
+
+/// The real `WINEVENTPROC` Windows calls on every `EVENT_OBJECT_DESTROY`,
+/// delivered on the calling thread's message loop (see [`register_taskbar_restore_watcher`]).
+/// Filters defensively (a null `hwnd`), then requires `idobject ==
+/// OBJID_WINDOW` and `idchild == CHILDID_SELF` -- unlike
+/// `EVENT_SYSTEM_FOREGROUND` ([`win_event_callback`]'s own doc comment),
+/// `EVENT_OBJECT_DESTROY` fires for many non-top-level-window UI objects
+/// too, so this extra check is required here to scope down to "a real
+/// top-level window itself was just destroyed" (see this module's doc
+/// comment).
+///
+/// Delegates the actual armed-window match + restore to
+/// [`crate::win32::take_armed_taskbar_restore_for_window`]/
+/// [`crate::win32::restore_taskbar`] -- an unrelated window's destroy event
+/// costs one mutex lock and one pointer comparison inside that call, no
+/// real Win32 call at all, satisfying this issue's "no measurable added
+/// cost" acceptance criterion for the common case.
+///
+/// OS-facing, and the exact real-hook-delivery path this issue's
+/// acceptance criteria call out as manual-usertest-only -- not exercised by
+/// this crate's automated tests (see
+/// `crate::win32::tests`' `set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_restores_the_real_taskbar_on_a_simulated_window_close`
+/// for the closest automated equivalent: it exercises the exact same two
+/// calls this callback makes, against the real taskbar, without needing a
+/// real second window's `EVENT_OBJECT_DESTROY` to actually fire).
+unsafe extern "system" fn window_destroy_callback(
+    _hwineventhook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    idobject: i32,
+    idchild: i32,
+    _ideventthread: u32,
+    _dwmseventtime: u32,
+) {
+    if hwnd.is_null() || idobject != OBJID_WINDOW || idchild != CHILDID_SELF as i32 {
+        return;
+    }
+
+    if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
+        if let Err(e) = crate::win32::restore_taskbar(restore) {
+            eprintln!("taskbar auto-restore on window close failed: {e}");
+        }
     }
 }
 

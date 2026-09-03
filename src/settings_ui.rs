@@ -18,11 +18,12 @@
 //!   real desktop session.
 
 use crate::profile_store::{
-    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TrackedGame,
+    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TaskbarHideMode, TrackedGame,
 };
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
+use crate::keyboard_hook;
 use crate::win32;
 use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
@@ -37,9 +38,9 @@ use std::rc::Rc;
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
-/// The four base presets (`Left`, `Right`, `HalfLeft`, `HalfRight`) are
-/// always present and are never added/removed -- only `Left`/`Right`'s
-/// depth-from-edge is adjustable, edited in place. `Custom` is the single
+/// The two base presets (`Left`, `Right`) are always present and are never
+/// added/removed -- only their depth-from-edge is adjustable, edited in
+/// place. `Custom` is the single
 /// optional preset: it is set/replaced entirely by the zone-editor overlay
 /// (see [`crate::zone_overlay::run_zone_editor_overlay`]), superseding the
 /// manual X/Y/width/height numeric entry this struct carried before issue
@@ -50,6 +51,12 @@ pub struct SettingsState {
     pub left_depth_percent: u8,
     pub right_depth_percent: u8,
     pub custom: Option<CustomRegion>,
+    /// The preset kind assigned to a newly-tracked game -- see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)", kept fully
+    /// separate from a tracked game's own "Active preset": changing this
+    /// never touches any already-tracked game's existing `preset` field.
+    /// Set by clicking a thumbnail in [`SettingsApp::preset_thumbnails_row`].
+    pub default_for_new_games: PresetKind,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
     /// `Some(field)` while a press-to-bind capture is in progress for that
@@ -73,6 +80,12 @@ pub struct SettingsState {
     /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
     /// entries are added.
     pub tracked_games: Vec<TrackedGame>,
+    /// Which technique GameFrame uses to hide the taskbar whenever any call
+    /// site hides it (issue #42) -- `FullyHidden` (new default, no
+    /// hover-reveal) or `HoverReveal` (today's pre-#42 native
+    /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
+    /// the global hotkeys in the Settings window.
+    pub taskbar_hide_mode: TaskbarHideMode,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -91,12 +104,14 @@ impl SettingsState {
             left_depth_percent: config.presets.left_depth_percent,
             right_depth_percent: config.presets.right_depth_percent,
             custom: config.presets.custom,
+            default_for_new_games: config.presets.default_for_new_games,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
             capturing: None,
             unsupported_key_pressed: false,
             duplicate_hotkey_error: None,
             tracked_games: config.tracked_games.clone(),
+            taskbar_hide_mode: config.taskbar_hide_mode,
         }
     }
 
@@ -107,6 +122,7 @@ impl SettingsState {
             left_depth_percent: self.left_depth_percent,
             right_depth_percent: self.right_depth_percent,
             custom: self.custom,
+            default_for_new_games: self.default_for_new_games,
         }
     }
 
@@ -120,6 +136,7 @@ impl SettingsState {
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
             },
             tracked_games: self.tracked_games.clone(),
+            taskbar_hide_mode: self.taskbar_hide_mode,
         }
     }
 
@@ -135,6 +152,14 @@ impl SettingsState {
     /// Clears the `Custom` preset entirely (back to "none set").
     pub fn clear_custom_preset(&mut self) {
         self.custom = None;
+    }
+
+    /// Sets `kind` as the new default preset assigned to future
+    /// newly-tracked games -- see `CONTEXT.md`'s "Default preset (for new
+    /// tracked games)". Never touches any already-tracked game's existing
+    /// `preset` assignment (that's "Active preset", a separate concept).
+    pub fn set_default_for_new_games(&mut self, kind: PresetKind) {
+        self.default_for_new_games = kind;
     }
 
     pub fn start_capture(&mut self, field: HotkeyField) {
@@ -159,7 +184,7 @@ impl SettingsState {
             return;
         };
 
-        if key == egui::Key::Escape {
+        if key == egui::Key::Escape && modifiers.is_none() {
             self.cancel_capture();
             return;
         }
@@ -197,6 +222,27 @@ impl SettingsState {
         self.tracked_games.remove(index);
     }
 
+    /// Completes the current capture (if any) directly with "Ctrl+Escape"
+    /// when `ctrl_escape_suppressed` is `true` -- the direct-completion path
+    /// needed because `keyboard_hook::keyboard_hook_proc` swallows the
+    /// physical Ctrl+Escape combination before it can ever arrive as a
+    /// normal `egui::Event::Key` for [`Self::handle_key_event`] to observe
+    /// (issue #40's CRITICAL review finding). A no-op when
+    /// `ctrl_escape_suppressed` is `false`, or when nothing is currently
+    /// capturing.
+    ///
+    /// Deliberately reuses [`Self::handle_key_event`]'s existing, already-
+    /// tested Ctrl+Escape formatting/duplicate-check logic rather than
+    /// duplicating it -- takes the already-polled flag as a plain `bool`
+    /// (see [`crate::keyboard_hook::take_suppressed_ctrl_escape`]) so this
+    /// stays pure and unit-testable without a real OS-level hook; only the
+    /// polling call itself is OS-facing.
+    pub fn complete_capture_with_ctrl_escape_if_suppressed(&mut self, ctrl_escape_suppressed: bool) {
+        if ctrl_escape_suppressed {
+            self.handle_key_event(egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE }, egui::Key::Escape);
+        }
+    }
+
     pub fn clear_hotkey(&mut self, field: HotkeyField) {
         match field {
             HotkeyField::ToggleBorderless => self.toggle_borderless.clear(),
@@ -215,8 +261,6 @@ fn preset_label(preset: &Preset) -> String {
     match preset {
         Preset::Left { depth_percent } => format!("Left ({depth_percent}%)"),
         Preset::Right { depth_percent } => format!("Right ({depth_percent}%)"),
-        Preset::HalfLeft => "Half Left".to_string(),
-        Preset::HalfRight => "Half Right".to_string(),
         Preset::Custom { x, y, width, height } => {
             format!("Custom ({x}, {y}, {width}x{height})")
         }
@@ -230,8 +274,6 @@ fn preset_kind_label(kind: PresetKind) -> &'static str {
     match kind {
         PresetKind::Left => "Left",
         PresetKind::Right => "Right",
-        PresetKind::HalfLeft => "Half Left",
-        PresetKind::HalfRight => "Half Right",
         PresetKind::Custom => "Custom",
     }
 }
@@ -276,20 +318,28 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 /// normalized against `monitor` (if it resolved), and -- if resolution
 /// failed -- an error to surface instead of silently omitting the preset
 /// from the row. Only `Custom` can fail to resolve (e.g. coordinates
-/// persisted while running on a different monitor configuration); the four
+/// persisted while running on a different monitor configuration); the two
 /// base presets always resolve.
 ///
-/// No longer tracks "is this the active preset" (issue #6's MVP
-/// single-global-preset mechanism, `win32::active_preset`, was removed by
-/// issue #31's per-game preset assignment -- see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md`'s consequence
-/// note): a preset's "active" status is now per-tracked-game, not global, so
-/// it has no meaning in this shared five-preset row anymore.
+/// Also carries `kind` and `is_default` (issue #36) so the thumbnail row
+/// can wire up "click to set as the default preset for new tracked games"
+/// and highlight whichever one currently is -- a concept kept fully
+/// separate from a tracked game's own "Active preset" (see `CONTEXT.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresetThumbnail {
+    /// Which preset kind this thumbnail represents -- lets the
+    /// click handler and the default-highlight both key off a stable
+    /// reference rather than parsing `label` back apart.
+    pub kind: PresetKind,
     pub label: String,
     pub region: Option<NormalizedRegion>,
     pub error: Option<String>,
+    /// `true` only for the thumbnail matching the current
+    /// `SettingsState::default_for_new_games` (see `CONTEXT.md`'s "Default
+    /// preset (for new tracked games)") -- the row renders exactly one
+    /// thumbnail with this flag set, distinct from any other per-thumbnail
+    /// state (hover, the `error` placeholder above).
+    pub is_default: bool,
 }
 
 /// Returns why `kind` currently can't be resolved to a concrete, drawable
@@ -345,7 +395,12 @@ fn live_apply_failure_message(display_name: &str) -> String {
 /// crate's automated tests, per this crate's established convention;
 /// [`live_apply_failure_message`] above is the pure decision this delegates
 /// to for its one testable piece (the message text).
-fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &MonitorGeometry) -> Option<String> {
+fn live_reapply_tracked_game(
+    game: &TrackedGame,
+    preset: &Preset,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Option<String> {
     // Not-running must always short-circuit before region resolution is even
     // attempted: a saved Custom zone that no longer fits the current monitor
     // would otherwise surface a spurious failure message for a game that was
@@ -360,7 +415,7 @@ fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &Moni
         }
     };
 
-    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, region) {
+    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, taskbar_hide_mode, region) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
             eprintln!("live re-apply failed for {}: {e}", game.display_name);
@@ -379,11 +434,16 @@ fn live_reapply_tracked_game(game: &TrackedGame, preset: &Preset, monitor: &Moni
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
-fn live_reapply_single_game(game: &TrackedGame, presets: &Presets, monitor: &MonitorGeometry) -> Vec<String> {
+fn live_reapply_single_game(
+    game: &TrackedGame,
+    presets: &Presets,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Vec<String> {
     let Some(preset) = presets.resolve(game.preset) else {
         return Vec::new();
     };
-    live_reapply_tracked_game(game, &preset, monitor).into_iter().collect()
+    live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode).into_iter().collect()
 }
 
 /// Issue #33's trigger 2/3 (a base preset's depth slider settling, or a
@@ -402,30 +462,48 @@ fn live_reapply_single_game(game: &TrackedGame, presets: &Presets, monitor: &Mon
 /// docs; [`profile_store::tracked_games_using_preset`] (the cascade
 /// selection) is the pure decision this delegates to, and is what's actually
 /// unit tested.
-fn live_reapply_cascade(games: &[&TrackedGame], presets: &Presets, kind: PresetKind, monitor: &MonitorGeometry) -> Vec<String> {
+fn live_reapply_cascade(
+    games: &[&TrackedGame],
+    presets: &Presets,
+    kind: PresetKind,
+    monitor: &MonitorGeometry,
+    taskbar_hide_mode: TaskbarHideMode,
+) -> Vec<String> {
     let Some(preset) = presets.resolve(kind) else {
         return Vec::new();
     };
-    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor)).collect()
+    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode)).collect()
 }
 
 pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
     let presets = state.to_presets();
+    // Fixed presentation order matching `Presets::all`'s (the two base
+    // presets, then `Custom` if present) -- `zip` naturally truncates to
+    // `presets.all()`'s length when `Custom` is absent.
+    let kinds = [PresetKind::Left, PresetKind::Right, PresetKind::Custom];
 
     presets
         .all()
         .into_iter()
-        .map(|preset| match resolve_region(&preset, monitor) {
-            Ok(region) => PresetThumbnail {
-                label: preset_label(&preset),
-                region: Some(normalize_region(&region, monitor)),
-                error: None,
-            },
-            Err(e) => PresetThumbnail {
-                label: preset_label(&preset),
-                region: None,
-                error: Some(e.to_string()),
-            },
+        .zip(kinds)
+        .map(|(preset, kind)| {
+            let is_default = kind == state.default_for_new_games;
+            match resolve_region(&preset, monitor) {
+                Ok(region) => PresetThumbnail {
+                    kind,
+                    label: preset_label(&preset),
+                    region: Some(normalize_region(&region, monitor)),
+                    error: None,
+                    is_default,
+                },
+                Err(e) => PresetThumbnail {
+                    kind,
+                    label: preset_label(&preset),
+                    region: None,
+                    error: Some(e.to_string()),
+                    is_default,
+                },
+            }
         })
         .collect()
 }
@@ -549,10 +627,14 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
         Key::Equals => "Equal",
         Key::Backtick => "Backquote",
         Key::Comma => "Comma",
-        // Anything else (including `Escape`, handled separately as the
-        // capture-cancel key, and keys with no token in GameFrame's stored
-        // string vocabulary) is not representable -- leave the capture
-        // listening rather than complete it with an unparsable binding.
+        // `Escape` is bindable as a main key ONLY when combined with a held
+        // modifier (e.g. `Ctrl+Escape`) -- a bare, unmodified Escape press is
+        // intercepted earlier by `handle_key_event`'s cancel-capture check
+        // (see issue #40) and never reaches this function at all.
+        Key::Escape => "Escape",
+        // Anything else (keys with no token in GameFrame's stored string
+        // vocabulary) is not representable -- leave the capture listening
+        // rather than complete it with an unparsable binding.
         _ => return None,
     })
 }
@@ -649,6 +731,10 @@ fn key_to_code(key: egui::Key) -> Option<Code> {
         Key::Equals => Code::Equal,
         Key::Backtick => Code::Backquote,
         Key::Comma => Code::Comma,
+        // See `key_display_name`'s matching `Escape` arm -- only reachable
+        // here when a modifier was held (an unmodified Escape cancels the
+        // capture before `format_captured_hotkey` is ever called).
+        Key::Escape => Code::Escape,
         // Anything else has no `Code` counterpart in the vocabulary GameFrame
         // supports -- see `key_display_name`'s matching fallback.
         _ => return None,
@@ -858,13 +944,22 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 // to open the overlay is not itself a commit, so whatever
                 // status messages were already showing must survive it.
                 status_messages = latest_status_messages;
-                match zone_overlay::run_zone_editor_overlay(latest_state.custom, PinnedEdges::NONE) {
+                match zone_overlay::run_zone_editor_overlay(
+                    latest_state.custom,
+                    PinnedEdges::NONE,
+                    latest_state.taskbar_hide_mode,
+                ) {
                     Ok(Some(zone)) => {
                         latest_state.set_custom_preset(zone);
                         let affected =
                             profile_store::tracked_games_using_preset(&latest_state.tracked_games, PresetKind::Custom);
-                        status_messages =
-                            live_reapply_cascade(&affected, &latest_state.to_presets(), PresetKind::Custom, &monitor);
+                        status_messages = live_reapply_cascade(
+                            &affected,
+                            &latest_state.to_presets(),
+                            PresetKind::Custom,
+                            &monitor,
+                            latest_state.taskbar_hide_mode,
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
@@ -921,6 +1016,7 @@ fn run_settings_frame(
                 monitor,
                 exit: exit_for_app,
                 pending_status_messages: initial_status_messages,
+                keyboard_hook: None,
             }))
         }),
     )
@@ -963,6 +1059,14 @@ struct SettingsApp {
     /// and replaced wholesale -- not accumulated -- on each new
     /// commit-triggered attempt, per this issue's acceptance criteria.
     pending_status_messages: Vec<String>,
+    /// `Some(guard)` while `state.capturing` is `Some` (kept in sync each
+    /// frame by [`Self::sync_keyboard_hook`]) -- suppresses the physical
+    /// Ctrl+Escape combination so Windows doesn't steal it for the Start
+    /// menu while a hotkey capture is listening (issue #40). `None`
+    /// otherwise; dropping it (either via that sync, or via `SettingsApp`
+    /// itself being torn down when the Settings window closes) uninstalls
+    /// the hook, per [`keyboard_hook::KeyboardHookGuard`]'s RAII contract.
+    keyboard_hook: Option<keyboard_hook::KeyboardHookGuard>,
 }
 
 impl SettingsApp {
@@ -1017,7 +1121,7 @@ impl SettingsApp {
     }
 
     /// Renders the "Games" section: one row per tracked game with its
-    /// display name, a preset dropdown (the five [`PresetKind`] variants),
+    /// display name, a preset dropdown (the three [`PresetKind`] variants),
     /// a taskbar-auto-hide checkbox, an auto-apply checkbox, and an
     /// immediate no-confirmation "Remove" button (see
     /// [`SettingsState::remove_tracked_game`]). A row whose assigned preset
@@ -1091,27 +1195,54 @@ impl SettingsApp {
         }
 
         if let Some(game) = committed_single_game {
-            self.pending_status_messages = live_reapply_single_game(&game, &presets, &monitor);
+            self.pending_status_messages =
+                live_reapply_single_game(&game, &presets, &monitor, self.state.taskbar_hide_mode);
         }
     }
 
     /// Renders the graphical thumbnail row: one small monitor-outline
     /// rectangle per preset (from [`preset_thumbnails`]), with the resolved
     /// region highlighted inside it.
-    fn preset_thumbnails_row(&self, ui: &mut egui::Ui) {
+    ///
+    /// Each thumbnail is clickable (issue #36): clicking one sets it as the
+    /// new default preset for future newly-tracked games (see
+    /// `CONTEXT.md`'s "Default preset (for new tracked games)" -- kept
+    /// fully separate from any tracked game's own "Active preset", so this
+    /// never touches an already-tracked game's existing assignment). The
+    /// thumbnail matching the current default renders with a distinct
+    /// gold outline, layered independently of the unrelated "unresolvable
+    /// preset" red-X placeholder below so the two states never collide.
+    fn preset_thumbnails_row(&mut self, ui: &mut egui::Ui) {
         const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(84.0, 48.0);
+        const DEFAULT_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 0);
         let fill_color = egui::Color32::from_rgb(90, 170, 250);
+
+        let mut newly_clicked_default: Option<PresetKind> = None;
 
         ui.horizontal_wrapped(|ui| {
             for thumbnail in preset_thumbnails(&self.state, &self.monitor) {
                 ui.vertical(|ui| {
-                    let (outline_rect, _response) =
-                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
+                    let (outline_rect, response) =
+                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::click());
+                    if response.clicked() {
+                        newly_clicked_default = Some(thumbnail.kind);
+                    }
+                    response.on_hover_text(if thumbnail.is_default {
+                        "Default preset for newly-tracked games"
+                    } else {
+                        "Click to set as the default preset for newly-tracked games"
+                    });
+
                     let painter = ui.painter();
+                    let (outline_color, outline_width) = if thumbnail.is_default {
+                        (DEFAULT_OUTLINE_COLOR, 3.0)
+                    } else {
+                        (egui::Color32::DARK_GRAY, 1.0)
+                    };
                     painter.rect_stroke(
                         outline_rect,
                         2.0,
-                        egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        egui::Stroke::new(outline_width, outline_color),
                         egui::StrokeKind::Outside,
                     );
 
@@ -1151,11 +1282,61 @@ impl SettingsApp {
                 });
             }
         });
+
+        if let Some(kind) = newly_clicked_default {
+            self.state.set_default_for_new_games(kind);
+        }
+    }
+
+    /// Installs/uninstalls [`Self::keyboard_hook`] to track `state.capturing`'s
+    /// `Some`/`None` transitions: installed the moment a capture starts,
+    /// uninstalled the moment it ends for any reason (successful capture,
+    /// explicit cancel/Escape) via the guard's `Drop`. Called from
+    /// [`eframe::App::ui`] -- both once at the very top of the frame, and
+    /// again immediately after [`Self::hotkey_row`] runs (see the call site's
+    /// comment for why: closes the one-frame install gap between a "Set
+    /// hotkey" click and the hook actually going live, an issue #40 review
+    /// finding). A no-op most calls, since it only ever acts when presence
+    /// (`Option::is_some`) disagrees with `capturing`, not on every call a
+    /// capture happens to still be active.
+    ///
+    /// While a capture is active, also polls
+    /// [`keyboard_hook::take_suppressed_ctrl_escape`] and completes the
+    /// capture directly when it reports the hook just swallowed a physical
+    /// Ctrl+Escape press -- see
+    /// [`SettingsState::complete_capture_with_ctrl_escape_if_suppressed`]'s
+    /// doc comment for why that combo can never arrive as a normal
+    /// `egui::Event::Key` (issue #40's CRITICAL review finding).
+    ///
+    /// Doesn't need to separately cover the Settings window closing while
+    /// still capturing -- that path is instead covered by `keyboard_hook`
+    /// simply being a field of `SettingsApp` itself: when the window
+    /// closes, the whole struct (and this field with it) drops regardless
+    /// of what state it was left in, uninstalling the hook exactly the
+    /// same way.
+    fn sync_keyboard_hook(&mut self) {
+        if self.state.capturing.is_some() {
+            if self.keyboard_hook.is_none() {
+                self.keyboard_hook = keyboard_hook::KeyboardHookGuard::install();
+                // Known, intentional tradeoff (issue #40, not fixed -- out of
+                // scope): if `install()` returns `None` (e.g. some
+                // restricted/sandboxed environment), this branch retries
+                // every call for the rest of the capture session, since
+                // `self.keyboard_hook` stays `None`. Harmless but wasteful;
+                // would need a separate "already tried and failed" flag to
+                // avoid, not required by this issue's acceptance criteria.
+            }
+            self.state.complete_capture_with_ctrl_escape_if_suppressed(keyboard_hook::take_suppressed_ctrl_escape());
+        } else {
+            self.keyboard_hook = None;
+        }
     }
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.sync_keyboard_hook();
+
         egui::CentralPanel::default().show(ui, |ui| {
             // Issue #33's non-blocking status line(s): zero or more messages
             // from the most recent commit-triggered live re-apply attempt.
@@ -1186,7 +1367,8 @@ impl eframe::App for SettingsApp {
             if left_depth_response.drag_stopped() {
                 let presets = self.state.to_presets();
                 let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Left);
-                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor);
+                self.pending_status_messages =
+                    live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor, self.state.taskbar_hide_mode);
             }
             ui.label("Right depth from edge:");
             let right_depth_response = ui.add(egui::Slider::new(
@@ -1196,7 +1378,8 @@ impl eframe::App for SettingsApp {
             if right_depth_response.drag_stopped() {
                 let presets = self.state.to_presets();
                 let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Right);
-                self.pending_status_messages = live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor);
+                self.pending_status_messages =
+                    live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor, self.state.taskbar_hide_mode);
             }
 
             ui.separator();
@@ -1226,6 +1409,27 @@ impl eframe::App for SettingsApp {
             ui.heading("Global hotkeys");
             self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
             self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+            // Re-sync immediately after both hotkey rows: a "Set hotkey" click
+            // just above sets `state.capturing = Some(..)` within this same
+            // `ui()` call, but the sync at the top of this function already
+            // ran against the *old* `None` state. Without this second call the
+            // hook wouldn't install until the following frame, leaving a
+            // one-frame window where physical Ctrl+Escape still reaches
+            // Windows' Start-menu shortcut (issue #40 MEDIUM review finding).
+            self.sync_keyboard_hook();
+
+            ui.separator();
+            ui.heading("Taskbar hiding");
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::FullyHidden,
+                "Fully hidden (no hover-reveal)",
+            );
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::HoverReveal,
+                "Hover to reveal (classic Windows behavior)",
+            );
 
             ui.separator();
             ui.heading("Games");
@@ -1354,6 +1558,7 @@ mod tests {
         assert_eq!(state.custom, None);
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "");
+        assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
     }
 
     #[test]
@@ -1363,12 +1568,14 @@ mod tests {
                 left_depth_percent: 20,
                 right_depth_percent: 80,
                 custom: Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }),
+                default_for_new_games: PresetKind::Custom,
             },
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
             tracked_games: Vec::new(),
+            taskbar_hide_mode: TaskbarHideMode::HoverReveal,
         };
 
         let state = SettingsState::from_config(&config);
@@ -1376,8 +1583,20 @@ mod tests {
         assert_eq!(state.left_depth_percent, 20);
         assert_eq!(state.right_depth_percent, 80);
         assert_eq!(state.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
+        assert_eq!(state.default_for_new_games, PresetKind::Custom);
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
+        assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
+    }
+
+    #[test]
+    fn to_config_round_trips_the_taskbar_hide_mode() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.taskbar_hide_mode = TaskbarHideMode::HoverReveal;
+
+        let config = state.to_config();
+
+        assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
     }
 
     #[test]
@@ -1398,6 +1617,7 @@ mod tests {
         config.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            config.presets.default_for_new_games,
         ));
 
         let state = SettingsState::from_config(&config);
@@ -1411,14 +1631,15 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            PresetKind::Right,
         ));
-        state.tracked_games[0].preset = PresetKind::HalfRight;
+        state.tracked_games[0].preset = PresetKind::Custom;
         state.tracked_games[0].auto_apply = false;
 
         let config = state.to_config();
 
         assert_eq!(config.tracked_games.len(), 1);
-        assert_eq!(config.tracked_games[0].preset, PresetKind::HalfRight);
+        assert_eq!(config.tracked_games[0].preset, PresetKind::Custom);
         assert!(!config.tracked_games[0].auto_apply);
     }
 
@@ -1428,10 +1649,12 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\a.exe"),
             "A".to_string(),
+            PresetKind::Right,
         ));
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\b.exe"),
             "B".to_string(),
+            PresetKind::Right,
         ));
 
         state.remove_tracked_game(0);
@@ -1462,6 +1685,17 @@ mod tests {
         assert_eq!(config.presets.left_depth_percent, 15);
         assert_eq!(config.presets.right_depth_percent, 85);
         assert_eq!(config.presets.custom, Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }));
+    }
+
+    #[test]
+    fn to_config_carries_the_current_default_for_new_games() {
+        let mut state = SettingsState::from_config(&Config::default());
+
+        state.set_default_for_new_games(PresetKind::Custom);
+
+        let config = state.to_config();
+
+        assert_eq!(config.presets.default_for_new_games, PresetKind::Custom);
     }
 
     #[test]
@@ -1526,6 +1760,54 @@ mod tests {
         state.handle_key_event(egui::Modifiers::NONE, egui::Key::Escape);
 
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_records_the_combo_when_the_hook_swallowed_it() {
+        // Mirrors `keyboard_hook::keyboard_hook_proc`'s CRITICAL fix: the hook
+        // swallows the physical Ctrl+Escape press before it can ever arrive as
+        // an `egui::Event::Key`, so this is the only path that can complete
+        // the capture for that specific combo.
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(true);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Escape");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_the_hook_did_not_swallow_anything() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(false);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, Some(HotkeyField::ToggleBorderless));
+    }
+
+    #[test]
+    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_nothing_is_capturing() {
+        let mut state = SettingsState::from_config(&Config::default());
+
+        state.complete_capture_with_ctrl_escape_if_suppressed(true);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.capturing, None);
+    }
+
+    #[test]
+    fn handle_key_event_with_ctrl_escape_records_the_combo_instead_of_cancelling() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        state.handle_key_event(modifiers, egui::Key::Escape);
+
+        assert_eq!(state.toggle_borderless, "Ctrl+Escape");
         assert_eq!(state.capturing, None);
     }
 
@@ -1662,8 +1944,6 @@ mod tests {
     fn preset_label_renders_human_readable_names_instead_of_debug_formatting() {
         assert_eq!(preset_label(&Preset::Left { depth_percent: 40 }), "Left (40%)");
         assert_eq!(preset_label(&Preset::Right { depth_percent: 60 }), "Right (60%)");
-        assert_eq!(preset_label(&Preset::HalfLeft), "Half Left");
-        assert_eq!(preset_label(&Preset::HalfRight), "Half Right");
         assert_eq!(
             preset_label(&Preset::Custom { x: 10, y: 20, width: 300, height: 400 }),
             "Custom (10, 20, 300x400)"
@@ -1674,8 +1954,6 @@ mod tests {
     fn preset_kind_label_renders_human_readable_names_for_every_kind() {
         assert_eq!(preset_kind_label(PresetKind::Left), "Left");
         assert_eq!(preset_kind_label(PresetKind::Right), "Right");
-        assert_eq!(preset_kind_label(PresetKind::HalfLeft), "Half Left");
-        assert_eq!(preset_kind_label(PresetKind::HalfRight), "Half Right");
         assert_eq!(preset_kind_label(PresetKind::Custom), "Custom");
     }
 
@@ -1718,16 +1996,27 @@ mod tests {
     }
 
     #[test]
-    fn preset_thumbnails_lists_only_the_four_base_presets_when_no_custom_is_set() {
+    fn preset_thumbnails_lists_only_the_two_base_presets_when_no_custom_is_set() {
         let state = SettingsState::from_config(&Config::default());
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 4);
+        assert_eq!(thumbnails.len(), 2);
         assert_eq!(thumbnails[0].label, preset_label(&Preset::Left { depth_percent: state.left_depth_percent }));
         assert_eq!(thumbnails[1].label, preset_label(&Preset::Right { depth_percent: state.right_depth_percent }));
-        assert_eq!(thumbnails[2].label, "Half Left");
-        assert_eq!(thumbnails[3].label, "Half Right");
+    }
+
+    #[test]
+    fn preset_thumbnails_marks_only_the_current_default_for_new_games_thumbnail_as_default() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.default_for_new_games = PresetKind::Right;
+
+        let thumbnails = preset_thumbnails(&state, &test_monitor());
+
+        assert_eq!(thumbnails[0].kind, PresetKind::Left);
+        assert_eq!(thumbnails[1].kind, PresetKind::Right);
+        assert!(!thumbnails[0].is_default);
+        assert!(thumbnails[1].is_default, "Right is the current default and must be marked as such");
     }
 
     #[test]
@@ -1737,8 +2026,8 @@ mod tests {
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 5);
-        assert_eq!(thumbnails[4].label, "Custom (10, 10, 200x100)");
+        assert_eq!(thumbnails.len(), 3);
+        assert_eq!(thumbnails[2].label, "Custom (10, 10, 200x100)");
     }
 
     #[test]
@@ -1753,8 +2042,8 @@ mod tests {
 
         let thumbnails = preset_thumbnails(&state, &test_monitor());
 
-        assert_eq!(thumbnails.len(), 5, "an unresolvable preset must still be represented, not dropped");
-        let custom_thumbnail = &thumbnails[4];
+        assert_eq!(thumbnails.len(), 3, "an unresolvable preset must still be represented, not dropped");
+        let custom_thumbnail = &thumbnails[2];
         assert_eq!(custom_thumbnail.label, "Custom (5000, 5000, 200x100)");
         assert_eq!(custom_thumbnail.region, None, "an unresolvable preset has no drawable region");
         assert!(custom_thumbnail.error.is_some(), "an unresolvable preset must surface an error");

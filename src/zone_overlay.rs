@@ -17,25 +17,26 @@
 //! re-derivation.
 //!
 //! Drives [`crate::zone_editor::AppState`] from real pointer input, and
-//! forces taskbar auto-hide on for the duration of the editing session via
-//! [`crate::win32::force_taskbar_autohide_on`], restoring exactly the
-//! previous state via [`crate::win32::restore_taskbar_autohide`] once the
-//! session ends -- Save, Cancel, the window being closed any other way, or
-//! even a panic partway through (an RAII guard, [`TaskbarRestoreGuard`],
-//! holds the remembered state and restores it on drop, so a stack unwind
-//! through `eframe::run_native` -- e.g. a wgpu device-lost panic on
-//! sleep/resume or an external-monitor unplug -- still restores the
-//! taskbar instead of leaving it stuck forced into auto-hide).
+//! hides the taskbar for the duration of the editing session via
+//! [`crate::win32::hide_taskbar`] (mode-aware as of issue #42 -- see
+//! [`crate::profile_store::TaskbarHideMode`]), restoring exactly the
+//! previous state via [`crate::win32::restore_taskbar`] once the session
+//! ends -- Save, Cancel, the window being closed any other way, or even a
+//! panic partway through (an RAII guard, [`TaskbarRestoreGuard`], holds the
+//! remembered [`crate::win32::TaskbarHideRestore`] and restores it on drop,
+//! so a stack unwind through `eframe::run_native` -- e.g. a wgpu
+//! device-lost panic on sleep/resume or an external-monitor unplug -- still
+//! restores the taskbar instead of leaving it stuck hidden).
 //!
 //! OS/GPU-facing: not exercised by this crate's automated tests, for the
 //! same reason [`crate::settings_ui::run_settings_window`] isn't -- a
 //! headless/CI sandbox cannot provide a real GPU-backed window to render
 //! into or a real taskbar to hide. The pure interaction logic it drives
-//! ([`crate::zone_editor`]) and the pure taskbar force/restore decision
-//! ([`crate::win32::plan_taskbar_force_on`]) are both fully unit tested
+//! ([`crate::zone_editor`]) and the pure taskbar hide/remember decision
+//! ([`crate::win32::plan_taskbar_hide`]) are both fully unit tested
 //! instead.
 
-use crate::profile_store::CustomRegion;
+use crate::profile_store::{CustomRegion, TaskbarHideMode};
 use crate::region_calc::MonitorGeometry;
 use crate::win32;
 use crate::zone_editor::{Action, AppState, EditorState, Handle, Monitor, PinnedEdges, Point, SessionOutcome};
@@ -81,19 +82,20 @@ impl std::error::Error for ZoneOverlayError {
 /// itself is general per [`crate::zone_editor`]'s design, so a later slice
 /// can reuse this for the Left/Right base presets without changes here.
 ///
-/// Forces taskbar auto-hide on for the session (see module docs) and always
-/// restores exactly the state found beforehand before returning -- whether
-/// the window ran cleanly, failed to run, or `eframe::run_native` panicked
-/// partway through -- via the [`TaskbarRestoreGuard`] RAII guard held across
-/// the call.
+/// Hides the taskbar for the session using whichever technique `mode`
+/// selects (see module docs) and always restores exactly the state found
+/// beforehand before returning -- whether the window ran cleanly, failed to
+/// run, or `eframe::run_native` panicked partway through -- via the
+/// [`TaskbarRestoreGuard`] RAII guard held across the call.
 pub fn run_zone_editor_overlay(
     initial: Option<CustomRegion>,
     pinned: PinnedEdges,
+    mode: TaskbarHideMode,
 ) -> Result<Option<CustomRegion>, ZoneOverlayError> {
     let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
     let monitor = Monitor { width: monitor_geometry.width, height: monitor_geometry.height };
 
-    let remembered_taskbar_state = win32::force_taskbar_autohide_on().map_err(ZoneOverlayError::Taskbar)?;
+    let remembered_taskbar_state = win32::hide_taskbar(mode).map_err(ZoneOverlayError::Taskbar)?;
 
     // RAII guard, not a manual "call restore after run_native" step: the
     // latter is skipped entirely if `eframe::run_native` panics mid-session
@@ -129,31 +131,33 @@ pub fn run_zone_editor_overlay(
     }
 }
 
-/// RAII guard that restores the taskbar's remembered auto-hide state when
-/// dropped, whether that happens via normal return, early `?` propagation,
-/// or a panic unwinding through `eframe::run_native`. A manual
-/// "force, call, then restore" sequence skips the restore step entirely if
-/// the call in between panics; `Drop` runs during unwinding regardless, so
-/// holding one of these across the call closes that gap.
+/// RAII guard that restores the taskbar's remembered state (which technique
+/// hid it, plus whatever it needs to restore exactly -- see
+/// [`win32::TaskbarHideRestore`]) when dropped, whether that happens via
+/// normal return, early `?` propagation, or a panic unwinding through
+/// `eframe::run_native`. A manual "hide, call, then restore" sequence skips
+/// the restore step entirely if the call in between panics; `Drop` runs
+/// during unwinding regardless, so holding one of these across the call
+/// closes that gap.
 ///
-/// `restore_taskbar_autohide`'s own error is logged rather than propagated
-/// or unwrapped -- a `Drop` impl that itself panics while already unwinding
+/// `restore_taskbar`'s own error is logged rather than propagated or
+/// unwrapped -- a `Drop` impl that itself panics while already unwinding
 /// from another panic aborts the process, which would be strictly worse
-/// than a taskbar left stuck in forced auto-hide.
+/// than a taskbar left stuck hidden.
 struct TaskbarRestoreGuard {
-    remembered: win32::TaskbarAutohideState,
+    remembered: win32::TaskbarHideRestore,
 }
 
 impl TaskbarRestoreGuard {
-    fn new(remembered: win32::TaskbarAutohideState) -> Self {
+    fn new(remembered: win32::TaskbarHideRestore) -> Self {
         Self { remembered }
     }
 }
 
 impl Drop for TaskbarRestoreGuard {
     fn drop(&mut self) {
-        if let Err(e) = win32::restore_taskbar_autohide(self.remembered) {
-            eprintln!("zone editor: failed to restore taskbar auto-hide state: {e}");
+        if let Err(e) = win32::restore_taskbar(self.remembered) {
+            eprintln!("zone editor: failed to restore taskbar state: {e}");
         }
     }
 }
@@ -314,38 +318,57 @@ impl OverlayApp {
 
     /// The overlay's own modal Save/Cancel controls (issue #28: "fully
     /// modal for its editing session with its own Save/Cancel controls").
-    /// "Save" is disabled outside `Placed` rather than silently rejected,
-    /// since there's no separate settings window backdrop to surface a
-    /// rejection message against here.
     fn control_panel(&mut self, ctx: &egui::Context) {
+        // "Save" is disabled outside `Placed` rather than silently rejected,
+        // since there's no separate settings window backdrop to surface a
+        // rejection message against here.
         let can_save = matches!(self.state.editor, EditorState::Placed { .. });
 
+        // issue #39: buttons enlarged/color-coded and moved further down
+        // from the top edge, and the hint label enlarged/centered, so the
+        // controls are impossible to miss against the darkened overlay.
         egui::Area::new(egui::Id::new("zone-editor-controls"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
                     .corner_radius(6.0)
-                    .inner_margin(10.0)
+                    .inner_margin(16.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                            let save_button =
+                                control_button("Save", egui::Color32::from_rgb(34, 160, 60));
+                            if ui.add_enabled(can_save, save_button).clicked() {
                                 if let Some(outcome) = self.state.apply(Action::Save) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
                             }
-                            if ui.button("Cancel").clicked() {
+                            let cancel_button =
+                                control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
+                            if ui.add(cancel_button).clicked() {
                                 if let Some(outcome) = self.state.apply(Action::Cancel) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
                             }
                         });
-                        ui.label(
-                            egui::RichText::new(&self.state.last_message).color(egui::Color32::LIGHT_GRAY).small(),
-                        );
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(&self.state.last_message)
+                                    .color(egui::Color32::LIGHT_GRAY)
+                                    .size(16.0),
+                            );
+                        });
                     });
             });
     }
+}
+
+/// Builds a Save/Cancel control button with the enlarged size and
+/// color-coded fill used by the zone editor's control panel (issue #39).
+fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text).size(22.0).color(egui::Color32::WHITE))
+        .fill(fill)
+        .min_size(egui::vec2(140.0, 56.0))
 }
 
 fn rect_from_points(a: Point, b: Point) -> egui::Rect {
