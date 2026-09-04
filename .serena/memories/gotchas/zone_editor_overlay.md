@@ -28,8 +28,13 @@ Key decisions:
   overlay. `SettingsState::set_custom_preset` now takes a `CustomRegion` directly (the overlay's
   output) instead of parsing text fields.
 - Only the Custom preset is wired to the overlay (`PinnedEdges::NONE`, all 8 handles) per #28's
-  acceptance criteria; Left/Right base-preset editing via the overlay (`PinnedEdges::LEFT_HALF`/
-  `RIGHT_HALF` already exist as consts) is a reasonable future extension but out of scope.
+  acceptance criteria; Left/Right base-preset editing via the overlay is a reasonable future
+  extension but out of scope. The `PinnedEdges::LEFT_HALF`/`RIGHT_HALF` convenience consts that
+  existed for this were removed (2026-09-04, unrelated to #37's `PresetKind::HalfLeft`/`HalfRight`
+  removal) after tripping a `dead_code` build warning -- they were only exercised in tests. If this
+  extension is picked up, reintroduce the pinned-edges literal (`left/top/bottom: true, right:
+  false` for Left, mirrored for Right) inline or as new consts; the `enabled()`/pin-locking logic
+  itself is untouched and still covered by tests using inline `PinnedEdges` literals.
 - The overlay's rendering/DX12/DirectComposition setup and the taskbar OS calls are untested by
   convention (no headless GPU/taskbar in CI) — same boundary as `settings_ui::run_settings_window`/
   `tray_ui::Tray::new`/`win32`'s other OS-facing functions.

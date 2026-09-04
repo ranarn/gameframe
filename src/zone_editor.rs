@@ -46,8 +46,6 @@ pub struct PinnedEdges {
 
 impl PinnedEdges {
     pub const NONE: Self = Self { left: false, top: false, right: false, bottom: false };
-    pub const LEFT_HALF: Self = Self { left: true, top: true, bottom: true, right: false };
-    pub const RIGHT_HALF: Self = Self { right: true, top: true, bottom: true, left: false };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,8 +310,9 @@ mod tests {
     #[test]
     fn new_with_zone_starts_placed_with_the_given_zone_and_pinned_edges() {
         let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let state = AppState::new_with_zone(monitor(), PinnedEdges::LEFT_HALF, zone);
-        assert_eq!(state.editor, EditorState::Placed { zone, pinned: PinnedEdges::LEFT_HALF });
+        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
+        let state = AppState::new_with_zone(monitor(), pinned, zone);
+        assert_eq!(state.editor, EditorState::Placed { zone, pinned });
     }
 
     #[test]
@@ -420,14 +419,15 @@ mod tests {
     #[test]
     fn grab_a_handle_locked_by_pinned_edges_is_rejected_and_leaves_state_placed() {
         let zone = CustomRegion { x: 0, y: 0, width: 960, height: 1080 };
-        let mut state = placed(zone, PinnedEdges::LEFT_HALF);
+        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
+        let mut state = placed(zone, pinned);
 
-        // West edge is pinned under LEFT_HALF, so W (and both NW/SW corners,
-        // which touch W) must be locked.
+        // West edge is pinned, so W (and both NW/SW corners, which touch W)
+        // must be locked.
         let outcome = state.apply(Action::Grab(Handle::W));
 
         assert_eq!(outcome, None);
-        assert_eq!(state.editor, EditorState::Placed { zone, pinned: PinnedEdges::LEFT_HALF });
+        assert_eq!(state.editor, EditorState::Placed { zone, pinned });
     }
 
     #[test]
@@ -461,11 +461,12 @@ mod tests {
 
     #[test]
     fn drag_while_resizing_a_pinned_edge_handle_never_moves_a_pinned_edge() {
-        // LEFT_HALF pins left/top/bottom -- only E is enabled/grabbable, and
+        // Pinning left/top/bottom leaves only E enabled/grabbable, and
         // dragging it must never move x/y/bottom even if the handle math is
         // asked to.
         let zone = CustomRegion { x: 0, y: 0, width: 960, height: 1080 };
-        let mut state = placed(zone, PinnedEdges::LEFT_HALF);
+        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
+        let mut state = placed(zone, pinned);
         state.apply(Action::Grab(Handle::E));
 
         state.apply(Action::Drag(Point { x: 1500, y: 40 }));
@@ -474,7 +475,7 @@ mod tests {
             state.editor,
             EditorState::Resizing {
                 original: zone,
-                pinned: PinnedEdges::LEFT_HALF,
+                pinned,
                 handle: Handle::E,
                 live: CustomRegion { x: 0, y: 0, width: 1500, height: 1080 }
             }
@@ -576,13 +577,15 @@ mod tests {
 
     #[test]
     fn pinned_edges_left_half_enables_only_the_east_edge_handle() {
-        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(PinnedEdges::LEFT_HALF)).collect();
+        let left_half = PinnedEdges { left: true, top: true, bottom: true, right: false };
+        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(left_half)).collect();
         assert_eq!(enabled, vec![Handle::E]);
     }
 
     #[test]
     fn pinned_edges_right_half_enables_only_the_west_edge_handle() {
-        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(PinnedEdges::RIGHT_HALF)).collect();
+        let right_half = PinnedEdges { right: true, top: true, bottom: true, left: false };
+        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(right_half)).collect();
         assert_eq!(enabled, vec![Handle::W]);
     }
 
