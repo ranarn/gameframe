@@ -30,9 +30,10 @@
 //!   crate's automated tests. See the module's doc comment in the issue
 //!   writeup for what could/couldn't be verified.
 //!
-//! [`toggle_taskbar_hide`] keeps its own [`TaskbarHideRestore`] state,
-//! completely separate from the borderless mechanic's [`RestoreState`] --
-//! the two toggles share no state.
+//! [`toggle_taskbar_hide`] keeps no remembered state at all -- it reads the
+//! taskbar's real OS-level state fresh on every press (see its doc comment
+//! for why) -- completely separate from the borderless mechanic's
+//! [`RestoreState`]; the two toggles share no state.
 
 use crate::profile_store::TaskbarHideMode;
 use crate::region_calc::Region;
@@ -722,9 +723,8 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
 /// dereferenced -- so the round trip through an integer is lossless and
 /// safe.
 ///
-/// Fully independent of [`toggle_taskbar_hide`]'s own `Option<TaskbarHideRestore>`
-/// state (owned by the caller, e.g. `taskbar_hide_state` in
-/// `crate::app::run_event_loop`): per
+/// Fully independent of [`toggle_taskbar_hide`] (which keeps no remembered
+/// state of its own at all -- see its doc comment): per
 /// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`, the manual
 /// global taskbar-autohide hotkey's own toggle must stay independent from
 /// the preset-apply paths' taskbar handling, and this static is never read
@@ -985,41 +985,56 @@ pub fn set_taskbar_hide_absolute_armed(hwnd: HWND, hide: bool, mode: TaskbarHide
     }
 }
 
-/// Toggles the taskbar's hidden/visible state on/off, preserving the manual
-/// global taskbar-autohide hotkey's own independent on/off toggle *concept*
-/// (issue #42's out-of-scope note) while making its "on" direction
-/// mode-aware: `None` (currently visible) hides via [`hide_taskbar`] and
-/// remembers which technique was used; `Some(restore)` (currently hidden)
-/// restores via [`restore_taskbar`] and forgets it. Mirrors
-/// [`toggle_borderless_on_foreground_window`]'s `Option<RestoreState>` shape
-/// for the same reason: a plain two-state enum can't also carry "which
-/// technique hid it", which is required so a restore is still correct if
-/// `mode` changes between the hide and this toggle-off (see
-/// [`TaskbarHideRestore`]'s doc comment).
+/// Reads the taskbar's *actual* current hidden/visible state directly from
+/// the OS, rather than trusting any caller-tracked flag: for `FullyHidden`,
+/// [`IsWindowVisible`] on the real `Shell_TrayWnd`; for `HoverReveal`, the
+/// real appbar auto-hide flag (via [`read_appbar_flags`]/[`state_from_flags`]).
+///
+/// This exists because [`toggle_taskbar_hide`] previously decided hide-vs-show
+/// from a remembered `Option<TaskbarHideRestore>` that only that hotkey ever
+/// wrote -- but the taskbar can also be hidden by an entirely different path
+/// (a tracked game's launch-detection auto-hide, [`set_taskbar_hide_absolute_armed`],
+/// which re-applies on every foreground switch back to the game, not just
+/// the initial launch). That path never touched the hotkey's own memory, so
+/// the two could disagree about whether the taskbar was hidden, making the
+/// hotkey's next press act on a stale premise (hiding an already-hidden
+/// taskbar is a no-op; the *following* press then does the opposite of what
+/// was expected). Grounding the decision in the real OS state on every press
+/// removes the possibility of that drift entirely.
+///
+/// OS-facing: locates the real taskbar window and reads its actual state.
+/// Not exercised by this crate's automated tests -- see module docs.
+fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
+    let hwnd = find_taskbar_window()?;
+    match mode {
+        TaskbarHideMode::FullyHidden => Ok(unsafe { IsWindowVisible(hwnd) } == 0),
+        TaskbarHideMode::HoverReveal => {
+            Ok(state_from_flags(read_appbar_flags(hwnd)) == TaskbarAutohideState::AutoHidden)
+        }
+    }
+}
+
+/// Toggles the taskbar's hidden/visible state on/off -- the manual global
+/// taskbar-autohide hotkey's own independent on/off toggle *concept* (issue
+/// #42's out-of-scope note), but grounded in the taskbar's real current
+/// state ([`is_taskbar_hidden`]) rather than a remembered flag (see that
+/// function's doc comment for why): currently visible hides via
+/// [`set_taskbar_hide_absolute`]; currently hidden shows via the same.
 ///
 /// Fully independent of [`toggle_borderless_on_foreground_window`]'s
-/// `RestoreState` -- `state` here is its own [`TaskbarHideRestore`], never
-/// shared with or derived from the borderless toggle's state, so either
-/// toggle works whether or not the other has been pressed yet in the same
-/// session.
+/// `RestoreState`, and of [`set_taskbar_hide_absolute_armed`]'s
+/// `ARMED_TASKBAR_RESTORE` bookkeeping -- this reads only the taskbar's real
+/// OS-level visibility, never any tracked-game config or armed-window state,
+/// so it remains independent of tracked-game state per
+/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`, just no
+/// longer independent of *reality*.
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow`/`SHAppBarMessage` call. Not exercised by this crate's
-/// automated tests -- see module docs. `*state` is only updated after the OS
-/// call so a failure (e.g. the taskbar window can't be found) leaves the
-/// remembered state consistent with what was actually last applied.
-pub fn toggle_taskbar_hide(state: &mut Option<TaskbarHideRestore>, mode: TaskbarHideMode) -> Result<(), Win32Error> {
-    match *state {
-        None => {
-            let restore = hide_taskbar(mode)?;
-            *state = Some(restore);
-        }
-        Some(restore) => {
-            restore_taskbar(restore)?;
-            *state = None;
-        }
-    }
-    Ok(())
+/// automated tests -- see module docs.
+pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
+    let hidden = is_taskbar_hidden(mode)?;
+    set_taskbar_hide_absolute(!hidden, mode)
 }
 
 /// Locates the taskbar's own window (class name `Shell_TrayWnd`, per the
@@ -2130,6 +2145,66 @@ mod tests {
             visible_after_restore, 0,
             "Shell_TrayWnd should be visible again after the simulated tray-Exit restore"
         );
+    }
+
+    /// Real-OS regression test for the bug this fix addresses: the manual
+    /// taskbar-autohide hotkey (`toggle_taskbar_hide`) used to decide
+    /// hide-vs-show from its own remembered `Option<TaskbarHideRestore>`,
+    /// which never learned about a hide performed by a completely different
+    /// call site (a tracked game's launch-detection auto-hide, simulated
+    /// here via `set_taskbar_hide_absolute_armed`) -- so the hotkey's first
+    /// press after such a hide was a no-op (hiding an already-hidden
+    /// taskbar), and the *next* press did the opposite of what was expected.
+    /// `toggle_taskbar_hide` now reads the taskbar's real state on every
+    /// press instead, so it must correctly show it (was hidden by the
+    /// simulated game) and then correctly hide it again (now visible) with
+    /// no state of its own passed in at all. Same real-OS caveats as the
+    /// tests above.
+    #[test]
+    #[ignore = "OS-facing: mutates the real taskbar window; run manually with --ignored"]
+    fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                let _ = show_taskbar();
+            }
+        }
+        let _restore = RestoreOnDrop;
+
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let fake_game_hwnd = 0xF00D_usize as HWND;
+
+        // Simulate a tracked game's launch-detection auto-hide -- a call
+        // site `toggle_taskbar_hide` never reads or writes state for.
+        set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
+            .expect("hide should succeed on a real desktop session");
+        assert_eq!(
+            unsafe { IsWindowVisible(taskbar_hwnd) },
+            0,
+            "Shell_TrayWnd should be hidden by the simulated game launch"
+        );
+
+        // The manual toggle, despite having no memory of that hide, must
+        // still detect "currently hidden" from the real OS state and show it.
+        toggle_taskbar_hide(TaskbarHideMode::FullyHidden).expect("toggle should succeed on a real desktop session");
+        assert_ne!(
+            unsafe { IsWindowVisible(taskbar_hwnd) },
+            0,
+            "toggle should show the taskbar since it was actually hidden"
+        );
+
+        // And the very next press must detect "currently visible" and hide
+        // it again -- the old remembered-flag design would get this wrong.
+        toggle_taskbar_hide(TaskbarHideMode::FullyHidden).expect("toggle should succeed on a real desktop session");
+        assert_eq!(
+            unsafe { IsWindowVisible(taskbar_hwnd) },
+            0,
+            "toggle should hide the taskbar again since it was actually visible"
+        );
+
+        // Clean up the simulated game's armed-window bookkeeping (the
+        // toggle above never touched it, so it's still armed).
+        let _ = take_armed_taskbar_restore_for_window(fake_game_hwnd);
     }
 
     #[test]
