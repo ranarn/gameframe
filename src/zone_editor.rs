@@ -233,15 +233,27 @@ impl AppState {
     }
 }
 
+/// A drawn/resized edge within this many pixels of a monitor boundary snaps
+/// to it exactly, rather than requiring the pointer to land on the exact
+/// boundary pixel -- mouse-drag precision rarely lands there, and no
+/// deliberately-configured zone edge sits closer than this to the monitor
+/// edge without meaning to be flush with it.
+const EDGE_SNAP_PX: i32 = 20;
+
+/// Snaps `value` to `edge` when within [`EDGE_SNAP_PX`] of it.
+fn snap_to_edge(value: i32, edge: i32) -> i32 {
+    if (value - edge).abs() <= EDGE_SNAP_PX { edge } else { value }
+}
+
 /// Normalizes a two-corner drag into a positive-area zone, clamped to the
 /// monitor. Mirrors `region_calc::resolve_region`'s Custom-preset semantics
 /// (clamp to fit rather than reject) since a live drag has no "invalid
 /// input" concept the way a typed X/Y/width/height field does.
 fn normalize(anchor: Point, current: Point, monitor: Monitor) -> CustomRegion {
-    let x0 = anchor.x.min(current.x).clamp(0, monitor.width);
-    let y0 = anchor.y.min(current.y).clamp(0, monitor.height);
-    let x1 = anchor.x.max(current.x).clamp(0, monitor.width);
-    let y1 = anchor.y.max(current.y).clamp(0, monitor.height);
+    let x0 = snap_to_edge(anchor.x.min(current.x).clamp(0, monitor.width), 0);
+    let y0 = snap_to_edge(anchor.y.min(current.y).clamp(0, monitor.height), 0);
+    let x1 = snap_to_edge(anchor.x.max(current.x).clamp(0, monitor.width), monitor.width);
+    let y1 = snap_to_edge(anchor.y.max(current.y).clamp(0, monitor.height), monitor.height);
     CustomRegion { x: x0, y: y0, width: (x1 - x0).max(1), height: (y1 - y0).max(1) }
 }
 
@@ -268,16 +280,16 @@ fn apply_handle_drag(
     let touches_bottom = matches!(handle, Handle::S | Handle::Sw | Handle::Se);
 
     if touches_left && !pinned.left {
-        left = pointer.x.clamp(0, right - 1);
+        left = snap_to_edge(pointer.x.clamp(0, right - 1), 0);
     }
     if touches_right && !pinned.right {
-        right = pointer.x.clamp(left + 1, monitor.width);
+        right = snap_to_edge(pointer.x.clamp(left + 1, monitor.width), monitor.width);
     }
     if touches_top && !pinned.top {
-        top = pointer.y.clamp(0, bottom - 1);
+        top = snap_to_edge(pointer.y.clamp(0, bottom - 1), 0);
     }
     if touches_bottom && !pinned.bottom {
-        bottom = pointer.y.clamp(top + 1, monitor.height);
+        bottom = snap_to_edge(pointer.y.clamp(top + 1, monitor.height), monitor.height);
     }
 
     CustomRegion { x: left, y: top, width: right - left, height: bottom - top }
@@ -395,6 +407,40 @@ mod tests {
     }
 
     #[test]
+    fn commit_snaps_a_drag_within_threshold_of_the_monitor_edges_flush_to_them() {
+        let mut state = AppState::new(monitor());
+        state.apply(Action::Start(Point { x: 10, y: 10 }));
+        state.apply(Action::Drag(Point { x: 1910, y: 1070 }));
+
+        state.apply(Action::Commit);
+
+        assert_eq!(
+            state.editor,
+            EditorState::Placed {
+                zone: CustomRegion { x: 0, y: 0, width: 1920, height: 1080 },
+                pinned: PinnedEdges::NONE
+            }
+        );
+    }
+
+    #[test]
+    fn commit_does_not_snap_a_drag_just_outside_the_edge_threshold() {
+        let mut state = AppState::new(monitor());
+        state.apply(Action::Start(Point { x: 21, y: 21 }));
+        state.apply(Action::Drag(Point { x: 1899, y: 1059 }));
+
+        state.apply(Action::Commit);
+
+        assert_eq!(
+            state.editor,
+            EditorState::Placed {
+                zone: CustomRegion { x: 21, y: 21, width: 1878, height: 1038 },
+                pinned: PinnedEdges::NONE
+            }
+        );
+    }
+
+    #[test]
     fn commit_is_illegal_from_empty_and_leaves_state_unchanged() {
         let mut state = AppState::new(monitor());
         let outcome = state.apply(Action::Commit);
@@ -478,6 +524,63 @@ mod tests {
                 pinned,
                 handle: Handle::E,
                 live: CustomRegion { x: 0, y: 0, width: 1500, height: 1080 }
+            }
+        );
+    }
+
+    #[test]
+    fn resize_snaps_the_west_handle_within_threshold_to_the_left_edge() {
+        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone, PinnedEdges::NONE);
+        state.apply(Action::Grab(Handle::W));
+
+        state.apply(Action::Drag(Point { x: 15, y: 100 }));
+
+        assert_eq!(
+            state.editor,
+            EditorState::Resizing {
+                original: zone,
+                pinned: PinnedEdges::NONE,
+                handle: Handle::W,
+                live: CustomRegion { x: 0, y: 100, width: 500, height: 300 }
+            }
+        );
+    }
+
+    #[test]
+    fn resize_snaps_the_east_handle_within_threshold_to_the_right_edge() {
+        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone, PinnedEdges::NONE);
+        state.apply(Action::Grab(Handle::E));
+
+        state.apply(Action::Drag(Point { x: 1910, y: 100 }));
+
+        assert_eq!(
+            state.editor,
+            EditorState::Resizing {
+                original: zone,
+                pinned: PinnedEdges::NONE,
+                handle: Handle::E,
+                live: CustomRegion { x: 100, y: 100, width: 1820, height: 300 }
+            }
+        );
+    }
+
+    #[test]
+    fn resize_does_not_snap_the_grabbed_handle_just_outside_the_edge_threshold() {
+        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone, PinnedEdges::NONE);
+        state.apply(Action::Grab(Handle::E));
+
+        state.apply(Action::Drag(Point { x: 1899, y: 100 }));
+
+        assert_eq!(
+            state.editor,
+            EditorState::Resizing {
+                original: zone,
+                pinned: PinnedEdges::NONE,
+                handle: Handle::E,
+                live: CustomRegion { x: 100, y: 100, width: 1799, height: 300 }
             }
         );
     }
