@@ -46,6 +46,7 @@
 //! the same reason [`crate::tray_ui::Tray::new`] isn't: it needs a live
 //! thread message queue that a headless/CI sandbox can't provide.
 
+use crate::autostart;
 use crate::hotkeys::{Hotkeys, HotkeyAction};
 use crate::launch_watcher;
 use crate::profile_store;
@@ -205,6 +206,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if matches!(event, TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }) {
                 tray.refresh_apply_to_window_menu();
+                tray.sync_start_with_windows_check();
             }
         }
 
@@ -245,6 +247,17 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     // so there's no window where both the old and new
                     // bindings are simultaneously held.
                     hotkeys = register_hotkeys(config_dir);
+                    tray.sync_start_with_windows_check();
+                }
+                Some(TrayAction::ToggleStartWithWindows) => {
+                    // `muda` has already flipped the check mark, but the
+                    // registry -- not the menu -- is the source of truth:
+                    // toggle what the registry says, then re-sync the check
+                    // so a failed write doesn't leave it showing a lie.
+                    if let Err(e) = autostart::set_enabled(!autostart::is_enabled()) {
+                        eprintln!("failed to change Start with Windows: {e}");
+                    }
+                    tray.sync_start_with_windows_check();
                 }
                 None => {}
             }
