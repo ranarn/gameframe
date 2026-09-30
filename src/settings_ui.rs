@@ -23,6 +23,7 @@ use crate::profile_store::{
 use crate::region_calc::{
     resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
 };
+use crate::autostart::{self, AutostartError};
 use crate::keyboard_hook;
 use crate::win32;
 use crate::zone_editor::PinnedEdges;
@@ -86,6 +87,11 @@ pub struct SettingsState {
     /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
     /// the global hotkeys in the Settings window.
     pub taskbar_hide_mode: TaskbarHideMode,
+    /// The "Start with Windows" checkbox. Not part of [`Config`] -- the
+    /// registry is its source of truth (see [`crate::autostart`]) -- so
+    /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
+    /// fills it from the registry; Save writes it back only if it changed.
+    pub start_with_windows: bool,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -112,6 +118,7 @@ impl SettingsState {
             duplicate_hotkey_error: None,
             tracked_games: config.tracked_games.clone(),
             taskbar_hide_mode: config.taskbar_hide_mode,
+            start_with_windows: false,
         }
     }
 
@@ -850,6 +857,7 @@ pub fn primary_monitor_geometry() -> MonitorGeometry {
 pub enum SettingsUiError {
     Config(ProfileStoreError),
     Window(eframe::Error),
+    Autostart(AutostartError),
 }
 
 impl std::fmt::Display for SettingsUiError {
@@ -857,6 +865,7 @@ impl std::fmt::Display for SettingsUiError {
         match self {
             SettingsUiError::Config(e) => write!(f, "failed to load/save the config: {e}"),
             SettingsUiError::Window(e) => write!(f, "failed to open the Settings window: {e}"),
+            SettingsUiError::Autostart(e) => write!(f, "failed to change Start with Windows: {e}"),
         }
     }
 }
@@ -866,6 +875,7 @@ impl std::error::Error for SettingsUiError {
         match self {
             SettingsUiError::Config(e) => Some(e),
             SettingsUiError::Window(e) => Some(e),
+            SettingsUiError::Autostart(e) => Some(e),
         }
     }
 }
@@ -883,7 +893,9 @@ impl std::error::Error for SettingsUiError {
 /// status messages, folded back in) rather than ending the session, since
 /// opening the zone editor is not itself a decision to close Settings.
 enum SettingsExit {
-    Saved(Config),
+    /// The config to persist, plus the "Start with Windows" choice (which
+    /// lives in the registry, not in [`Config`]).
+    Saved(Config, bool),
     Cancelled,
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`],
@@ -928,13 +940,22 @@ enum SettingsExit {
 pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let mut state = SettingsState::from_config(&config);
+    let started_with_windows = autostart::is_enabled();
+    state.start_with_windows = started_with_windows;
     let monitor = primary_monitor_geometry();
     let mut status_messages: Vec<String> = Vec::new();
 
     loop {
         match run_settings_frame(state, monitor, status_messages)? {
-            SettingsExit::Saved(config) => {
-                return profile_store::save(config_dir, &config).map_err(SettingsUiError::Config);
+            SettingsExit::Saved(config, start_with_windows) => {
+                profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
+                // Only touch the registry on an actual change, so saving
+                // unrelated settings never re-points an existing entry at
+                // whichever exe happens to be running (e.g. a dev build).
+                if start_with_windows != started_with_windows {
+                    autostart::set_enabled(start_with_windows).map_err(SettingsUiError::Autostart)?;
+                }
+                return Ok(());
             }
             SettingsExit::Cancelled => return Ok(()),
             SettingsExit::EditCustomZone(mut latest_state, latest_status_messages) => {
@@ -1436,9 +1457,13 @@ impl eframe::App for SettingsApp {
             self.games_section(ui);
 
             ui.separator();
+            ui.heading("Startup");
+            ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config()));
+                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config(), self.state.start_with_windows));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {

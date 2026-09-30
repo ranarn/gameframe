@@ -51,7 +51,28 @@ cargo build --release
 The release build produces a single self-contained executable at
 `target\release\gameframe.exe` — no separate runtime DLLs are required (the CRT is statically
 linked via `.cargo\config.toml`; the binary depends only on standard Windows system DLLs already
-present on any Windows install). Just copy `gameframe.exe` wherever you want to run it from.
+present on any Windows install).
+
+### Installer
+
+```powershell
+# One-time: install Inno Setup 6
+winget install JRSoftware.InnoSetup
+
+# Build target\installer\GameFrame-Setup-<version>.exe
+.\installer\build.ps1
+```
+
+The installer (`installer\gameframe.iss`) installs per user, with no admin prompt, to
+`%LOCALAPPDATA%\Programs\GameFrame`. It adds a Start-menu shortcut and an entry under
+Settings > Apps for uninstalling, and offers a "Start GameFrame with Windows" checkbox. Running a
+newer installer upgrades in place, and your config in `%APPDATA%\GameFrame` is kept, including on
+uninstall.
+
+**Start with Windows** is the `GameFrame` value under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. The installer checkbox, the tray menu's
+"Start with Windows" item and the Settings window's checkbox all read and write that same value,
+so they always agree.
 
 The release profile (`[profile.release]` in `Cargo.toml`) is tuned for binary size
 (`opt-level = "z"`, LTO, single codegen unit, `panic = "abort"`, symbols stripped), since `egui`/

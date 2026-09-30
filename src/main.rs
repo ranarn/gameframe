@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod hotkeys;
 mod keyboard_hook;
 mod launch_watcher;

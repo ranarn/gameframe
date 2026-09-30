@@ -24,7 +24,7 @@
 //! encode/decode logic, fully unit tested in isolation from any real menu
 //! or window.
 
-use tray_icon::menu::{Menu, MenuId, MenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -39,11 +39,13 @@ use windows_sys::Win32::Foundation::HWND;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     ShowSettings,
+    ToggleStartWithWindows,
     Exit,
 }
 
 const SHOW_SETTINGS_ID: &str = "gameframe-show-settings";
 const APPLY_TO_WINDOW_ID: &str = "gameframe-apply-to-window";
+const START_WITH_WINDOWS_ID: &str = "gameframe-start-with-windows";
 const EXIT_ID: &str = "gameframe-exit";
 
 /// Prefix for the dynamically-generated "Apply to Window" submenu items'
@@ -85,6 +87,7 @@ pub fn decode_window_item_id(id: &MenuId) -> Option<HWND> {
 pub struct TrayMenuIds {
     show_settings: MenuId,
     apply_to_window: MenuId,
+    start_with_windows: MenuId,
     exit: MenuId,
 }
 
@@ -93,6 +96,7 @@ impl TrayMenuIds {
         Self {
             show_settings: MenuId::new(SHOW_SETTINGS_ID),
             apply_to_window: MenuId::new(APPLY_TO_WINDOW_ID),
+            start_with_windows: MenuId::new(START_WITH_WINDOWS_ID),
             exit: MenuId::new(EXIT_ID),
         }
     }
@@ -108,6 +112,8 @@ impl TrayMenuIds {
     pub fn action_for(&self, id: &MenuId) -> Option<TrayAction> {
         if *id == self.show_settings {
             Some(TrayAction::ShowSettings)
+        } else if *id == self.start_with_windows {
+            Some(TrayAction::ToggleStartWithWindows)
         } else if *id == self.exit {
             Some(TrayAction::Exit)
         } else {
@@ -164,6 +170,7 @@ pub struct Tray {
     _icon: TrayIcon,
     ids: TrayMenuIds,
     apply_to_window_menu: Submenu,
+    start_with_windows_item: CheckMenuItem,
 }
 
 impl Tray {
@@ -192,6 +199,15 @@ impl Tray {
         rebuild_apply_to_window_items(&apply_to_window_menu);
         menu.append(&apply_to_window_menu).map_err(TrayUiError::Menu)?;
 
+        let start_with_windows_item = CheckMenuItem::with_id(
+            ids.start_with_windows.clone(),
+            "Start with Windows",
+            true,
+            crate::autostart::is_enabled(),
+            None,
+        );
+        menu.append(&start_with_windows_item).map_err(TrayUiError::Menu)?;
+
         menu.append(&MenuItem::with_id(ids.exit.clone(), "Exit", true, None))
             .map_err(TrayUiError::Menu)?;
 
@@ -204,7 +220,7 @@ impl Tray {
             .build()
             .map_err(TrayUiError::Tray)?;
 
-        Ok(Self { _icon: tray_icon, ids, apply_to_window_menu })
+        Ok(Self { _icon: tray_icon, ids, apply_to_window_menu, start_with_windows_item })
     }
 
     /// The id -> action mapping for this tray's three fixed top-level menu
@@ -257,6 +273,16 @@ impl Tray {
     pub fn refresh_apply_to_window_menu(&self) {
         rebuild_apply_to_window_items(&self.apply_to_window_menu);
     }
+
+    /// Re-reads the registry ([`crate::autostart::is_enabled`], the single
+    /// source of truth) into the "Start with Windows" check mark. `muda`
+    /// flips the check itself on every click, so this is called after a
+    /// toggle (to undo that flip if the registry write failed) and before
+    /// the menu shows (in case Settings, the installer or Task Manager
+    /// changed it in the meantime).
+    pub fn sync_start_with_windows_check(&self) {
+        self.start_with_windows_item.set_checked(crate::autostart::is_enabled());
+    }
 }
 
 /// Clears `submenu`'s current items and re-populates it with one
@@ -304,6 +330,16 @@ mod tests {
         let ids = TrayMenuIds::new();
 
         assert_eq!(ids.action_for(&MenuId::new(EXIT_ID)), Some(TrayAction::Exit));
+    }
+
+    #[test]
+    fn action_for_maps_the_start_with_windows_id_to_the_toggle_action() {
+        let ids = TrayMenuIds::new();
+
+        assert_eq!(
+            ids.action_for(&MenuId::new(START_WITH_WINDOWS_ID)),
+            Some(TrayAction::ToggleStartWithWindows)
+        );
     }
 
     #[test]
