@@ -79,6 +79,10 @@ pub fn run() -> Result<(), TrayUiError> {
     // `launch_watcher_hook` above.
     let taskbar_restore_watcher_hook = launch_watcher::register_taskbar_restore_watcher();
 
+    // Re-applies a tracked game's preset if the game itself resizes/restyles
+    // its window afterwards (e.g. after an in-game settings change).
+    let drift_watcher_hook = launch_watcher::register_drift_watcher();
+
     run_event_loop(&tray, hotkeys, &config_dir);
 
     // Issue #43: if a preset-apply's taskbar hide is still armed when the
@@ -97,6 +101,9 @@ pub fn run() -> Result<(), TrayUiError> {
         launch_watcher::unregister(hook);
     }
     if let Some(hook) = taskbar_restore_watcher_hook {
+        launch_watcher::unregister(hook);
+    }
+    if let Some(hook) = drift_watcher_hook {
         launch_watcher::unregister(hook);
     }
 
@@ -656,6 +663,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         eprintln!("apply to window failed: {e}");
         return;
     }
+    win32::remember_applied_window(target_hwnd);
 
     // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
     // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
@@ -722,12 +730,44 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         eprintln!("launch detection: failed to apply borderless treatment to {}: {e}", tracked_game.display_name);
         return;
     }
+    // Lets the location-change watcher re-apply if the game later resizes
+    // or restyles itself (e.g. after an in-game settings change).
+    win32::remember_applied_window(hwnd);
 
     // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
     // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
     // automatically restores the taskbar with no hotkey press required.
     if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
         eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+    }
+}
+
+/// Reacts to a location-change event on a window GameFrame previously
+/// applied a preset to (see [`win32::is_applied_window`]): if the game moved,
+/// resized, or re-added its border itself (e.g. after an in-game graphics
+/// setting change), re-applies the tracked game's preset. A no-op when the
+/// window still matches the target, which also stops GameFrame's own
+/// `SetWindowPos` from re-triggering itself. Does not touch the taskbar.
+///
+/// OS-facing; the drift decision is [`win32::window_drifted`], unit tested.
+pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
+    let Some(exe_path) = window_filter::exe_path_for_window(hwnd) else {
+        return;
+    };
+    let Ok(config) = profile_store::load(config_dir) else {
+        return;
+    };
+    let Some((tracked_game, preset)) = resolve_auto_apply(&config, &exe_path) else {
+        return;
+    };
+    let Ok(target_region) = resolve_region(&preset, &primary_monitor_geometry()) else {
+        return;
+    };
+    if !matches!(win32::window_has_drifted(hwnd, target_region), Ok(true)) {
+        return;
+    }
+    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
+        eprintln!("drift re-apply: failed for {}: {e}", tracked_game.display_name);
     }
 }
 

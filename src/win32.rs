@@ -408,6 +408,44 @@ fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
     set_corner_preference(hwnd, DWMWCP_DEFAULT)
 }
 
+/// Pure decision: has a window that was previously made borderless at
+/// `target` drifted from it? True if its bounds differ from `target`, or if
+/// any border/title-bar style bit (see [`strip_border_style`]) came back.
+/// Used by the in-game-resize watcher so it only re-applies when the game
+/// actually changed the window -- which also keeps GameFrame's own
+/// `SetWindowPos` (which fires another location-change event) from looping.
+pub fn window_drifted(current_region: Region, current_style: u32, target: Region) -> bool {
+    current_region != target || strip_border_style(current_style) != current_style
+}
+
+static APPLIED_WINDOWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// Remembers `hwnd` as one GameFrame applied a preset to, so the
+/// location-change watcher can cheaply (one mutex lock + scan) ignore every
+/// other window's move events.
+pub fn remember_applied_window(hwnd: HWND) {
+    let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    if !windows.contains(&(hwnd as isize)) {
+        windows.push(hwnd as isize);
+    }
+}
+
+/// Whether `hwnd` was previously registered via [`remember_applied_window`].
+pub fn is_applied_window(hwnd: HWND) -> bool {
+    APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).contains(&(hwnd as isize))
+}
+
+/// Forgets `hwnd` (called when it is destroyed).
+pub fn forget_applied_window(hwnd: HWND) {
+    APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).retain(|h| *h != hwnd as isize);
+}
+
+/// Reads `hwnd`'s live bounds/style and reports [`window_drifted`] against
+/// `target`. OS-facing.
+pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error> {
+    Ok(window_drifted(get_window_region(hwnd)?, get_window_style(hwnd)?, target))
+}
+
 /// Strips a window's border and moves/resizes it to `target_region`: the
 /// shared "make borderless" mutation shared by
 /// [`toggle_borderless_on_foreground_window`] (acting on
@@ -1587,6 +1625,31 @@ mod tests {
 
         assert_eq!(stripped & WS_CAPTION, 0);
         assert_eq!(stripped & WS_THICKFRAME, 0);
+    }
+
+    // Regression: Last Epoch re-created its caption and resized itself after an
+    // in-game settings change (rect 1660,0,3460x1440 -> 632,0,3856x1479, style
+    // 0x14000000 -> 0x14CF0000) and GameFrame never re-applied.
+    #[test]
+    fn window_drifted_detects_the_last_epoch_settings_change() {
+        let target = Region { x: 1660, y: 0, width: 3460, height: 1440 };
+        let drifted = Region { x: 632, y: 0, width: 3856, height: 1479 };
+
+        assert!(window_drifted(drifted, 0x14CF0000, target));
+    }
+
+    #[test]
+    fn window_drifted_detects_a_restored_caption_even_when_bounds_match() {
+        let target = Region { x: 0, y: 0, width: 100, height: 100 };
+
+        assert!(window_drifted(target, 0x14CF0000, target));
+    }
+
+    #[test]
+    fn window_drifted_is_false_for_the_state_gameframe_itself_applied() {
+        let target = Region { x: 1660, y: 0, width: 3460, height: 1440 };
+
+        assert!(!window_drifted(target, 0x14000000, target));
     }
 
     #[test]

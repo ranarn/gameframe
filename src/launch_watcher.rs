@@ -104,7 +104,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
 };
 
 /// The config directory the callback reloads the config from on every
@@ -245,11 +245,58 @@ unsafe extern "system" fn window_destroy_callback(
         return;
     }
 
+    crate::win32::forget_applied_window(hwnd);
+
     if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
         if let Err(e) = crate::win32::restore_taskbar(restore) {
             eprintln!("taskbar auto-restore on window close failed: {e}");
         }
     }
+}
+
+/// Registers an `EVENT_OBJECT_LOCATIONCHANGE` hook so a game that moves,
+/// resizes or re-adds its border itself after GameFrame applied a preset
+/// (e.g. Last Epoch after an in-game settings change) is put back. Same
+/// thread/message-loop requirements as [`register`]. OS-facing.
+pub fn register_drift_watcher() -> Option<HWINEVENTHOOK> {
+    // Safety: `drift_callback` matches the `WINEVENTPROC` signature.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            std::ptr::null_mut(),
+            Some(drift_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if hook.is_null() { None } else { Some(hook) }
+}
+
+/// `EVENT_OBJECT_LOCATIONCHANGE` fires very often system-wide, so this
+/// filters to `OBJID_WINDOW`/`CHILDID_SELF` and then to windows GameFrame
+/// itself applied a preset to (one mutex lock + scan) before doing any real
+/// work. OS-facing; not unit tested.
+unsafe extern "system" fn drift_callback(
+    _hwineventhook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    idobject: i32,
+    idchild: i32,
+    _ideventthread: u32,
+    _dwmseventtime: u32,
+) {
+    if hwnd.is_null() || idobject != OBJID_WINDOW || idchild != CHILDID_SELF as i32 {
+        return;
+    }
+    if !crate::win32::is_applied_window(hwnd) {
+        return;
+    }
+    let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
+        return;
+    };
+    crate::app::handle_applied_window_drift(config_dir, hwnd);
 }
 
 /// The real `WINEVENTPROC` Windows calls on every `EVENT_SYSTEM_FOREGROUND`
