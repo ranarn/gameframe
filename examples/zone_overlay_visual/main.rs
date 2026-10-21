@@ -178,7 +178,7 @@ impl OverlayApp {
         if !matches!(self.state.editor, EditorState::Empty | EditorState::Dragging { .. }) {
             return;
         }
-        let response = ui.interact(ui.max_rect(), ui.id().with("draw-area"), egui::Sense::click_and_drag());
+        let response = ui.interact(ui.max_rect(), ui.scope_id().with("draw-area"), egui::Sense::click_and_drag());
         let Some(pos) = response.interact_pointer_pos() else { return };
         let point = Point { x: pos.x as i32, y: pos.y as i32 };
 
@@ -208,7 +208,7 @@ impl OverlayApp {
             }
             let center = handle_center(&zone, handle);
             let rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
-            let response = ui.interact(rect, ui.id().with(("handle", format!("{handle:?}"))), egui::Sense::drag());
+            let response = ui.interact(rect, ui.scope_id().with(("handle", format!("{handle:?}"))), egui::Sense::drag());
             let Some(pos) = response.interact_pointer_pos() else { continue };
             let point = Point { x: pos.x as i32, y: pos.y as i32 };
 
@@ -223,7 +223,7 @@ impl OverlayApp {
     }
 
     fn control_panel(&mut self, ctx: &egui::Context) {
-        egui::Area::new(egui::Id::new("controls"))
+        egui::Area::new(egui::Id::unique("controls"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
