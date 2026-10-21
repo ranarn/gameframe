@@ -1,4 +1,4 @@
-; GameFrame installer (Inno Setup 6). Build with installer\build.ps1, which
+; GameFrame installer (Inno Setup 7). Build with installer\build.ps1, which
 ; compiles the release exe and passes AppVersion from Cargo.toml.
 ;
 ; Per-user install: no admin prompt, lands in %LOCALAPPDATA%\Programs\GameFrame,

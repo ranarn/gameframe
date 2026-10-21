@@ -56,8 +56,8 @@ present on any Windows install).
 ### Installer
 
 ```powershell
-# One-time: install Inno Setup 6
-winget install JRSoftware.InnoSetup
+# One-time: install Inno Setup 7
+winget install JRSoftware.InnoSetup.7
 
 # Build target\installer\GameFrame-Setup-<version>.exe
 .\installer\build.ps1

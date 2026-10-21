@@ -13,7 +13,7 @@ Autostart + installer (branch feat/installer-autostart, 2026-09-30).
   re-points the Run value at target\... exe.
 - Tests use a scratch `HKCU\Software\GameFrameTest-<pid>-<name>` key via `RegistryLocation`, deleted
   with RegDeleteTreeW on drop.
-- Installer: `installer/gameframe.iss` (Inno Setup 6, per-user, {autopf} = %LOCALAPPDATA%\Programs),
+- Installer: `installer/gameframe.iss` (Inno Setup 7 since 2026-10-21 -- build.ps1 searches only Inno Setup 7 dirs; per-user, {autopf} = %LOCALAPPDATA%\Programs),
   built by `installer/build.ps1` (passes /DAppVersion from Cargo.toml). The .iss must keep the same
   value name `GameFrame` as autostart.rs. App has no graceful-close protocol, so install/uninstall
   `taskkill /F` it in [Code] (CloseApplications=no). Uninstall removes Run + StartupApproved values,
