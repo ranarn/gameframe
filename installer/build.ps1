@@ -1,18 +1,19 @@
 # Builds the GameFrame installer: release exe -> Inno Setup -> target\installer\GameFrame-Setup-<version>.exe
 #
-# Requires Inno Setup 6 (winget install JRSoftware.InnoSetup).
+# Requires Inno Setup 7 (winget install JRSoftware.InnoSetup.7). Only Inno
+# Setup 7 install dirs are searched -- it installs side by side with 6, and an
+# ISCC.exe on PATH could be either.
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 
 $iscc = @(
-    (Get-Command ISCC.exe -ErrorAction SilentlyContinue)?.Source
-    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe"
+    "$env:ProgramFiles\Inno Setup 7\ISCC.exe"
+    "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) {
-    throw 'ISCC.exe not found -- install Inno Setup 6: winget install JRSoftware.InnoSetup'
+    throw 'ISCC.exe not found -- install Inno Setup 7: winget install JRSoftware.InnoSetup.7'
 }
 
 Push-Location $repo
