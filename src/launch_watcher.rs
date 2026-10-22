@@ -1,6 +1,6 @@
 //! Detects a tracked game launching while GameFrame is idle in the tray via
 //! a `SetWinEventHook(WINEVENT_OUTOFCONTEXT)` registration on
-//! `EVENT_SYSTEM_FOREGROUND`, and reacts by applying that game's preset and
+//! `EVENT_SYSTEM_FOREGROUND`, and reacts by applying the Zone and
 //! taskbar-auto-hide state the same way the hotkey/tray "Apply to Window"
 //! paths do -- with no hotkey press required. See issue #32 and
 //! `docs/research/idle-game-launch-detection.md` for the comparison
@@ -255,7 +255,7 @@ unsafe extern "system" fn window_destroy_callback(
 }
 
 /// Registers an `EVENT_OBJECT_LOCATIONCHANGE` hook so a game that moves,
-/// resizes or re-adds its border itself after GameFrame applied a preset
+/// resizes or re-adds its border itself after GameFrame applied the Zone
 /// (e.g. Last Epoch after an in-game settings change) is put back. Same
 /// thread/message-loop requirements as [`register`]. OS-facing.
 pub fn register_drift_watcher() -> Option<HWINEVENTHOOK> {
@@ -276,7 +276,7 @@ pub fn register_drift_watcher() -> Option<HWINEVENTHOOK> {
 
 /// `EVENT_OBJECT_LOCATIONCHANGE` fires very often system-wide, so this
 /// filters to `OBJID_WINDOW`/`CHILDID_SELF` and then to windows GameFrame
-/// itself applied a preset to (one mutex lock + scan) before doing any real
+/// itself applied the Zone to (one mutex lock + scan) before doing any real
 /// work. OS-facing; not unit tested.
 unsafe extern "system" fn drift_callback(
     _hwineventhook: HWINEVENTHOOK,

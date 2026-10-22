@@ -1,6 +1,6 @@
 # Preset set is a fixed structure, not a free-form list — and config.toml is not migrated
 
-**Status:** accepted
+**Status:** accepted — the no-migration stance was superseded for the Zone change by `0003-zone-config-migration.md`; the preset structure it describes no longer exists.
 
 The preset set (originally `Left`, `Right`, `HalfLeft`, `HalfRight`, plus an optional `Custom`) was previously a free-form `Vec<Preset>`: any number of any variant could be added or removed, and editing meant removing an entry and re-adding it. That no longer matches the domain — the base presets are mandatory and non-deletable, and at most one `Custom` can exist — so the config's `presets: Vec<Preset>` becomes a fixed structure with one field per base preset plus `custom: Option<Custom>`. This makes "always the fixed set of base presets, at most one Custom" a type-level invariant instead of a UI-only or runtime-checked rule.
 

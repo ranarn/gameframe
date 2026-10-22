@@ -420,7 +420,7 @@ pub fn window_drifted(current_region: Region, current_style: u32, target: Region
 
 static APPLIED_WINDOWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
 
-/// Remembers `hwnd` as one GameFrame applied a preset to, so the
+/// Remembers `hwnd` as one GameFrame applied the Zone to, so the
 /// location-change watcher can cheaply (one mutex lock + scan) ignore every
 /// other window's move events.
 pub fn remember_applied_window(hwnd: HWND) {
@@ -765,7 +765,7 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
 /// state of its own at all -- see its doc comment): per
 /// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`, the manual
 /// global taskbar-autohide hotkey's own toggle must stay independent from
-/// the preset-apply paths' taskbar handling, and this static is never read
+/// the Zone-apply paths' taskbar handling, and this static is never read
 /// or written by [`toggle_taskbar_hide`] or the zone editor's own
 /// session-scoped hide (`crate::zone_overlay`, which keeps its remembered
 /// [`TaskbarHideRestore`] locally in its own guard struct, not here).
@@ -885,7 +885,7 @@ fn join_taskbar_hide_session(hwnd: HWND) {
 /// removing `hwnd` from the currently-armed set empties it, via
 /// [`ArmedTaskbarWindows::leave`]. Called by [`crate::launch_watcher`]'s
 /// `EVENT_OBJECT_DESTROY` callback when `hwnd` closes: an empty result
-/// means that was the last window whose preset-apply had hidden the
+/// means that was the last window whose Zone-apply had hidden the
 /// taskbar, so the caller should restore it immediately with no hotkey
 /// press required (issue #43's core behavior). Returns `None` for every
 /// other window closing (unarmed, or other windows still relying on the

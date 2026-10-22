@@ -2,7 +2,7 @@
 //! always-on-top egui/wgpu window covering the primary monitor's full
 //! bounds (not the taskbar-excluded work area -- a drawn zone may extend
 //! into the taskbar's screen strip), used to drag-draw or resize the
-//! Custom preset's region interactively instead of typing X/Y/width/height
+//! Zone interactively instead of typing X/Y/width/height
 //! by hand.
 //!
 //! Lifts the verified rendering/platform setup from
@@ -36,7 +36,7 @@
 //! ([`crate::win32::plan_taskbar_hide`]) are both fully unit tested
 //! instead.
 
-use crate::profile_store::{CustomRegion, TaskbarHideMode};
+use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
 use crate::win32;
 use crate::zone_editor::{Action, AppState, EditorState, Handle, Monitor, PinnedEdges, Point, SessionOutcome};
@@ -75,12 +75,10 @@ impl std::error::Error for ZoneOverlayError {
 /// legal Save; `Ok(None)` on Cancel or an unclean close.
 ///
 /// `initial` pre-loads the overlay with an existing region (e.g. the
-/// already-configured Custom preset) so resizing it doesn't require
+/// already-configured Zone) so resizing it doesn't require
 /// redrawing from scratch; `pinned` controls which resize handles are
-/// active. Issue #28's production wiring only calls this for the Custom
-/// preset (`PinnedEdges::NONE`, all 8 handles active) -- the parameter
-/// itself is general per [`crate::zone_editor`]'s design, so a later slice
-/// can reuse this for the Left/Right base presets without changes here.
+/// active. Production wiring always passes `PinnedEdges::NONE` (all 8
+/// handles active); issue #51 removes the parameter.
 ///
 /// Hides the taskbar for the session using whichever technique `mode`
 /// selects (see module docs) and always restores exactly the state found
@@ -88,10 +86,10 @@ impl std::error::Error for ZoneOverlayError {
 /// run, or `eframe::run_native` panicked partway through -- via the
 /// [`TaskbarRestoreGuard`] RAII guard held across the call.
 pub fn run_zone_editor_overlay(
-    initial: Option<CustomRegion>,
+    initial: Option<Zone>,
     pinned: PinnedEdges,
     mode: TaskbarHideMode,
-) -> Result<Option<CustomRegion>, ZoneOverlayError> {
+) -> Result<Option<Zone>, ZoneOverlayError> {
     let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
     let monitor = Monitor { width: monitor_geometry.width, height: monitor_geometry.height };
 
@@ -375,14 +373,14 @@ fn rect_from_points(a: Point, b: Point) -> egui::Rect {
     egui::Rect::from_two_pos(egui::pos2(a.x as f32, a.y as f32), egui::pos2(b.x as f32, b.y as f32))
 }
 
-fn rect_from_zone(zone: &CustomRegion) -> egui::Rect {
+fn rect_from_zone(zone: &Zone) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(zone.x as f32, zone.y as f32),
         egui::vec2(zone.width as f32, zone.height as f32),
     )
 }
 
-fn handle_center(zone: &CustomRegion, handle: Handle) -> egui::Pos2 {
+fn handle_center(zone: &Zone, handle: Handle) -> egui::Pos2 {
     let (x, y, w, h) = (zone.x as f32, zone.y as f32, zone.width as f32, zone.height as f32);
     match handle {
         Handle::N => egui::pos2(x + w / 2.0, y),

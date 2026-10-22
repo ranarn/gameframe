@@ -1,3 +1,5 @@
+> **Stale-warning (issue #48, branch feature/single-zone-replaces-presets, based on f3b42d4):** presets are gone. Config now holds `zone: Option<Zone>` (`CustomRegion` renamed `Zone`); `Presets`/`PresetKind`/`region_calc::Preset`/preset thumbnails/per-game preset dropdown/`live_reapply_cascade` no longer exist. `resolve_tracked_apply`/`resolve_auto_apply` return `Option<(TrackedGame, Zone)>` (`None` for untracked, no Zone, or auto-apply off). `SettingsState` has `zone` with `set_zone`/`clear_zone`. See `CONTEXT.md` and `docs/adr/0003-zone-config-migration.md`. Everything below describes the pre-#48 design.
+
 Issue #28 added `src/zone_editor.rs` (pure state machine: `Empty -> Dragging -> Placed <-> Resizing`,
 `PinnedEdges`/`Handle::enabled`, `AppState::apply(Action) -> Option<SessionOutcome>`) and
 `src/zone_overlay.rs` (OS-facing eframe/wgpu transparent overlay window driving it, lifted from

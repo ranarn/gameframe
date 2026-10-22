@@ -11,17 +11,17 @@ Full problem statement, research, and design decisions: [`Project Ideas/gamefram
 MVP complete. GameFrame runs as a tray-resident background process with:
 
 - **Tray icon** with a right-click menu: **Show Settings**, **Apply to Window** (a submenu listing
-  currently open, listable windows — picking one applies the active region preset to it), and
+  currently open, listable windows — picking one applies the Zone to it), and
   **Exit**.
 - **Global hotkeys**:
   - Borderless toggle — strips the window border/titlebar from the current foreground window and
-    moves/resizes it to the active region preset; pressing it again restores the window's original
+    moves/resizes it to the Zone; pressing it again restores the window's original
     style and position.
   - Taskbar auto-hide toggle — flips the Windows taskbar between always-visible and auto-hide.
 - **Settings window** (`egui`, opened on demand from the tray menu, not resident at idle) for
-  managing region presets (built-in presets plus custom presets with user-defined dimensions) and
+  drawing/editing the Zone (the single screen region games are placed into) and
   binding the two global hotkeys.
-- **Config persistence** — presets and hotkey bindings are saved as TOML to
+- **Config persistence** — the Zone and hotkey bindings are saved as TOML to
   `%APPDATA%\GameFrame\config.toml` and reloaded on the next launch.
 
 ## Tech stack

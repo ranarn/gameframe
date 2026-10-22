@@ -18,7 +18,7 @@
 //! tracked-games list (adding it, with this issue's new-tracked-game
 //! defaults, if not already tracked -- see
 //! [`crate::profile_store::upsert_tracked_game`]) and applies its assigned
-//! preset's borderless+reposition treatment to that specific window via
+//! Zone's borderless+reposition treatment to that specific window via
 //! [`win32::apply_borderless_to_window`] -- a one-shot action with no
 //! remembered restore state, unlike the hotkey path's `toggle_state` (see
 //! [`handle_apply_to_window`]).
@@ -26,7 +26,7 @@
 //! A third trigger requires no user action at all: [`crate::launch_watcher`]
 //! registers a `SetWinEventHook` on the same message loop and, on every
 //! foreground-window change, delegates to [`handle_auto_apply_launch`] --
-//! which applies a tracked game's preset the moment it becomes the
+//! which applies the Zone to a tracked game the moment it becomes the
 //! foreground window, but only if that game's `auto_apply` flag is on (see
 //! [`resolve_auto_apply`]).
 //!
@@ -79,13 +79,13 @@ pub fn run() -> Result<(), TrayUiError> {
     // `launch_watcher_hook` above.
     let taskbar_restore_watcher_hook = launch_watcher::register_taskbar_restore_watcher();
 
-    // Re-applies a tracked game's preset if the game itself resizes/restyles
+    // Re-applies the Zone to a tracked game if the game itself resizes/restyles
     // its window afterwards (e.g. after an in-game settings change).
     let drift_watcher_hook = launch_watcher::register_drift_watcher();
 
     run_event_loop(&tray, hotkeys, &config_dir);
 
-    // Issue #43: if a preset-apply's taskbar hide is still armed when the
+    // Issue #43: if a Zone-apply's taskbar hide is still armed when the
     // user quits via the tray "Exit" item, restore it now -- before `tray`
     // is dropped below (which just removes the tray icon; it has no bearing
     // on the taskbar) and before the process actually exits, so the desktop
@@ -302,26 +302,32 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
 }
 
 /// Resolves the tracked game (if any) whose executable path is `exe_path`,
-/// and its assigned preset resolved against `config.presets` -- the shared
-/// decision logic behind both [`handle_toggle_borderless`]'s and
-/// [`handle_apply_to_window`]'s "resolve against tracked games" rule.
+/// and the configured Zone -- the shared decision logic behind
+/// [`handle_toggle_borderless`]'s "resolve against tracked games" rule.
 ///
 /// Returns `None` in either of two cases, both treated identically by
-/// callers (log and do nothing, no fallback):
+/// callers (do nothing, no fallback; see [`no_apply_reason`] for the
+/// distinct log text):
 /// - no tracked game matches `exe_path` (an untracked process); or
-/// - one does, but its assigned preset can't currently be resolved (e.g. it
-///   was assigned `Custom`, and `Custom` was since cleared -- see
-///   [`crate::profile_store::Presets::resolve`]'s doc comment).
+/// - no Zone is set in the config.
 ///
 /// Pure -- no OS call -- so it's unit testable in complete isolation from
 /// the live foreground-window/tray-hwnd resolution that supplies `exe_path`.
 fn resolve_tracked_apply(
     config: &profile_store::Config,
     exe_path: &std::path::Path,
-) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
+) -> Option<(profile_store::TrackedGame, profile_store::Zone)> {
     let game = profile_store::find_tracked_game(&config.tracked_games, exe_path)?.clone();
-    let preset = config.presets.resolve(game.preset)?;
-    Some((game, preset))
+    let zone = config.zone?;
+    Some((game, zone))
+}
+
+/// Why [`resolve_tracked_apply`] returned `None`, for logging: "no Zone set"
+/// is reported distinctly from "not a tracked game". Decided from
+/// `config.zone` alone, so with no Zone it reports that even for an untracked
+/// process.
+fn no_apply_reason(config: &profile_store::Config) -> &'static str {
+    if config.zone.is_none() { "no Zone is set" } else { "the process is not a tracked game" }
 }
 
 /// Like [`resolve_tracked_apply`], but additionally requires the tracked
@@ -332,9 +338,8 @@ fn resolve_tracked_apply(
 /// without a hotkey press, not whether a manual hotkey/tray press works).
 ///
 /// Returns `None` for exactly the same two cases [`resolve_tracked_apply`]
-/// does (no match; matched but the assigned preset can't currently be
-/// resolved), plus a third: matched, preset resolves, but `auto_apply` is
-/// off.
+/// does (no match; no Zone set), plus a third: matched, Zone set, but
+/// `auto_apply` is off.
 ///
 /// Pure -- no OS call -- so it's unit testable in complete isolation from
 /// the real WinEvent hook registration/callback (`crate::launch_watcher`)
@@ -342,12 +347,12 @@ fn resolve_tracked_apply(
 pub(crate) fn resolve_auto_apply(
     config: &profile_store::Config,
     exe_path: &std::path::Path,
-) -> Option<(profile_store::TrackedGame, crate::region_calc::Preset)> {
-    let (game, preset) = resolve_tracked_apply(config, exe_path)?;
+) -> Option<(profile_store::TrackedGame, profile_store::Zone)> {
+    let (game, zone) = resolve_tracked_apply(config, exe_path)?;
     if !game.auto_apply {
         return None;
     }
-    Some((game, preset))
+    Some((game, zone))
 }
 
 /// Decides whether [`handle_toggle_borderless`]'s tracked-game gate should
@@ -355,7 +360,7 @@ pub(crate) fn resolve_auto_apply(
 /// *restore* (`is_restoring`, i.e. `toggle_state.is_some()` -- see
 /// [`win32::plan_toggle`], which derives the same strip-vs-restore decision
 /// from that same remembered state) and whether the foreground window's
-/// process currently resolves to a tracked game with a resolvable preset
+/// process currently resolves to a tracked game with a Zone set
 /// (`tracked`, i.e. `resolve_tracked_apply(..).is_some()`).
 ///
 /// Only the strip direction is gated on tracked-game membership: an
@@ -365,11 +370,11 @@ pub(crate) fn resolve_auto_apply(
 /// finding on issue #31) -- gating both directions uniformly would
 /// permanently orphan a currently-stripped window in its borderless state
 /// for the rest of the running session if its tracked game were removed via
-/// Settings (or its assigned preset's `Custom` region cleared) in between
+/// Settings (or the Zone cleared) in between
 /// the strip press and the restore press, since nothing else in the app can
 /// restore it once the remembered `RestoreState` game is no longer
 /// resolvable. `plan_toggle`'s `Restore` arm doesn't need a resolved
-/// preset/region at all, so there is no correctness reason to require one
+/// Zone/region at all, so there is no correctness reason to require one
 /// here.
 ///
 /// This function alone is *not* sufficient to greenlight a restore, though:
@@ -422,7 +427,7 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
 /// strip (per this issue's acceptance criteria and `CONTEXT.md`'s "Applying
-/// a preset to a window whose process is not a tracked game does nothing"),
+/// the Zone to a window whose process is not a tracked game does nothing"),
 /// but never blocks a pending *restore* purely because the untracked window
 /// happens to be the one now in the foreground -- see that function's doc
 /// comment for the full reasoning.
@@ -449,7 +454,7 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// other case (success, or a non-elevation failure that was just logged).
 ///
 /// Reloads the config from disk on every press (rather than caching it
-/// across the whole run) so a preset/assignment added/edited via Settings
+/// across the whole run) so a Zone/game added/edited via Settings
 /// since the last press is picked up immediately -- the trade-off is a
 /// small, infrequent disk read on a user-initiated action, which is cheap.
 /// The hotkey binding itself is re-registered separately, right after the
@@ -495,19 +500,17 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
         .and_then(|exe_path| resolve_tracked_apply(&config, &exe_path));
 
     if should_block_untracked_toggle(is_restoring, tracked.is_some()) {
-        eprintln!(
-            "borderless toggle: foreground window's process is not a tracked game (or its assigned preset is unavailable); ignoring"
-        );
+        eprintln!("borderless toggle: not applying ({}); ignoring", no_apply_reason(&config));
         return false;
     }
 
     let target_region = match &tracked {
-        Some((tracked_game, preset)) => {
+        Some((tracked_game, zone)) => {
             let monitor = primary_monitor_geometry();
-            match resolve_region(preset, &monitor) {
+            match resolve_region(zone, &monitor) {
                 Ok(region) => region,
                 Err(e) => {
-                    eprintln!("borderless toggle: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+                    eprintln!("borderless toggle: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
                     return false;
                 }
             }
@@ -584,12 +587,10 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// Reacts to a click on one of the "Apply to Window" submenu's
 /// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
 /// `target_hwnd`'s owning process's executable path, looks it up (or adds it,
-/// with the current `Presets::default_for_new_games` preset -- see
-/// `CONTEXT.md`'s "Default preset (for new tracked games)" -- auto-apply
-/// on, taskbar-auto-hide on) in the tracked-games list via
+/// with auto-apply on, taskbar-auto-hide on) in the tracked-games list via
 /// [`profile_store::upsert_tracked_game`], persists that list update
 /// immediately (even if a later step below fails), then applies the
-/// resolved preset's borderless+reposition treatment to `target_hwnd` --
+/// Zone's borderless+reposition treatment to `target_hwnd` --
 /// which may not be the foreground window at all, that's the whole point of
 /// this tray-menu path -- via [`win32::apply_borderless_to_window`], and,
 /// only once that border-apply succeeds, sets the tracked game's
@@ -628,33 +629,28 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     };
 
     let display_name = win32::window_text(target_hwnd);
-    let index = profile_store::upsert_tracked_game(
-        &mut config.tracked_games,
-        exe_path,
-        display_name,
-        config.presets.default_for_new_games,
-    );
+    let index = profile_store::upsert_tracked_game(&mut config.tracked_games, exe_path, display_name);
     let tracked_game = config.tracked_games[index].clone();
 
     // Persist the (possibly newly-added) tracked game immediately, before
     // attempting the region/border/taskbar steps below -- so a downstream
-    // failure (e.g. an unresolvable preset, or the window manipulation
+    // failure (e.g. no Zone set, or the window manipulation
     // itself failing) never costs the user the "this window is now tracked"
     // outcome that "Apply to Window" is documented to guarantee.
     if let Err(e) = profile_store::save(config_dir, &config) {
         eprintln!("apply to window: failed to save tracked game {}: {e}", tracked_game.display_name);
     }
 
-    let Some(preset) = config.presets.resolve(tracked_game.preset) else {
-        eprintln!("apply to window: {}'s assigned preset is unavailable; ignoring", tracked_game.display_name);
+    let Some(zone) = config.zone else {
+        eprintln!("apply to window: no Zone is set; {} is tracked but nothing was applied", tracked_game.display_name);
         return;
     };
 
     let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(&preset, &monitor) {
+    let target_region = match resolve_region(&zone, &monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("apply to window: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+            eprintln!("apply to window: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
             return;
         }
     };
@@ -676,7 +672,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// Reacts to a [`crate::launch_watcher`]-detected foreground-window change:
 /// resolves `hwnd`'s owning process's executable path and, only if it
 /// matches a tracked game with auto-apply on (see [`resolve_auto_apply`]),
-/// applies that game's assigned preset's borderless+reposition treatment to
+/// applies the Zone's borderless+reposition treatment to
 /// `hwnd` via [`win32::apply_borderless_to_window`], then, only once that
 /// succeeds, sets the tracked game's taskbar-auto-hide value absolutely --
 /// exactly mirroring [`handle_apply_to_window`]'s one-shot apply shape
@@ -713,15 +709,22 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         return;
     };
 
-    let Some((tracked_game, preset)) = resolve_auto_apply(&config, &exe_path) else {
+    let Some((tracked_game, zone)) = resolve_auto_apply(&config, &exe_path) else {
+        // Distinct from "untracked" (silent, the common case): a tracked
+        // auto-apply game that launched while no Zone is set.
+        if config.zone.is_none()
+            && profile_store::find_tracked_game(&config.tracked_games, &exe_path).is_some_and(|g| g.auto_apply)
+        {
+            eprintln!("launch detection: not applying to a tracked game ({})", no_apply_reason(&config));
+        }
         return;
     };
 
     let monitor = primary_monitor_geometry();
-    let target_region = match resolve_region(&preset, &monitor) {
+    let target_region = match resolve_region(&zone, &monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("launch detection: failed to resolve {}'s preset region: {e}", tracked_game.display_name);
+            eprintln!("launch detection: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
             return;
         }
     };
@@ -743,9 +746,9 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 }
 
 /// Reacts to a location-change event on a window GameFrame previously
-/// applied a preset to (see [`win32::is_applied_window`]): if the game moved,
+/// applied the Zone to (see [`win32::is_applied_window`]): if the game moved,
 /// resized, or re-added its border itself (e.g. after an in-game graphics
-/// setting change), re-applies the tracked game's preset. A no-op when the
+/// setting change), re-applies the Zone. A no-op when the
 /// window still matches the target, which also stops GameFrame's own
 /// `SetWindowPos` from re-triggering itself. Does not touch the taskbar.
 ///
@@ -757,10 +760,10 @@ pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
     let Ok(config) = profile_store::load(config_dir) else {
         return;
     };
-    let Some((tracked_game, preset)) = resolve_auto_apply(&config, &exe_path) else {
+    let Some((tracked_game, zone)) = resolve_auto_apply(&config, &exe_path) else {
         return;
     };
-    let Ok(target_region) = resolve_region(&preset, &primary_monitor_geometry()) else {
+    let Ok(target_region) = resolve_region(&zone, &primary_monitor_geometry()) else {
         return;
     };
     if !matches!(win32::window_has_drifted(hwnd, target_region), Ok(true)) {
@@ -824,8 +827,7 @@ fn config_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::hotkeys::resolve_bindings;
-    use crate::profile_store::{Config, PresetKind, TrackedGame};
-    use crate::region_calc::Preset;
+    use crate::profile_store::{Config, TrackedGame, Zone};
     use global_hotkey::hotkey::HotKey;
     use std::path::PathBuf;
 
@@ -882,9 +884,20 @@ mod tests {
         assert!(!should_allow_restore(Some(hwnd), None));
     }
 
+    fn config_with_zone_and_game(zone: Option<Zone>, auto_apply: bool) -> (Config, PathBuf) {
+        let mut config = Config { zone, ..Config::default() };
+        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
+        let mut game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string());
+        game.auto_apply = auto_apply;
+        config.tracked_games.push(game);
+        (config, exe_path)
+    }
+
+    const A_ZONE: Zone = Zone { x: 10, y: 20, width: 300, height: 200 };
+
     #[test]
     fn resolve_tracked_apply_returns_none_for_an_untracked_executable_path() {
-        let config = Config::default();
+        let config = Config { zone: Some(A_ZONE), ..Config::default() };
 
         let result = resolve_tracked_apply(&config, &PathBuf::from("C:\\Games\\thing.exe"));
 
@@ -892,52 +905,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tracked_apply_resolves_a_tracked_games_assigned_preset() {
-        let mut config = Config::default();
-        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        config.tracked_games.push(TrackedGame::new_default(
-            exe_path.clone(),
-            "Thing".to_string(),
-            config.presets.default_for_new_games,
-        ));
+    fn resolve_tracked_apply_returns_none_when_no_zone_is_set() {
+        let (config, exe_path) = config_with_zone_and_game(None, true);
 
-        let (game, preset) = resolve_tracked_apply(&config, &exe_path).expect("expected a tracked game match");
-
-        assert_eq!(game.display_name, "Thing");
-        assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+        assert!(resolve_tracked_apply(&config, &exe_path).is_none());
     }
 
     #[test]
-    fn resolve_auto_apply_resolves_when_matched_and_auto_apply_is_on() {
-        let mut config = Config::default();
-        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let game = TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
-        assert!(game.auto_apply);
-        config.tracked_games.push(game);
+    fn resolve_tracked_apply_returns_the_game_and_the_zone() {
+        let (config, exe_path) = config_with_zone_and_game(Some(A_ZONE), true);
 
-        let (game, preset) = resolve_auto_apply(&config, &exe_path).expect("expected a resolved auto-apply match");
+        let (game, zone) = resolve_tracked_apply(&config, &exe_path).expect("expected a tracked game match");
 
         assert_eq!(game.display_name, "Thing");
-        assert_eq!(preset, Preset::Right { depth_percent: config.presets.right_depth_percent });
+        assert_eq!(zone, A_ZONE);
+    }
+
+    #[test]
+    fn resolve_auto_apply_returns_the_game_and_the_zone_when_auto_apply_is_on() {
+        let (config, exe_path) = config_with_zone_and_game(Some(A_ZONE), true);
+
+        let (game, zone) = resolve_auto_apply(&config, &exe_path).expect("expected a resolved auto-apply match");
+
+        assert_eq!(game.display_name, "Thing");
+        assert_eq!(zone, A_ZONE);
     }
 
     #[test]
     fn resolve_auto_apply_returns_none_when_auto_apply_is_off() {
-        let mut config = Config::default();
-        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game =
-            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
-        game.auto_apply = false;
-        config.tracked_games.push(game);
+        let (config, exe_path) = config_with_zone_and_game(Some(A_ZONE), false);
 
-        let result = resolve_auto_apply(&config, &exe_path);
-
-        assert!(result.is_none());
+        assert!(resolve_auto_apply(&config, &exe_path).is_none());
     }
 
     #[test]
     fn resolve_auto_apply_returns_none_for_an_untracked_executable_path() {
-        let config = Config::default();
+        let config = Config { zone: Some(A_ZONE), ..Config::default() };
 
         let result = resolve_auto_apply(&config, &PathBuf::from("C:\\Games\\thing.exe"));
 
@@ -945,37 +948,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
-        let mut config = Config::default();
-        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game =
-            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
-        game.preset = PresetKind::Custom;
-        assert!(game.auto_apply);
-        config.tracked_games.push(game);
-        assert_eq!(config.presets.custom, None);
+    fn resolve_auto_apply_returns_none_when_no_zone_is_set() {
+        let (config, exe_path) = config_with_zone_and_game(None, true);
 
-        let result = resolve_auto_apply(&config, &exe_path);
-
-        assert!(result.is_none());
+        assert!(resolve_auto_apply(&config, &exe_path).is_none());
     }
 
     #[test]
-    fn resolve_tracked_apply_returns_none_when_the_tracked_games_custom_preset_was_since_cleared() {
-        // A game assigned to Custom after Custom was since cleared/replaced
-        // with None -- treated the same as "untracked" for this one apply,
-        // not a silent fallback to a different preset.
-        let mut config = Config::default();
-        let exe_path = PathBuf::from("C:\\Games\\thing.exe");
-        let mut game =
-            TrackedGame::new_default(exe_path.clone(), "Thing".to_string(), config.presets.default_for_new_games);
-        game.preset = PresetKind::Custom;
-        config.tracked_games.push(game);
-        assert_eq!(config.presets.custom, None);
+    fn no_apply_reason_distinguishes_no_zone_from_untracked() {
+        let no_zone = Config::default();
+        let with_zone = Config { zone: Some(A_ZONE), ..Config::default() };
 
-        let result = resolve_tracked_apply(&config, &exe_path);
-
-        assert!(result.is_none());
+        assert_eq!(no_apply_reason(&no_zone), "no Zone is set");
+        assert_eq!(no_apply_reason(&with_zone), "the process is not a tracked game");
     }
 
     /// Regression coverage for the bug where a hotkey bound via Settings

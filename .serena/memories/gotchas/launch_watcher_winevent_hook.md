@@ -1,3 +1,5 @@
+> **Stale-warning (issue #48, branch feature/single-zone-replaces-presets, based on f3b42d4):** presets are gone; config holds `zone: Option<Zone>`, and `resolve_tracked_apply`/`resolve_auto_apply` return `Option<(TrackedGame, Zone)>`. See `CONTEXT.md` and `docs/adr/0003-zone-config-migration.md`. Preset references below describe the pre-#48 design.
+
 ## `SetWinEventHook` launch detection (issue #32)
 
 ### Feature-flag correction (important — corrects the issue's own brief/research doc)
