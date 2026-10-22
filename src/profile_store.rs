@@ -146,6 +146,12 @@ impl Default for Config {
     }
 }
 
+/// Whether startup should open the zone editor once: true exactly when the
+/// config has no Zone (first run, or a corrupt config reset to defaults).
+pub fn should_prompt_for_zone(config: &Config) -> bool {
+    config.zone.is_none()
+}
+
 /// Reasons loading or saving the config can fail.
 ///
 /// There is no `Malformed`/invalid-TOML variant: [`load`] never surfaces a
@@ -208,9 +214,10 @@ const PER_GAME_TASKBAR_KEY: &str = "taskbar_autohide";
 
 /// Folds per-game `taskbar_autohide` flags (present in preset-era and #48-era
 /// configs) into the global `hide_taskbar_on_apply` key: true if any game had
-/// it on, false if every game had it off. The no-games case never reaches this
-/// fold; it comes from `default_hide_taskbar_on_apply`. The per-game keys are
-/// removed. A table that already carries `hide_taskbar_on_apply` keeps it.
+/// it on, false if every game had it off. The no-games case does reach this
+/// fold but changes nothing (the value then comes from
+/// `default_hide_taskbar_on_apply`). The per-game keys are removed. A table
+/// that already carries `hide_taskbar_on_apply` keeps it.
 /// Returns whether the table changed. Pure -- no filesystem access.
 fn fold_per_game_taskbar_flags(table: &mut toml::Table) -> bool {
     let mut flags = Vec::new();
@@ -261,9 +268,12 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
 ///
 /// Order: a config already in the Zone shape loads as-is; a legacy
 /// (preset-era, has a `[presets]` table) config is converted via
-/// [`convert_legacy_config`] and the new shape is written back immediately;
-/// anything else (corrupt TOML, unrecognised shape) is replaced with a
-/// freshly written default config rather than returned as an error -- see
+/// [`convert_legacy_config`] and the new shape is written back immediately; a
+/// #48-era config still carrying per-game `taskbar_autohide` flags has them
+/// folded into the global setting ([`fold_per_game_taskbar_flags`]) and is
+/// written back too; anything else (corrupt TOML, unrecognised shape) is
+/// replaced with a freshly written default config rather than returned as an
+/// error -- see
 /// `docs/adr/0003-zone-config-migration.md`.
 pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     let path = config_dir.join(CONFIG_FILE_NAME);
@@ -291,7 +301,6 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
                 // name is used) and identical bytes are not backed up twice. If the copy
                 // cannot be made, skip this write-back and retry on the next load; a
                 // later save still writes the new shape over the original.
-                // is reversible. An existing copy is never overwritten (a free\n                // numbered name is used). If the copy cannot be made, skip this\n                // write-back and retry on the next load; a later save still\n                // writes the new shape over the original.
                 if keep_pre_zone_backup(config_dir, &contents) {
                     // A failed write-back (read-only file, AV lock) must not
                     // make every caller fail; the config is valid in memory.
@@ -450,6 +459,20 @@ mod tests {
     fn write_config_file(config_dir: &Path, contents: &str) {
         std::fs::create_dir_all(config_dir).unwrap();
         std::fs::write(config_dir.join(CONFIG_FILE_NAME), contents).unwrap();
+    }
+
+    #[test]
+    fn should_prompt_for_zone_when_no_zone_is_set() {
+        assert!(should_prompt_for_zone(&Config::default()));
+    }
+
+    #[test]
+    fn should_not_prompt_for_zone_when_a_zone_is_set() {
+        let config = Config {
+            zone: Some(Zone { x: 0, y: 0, width: 800, height: 600 }),
+            ..Config::default()
+        };
+        assert!(!should_prompt_for_zone(&config));
     }
 
     #[test]

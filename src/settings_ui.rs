@@ -324,7 +324,7 @@ fn config_with_zone(mut config: Config, zone: Option<Zone>) -> Config {
 /// Returns the config as saved, so callers act on the on-disk taskbar settings
 /// (`hide_taskbar_on_apply`, `taskbar_hide_mode`) rather than on unsaved
 /// Settings state.
-fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<Config, SettingsUiError> {
+pub(crate) fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<Config, SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let updated = config_with_zone(config, zone);
     profile_store::save(config_dir, &updated).map_err(SettingsUiError::Config)?;

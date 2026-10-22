@@ -55,6 +55,8 @@ use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::win32::{self, RestoreState};
 use crate::window_filter;
+use crate::zone_editor::PinnedEdges;
+use crate::zone_overlay;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::menu::MenuEvent;
@@ -65,6 +67,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW,
 pub fn run() -> Result<(), TrayUiError> {
     let tray = Tray::new()?;
     let config_dir = config_dir();
+
+    // First run (no Zone yet): open the zone editor once, now that the tray is up.
+    prompt_for_zone_if_unset(&config_dir);
+
     let hotkeys = register_hotkeys(&config_dir);
 
     // Registered before entering `run_event_loop`'s `GetMessageW` pump --
@@ -108,6 +114,36 @@ pub fn run() -> Result<(), TrayUiError> {
     }
 
     Ok(())
+}
+
+/// Opens the zone editor blank when the loaded config has no Zone (see
+/// [`profile_store::should_prompt_for_zone`]), persisting the Zone on Save
+/// exactly like Settings' "Draw zone" does. Cancel, a close, or any failure
+/// leaves the Zone unset and startup simply continues -- there is no
+/// re-prompt this session. No window is placed here either way.
+///
+/// OS-facing (opens a real window), so not unit-tested; the decision itself is.
+fn prompt_for_zone_if_unset(config_dir: &Path) {
+    let config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("failed to load config for the first-run zone prompt: {e}");
+            return;
+        }
+    };
+    if !profile_store::should_prompt_for_zone(&config) {
+        return;
+    }
+
+    match zone_overlay::run_zone_editor_overlay(None, PinnedEdges::NONE, config.taskbar_hide_mode) {
+        Ok(Some(zone)) => {
+            if let Err(e) = settings_ui::persist_zone(config_dir, Some(zone)) {
+                eprintln!("failed to save the zone: {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
+    }
 }
 
 /// Loads the config and registers its bound hotkeys with the OS. A failure
