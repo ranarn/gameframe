@@ -2,7 +2,7 @@
 //! always-on-top egui/wgpu window covering the primary monitor's full
 //! bounds (not the taskbar-excluded work area -- a drawn zone may extend
 //! into the taskbar's screen strip), used to drag-draw or resize the
-//! Custom preset's region interactively instead of typing X/Y/width/height
+//! Zone interactively instead of typing X/Y/width/height
 //! by hand.
 //!
 //! Lifts the verified rendering/platform setup from
@@ -36,10 +36,10 @@
 //! ([`crate::win32::plan_taskbar_hide`]) are both fully unit tested
 //! instead.
 
-use crate::profile_store::{CustomRegion, TaskbarHideMode};
+use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
 use crate::win32;
-use crate::zone_editor::{Action, AppState, EditorState, Handle, Monitor, PinnedEdges, Point, SessionOutcome};
+use crate::zone_editor::{Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome};
 use eframe::egui;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -75,12 +75,8 @@ impl std::error::Error for ZoneOverlayError {
 /// legal Save; `Ok(None)` on Cancel or an unclean close.
 ///
 /// `initial` pre-loads the overlay with an existing region (e.g. the
-/// already-configured Custom preset) so resizing it doesn't require
-/// redrawing from scratch; `pinned` controls which resize handles are
-/// active. Issue #28's production wiring only calls this for the Custom
-/// preset (`PinnedEdges::NONE`, all 8 handles active) -- the parameter
-/// itself is general per [`crate::zone_editor`]'s design, so a later slice
-/// can reuse this for the Left/Right base presets without changes here.
+/// already-configured Zone) so resizing it doesn't require
+/// redrawing from scratch. All eight resize handles are always active.
 ///
 /// Hides the taskbar for the session using whichever technique `mode`
 /// selects (see module docs) and always restores exactly the state found
@@ -88,10 +84,9 @@ impl std::error::Error for ZoneOverlayError {
 /// run, or `eframe::run_native` panicked partway through -- via the
 /// [`TaskbarRestoreGuard`] RAII guard held across the call.
 pub fn run_zone_editor_overlay(
-    initial: Option<CustomRegion>,
-    pinned: PinnedEdges,
+    initial: Option<Zone>,
     mode: TaskbarHideMode,
-) -> Result<Option<CustomRegion>, ZoneOverlayError> {
+) -> Result<Option<Zone>, ZoneOverlayError> {
     let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
     let monitor = Monitor { width: monitor_geometry.width, height: monitor_geometry.height };
 
@@ -108,7 +103,7 @@ pub fn run_zone_editor_overlay(
     let _taskbar_restore_guard = TaskbarRestoreGuard::new(remembered_taskbar_state);
 
     let state = match initial {
-        Some(zone) => AppState::new_with_zone(monitor, pinned, zone),
+        Some(zone) => AppState::new_with_zone(monitor, zone),
         None => AppState::new(monitor),
     };
 
@@ -227,9 +222,8 @@ impl eframe::App for OverlayApp {
 impl OverlayApp {
     /// Dims the whole desktop, then draws the current/live zone as a
     /// brighter cutout with an outline, plus one small colored square per
-    /// resize handle (brighter when enabled, gray when locked by a pinned
-    /// edge). Deliberately unpolished per issue #28's scope (visual polish
-    /// -- dim/handle styling, hover cursors -- is explicitly out of scope).
+    /// resize handle. Deliberately unpolished: visual polish (dim/handle
+    /// styling, hover cursors) is out of scope per issue #28.
     fn draw_dim_and_zone(&self, ui: &egui::Ui) {
         let painter = ui.painter();
         let screen = ui.max_rect();
@@ -252,17 +246,10 @@ impl OverlayApp {
             );
         }
 
-        if let EditorState::Placed { zone, pinned } | EditorState::Resizing { pinned, live: zone, .. } =
-            &self.state.editor
-        {
+        if let EditorState::Placed { zone } | EditorState::Resizing { live: zone, .. } = &self.state.editor {
             for handle in Handle::ALL {
                 let center = handle_center(zone, handle);
-                let enabled = handle.enabled(*pinned);
-                let color = if enabled {
-                    egui::Color32::from_rgb(80, 200, 255)
-                } else {
-                    egui::Color32::from_gray(90)
-                };
+                let color = egui::Color32::from_rgb(80, 200, 255);
                 painter.rect_filled(egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0)), 2.0, color);
             }
         }
@@ -287,19 +274,16 @@ impl OverlayApp {
         }
     }
 
-    /// One drag-sense rect per enabled resize handle, for `Placed`/
+    /// One drag-sense rect per resize handle, for `Placed`/
     /// `Resizing` states.
     fn handle_resize_interaction(&mut self, ui: &egui::Ui) {
-        let (zone, pinned) = match &self.state.editor {
-            EditorState::Placed { zone, pinned } => (*zone, *pinned),
-            EditorState::Resizing { live, pinned, .. } => (*live, *pinned),
+        let zone = match &self.state.editor {
+            EditorState::Placed { zone } => *zone,
+            EditorState::Resizing { live, .. } => *live,
             _ => return,
         };
 
         for handle in Handle::ALL {
-            if !handle.enabled(pinned) {
-                continue;
-            }
             let center = handle_center(&zone, handle);
             let rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
             let response = ui.interact(rect, ui.scope_id().with(("handle", format!("{handle:?}"))), egui::Sense::drag());
@@ -375,14 +359,14 @@ fn rect_from_points(a: Point, b: Point) -> egui::Rect {
     egui::Rect::from_two_pos(egui::pos2(a.x as f32, a.y as f32), egui::pos2(b.x as f32, b.y as f32))
 }
 
-fn rect_from_zone(zone: &CustomRegion) -> egui::Rect {
+fn rect_from_zone(zone: &Zone) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(zone.x as f32, zone.y as f32),
         egui::vec2(zone.width as f32, zone.height as f32),
     )
 }
 
-fn handle_center(zone: &CustomRegion, handle: Handle) -> egui::Pos2 {
+fn handle_center(zone: &Zone, handle: Handle) -> egui::Pos2 {
     let (x, y, w, h) = (zone.x as f32, zone.y as f32, zone.width as f32, zone.height as f32);
     match handle {
         Handle::N => egui::pos2(x + w / 2.0, y),

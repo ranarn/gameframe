@@ -27,12 +27,9 @@ Source map:
   follows the same manual Display/std::error::Error convention as `RegionCalcError`/
   `ProfileStoreError` (no `thiserror` in the codebase, even though `tray-icon`/`muda` themselves
   use `thiserror` internally — that's fine, it's their own crate's business).
-- `src/region_calc.rs` — pure arithmetic resolving a `Preset` (LeftHalf/RightHalf/FullScreen/
-  Custom) against a `MonitorGeometry` into a `Region`. No OS calls, no I/O. Still has its
-  `#![allow(dead_code)]` — no consumer landed yet (out of scope for #4).
-- `src/profile_store.rs` — (issue #3) loads/saves GameFrame's config (presets + two named hotkey
-  bindings) as TOML. Still has its `#![allow(dead_code)]` — no consumer landed yet (out of scope
-  for #4). See prior memory content for full API details (unchanged by #4).
+- `src/region_calc.rs` — pure arithmetic resolving the `Zone` (`region_calc::Zone`, re-exported as `profile_store::Zone`) against a `MonitorGeometry` into a `Region`. No OS calls, no I/O.
+- `src/profile_store.rs` — (issue #3) loads/saves GameFrame's config (optional Zone + two named hotkey
+  bindings) as TOML. See prior memory content for full API details (unchanged by #4).
 - `README.md` — problem statement summary; full design/research lives outside this repo at
   `Project Ideas/gameframe.md` (sibling directory, not in this repo).
 - `.claude/project/` — engineering-pipeline config: `issue-tracker.md` (GitHub Project #4 field

@@ -6,7 +6,7 @@
 //! "Apply to Window" is itself a live [`Submenu`] of currently-visible
 //! top-level windows (see [`Tray::refresh_apply_to_window_menu`] for the
 //! live-refresh mechanism/rationale) rather than a single clickable item --
-//! selecting one applies the active preset's borderless+reposition
+//! selecting one applies the Zone's borderless+reposition
 //! treatment to that specific window (see `crate::app`'s dispatch of a
 //! decoded window-item id, [`decode_window_item_id`]).
 //!

@@ -1,9 +1,11 @@
-//! Loads and saves GameFrame's config (presets + hotkey bindings) as TOML,
-//! under a config directory injected by the caller. This module never
-//! resolves `%APPDATA%` itself — the caller passes in the directory to use.
+//! Loads and saves GameFrame's config (Zone + hotkey bindings + tracked
+//! games) as TOML, under a config directory injected by the caller. This
+//! module never resolves `%APPDATA%` itself -- the caller passes in the
+//! directory to use.
 
-use crate::region_calc::Preset;
 use std::path::{Path, PathBuf};
+
+pub use crate::region_calc::Zone;
 
 /// The config file name written inside the injected config directory.
 pub const CONFIG_FILE_NAME: &str = "config.toml";
@@ -19,127 +21,11 @@ pub struct HotkeyBindings {
     pub toggle_taskbar_autohide: HotkeyBinding,
 }
 
-/// The default depth-from-edge percentage a freshly-created `Left`/`Right`
-/// preset starts at.
-pub const DEFAULT_DEPTH_PERCENT: u8 = 50;
-
-/// The absolute-screen-coordinate bounds of the single optional Custom
-/// preset. Kept as a plain struct (rather than reusing `Preset::Custom`
-/// directly) so [`Presets`] can express "at most one Custom" as
-/// `Option<CustomRegion>` without also having to guard against a `Custom`
-/// value smuggling in a `Left`/`Right` variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CustomRegion {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-/// GameFrame's preset set: exactly one of each of the two base presets
-/// (`Left`, `Right`) plus at most one `Custom`. This makes "always two base
-/// presets, at most one Custom, neither base preset individually removable"
-/// a type-level invariant instead of a UI-only or runtime-checked rule --
-/// see `docs/adr/0001-preset-fixed-structure-no-migration.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Presets {
-    pub left_depth_percent: u8,
-    pub right_depth_percent: u8,
-    pub custom: Option<CustomRegion>,
-    /// The preset kind assigned to a newly-tracked game (see
-    /// `CONTEXT.md`'s "Default preset (for new tracked games)") -- distinct
-    /// from a tracked game's own "Active preset", which this field never
-    /// changes once assigned. `#[serde(default = "default_preset_kind_for_new_games")]`
-    /// resolves to `Right` for configs written before this field existed,
-    /// matching the previously hardcoded behavior in `TrackedGame::new_default`.
-    #[serde(default = "default_preset_kind_for_new_games")]
-    pub default_for_new_games: PresetKind,
-}
-
-/// The `default_for_new_games` value used both as [`Presets`]'s
-/// `Default` and as the serde fallback for configs predating this field --
-/// `Right`, matching the previously hardcoded behavior of
-/// `TrackedGame::new_default`.
-fn default_preset_kind_for_new_games() -> PresetKind {
-    PresetKind::Right
-}
-
-impl Default for Presets {
-    fn default() -> Self {
-        Presets {
-            left_depth_percent: DEFAULT_DEPTH_PERCENT,
-            right_depth_percent: DEFAULT_DEPTH_PERCENT,
-            custom: None,
-            default_for_new_games: default_preset_kind_for_new_games(),
-        }
-    }
-}
-
-/// A reference to one of GameFrame's three preset kinds -- never a copy of a
-/// preset's data. A [`TrackedGame`]'s assigned preset is stored as one of
-/// these (see [`CONTEXT.md`](../CONTEXT.md)'s "Active preset"), resolved
-/// against the live [`Presets`] set at apply-time via [`Presets::resolve`],
-/// so editing a base preset (or replacing Custom) immediately changes what
-/// every game assigned to it applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PresetKind {
-    Left,
-    Right,
-    Custom,
-}
-
-impl PresetKind {
-    /// All three preset kinds, in the same fixed presentation order as
-    /// [`Presets::all`].
-    pub const ALL: [PresetKind; 3] = [PresetKind::Left, PresetKind::Right, PresetKind::Custom];
-}
-
-impl Presets {
-    pub fn left(&self) -> Preset {
-        Preset::Left { depth_percent: self.left_depth_percent }
-    }
-
-    pub fn right(&self) -> Preset {
-        Preset::Right { depth_percent: self.right_depth_percent }
-    }
-
-    pub fn custom(&self) -> Option<Preset> {
-        self.custom.map(|c| Preset::Custom { x: c.x, y: c.y, width: c.width, height: c.height })
-    }
-
-    /// All presets currently in the set, in a fixed presentation order (the
-    /// two base presets, then `Custom` if present).
-    pub fn all(&self) -> Vec<Preset> {
-        let mut presets = vec![self.left(), self.right()];
-        if let Some(custom) = self.custom() {
-            presets.push(custom);
-        }
-        presets
-    }
-
-    /// Resolves a [`PresetKind`] reference against this preset set into the
-    /// actual [`Preset`] value to apply.
-    ///
-    /// Returns `None` only for [`PresetKind::Custom`] when no `Custom`
-    /// preset is currently set (e.g. a tracked game was assigned `Custom`,
-    /// then `Custom` was since cleared or replaced) -- every other kind
-    /// always resolves. Callers must treat that `None` the same as "no
-    /// tracked game found": no-op and log, never silently substitute a
-    /// different preset.
-    pub fn resolve(&self, kind: PresetKind) -> Option<Preset> {
-        match kind {
-            PresetKind::Left => Some(self.left()),
-            PresetKind::Right => Some(self.right()),
-            PresetKind::Custom => self.custom(),
-        }
-    }
-}
-
 /// A process, identified by its executable path, that has been added to
 /// GameFrame's per-game list -- see `CONTEXT.md`'s "Tracked game". Added
-/// only through "Apply to Window": picking a window applies its
-/// (default/existing) preset immediately and adds it to this list if it
-/// isn't already present (see [`upsert_tracked_game`]).
+/// only through "Apply to Window": picking a window applies the Zone
+/// immediately and adds it to this list if it isn't already present (see
+/// [`upsert_tracked_game`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrackedGame {
     /// The full path to the game's executable -- this game's identity.
@@ -150,48 +36,25 @@ pub struct TrackedGame {
     /// added -- never refreshed on a later re-apply, even if the window's
     /// title has since changed.
     pub display_name: String,
-    /// The preset kind currently assigned to this game (see
-    /// `CONTEXT.md`'s "Active preset"), resolved against the live
-    /// [`Presets`] set at apply-time via [`Presets::resolve`].
-    pub preset: PresetKind,
-    /// Whether this game's preset should be applied the moment the game
-    /// launches (issue #32), versus only on demand via the hotkey or tray
-    /// menu.
+    /// Whether the Zone should be applied the moment the game launches,
+    /// versus only on demand via the hotkey or tray menu.
     pub auto_apply: bool,
-    /// Whether applying this game's preset should also set the taskbar to
-    /// auto-hide -- see `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`.
-    pub taskbar_autohide: bool,
 }
 
 impl TrackedGame {
-    /// Builds a freshly-added tracked game with this issue's specified
-    /// defaults: preset `default_preset` (the live
-    /// `Presets::default_for_new_games` at the time of adding -- see
-    /// `CONTEXT.md`'s "Default preset (for new tracked games)"), auto-apply
-    /// on, taskbar-auto-hide on.
-    pub fn new_default(exe_path: PathBuf, display_name: String, default_preset: PresetKind) -> Self {
-        TrackedGame {
-            exe_path,
-            display_name,
-            preset: default_preset,
-            auto_apply: true,
-            taskbar_autohide: true,
-        }
+    /// Builds a freshly-added tracked game with the specified defaults:
+    /// auto-apply on.
+    pub fn new_default(exe_path: PathBuf, display_name: String) -> Self {
+        TrackedGame { exe_path, display_name, auto_apply: true }
     }
 }
 
 /// Finds a tracked game whose `exe_path` matches, or appends a fresh
-/// default-configured one ([`TrackedGame::new_default`], seeded with
-/// `default_preset`) if none matched -- the identity/dedupe rule behind the
-/// "Apply to Window" add flow (a game is identified solely by its executable
-/// path; picking an already-tracked game again must not create a duplicate
-/// entry, nor reset its existing assignment/settings, nor overwrite its
-/// captured `display_name`).
-///
-/// `default_preset` is the caller's current `Presets::default_for_new_games`
-/// at the time of adding (see `CONTEXT.md`'s "Default preset (for new
-/// tracked games)") -- only used when appending a new entry; it is never
-/// applied to an existing match.
+/// default-configured one ([`TrackedGame::new_default`]) if none matched --
+/// the identity/dedupe rule behind the "Apply to Window" add flow (a game is
+/// identified solely by its executable path; picking an already-tracked game
+/// again must not create a duplicate entry, nor reset its existing settings,
+/// nor overwrite its captured `display_name`).
 ///
 /// Returns the index of the matched-or-inserted entry in `games` so the
 /// caller can read back whichever one now applies. Pure -- no OS/I-O
@@ -204,41 +67,23 @@ impl TrackedGame {
 /// a live process, which returns a consistent casing run-to-run, so two
 /// differently-cased paths for the *same* game are not expected in
 /// practice.
-pub fn upsert_tracked_game(
-    games: &mut Vec<TrackedGame>,
-    exe_path: PathBuf,
-    display_name: String,
-    default_preset: PresetKind,
-) -> usize {
+pub fn upsert_tracked_game(games: &mut Vec<TrackedGame>, exe_path: PathBuf, display_name: String) -> usize {
     if let Some(pos) = games.iter().position(|g| g.exe_path == exe_path) {
         return pos;
     }
-    games.push(TrackedGame::new_default(exe_path, display_name, default_preset));
+    games.push(TrackedGame::new_default(exe_path, display_name));
     games.len() - 1
 }
 
 /// Finds the tracked game (if any) whose `exe_path` matches -- the lookup
 /// side of the hotkey/tray apply paths' "resolve against tracked games"
 /// rule. Returns `None` for an untracked process: callers must treat that as
-/// "no fallback", per this issue's acceptance criteria.
+/// "no fallback".
 ///
 /// Same case-sensitive-`PathBuf`-`Eq`-on-a-case-insensitive-filesystem
 /// caveat as [`upsert_tracked_game`] -- accepted risk, see its doc comment.
 pub fn find_tracked_game<'a>(games: &'a [TrackedGame], exe_path: &Path) -> Option<&'a TrackedGame> {
     games.iter().find(|g| g.exe_path == exe_path)
-}
-
-/// Selects every tracked game currently assigned to `kind` -- the
-/// cascade-selection decision behind issue #33's live re-apply: editing a
-/// *shared* value (a base preset's depth-from-edge, or the Custom zone)
-/// affects every tracked game assigned to that preset, unlike reassigning a
-/// single game's own dropdown, which only affects that one game.
-///
-/// Pure -- no OS/I-O dependency -- so it's unit testable in complete
-/// isolation from the live-window resolution/apply step that consumes this
-/// selection.
-pub fn tracked_games_using_preset(tracked_games: &[TrackedGame], kind: PresetKind) -> Vec<&TrackedGame> {
-    tracked_games.iter().filter(|g| g.preset == kind).collect()
 }
 
 /// Which technique GameFrame uses to hide the taskbar (issue #42) -- applies
@@ -264,39 +109,56 @@ pub enum TaskbarHideMode {
     HoverReveal,
 }
 
-/// GameFrame's persisted config: the preset set, the two global hotkey
+/// GameFrame's persisted config: the optional Zone, the two global hotkey
 /// bindings, and the per-game tracked-games list.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
-    pub presets: Presets,
+    /// The single optional Zone. `None` until the user draws one.
+    #[serde(default)]
+    pub zone: Option<Zone>,
     pub hotkeys: HotkeyBindings,
     #[serde(default)]
     pub tracked_games: Vec<TrackedGame>,
     #[serde(default)]
     pub taskbar_hide_mode: TaskbarHideMode,
+    /// Whether applying the Zone also hides the taskbar (using
+    /// `taskbar_hide_mode`).
+    #[serde(default = "default_hide_taskbar_on_apply")]
+    pub hide_taskbar_on_apply: bool,
+}
+
+fn default_hide_taskbar_on_apply() -> bool {
+    true
 }
 
 impl Default for Config {
-    /// The starter config written on first run: default-depth Left/Right, no
-    /// Custom, both hotkeys unbound, no tracked games yet, and the taskbar
-    /// hidden fully (no hover-reveal) once a preset is applied.
+    /// The starter config written on first run: no Zone, both hotkeys
+    /// unbound, no tracked games yet, and the taskbar hidden fully (no
+    /// hover-reveal) once the Zone is applied.
     fn default() -> Self {
         Config {
-            presets: Presets::default(),
+            zone: None,
             hotkeys: HotkeyBindings::default(),
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::default(),
+            hide_taskbar_on_apply: true,
         }
     }
 }
 
+/// Whether startup should open the zone editor once: true exactly when the
+/// config has no Zone (first run, or a corrupt config reset to defaults).
+pub fn should_prompt_for_zone(config: &Config) -> bool {
+    config.zone.is_none()
+}
+
 /// Reasons loading or saving the config can fail.
 ///
-/// There is no `Malformed`/invalid-TOML variant: since the no-migration
-/// reshape (issue #26), [`load`] never surfaces a malformed or
-/// incompatible-schema config file as an error -- it discards it and
-/// replaces it with defaults instead (see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md`).
+/// There is no `Malformed`/invalid-TOML variant: [`load`] never surfaces a
+/// malformed or incompatible-schema config file as an error -- it discards
+/// it and replaces it with defaults instead (see
+/// `docs/adr/0001-preset-fixed-structure-no-migration.md` and
+/// `docs/adr/0003-zone-config-migration.md`).
 #[derive(Debug)]
 pub enum ProfileStoreError {
     /// A filesystem operation (read, write, or directory creation) failed.
@@ -324,16 +186,95 @@ impl std::error::Error for ProfileStoreError {
     }
 }
 
+/// The preset-era config shape (`[presets]` table with `custom`, tracked
+/// games carrying a `preset`). Only the fields that survive into the Zone
+/// model are declared; everything else (depths, `default_for_new_games`, a
+/// tracked game's `preset`) is ignored on purpose.
+#[derive(serde::Deserialize)]
+struct LegacyConfig {
+    presets: LegacyPresets,
+    hotkeys: HotkeyBindings,
+    #[serde(default)]
+    tracked_games: Vec<TrackedGame>,
+    #[serde(default)]
+    taskbar_hide_mode: TaskbarHideMode,
+    #[serde(default = "default_hide_taskbar_on_apply")]
+    hide_taskbar_on_apply: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyPresets {
+    #[serde(default)]
+    custom: Option<Zone>,
+}
+
+/// Key of the per-game taskbar flag that issue #49 folded into the global
+/// [`Config::hide_taskbar_on_apply`].
+const PER_GAME_TASKBAR_KEY: &str = "taskbar_autohide";
+
+/// Folds per-game `taskbar_autohide` flags (present in preset-era and #48-era
+/// configs) into the global `hide_taskbar_on_apply` key: true if any game had
+/// it on, false if every game had it off. The no-games case does reach this
+/// fold but changes nothing (the value then comes from
+/// `default_hide_taskbar_on_apply`). The per-game keys are removed. A table
+/// that already carries `hide_taskbar_on_apply` keeps it.
+/// Returns whether the table changed. Pure -- no filesystem access.
+fn fold_per_game_taskbar_flags(table: &mut toml::Table) -> bool {
+    let mut flags = Vec::new();
+    let mut changed = false;
+    if let Some(toml::Value::Array(games)) = table.get_mut("tracked_games") {
+        for game in games.iter_mut() {
+            if let Some(entry) = game.as_table_mut()
+                && let Some(value) = entry.remove(PER_GAME_TASKBAR_KEY)
+            {
+                changed = true;
+                // A malformed (non-bool) flag counts as the old default, on.
+                flags.push(value.as_bool().unwrap_or(true));
+            }
+        }
+    }
+    if changed && !table.contains_key("hide_taskbar_on_apply") {
+        let global = flags.iter().any(|&f| f);
+        table.insert(
+            "hide_taskbar_on_apply".to_string(),
+            toml::Value::Boolean(global),
+        );
+    }
+    changed
+}
+
+/// Converts a parsed preset-era config table into the Zone-based [`Config`]:
+/// `presets.custom` becomes the Zone (identical coordinates; absent means
+/// `None`), and tracked games (exe path, display name, auto-apply), hotkeys
+/// and hide mode are kept; per-game taskbar flags fold into the global
+/// `hide_taskbar_on_apply` (see [`fold_per_game_taskbar_flags`]). Pure -- no
+/// filesystem access.
+///
+/// Returns `None` if the table isn't a convertible legacy config.
+pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
+    fold_per_game_taskbar_flags(&mut table);
+    let legacy: LegacyConfig = table.try_into().ok()?;
+    Some(Config {
+        zone: legacy.presets.custom,
+        hotkeys: legacy.hotkeys,
+        tracked_games: legacy.tracked_games,
+        taskbar_hide_mode: legacy.taskbar_hide_mode,
+        hide_taskbar_on_apply: legacy.hide_taskbar_on_apply,
+    })
+}
+
 /// Loads the config from `config_dir`, creating and persisting a default one
 /// if none exists yet.
 ///
-/// No migration path: if the file exists but its contents don't match the
-/// current `Config` schema (whether that's an old pre-reshape shape, or
-/// otherwise-corrupt TOML), it is discarded and replaced with a freshly
-/// written default config rather than returned as an error -- see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md`. GameFrame is
-/// pre-release with a single user, so the cost of a migration outweighs its
-/// value here.
+/// Order: a config already in the Zone shape loads as-is; a legacy
+/// (preset-era, has a `[presets]` table) config is converted via
+/// [`convert_legacy_config`] and the new shape is written back immediately; a
+/// #48-era config still carrying per-game `taskbar_autohide` flags has them
+/// folded into the global setting ([`fold_per_game_taskbar_flags`]) and is
+/// written back too; anything else (corrupt TOML, unrecognised shape) is
+/// replaced with a freshly written default config rather than returned as an
+/// error -- see
+/// `docs/adr/0003-zone-config-migration.md`.
 pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     let path = config_dir.join(CONFIG_FILE_NAME);
 
@@ -345,15 +286,151 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
         Err(e) => return Err(ProfileStoreError::Io(e)),
     };
 
-    match toml::from_str(&contents) {
-        Ok(config) => Ok(config),
-        Err(_) => write_default_config(config_dir),
+    let Ok(table) = contents.parse::<toml::Table>() else {
+        return reset_unreadable_config(config_dir, &contents);
+    };
+
+    // A legacy file also deserializes as the new shape (serde ignores the
+    // unknown `presets` key and would silently drop the Custom region), so
+    // the legacy marker is checked first.
+    if table.contains_key("presets") {
+        return match convert_legacy_config(table) {
+            Some(config) => {
+                // Keep the original preset-era file so the one-way migration is
+                // reversible. An existing backup is never overwritten (a free numbered
+                // name is used) and identical bytes are not backed up twice. If the copy
+                // cannot be made, skip this write-back and retry on the next load; a
+                // later save still writes the new shape over the original.
+                if keep_pre_zone_backup(config_dir, &contents) {
+                    // A failed write-back (read-only file, AV lock) must not
+                    // make every caller fail; the config is valid in memory.
+                    if let Err(e) = save(config_dir, &config) {
+                        eprintln!("GameFrame: could not write back migrated config: {e}");
+                    }
+                }
+                Ok(config)
+            }
+            None => reset_unreadable_config(config_dir, &contents),
+        };
+    }
+
+    // A #48-era config still carries per-game taskbar flags: fold them into
+    // the global setting and write the new shape back.
+    let mut table = table;
+    let folded = fold_per_game_taskbar_flags(&mut table);
+
+    match table.try_into::<Config>() {
+        Ok(config) => {
+            if folded && let Err(e) = save(config_dir, &config) {
+                eprintln!("GameFrame: could not write back migrated config: {e}");
+            }
+            Ok(config)
+        }
+        Err(_) => reset_unreadable_config(config_dir, &contents),
     }
 }
 
+/// Writes `contents` into a brand-new file at the first free name among
+/// `<base>`, `<base>.1`, `<base>.2`, ... and returns the path used, or `None`
+/// if an existing backup already holds exactly these bytes (nothing is written,
+/// so retrying a load whose write-back keeps failing cannot pile up identical
+/// copies). The destination is opened with `create_new`, so an existing backup
+/// is never overwritten, even by an overlapping caller. Writing the bytes the
+/// caller parsed (not re-reading the file) keeps the backup faithful to what
+/// was converted.
+fn write_free_backup(contents: &str, base: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::Write;
+    let mut n = 0u32;
+    loop {
+        let candidate = if n == 0 {
+            base.to_path_buf()
+        } else {
+            let mut name = base.as_os_str().to_owned();
+            name.push(format!(".{n}"));
+            PathBuf::from(name)
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut dest) => {
+                if let Err(e) = dest.write_all(contents.as_bytes()) {
+                    // Don't leave a partial copy that looks like a good backup.
+                    drop(dest);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(e);
+                }
+                return Ok(Some(candidate));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&candidate).is_ok_and(|b| b == contents.as_bytes()) {
+                    return Ok(None);
+                }
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Backs up the preset-era `contents` to `config.toml.pre-zone.bak` (or the
+/// first free `config.toml.pre-zone.bak.N`, so an earlier different original is
+/// kept too). Returns whether a backup of these bytes is in place.
+fn keep_pre_zone_backup(config_dir: &Path, contents: &str) -> bool {
+    let base = config_dir.join(format!("{CONFIG_FILE_NAME}.pre-zone.bak"));
+    match write_free_backup(contents, &base) {
+        Ok(Some(backup)) => {
+            eprintln!(
+                "GameFrame: migrated config to the Zone shape, original kept at {}",
+                backup.display()
+            );
+            true
+        }
+        Ok(None) => true,
+        Err(e) => {
+            eprintln!("GameFrame: could not back up the config before migrating: {e}");
+            false
+        }
+    }
+}
+
+/// Backs up the `contents` of a config that is about to be replaced with
+/// defaults to `config.toml.bak` (or the first free `config.toml.bak.N`), so an
+/// earlier backup survives a second reset. Returns whether a backup of these
+/// bytes is in place.
+fn back_up_unreadable_config(config_dir: &Path, contents: &str) -> bool {
+    let base = config_dir.join(format!("{CONFIG_FILE_NAME}.bak"));
+    match write_free_backup(contents, &base) {
+        Ok(Some(backup)) => {
+            eprintln!(
+                "GameFrame: config could not be read; reset to defaults, original kept at {}",
+                backup.display()
+            );
+            true
+        }
+        Ok(None) => true,
+        Err(e) => {
+            eprintln!("GameFrame: config could not be read and backup failed: {e}");
+            false
+        }
+    }
+}
+
+/// Backs the unreadable config up and replaces it with defaults. If the backup
+/// fails the file is left alone and defaults are returned in memory only. That
+/// is no lasting protection: a later save (Settings, overlay Zone Save or
+/// Clear) writes over the original, and no copy of it was made.
+fn reset_unreadable_config(config_dir: &Path, contents: &str) -> Result<Config, ProfileStoreError> {
+    if back_up_unreadable_config(config_dir, contents) {
+        write_default_config(config_dir)
+    } else {
+        Ok(Config::default())
+    }
+}
 /// Builds a default [`Config`], persists it to `config_dir`, and returns it
 /// -- the shared fallback for both "no config file yet" and "existing config
-/// file doesn't match the current schema".
+/// file doesn't match any known schema".
 fn write_default_config(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     let default_config = Config::default();
     save(config_dir, &default_config)?;
@@ -379,6 +456,25 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
 mod tests {
     use super::*;
 
+    fn write_config_file(config_dir: &Path, contents: &str) {
+        std::fs::create_dir_all(config_dir).unwrap();
+        std::fs::write(config_dir.join(CONFIG_FILE_NAME), contents).unwrap();
+    }
+
+    #[test]
+    fn should_prompt_for_zone_when_no_zone_is_set() {
+        assert!(should_prompt_for_zone(&Config::default()));
+    }
+
+    #[test]
+    fn should_not_prompt_for_zone_when_a_zone_is_set() {
+        let config = Config {
+            zone: Some(Zone { x: 0, y: 0, width: 800, height: 600 }),
+            ..Config::default()
+        };
+        assert!(!should_prompt_for_zone(&config));
+    }
+
     #[test]
     fn load_on_empty_directory_creates_default_config_file_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -389,37 +485,33 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                presets: Presets {
-                    left_depth_percent: DEFAULT_DEPTH_PERCENT,
-                    right_depth_percent: DEFAULT_DEPTH_PERCENT,
-                    custom: None,
-                    default_for_new_games: PresetKind::Right,
-                },
+                zone: None,
                 hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None },
                 tracked_games: Vec::new(),
                 taskbar_hide_mode: TaskbarHideMode::FullyHidden,
+                hide_taskbar_on_apply: true,
             }
         );
         assert!(config_dir.join(CONFIG_FILE_NAME).exists());
     }
 
     #[test]
-    fn load_reads_back_an_existing_config_file_on_a_later_run() {
+    fn a_new_shape_config_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
         let written = Config {
-            presets: Presets {
-                left_depth_percent: 30,
-                right_depth_percent: 70,
-                custom: Some(CustomRegion { x: 1, y: 2, width: 300, height: 400 }),
-                default_for_new_games: PresetKind::Custom,
-            },
+            zone: Some(Zone { x: 1, y: 2, width: 300, height: 400 }),
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
-            tracked_games: Vec::new(),
+            tracked_games: vec![TrackedGame {
+                exe_path: PathBuf::from("C:\\Games\\thing.exe"),
+                display_name: "Thing".to_string(),
+                auto_apply: false,
+            }],
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
+            hide_taskbar_on_apply: false,
         };
         save(&config_dir, &written).unwrap();
 
@@ -432,185 +524,349 @@ mod tests {
     fn load_of_a_corrupt_config_file_resets_to_defaults_instead_of_erroring() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), "this is not { valid toml : : :").unwrap();
+        write_config_file(&config_dir, "this is not { valid toml : : :");
 
         let config = load(&config_dir).unwrap();
 
         assert_eq!(config, Config::default());
+        assert_eq!(config.zone, None);
+        let backup = std::fs::read_to_string(config_dir.join("config.toml.bak")).unwrap();
+        assert_eq!(backup, "this is not { valid toml : : :");
     }
 
+    const LEGACY_WITH_CUSTOM: &str = r#"
+        taskbar_hide_mode = "HoverReveal"
+
+        [presets]
+        left_depth_percent = 40
+        right_depth_percent = 60
+        default_for_new_games = "Right"
+
+        [presets.custom]
+        x = 10
+        y = 20
+        width = 200
+        height = 100
+
+        [hotkeys]
+        toggle_borderless = "Ctrl+Alt+B"
+        toggle_taskbar_autohide = "Ctrl+Alt+T"
+
+        [[tracked_games]]
+        exe_path = "C:\\Games\\thing.exe"
+        display_name = "Thing"
+        preset = "Custom"
+        auto_apply = false
+        taskbar_autohide = false
+
+        [[tracked_games]]
+        exe_path = "C:\\Games\\other.exe"
+        display_name = "Other"
+        preset = "Left"
+        auto_apply = true
+        taskbar_autohide = true
+    "#;
+
     #[test]
-    fn load_of_an_old_shape_config_file_resets_to_defaults_with_no_migration() {
-        // The pre-reshape config shape: `presets` was a free-form array
-        // including the now-removed `FullScreen` variant and `LeftHalf`/
-        // `RightHalf` instead of `Left`/`Right`. This no longer deserializes
-        // into the current `Config` schema at all, and per
-        // docs/adr/0001-preset-fixed-structure-no-migration.md there is no
-        // migration path -- it is discarded and replaced with defaults.
+    fn a_legacy_config_with_custom_loads_as_a_zone_keeping_everything_else() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let old_shape_toml = r#"
-            [[presets]]
-            type = "LeftHalf"
-
-            [[presets]]
-            type = "FullScreen"
-
-            [hotkeys]
-            toggle_borderless = "Ctrl+Alt+B"
-            toggle_taskbar_autohide = "Ctrl+Alt+T"
-        "#;
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), old_shape_toml).unwrap();
+        write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
 
         let config = load(&config_dir).unwrap();
 
-        assert_eq!(config, Config::default());
-        // The reset is also persisted, so the next load doesn't need to
-        // rediscover the same incompatible file.
-        let reloaded = load(&config_dir).unwrap();
-        assert_eq!(reloaded, Config::default());
-    }
-
-    #[test]
-    fn load_of_a_current_shape_config_file_missing_only_the_tracked_games_key_still_deserializes() {
-        // A config saved between #26 (current `presets`/`hotkeys` shape
-        // landed) and #31 (this `tracked_games` field being added) landing --
-        // distinct from `load_of_an_old_shape_config_file_resets_to_defaults_with_no_migration`
-        // above, which covers a pre-#26 shape that doesn't deserialize into
-        // `Config` at all. Here the rest of the shape is valid and current;
-        // only the new `tracked_games` key is absent. `#[serde(default)]`
-        // on `Config::tracked_games` exists specifically so this succeeds
-        // with the rest of the config preserved, rather than falling into
-        // the "incompatible schema, reset everything" path.
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let toml_missing_tracked_games = r#"
-            [presets]
-            left_depth_percent = 40
-            right_depth_percent = 60
-            custom = { x = 10, y = 10, width = 200, height = 100 }
-
-            [hotkeys]
-            toggle_borderless = "Ctrl+Alt+B"
-            toggle_taskbar_autohide = "Ctrl+Alt+T"
-        "#;
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_missing_tracked_games).unwrap();
-
-        let config = load(&config_dir).unwrap();
-
-        assert_eq!(config.presets.left_depth_percent, 40);
-        assert_eq!(config.presets.right_depth_percent, 60);
-        assert_eq!(config.presets.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
+        assert_eq!(config.zone, Some(Zone { x: 10, y: 20, width: 200, height: 100 }));
         assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
         assert_eq!(config.hotkeys.toggle_taskbar_autohide, Some("Ctrl+Alt+T".to_string()));
-        assert_eq!(config.tracked_games, Vec::new(), "a missing tracked_games key must default to empty, not error");
-    }
-
-    #[test]
-    fn load_of_a_config_file_missing_the_taskbar_hide_mode_key_defaults_to_fully_hidden() {
-        // Issue #42 added `taskbar_hide_mode` after `tracked_games` (#31) --
-        // a config saved between those two landing has every key except this
-        // new one. `#[serde(default)]` on `Config::taskbar_hide_mode` (which
-        // resolves via `TaskbarHideMode`'s `#[default]` variant) exists
-        // specifically so this loads as `FullyHidden` -- issue #42's new
-        // default -- rather than resetting the whole config or erroring.
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let toml_missing_taskbar_hide_mode = r#"
-            [presets]
-            left_depth_percent = 40
-            right_depth_percent = 60
-            custom = { x = 10, y = 10, width = 200, height = 100 }
-
-            [hotkeys]
-            toggle_borderless = "Ctrl+Alt+B"
-            toggle_taskbar_autohide = "Ctrl+Alt+T"
-
-            tracked_games = []
-        "#;
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_missing_taskbar_hide_mode).unwrap();
-
-        let config = load(&config_dir).unwrap();
-
-        assert_eq!(config.presets.left_depth_percent, 40);
+        assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
         assert_eq!(
-            config.taskbar_hide_mode,
-            TaskbarHideMode::FullyHidden,
-            "a missing taskbar_hide_mode key must default to FullyHidden, not error"
+            config.tracked_games,
+            vec![
+                TrackedGame {
+                    exe_path: PathBuf::from("C:\\Games\\thing.exe"),
+                    display_name: "Thing".to_string(),
+                    auto_apply: false,
+                },
+                TrackedGame {
+                    exe_path: PathBuf::from("C:\\Games\\other.exe"),
+                    display_name: "Other".to_string(),
+                    auto_apply: true,
+                },
+            ]
         );
     }
 
     #[test]
-    fn load_of_a_current_shape_config_file_missing_only_the_default_for_new_games_key_still_deserializes() {
-        // A config saved before this issue's `default_for_new_games` field
-        // was added -- `#[serde(default = "default_preset_kind_for_new_games")]`
-        // exists specifically so this still deserializes (rather than
-        // resetting to defaults), resolving to `Right` to match the
-        // previously hardcoded `TrackedGame::new_default` behavior.
+    fn a_legacy_config_without_custom_gives_no_zone_and_keeps_games_and_hotkeys() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let toml_missing_default_for_new_games = r#"
+        write_config_file(
+            &config_dir,
+            r#"
             [presets]
             left_depth_percent = 40
             right_depth_percent = 60
-            custom = { x = 10, y = 10, width = 200, height = 100 }
 
             [hotkeys]
             toggle_borderless = "Ctrl+Alt+B"
-            toggle_taskbar_autohide = "Ctrl+Alt+T"
-        "#;
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_missing_default_for_new_games).unwrap();
-
-        let config = load(&config_dir).unwrap();
-
-        assert_eq!(
-            config.presets.default_for_new_games,
-            PresetKind::Right,
-            "a missing default_for_new_games key must default to Right, not error"
-        );
-    }
-
-    #[test]
-    fn load_of_a_config_file_with_a_tracked_game_referencing_a_removed_preset_kind_resets_to_defaults() {
-        // Issue #37: HalfLeft/HalfRight were removed from `PresetKind`. Per
-        // ADR 0001's "no migration" stance, a config file with a tracked
-        // game still referencing one of those removed kinds no longer
-        // deserializes at all -- it is discarded and replaced with defaults,
-        // the same as any other schema mismatch.
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("GameFrame");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let toml_referencing_a_removed_preset_kind = r#"
-            [presets]
-            left_depth_percent = 40
-            right_depth_percent = 60
-            default_for_new_games = "Right"
-
-            [hotkeys]
-            toggle_borderless = "Ctrl+Alt+B"
-            toggle_taskbar_autohide = "Ctrl+Alt+T"
 
             [[tracked_games]]
             exe_path = "C:\\Games\\thing.exe"
             display_name = "Thing"
-            preset = "HalfLeft"
+            preset = "Right"
             auto_apply = true
             taskbar_autohide = true
-        "#;
-        std::fs::write(config_dir.join(CONFIG_FILE_NAME), toml_referencing_a_removed_preset_kind).unwrap();
+            "#,
+        );
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(config.zone, None);
+        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
+        assert_eq!(config.hotkeys.toggle_taskbar_autohide, None);
+        assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
+        assert_eq!(config.tracked_games.len(), 1);
+        assert_eq!(config.tracked_games[0].display_name, "Thing");
+    }
+
+    #[test]
+    fn a_migrated_legacy_config_is_written_back_in_the_new_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
+
+        let migrated = load(&config_dir).unwrap();
+
+        let on_disk = std::fs::read_to_string(config_dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert!(!on_disk.contains("presets"), "the legacy [presets] table must be gone: {on_disk}");
+        assert!(!on_disk.contains("preset ="), "tracked games must no longer carry a preset: {on_disk}");
+        assert!(on_disk.contains("[zone]"), "the zone must be written: {on_disk}");
+        let second = load(&config_dir).unwrap();
+        assert_eq!(second, migrated);
+    }
+
+    /// Builds config TOML (legacy or #48 shape) with one tracked game per
+    /// entry of `flags`, each carrying that per-game taskbar flag.
+    fn config_with_game_flags(legacy: bool, flags: &[bool]) -> String {
+        let mut s = String::new();
+        if legacy {
+            s.push_str("[presets]\nleft_depth_percent = 40\n\n");
+        }
+        s.push_str("[hotkeys]\n");
+        for (i, flag) in flags.iter().enumerate() {
+            s.push_str(&format!(
+                "\n[[tracked_games]]\nexe_path = \"C:\\\\Games\\\\g{i}.exe\"\ndisplay_name = \"G{i}\"\nauto_apply = true\ntaskbar_autohide = {flag}\n"
+            ));
+            if legacy {
+                s.push_str("preset = \"Left\"\n");
+            }
+        }
+        s
+    }
+
+    fn assert_global_flag_derivation(legacy: bool, flags: &[bool], expected: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, &config_with_game_flags(legacy, flags));
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(
+            config.hide_taskbar_on_apply, expected,
+            "legacy={legacy} flags={flags:?}"
+        );
+        assert_eq!(config.tracked_games.len(), flags.len());
+        let on_disk = std::fs::read_to_string(config_dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert!(
+            !on_disk
+                .lines()
+                .any(|l| l.trim_start().starts_with("taskbar_autohide =")),
+            "per-game flags must be gone: {on_disk}"
+        );
+        assert!(
+            on_disk.contains(&format!("hide_taskbar_on_apply = {expected}")),
+            "{on_disk}"
+        );
+        assert_eq!(
+            load(&config_dir).unwrap(),
+            config,
+            "the written-back file must read back identically"
+        );
+    }
+
+    #[test]
+    fn global_taskbar_flag_is_on_when_any_game_had_it_on() {
+        assert_global_flag_derivation(true, &[false, true], true);
+        assert_global_flag_derivation(false, &[false, true], true);
+    }
+
+    #[test]
+    fn global_taskbar_flag_is_off_when_every_game_had_it_off() {
+        assert_global_flag_derivation(true, &[false, false], false);
+        assert_global_flag_derivation(false, &[false, false], false);
+    }
+
+    #[test]
+    fn global_taskbar_flag_is_on_when_there_were_no_games() {
+        assert_global_flag_derivation(true, &[], true);
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, "[hotkeys]\n");
+        assert!(load(&config_dir).unwrap().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn an_existing_global_flag_is_not_overridden_by_stale_per_game_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(
+            &config_dir,
+            &format!(
+                "hide_taskbar_on_apply = false\n{}",
+                config_with_game_flags(false, &[true])
+            ),
+        );
+
+        assert!(!load(&config_dir).unwrap().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn migrating_a_legacy_config_keeps_a_pre_zone_backup_and_never_overwrites_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
+        let backup = config_dir.join("config.toml.pre-zone.bak");
+
+        load(&config_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            LEGACY_WITH_CUSTOM
+        );
+
+        // A second preset-era file later (e.g. after a downgrade) must not
+        // clobber the first backup, and its own original must be kept too.
+        let second = config_with_game_flags(true, &[true]);
+        write_config_file(&config_dir, &second);
+        load(&config_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            LEGACY_WITH_CUSTOM
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("config.toml.pre-zone.bak.1")).unwrap(),
+            second
+        );
+    }
+
+    #[test]
+    fn a_second_unreadable_config_does_not_destroy_the_earlier_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, "first { broken");
+        load(&config_dir).unwrap();
+        write_config_file(&config_dir, "second { broken");
+
+        load(&config_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("config.toml.bak")).unwrap(),
+            "first { broken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("config.toml.bak.1")).unwrap(),
+            "second { broken"
+        );
+    }
+
+    /// Makes every `save` into `config_dir` fail: its temp file's name is
+    /// taken by a directory.
+    fn block_saves(config_dir: &Path) {
+        std::fs::create_dir(config_dir.join(format!("{CONFIG_FILE_NAME}.tmp"))).unwrap();
+    }
+
+    fn backup_files(config_dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(config_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn repeated_loads_of_an_unsavable_legacy_config_keep_exactly_one_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
+        block_saves(&config_dir);
+
+        for _ in 0..3 {
+            load(&config_dir).unwrap();
+        }
+
+        assert_eq!(backup_files(&config_dir), ["config.toml.pre-zone.bak"]);
+    }
+
+    #[test]
+    fn repeated_loads_of_an_unreadable_config_that_cannot_be_reset_keep_exactly_one_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, "broken { toml");
+        block_saves(&config_dir);
+
+        for _ in 0..3 {
+            let _ = load(&config_dir);
+        }
+
+        assert_eq!(backup_files(&config_dir), ["config.toml.bak"]);
+    }
+
+    #[test]
+    fn load_of_an_unconvertible_old_shape_config_resets_to_defaults() {
+        // The pre-#26 shape (`presets` as an array of tagged variants) is
+        // not convertible -- it is discarded and replaced with defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(
+            &config_dir,
+            r#"
+            [[presets]]
+            type = "LeftHalf"
+
+            [hotkeys]
+            toggle_borderless = "Ctrl+Alt+B"
+            toggle_taskbar_autohide = "Ctrl+Alt+T"
+            "#,
+        );
 
         let config = load(&config_dir).unwrap();
 
         assert_eq!(config, Config::default());
-        // The reset is also persisted, so the next load doesn't need to
-        // rediscover the same incompatible file.
-        let reloaded = load(&config_dir).unwrap();
-        assert_eq!(reloaded, Config::default());
+        assert_eq!(load(&config_dir).unwrap(), Config::default());
+        let backup = std::fs::read_to_string(config_dir.join("config.toml.bak")).unwrap();
+        assert!(backup.contains("LeftHalf"));
+    }
+
+    #[test]
+    fn load_of_a_config_file_missing_optional_keys_still_deserializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(
+            &config_dir,
+            r#"
+            [hotkeys]
+            toggle_borderless = "Ctrl+Alt+B"
+            "#,
+        );
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(config.zone, None);
+        assert_eq!(config.tracked_games, Vec::new());
+        assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
+        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
     }
 
     #[test]
@@ -643,174 +899,44 @@ mod tests {
     }
 
     #[test]
-    fn presets_all_lists_the_two_base_presets_in_fixed_order_with_no_custom_by_default() {
-        let presets = Presets::default();
-
-        let all = presets.all();
-
-        assert_eq!(
-            all,
-            vec![
-                Preset::Left { depth_percent: DEFAULT_DEPTH_PERCENT },
-                Preset::Right { depth_percent: DEFAULT_DEPTH_PERCENT },
-            ]
-        );
-    }
-
-    #[test]
-    fn presets_all_appends_custom_when_present() {
-        let presets = Presets {
-            left_depth_percent: 20,
-            right_depth_percent: 80,
-            custom: Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }),
-            default_for_new_games: PresetKind::Right,
-        };
-
-        let all = presets.all();
-
-        assert_eq!(
-            all,
-            vec![
-                Preset::Left { depth_percent: 20 },
-                Preset::Right { depth_percent: 80 },
-                Preset::Custom { x: 1, y: 2, width: 3, height: 4 },
-            ]
-        );
-    }
-
-    #[test]
-    fn presets_resolve_returns_the_matching_preset_for_each_base_kind() {
-        let presets = Presets {
-            left_depth_percent: 20,
-            right_depth_percent: 80,
-            custom: None,
-            default_for_new_games: PresetKind::Right,
-        };
-
-        assert_eq!(presets.resolve(PresetKind::Left), Some(Preset::Left { depth_percent: 20 }));
-        assert_eq!(presets.resolve(PresetKind::Right), Some(Preset::Right { depth_percent: 80 }));
-    }
-
-    #[test]
-    fn presets_resolve_returns_the_custom_preset_when_one_is_set() {
-        let presets = Presets {
-            left_depth_percent: 20,
-            right_depth_percent: 80,
-            custom: Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }),
-            default_for_new_games: PresetKind::Right,
-        };
-
-        assert_eq!(presets.resolve(PresetKind::Custom), Some(Preset::Custom { x: 1, y: 2, width: 3, height: 4 }));
-    }
-
-    #[test]
-    fn presets_resolve_returns_none_for_custom_when_none_is_currently_set() {
-        // A game assigned to Custom after Custom was since cleared/replaced
-        // with None -- callers must treat this the same as "untracked" for
-        // that one apply, not silently fall back to a different preset.
-        let presets = Presets {
-            left_depth_percent: 20,
-            right_depth_percent: 80,
-            custom: None,
-            default_for_new_games: PresetKind::Right,
-        };
-
-        assert_eq!(presets.resolve(PresetKind::Custom), None);
-    }
-
-    #[test]
-    fn tracked_game_new_default_uses_the_given_default_preset_auto_apply_and_taskbar_autohide_on() {
-        let game = TrackedGame::new_default(
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Right,
-        );
+    fn tracked_game_new_default_has_auto_apply_on() {
+        let game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
 
         assert_eq!(game.exe_path, PathBuf::from("C:\\Games\\thing.exe"));
         assert_eq!(game.display_name, "Thing");
-        assert_eq!(game.preset, PresetKind::Right);
         assert!(game.auto_apply);
-        assert!(game.taskbar_autohide);
-    }
-
-    #[test]
-    fn tracked_game_new_default_uses_whichever_default_preset_it_is_given() {
-        // Confirms the assigned preset tracks the passed-in parameter, not a
-        // hardcoded kind -- see CONTEXT.md's "Default preset (for new
-        // tracked games)".
-        let game = TrackedGame::new_default(
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Custom,
-        );
-
-        assert_eq!(game.preset, PresetKind::Custom);
     }
 
     #[test]
     fn upsert_tracked_game_appends_a_new_default_entry_when_no_existing_match() {
         let mut games: Vec<TrackedGame> = Vec::new();
 
-        let index = upsert_tracked_game(
-            &mut games,
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Right,
-        );
+        let index = upsert_tracked_game(&mut games, PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
 
         assert_eq!(index, 0);
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].display_name, "Thing");
-        assert_eq!(games[0].preset, PresetKind::Right);
-    }
-
-    #[test]
-    fn upsert_tracked_game_appends_a_new_entry_using_whichever_default_preset_it_is_given() {
-        // A newly-tracked game (e.g. via "Apply to Window") must be seeded
-        // from the caller's current `Presets::default_for_new_games`, not a
-        // hardcoded kind -- see CONTEXT.md's "Default preset (for new
-        // tracked games)".
-        let mut games: Vec<TrackedGame> = Vec::new();
-
-        let index = upsert_tracked_game(
-            &mut games,
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Custom,
-        );
-
-        assert_eq!(index, 0);
-        assert_eq!(games[0].preset, PresetKind::Custom);
+        assert!(games[0].auto_apply);
     }
 
     #[test]
     fn upsert_tracked_game_reuses_the_existing_entry_for_a_matching_executable_path() {
-        let mut games = vec![TrackedGame::new_default(
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Right,
-        )];
-        games[0].preset = PresetKind::Custom;
+        let mut games =
+            vec![TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string())];
         games[0].auto_apply = false;
-        games[0].taskbar_autohide = false;
 
         let index = upsert_tracked_game(
             &mut games,
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing (different window title)".to_string(),
-            PresetKind::Right,
         );
 
         assert_eq!(index, 0);
         assert_eq!(games.len(), 1, "picking an already-tracked game again must not create a duplicate entry");
-        // Display name is captured only at add-time -- a later re-pick with
-        // a different window title must not overwrite it.
+        // Display name is captured only at add-time.
         assert_eq!(games[0].display_name, "Thing");
-        // Existing assignment/settings are preserved untouched, not reset
-        // back to defaults.
-        assert_eq!(games[0].preset, PresetKind::Custom);
+        // Existing settings are preserved untouched, not reset to defaults.
         assert!(!games[0].auto_apply);
-        assert!(!games[0].taskbar_autohide);
     }
 
     #[test]
@@ -822,11 +948,7 @@ mod tests {
 
     #[test]
     fn find_tracked_game_returns_the_matching_entry() {
-        let games = vec![TrackedGame::new_default(
-            PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-            PresetKind::Right,
-        )];
+        let games = vec![TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string())];
 
         let found = find_tracked_game(&games, std::path::Path::new("C:\\Games\\thing.exe"));
 
@@ -834,80 +956,8 @@ mod tests {
     }
 
     #[test]
-    fn tracked_games_using_preset_returns_empty_for_an_empty_list() {
-        let games: Vec<TrackedGame> = Vec::new();
-
-        let matches = tracked_games_using_preset(&games, PresetKind::Left);
-
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn tracked_games_using_preset_returns_empty_when_no_game_uses_the_preset() {
-        let mut game =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string(), PresetKind::Right);
-        game.preset = PresetKind::Right;
-        let games = vec![game];
-
-        let matches = tracked_games_using_preset(&games, PresetKind::Left);
-
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn tracked_games_using_preset_returns_the_single_matching_game() {
-        let mut game =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string(), PresetKind::Right);
-        game.preset = PresetKind::Left;
-        let games = vec![game];
-
-        let matches = tracked_games_using_preset(&games, PresetKind::Left);
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].display_name, "Thing");
-    }
-
-    #[test]
-    fn tracked_games_using_preset_returns_every_matching_game_and_none_else() {
-        let mut a =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\a.exe"), "A".to_string(), PresetKind::Right);
-        a.preset = PresetKind::Custom;
-        let mut b =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\b.exe"), "B".to_string(), PresetKind::Right);
-        b.preset = PresetKind::Left;
-        let mut c =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\c.exe"), "C".to_string(), PresetKind::Right);
-        c.preset = PresetKind::Custom;
-        let games = vec![a, b, c];
-
-        let matches = tracked_games_using_preset(&games, PresetKind::Custom);
-
-        let names: Vec<&str> = matches.iter().map(|g| g.display_name.as_str()).collect();
-        assert_eq!(names, vec!["A", "C"]);
-    }
-
-    #[test]
     fn config_default_has_no_tracked_games() {
         assert_eq!(Config::default().tracked_games, Vec::new());
-    }
-
-    #[test]
-    fn load_reads_back_tracked_games_persisted_in_a_saved_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("GameFrame");
-        let mut written = Config::default();
-        written.tracked_games.push(TrackedGame {
-            exe_path: PathBuf::from("C:\\Games\\thing.exe"),
-            display_name: "Thing".to_string(),
-            preset: PresetKind::Custom,
-            auto_apply: false,
-            taskbar_autohide: true,
-        });
-        save(&config_dir, &written).unwrap();
-
-        let loaded = load(&config_dir).unwrap();
-
-        assert_eq!(loaded, written);
     }
 
     #[test]

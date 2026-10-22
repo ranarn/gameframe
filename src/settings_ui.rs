@@ -1,13 +1,12 @@
-//! Lazily-instantiated egui Settings window: adjust the depth-from-edge of
-//! the `Left`/`Right` base presets, set/clear the single optional `Custom`
-//! preset, and assign GameFrame's two global hotkey bindings, persisted via
+//! Lazily-instantiated egui Settings window: draw/edit the single optional
+//! Zone, and assign GameFrame's two global hotkey bindings, persisted via
 //! [`crate::profile_store`].
 //!
 //! Split in two:
 //! - [`SettingsState`]: the editable view-model, plain data with no egui/OS
-//!   dependency, fully unit tested below. [`preset_thumbnails`]/
-//!   [`normalize_region`] are pure helpers that turn that state into the data
-//!   a thumbnail painter needs, also fully unit tested.
+//!   dependency, fully unit tested below. [`zone_view`]/[`normalize_region`]
+//!   are pure helpers that turn that state into the data a thumbnail painter
+//!   needs, also fully unit tested.
 //! - [`SettingsApp`] / [`run_settings_window`]: the actual egui/eframe
 //!   window construction, rendering, and teardown. This is OS/GPU-facing --
 //!   it needs a live desktop/GPU context to open and render a window, and a
@@ -18,46 +17,30 @@
 //!   real desktop session.
 
 use crate::profile_store::{
-    self, Config, CustomRegion, HotkeyBindings, PresetKind, Presets, ProfileStoreError, TaskbarHideMode, TrackedGame,
+    self, Config, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame, Zone,
 };
-use crate::region_calc::{
-    resolve_region, MonitorGeometry, Preset, Region, MAX_DEPTH_PERCENT, MIN_DEPTH_PERCENT,
-};
+use crate::region_calc::{resolve_region, MonitorGeometry, Region};
 use crate::autostart::{self, AutostartError};
 use crate::keyboard_hook;
 use crate::win32;
-use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-/// The editable state backing the Settings window: the `Left`/`Right`
-/// depth-from-edge percentages, the single optional `Custom` preset, and the
-/// two hotkey binding strings (empty = unbound).
+/// The editable state backing the Settings window: the single optional
+/// [`Zone`] and the two hotkey binding strings (empty = unbound).
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
-/// The two base presets (`Left`, `Right`) are always present and are never
-/// added/removed -- only their depth-from-edge is adjustable, edited in
-/// place. `Custom` is the single
-/// optional preset: it is set/replaced entirely by the zone-editor overlay
-/// (see [`crate::zone_overlay::run_zone_editor_overlay`]), superseding the
-/// manual X/Y/width/height numeric entry this struct carried before issue
-/// #28 -- there is no scratch input state to hold here, `Custom` is written
-/// directly once the overlay reports a Save.
+/// The Zone is set/replaced entirely by the zone-editor overlay (see
+/// [`crate::zone_overlay::run_zone_editor_overlay`]) -- there is no scratch
+/// input state to hold here, it is written directly once the overlay
+/// reports a Save.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsState {
-    pub left_depth_percent: u8,
-    pub right_depth_percent: u8,
-    pub custom: Option<CustomRegion>,
-    /// The preset kind assigned to a newly-tracked game -- see
-    /// `CONTEXT.md`'s "Default preset (for new tracked games)", kept fully
-    /// separate from a tracked game's own "Active preset": changing this
-    /// never touches any already-tracked game's existing `preset` field.
-    /// Set by clicking a thumbnail in [`SettingsApp::preset_thumbnails_row`].
-    pub default_for_new_games: PresetKind,
+    pub zone: Option<Zone>,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
     /// `Some(field)` while a press-to-bind capture is in progress for that
@@ -77,7 +60,7 @@ pub struct SettingsState {
     /// a new capture starts or the current one ends.
     pub duplicate_hotkey_error: Option<String>,
     /// The tracked-games list, editable in place by the Settings "Games"
-    /// section (preset/auto-apply/taskbar-auto-hide per row, and immediate
+    /// section (auto-apply per row, and immediate
     /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
     /// entries are added.
     pub tracked_games: Vec<TrackedGame>,
@@ -87,6 +70,9 @@ pub struct SettingsState {
     /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
     /// the global hotkeys in the Settings window.
     pub taskbar_hide_mode: TaskbarHideMode,
+    /// Whether applying the Zone also hides the taskbar -- the global
+    /// "Hide taskbar when the Zone is applied" checkbox (issue #49).
+    pub hide_taskbar_on_apply: bool,
     /// The "Start with Windows" checkbox. Not part of [`Config`] -- the
     /// registry is its source of truth (see [`crate::autostart`]) -- so
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
@@ -107,10 +93,7 @@ impl SettingsState {
     /// hotkeys (`None`) become empty strings.
     pub fn from_config(config: &Config) -> Self {
         Self {
-            left_depth_percent: config.presets.left_depth_percent,
-            right_depth_percent: config.presets.right_depth_percent,
-            custom: config.presets.custom,
-            default_for_new_games: config.presets.default_for_new_games,
+            zone: config.zone,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
             capturing: None,
@@ -118,18 +101,8 @@ impl SettingsState {
             duplicate_hotkey_error: None,
             tracked_games: config.tracked_games.clone(),
             taskbar_hide_mode: config.taskbar_hide_mode,
+            hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
-        }
-    }
-
-    /// Builds the [`Presets`] to persist from the current depth percentages
-    /// and `Custom` value.
-    pub fn to_presets(&self) -> Presets {
-        Presets {
-            left_depth_percent: self.left_depth_percent,
-            right_depth_percent: self.right_depth_percent,
-            custom: self.custom,
-            default_for_new_games: self.default_for_new_games,
         }
     }
 
@@ -137,36 +110,29 @@ impl SettingsState {
     /// field is treated as unbound (`None`).
     pub fn to_config(&self) -> Config {
         Config {
-            presets: self.to_presets(),
+            zone: self.zone,
             hotkeys: HotkeyBindings {
                 toggle_borderless: non_empty(&self.toggle_borderless),
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
             },
             tracked_games: self.tracked_games.clone(),
             taskbar_hide_mode: self.taskbar_hide_mode,
+            hide_taskbar_on_apply: self.hide_taskbar_on_apply,
         }
     }
 
-    /// Replaces the `Custom` preset entirely with `zone` -- the result of a
-    /// completed zone-editor overlay session
+    /// Replaces the Zone entirely with `zone` -- the result of a completed
+    /// zone-editor overlay session
     /// ([`crate::zone_overlay::run_zone_editor_overlay`] returning
-    /// `Ok(Some(region))`). There is at most one `Custom`, so this always
+    /// `Ok(Some(zone))`). There is at most one Zone, so this always
     /// replaces rather than appends.
-    pub fn set_custom_preset(&mut self, zone: CustomRegion) {
-        self.custom = Some(zone);
+    pub fn set_zone(&mut self, zone: Zone) {
+        self.zone = Some(zone);
     }
 
-    /// Clears the `Custom` preset entirely (back to "none set").
-    pub fn clear_custom_preset(&mut self) {
-        self.custom = None;
-    }
-
-    /// Sets `kind` as the new default preset assigned to future
-    /// newly-tracked games -- see `CONTEXT.md`'s "Default preset (for new
-    /// tracked games)". Never touches any already-tracked game's existing
-    /// `preset` assignment (that's "Active preset", a separate concept).
-    pub fn set_default_for_new_games(&mut self, kind: PresetKind) {
-        self.default_for_new_games = kind;
+    /// Clears the Zone entirely (back to "no zone set").
+    pub fn clear_zone(&mut self) {
+        self.zone = None;
     }
 
     pub fn start_capture(&mut self, field: HotkeyField) {
@@ -224,7 +190,7 @@ impl SettingsState {
 
     /// Removes the tracked game at `index` immediately, with no confirmation
     /// -- matching this module's existing immediate-no-confirm pattern (see
-    /// [`Self::clear_hotkey`]/[`Self::clear_custom_preset`]).
+    /// [`Self::clear_hotkey`]/[`Self::clear_zone`]).
     pub fn remove_tracked_game(&mut self, index: usize) {
         self.tracked_games.remove(index);
     }
@@ -258,30 +224,6 @@ impl SettingsState {
         if self.capturing == Some(field) {
             self.cancel_capture();
         }
-    }
-}
-
-/// A human-readable label for a preset, for use as a thumbnail's caption in
-/// the Settings preset UI -- deliberately not `Preset`'s `Debug` formatting,
-/// which is meant for diagnostics, not end-user display.
-fn preset_label(preset: &Preset) -> String {
-    match preset {
-        Preset::Left { depth_percent } => format!("Left ({depth_percent}%)"),
-        Preset::Right { depth_percent } => format!("Right ({depth_percent}%)"),
-        Preset::Custom { x, y, width, height } => {
-            format!("Custom ({x}, {y}, {width}x{height})")
-        }
-    }
-}
-
-/// A human-readable label for a [`PresetKind`] reference, for use in the
-/// Games section's per-tracked-game preset dropdown -- deliberately not
-/// `PresetKind`'s `Debug` formatting, matching [`preset_label`]'s rationale.
-fn preset_kind_label(kind: PresetKind) -> &'static str {
-    match kind {
-        PresetKind::Left => "Left",
-        PresetKind::Right => "Right",
-        PresetKind::Custom => "Custom",
     }
 }
 
@@ -321,80 +263,82 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
     }
 }
 
-/// The graphical-thumbnail data for a single preset: a caption, its region
-/// normalized against `monitor` (if it resolved), and -- if resolution
-/// failed -- an error to surface instead of silently omitting the preset
-/// from the row. Only `Custom` can fail to resolve (e.g. coordinates
-/// persisted while running on a different monitor configuration); the two
-/// base presets always resolve.
-///
-/// Also carries `kind` and `is_default` (issue #36) so the thumbnail row
-/// can wire up "click to set as the default preset for new tracked games"
-/// and highlight whichever one currently is -- a concept kept fully
-/// separate from a tracked game's own "Active preset" (see `CONTEXT.md`).
+/// What the Settings "Zone" section shows for the current Zone against the
+/// current monitor.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PresetThumbnail {
-    /// Which preset kind this thumbnail represents -- lets the
-    /// click handler and the default-highlight both key off a stable
-    /// reference rather than parsing `label` back apart.
-    pub kind: PresetKind,
-    pub label: String,
-    pub region: Option<NormalizedRegion>,
-    pub error: Option<String>,
-    /// `true` only for the thumbnail matching the current
-    /// `SettingsState::default_for_new_games` (see `CONTEXT.md`'s "Default
-    /// preset (for new tracked games)") -- the row renders exactly one
-    /// thumbnail with this flag set, distinct from any other per-thumbnail
-    /// state (hover, the `error` placeholder above).
-    pub is_default: bool,
+pub enum ZoneView {
+    /// No Zone is set: the section shows "No zone set" and a "Draw zone"
+    /// button.
+    NotSet,
+    /// The Zone resolves on this monitor: draw it, normalized, on the
+    /// monitor thumbnail.
+    Resolved(NormalizedRegion),
+    /// A Zone is set but can't be resolved on the current monitor (e.g.
+    /// coordinates persisted while running on a different monitor
+    /// configuration). Carries the red reason to show.
+    Unresolvable(String),
 }
 
-/// Returns why `kind` currently can't be resolved to a concrete, drawable
-/// region against `presets`/`monitor` (`Some(message)`), or `None` if it
-/// resolves fine. Used by the Settings "Games" section to surface feedback
-/// next to a tracked game's preset dropdown when its assignment is
-/// currently unresolvable -- e.g. assigned `Custom` while no `Custom`
-/// preset exists (`Presets::resolve` returns `None`; see
-/// `profile_store::Presets::resolve`'s doc comment), or one exists but its
-/// stored coordinates don't fit `monitor` (mirrors [`preset_thumbnails`]'s
-/// per-preset error path, just keyed off a [`PresetKind`] reference rather
-/// than an already-materialized [`Preset`]).
-pub fn preset_kind_unavailable_reason(
-    kind: PresetKind,
-    presets: &Presets,
-    monitor: &MonitorGeometry,
-) -> Option<String> {
-    match presets.resolve(kind) {
-        None => Some("no Custom region is set".to_string()),
-        Some(preset) => resolve_region(&preset, monitor).err().map(|e| e.to_string()),
+/// Decides what the Zone section shows for `zone` against `monitor` -- the
+/// pure data behind the thumbnail painter and the red unresolvable reason.
+pub fn zone_view(zone: Option<&Zone>, monitor: &MonitorGeometry) -> ZoneView {
+    match zone {
+        None => ZoneView::NotSet,
+        Some(zone) => match resolve_region(zone, monitor) {
+            Ok(region) => ZoneView::Resolved(normalize_region(&region, monitor)),
+            Err(e) => ZoneView::Unresolvable(e.to_string()),
+        },
     }
 }
 
 /// The non-blocking status-line message shown for a tracked game whose live
 /// re-apply attempt (issue #33) failed -- e.g. the window couldn't be
-/// repositioned because of an access-denied error. Its setting still saved
-/// normally; the message just explains that the change will take effect the
-/// next time the game launches, or the hotkey/tray-apply is used, instead of
-/// immediately.
+/// repositioned because of an access-denied error. The Zone itself was already
+/// saved (the overlay persists it on Save); the message just explains that
+/// the game will pick it up the next time it is applied (launch, hotkey or
+/// tray "Apply to Window") instead of immediately.
 ///
 /// Pure string formatting -- no OS dependency -- so it's unit tested in
 /// complete isolation from the live re-apply attempt that decides whether to
 /// show it.
 fn live_apply_failure_message(display_name: &str) -> String {
-    format!("couldn't reposition {display_name} live -- will apply on next launch")
+    format!(
+        "couldn't reposition {display_name} live -- the saved zone will be used the next time it launches or you apply it"
+    )
 }
 
-/// Attempts issue #33's live re-apply for a single tracked game already
-/// resolved to `preset`, via [`win32::resolve_running_window`] +
-/// [`win32::live_reapply_running_window`]. Returns `Some(message)` only when
-/// an attempt was actually made and failed (the game was running, but
-/// repositioning it hit an OS-level error, e.g. a resolvable window but an
-/// unresolvable/inapplicable region) -- a game that isn't currently running
-/// is silently skipped (`None`) *before* its preset's region is even
-/// resolved, per this issue's acceptance criteria: its setting still saved
-/// normally and will apply on its next launch/hotkey/tray-apply. This
-/// ordering matters -- see the inline comment below -- a not-running game
-/// must never surface a region-resolution error as a live-apply failure.
+/// The config to persist when the Zone changes on its own (overlay Save or
+/// Clear): the on-disk `config` with only its Zone replaced, so every other
+/// field -- including edits Settings has not saved yet, which are not in
+/// `config` -- is left exactly as it is on disk.
+fn config_with_zone(mut config: Config, zone: Option<Zone>) -> Config {
+    config.zone = zone;
+    config
+}
+
+/// Persists `zone` to `config_dir` immediately (load, replace the Zone, save),
+/// so the on-disk Zone -- which the background re-apply paths read -- never
+/// disagrees with the Zone applied to running windows.
+///
+/// Returns the config as saved, so callers act on the on-disk taskbar settings
+/// (`hide_taskbar_on_apply`, `taskbar_hide_mode`) rather than on unsaved
+/// Settings state.
+pub(crate) fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<Config, SettingsUiError> {
+    let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
+    let updated = config_with_zone(config, zone);
+    profile_store::save(config_dir, &updated).map_err(SettingsUiError::Config)?;
+    Ok(updated)
+}
+
+/// Attempts issue #33's live re-apply for a single tracked game, via
+/// [`win32::resolve_running_window`] + [`win32::live_reapply_running_window`].
+/// Returns `Some(message)` only when an attempt was actually made and failed
+/// (the game was running, but repositioning it hit an OS-level error) -- a
+/// game that isn't currently running is silently skipped (`None`) *before*
+/// the Zone's region is even resolved: its setting still saved normally and
+/// will apply on its next launch/hotkey/tray-apply. This ordering matters --
+/// a not-running game must never surface a region-resolution error as a
+/// live-apply failure.
 ///
 /// OS-facing (delegates to [`win32::resolve_running_window`]/
 /// [`win32::live_reapply_running_window`], which perform the real toolhelp
@@ -404,25 +348,32 @@ fn live_apply_failure_message(display_name: &str) -> String {
 /// to for its one testable piece (the message text).
 fn live_reapply_tracked_game(
     game: &TrackedGame,
-    preset: &Preset,
+    zone: &Zone,
     monitor: &MonitorGeometry,
+    hide_taskbar_on_apply: bool,
     taskbar_hide_mode: TaskbarHideMode,
 ) -> Option<String> {
     // Not-running must always short-circuit before region resolution is even
-    // attempted: a saved Custom zone that no longer fits the current monitor
-    // would otherwise surface a spurious failure message for a game that was
+    // attempted: a saved Zone that no longer fits the current monitor would
+    // otherwise surface a spurious failure message for a game that was
     // never actually running (issue #33's iteration-3 review fix).
     let hwnd = win32::resolve_running_window(&game.exe_path)?;
 
-    let region = match resolve_region(preset, monitor) {
+    let region = match resolve_region(zone, monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("live re-apply: failed to resolve {}'s preset region: {e}", game.display_name);
+            eprintln!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
             return Some(live_apply_failure_message(&game.display_name));
         }
     };
 
-    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, taskbar_hide_mode, region) {
+    match win32::live_reapply_running_window(
+        hwnd,
+        &game.display_name,
+        hide_taskbar_on_apply,
+        taskbar_hide_mode,
+        region,
+    ) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
             eprintln!("live re-apply failed for {}: {e}", game.display_name);
@@ -431,86 +382,31 @@ fn live_reapply_tracked_game(
     }
 }
 
-/// Issue #33's trigger 1 (reassigning a single tracked game's preset
-/// dropdown): live re-applies just `game`'s newly-assigned preset, resolved
-/// against the current `presets`. Returns an empty list (no status line) if
-/// the assignment currently can't be resolved at all (e.g. assigned `Custom`
-/// while none is set -- already surfaced by the row's own "Unavailable"
-/// label, so a live-apply attempt would be redundant) or if the single
-/// attempt made didn't fail.
+/// Live re-applies a newly-saved `zone` to every tracked game in `games`
+/// (the Zone is shared, so a new one affects all of them). Returns one
+/// status-line message per game whose live re-apply attempt failed -- an
+/// empty list if every game either isn't running or was repositioned
+/// successfully.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
-fn live_reapply_single_game(
-    game: &TrackedGame,
-    presets: &Presets,
+fn live_reapply_all(
+    games: &[TrackedGame],
+    zone: &Zone,
     monitor: &MonitorGeometry,
+    hide_taskbar_on_apply: bool,
     taskbar_hide_mode: TaskbarHideMode,
 ) -> Vec<String> {
-    let Some(preset) = presets.resolve(game.preset) else {
-        return Vec::new();
-    };
-    live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode).into_iter().collect()
-}
-
-/// Issue #33's trigger 2/3 (a base preset's depth slider settling, or a
-/// Custom zone save): live re-applies `kind`'s newly-committed value to
-/// every currently-affected tracked game in `games` (see
-/// [`profile_store::tracked_games_using_preset`]). Returns one status-line
-/// message per game whose live re-apply attempt failed -- an empty list if
-/// every affected game either isn't running or was repositioned
-/// successfully, and also if `kind` itself can't currently be resolved
-/// (`Custom` with none set -- can't happen for the `Custom`-save call site
-/// itself, since that only fires right after a successful `set_custom_preset`,
-/// but is still handled defensively here for `Left`/`Right`'s sake, which
-/// always resolve).
-///
-/// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs; [`profile_store::tracked_games_using_preset`] (the cascade
-/// selection) is the pure decision this delegates to, and is what's actually
-/// unit tested.
-fn live_reapply_cascade(
-    games: &[&TrackedGame],
-    presets: &Presets,
-    kind: PresetKind,
-    monitor: &MonitorGeometry,
-    taskbar_hide_mode: TaskbarHideMode,
-) -> Vec<String> {
-    let Some(preset) = presets.resolve(kind) else {
-        return Vec::new();
-    };
-    games.iter().filter_map(|game| live_reapply_tracked_game(game, &preset, monitor, taskbar_hide_mode)).collect()
-}
-
-pub fn preset_thumbnails(state: &SettingsState, monitor: &MonitorGeometry) -> Vec<PresetThumbnail> {
-    let presets = state.to_presets();
-    // Fixed presentation order matching `Presets::all`'s (the two base
-    // presets, then `Custom` if present) -- `zip` naturally truncates to
-    // `presets.all()`'s length when `Custom` is absent.
-    let kinds = [PresetKind::Left, PresetKind::Right, PresetKind::Custom];
-
-    presets
-        .all()
-        .into_iter()
-        .zip(kinds)
-        .map(|(preset, kind)| {
-            let is_default = kind == state.default_for_new_games;
-            match resolve_region(&preset, monitor) {
-                Ok(region) => PresetThumbnail {
-                    kind,
-                    label: preset_label(&preset),
-                    region: Some(normalize_region(&region, monitor)),
-                    error: None,
-                    is_default,
-                },
-                Err(e) => PresetThumbnail {
-                    kind,
-                    label: preset_label(&preset),
-                    region: None,
-                    error: Some(e.to_string()),
-                    is_default,
-                },
-            }
+    games
+        .iter()
+        .filter_map(|game| {
+            live_reapply_tracked_game(
+                game,
+                zone,
+                monitor,
+                hide_taskbar_on_apply,
+                taskbar_hide_mode,
+            )
         })
         .collect()
 }
@@ -882,13 +778,13 @@ impl std::error::Error for SettingsUiError {
 
 /// What closed the Settings window: a completed Save (carrying the
 /// [`Config`] to persist), a Cancel/close-without-saving, or a request to
-/// open the zone-editor overlay for the Custom preset (carrying the current
+/// open the zone-editor overlay for the Zone (carrying the current
 /// in-progress [`SettingsState`], plus this session's current pending
 /// live-re-apply status messages -- issue #33's
 /// [`SettingsApp::pending_status_messages`] -- so neither is lost while the
 /// overlay is open).
 ///
-/// [`run_settings_window`] loops on this: `EditCustomZone` re-opens the
+/// [`run_settings_window`] loops on this: `EditZone` re-opens the
 /// Settings window (with the overlay's result, and the carried-forward
 /// status messages, folded back in) rather than ending the session, since
 /// opening the zone editor is not itself a decision to close Settings.
@@ -899,22 +795,25 @@ enum SettingsExit {
     Cancelled,
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`],
-    /// issue #33) -- so a message surfaced by a slider/dropdown commit made
-    /// just before "Edit Custom Zone..." was clicked isn't lost when this
+    /// issue #33) -- so a message surfaced by a Zone commit made
+    /// just before "Edit zone" was clicked isn't lost when this
     /// session's `SettingsApp` is torn down; [`run_settings_window`] carries
     /// it forward as the next session's initial status messages.
-    EditCustomZone(SettingsState, Vec<String>),
+    EditZone(SettingsState, Vec<String>),
 }
 
 /// Opens the Settings window, blocking until it's closed, then returns.
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
-/// lets the user edit presets and hotkey bindings, and -- only if the user
+/// lets the user edit the Zone and hotkey bindings, and -- only if the user
 /// clicks "Save" -- persists the result via [`profile_store::save`] before
 /// returning. Closing the window any other way (the "Cancel" button, the
-/// window's own close button) discards the edits.
+/// window's own close button) discards the edits -- except the Zone, which
+/// Save/Cancel don't govern: saving in the zone editor overlay (and "Clear")
+/// persists it immediately, so the disk and the windows it was live-applied
+/// to never disagree.
 ///
-/// Clicking "Edit Custom Zone" opens the zone-editor overlay
+/// Clicking "Draw zone"/"Edit zone" opens the zone-editor overlay
 /// ([`zone_overlay::run_zone_editor_overlay`]) *sequentially* rather than
 /// nesting it inside the Settings window's own event loop -- egui/winit
 /// don't support one native event loop starting another while it's still
@@ -926,12 +825,12 @@ enum SettingsExit {
 ///
 /// Also threads issue #33's non-blocking live-re-apply status messages
 /// across that same close-then-reopen boundary: `status_messages` starts
-/// empty, is replaced wholesale by whatever [`SettingsExit::EditCustomZone`]
+/// empty, is replaced wholesale by whatever [`SettingsExit::EditZone`]
 /// carried out of the just-closed session (either its untouched
 /// carried-forward messages, or a fresh set if the overlay's save fired
 /// trigger 3's cascade), and is handed to the next [`run_settings_frame`]
 /// call as its `initial_status_messages` -- so a status line surfaced right
-/// before "Edit Custom Zone..." was clicked survives the round trip through
+/// before "Edit zone" was clicked survives the round trip through
 /// the overlay instead of vanishing with the torn-down `SettingsApp`.
 ///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
@@ -946,7 +845,7 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
     let mut status_messages: Vec<String> = Vec::new();
 
     loop {
-        match run_settings_frame(state, monitor, status_messages)? {
+        match run_settings_frame(config_dir, state, monitor, status_messages)? {
             SettingsExit::Saved(config, start_with_windows) => {
                 profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
                 // Only touch the registry on an actual change, so saving
@@ -958,7 +857,7 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 return Ok(());
             }
             SettingsExit::Cancelled => return Ok(()),
-            SettingsExit::EditCustomZone(mut latest_state, latest_status_messages) => {
+            SettingsExit::EditZone(mut latest_state, latest_status_messages) => {
                 // Carried forward as-is unless the overlay actually commits a
                 // new zone below (trigger 3 only fires on an accepted save,
                 // per this issue's "commit only" rule) -- cancelling/failing
@@ -966,21 +865,31 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 // status messages were already showing must survive it.
                 status_messages = latest_status_messages;
                 match zone_overlay::run_zone_editor_overlay(
-                    latest_state.custom,
-                    PinnedEdges::NONE,
+                    latest_state.zone,
                     latest_state.taskbar_hide_mode,
                 ) {
                     Ok(Some(zone)) => {
-                        latest_state.set_custom_preset(zone);
-                        let affected =
-                            profile_store::tracked_games_using_preset(&latest_state.tracked_games, PresetKind::Custom);
-                        status_messages = live_reapply_cascade(
-                            &affected,
-                            &latest_state.to_presets(),
-                            PresetKind::Custom,
-                            &monitor,
-                            latest_state.taskbar_hide_mode,
-                        );
+                        // Persist first, then apply: the Zone on disk (read by
+                        // the drift and launch re-apply paths) must never
+                        // disagree with the Zone the windows are placed in.
+                        match persist_zone(config_dir, Some(zone)) {
+                            Ok(saved) => {
+                                latest_state.set_zone(zone);
+                                // The on-disk taskbar settings, not the
+                                // unsaved Settings state.
+                                status_messages = live_reapply_all(
+                                    &saved.tracked_games,
+                                    &zone,
+                                    &monitor,
+                                    saved.hide_taskbar_on_apply,
+                                    saved.taskbar_hide_mode,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("failed to save the zone: {e}");
+                                status_messages = vec![format!("couldn't save the zone: {e}")];
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
@@ -998,19 +907,21 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
 ///
 /// `initial_status_messages` seeds the new [`SettingsApp`]'s
 /// [`SettingsApp::pending_status_messages`] (issue #33) -- carried over from
-/// the previous session's [`SettingsExit::EditCustomZone`], or empty on the
+/// the previous session's [`SettingsExit::EditZone`], or empty on the
 /// very first call from [`run_settings_window`]. Any close other than an
-/// explicit Save, Cancel, or "Edit Custom Zone..." click -- concretely, the
+/// explicit Save, Cancel, or "Draw zone"/"Edit zone" click -- concretely, the
 /// window's own close button -- is treated as [`SettingsExit::Cancelled`]:
 /// this function's documented "discards the edits" contract for any
 /// non-Save close.
 fn run_settings_frame(
+    config_dir: &Path,
     state: SettingsState,
     monitor: MonitorGeometry,
     initial_status_messages: Vec<String>,
 ) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
+    let config_dir = config_dir.to_path_buf();
 
     // `.with_position(...)` here only ever takes effect on a genuine
     // first-ever launch (no saved `WindowSettings` yet). Once eframe has
@@ -1033,6 +944,7 @@ fn run_settings_frame(
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(SettingsApp {
+                config_dir,
                 state,
                 monitor,
                 exit: exit_for_app,
@@ -1044,7 +956,7 @@ fn run_settings_frame(
     .map_err(SettingsUiError::Window)?;
 
     // A close via the window's own close button (rather than Save/Cancel/Edit
-    // Custom Zone) leaves `exit` empty -- treat that the same as an explicit
+    // zone) leaves `exit` empty -- treat that the same as an explicit
     // Cancel, matching this function's documented "discards the edits"
     // contract for any non-Save close.
     Ok(exit.borrow_mut().take().unwrap_or(SettingsExit::Cancelled))
@@ -1064,11 +976,14 @@ fn window_icon() -> egui::IconData {
 /// Also owns issue #33's transient live-re-apply status messages
 /// ([`pending_status_messages`](SettingsApp::pending_status_messages)),
 /// which -- unlike `state` -- deliberately don't survive a
-/// [`SettingsExit::EditCustomZone`] round trip unchanged: they're carried
+/// [`SettingsExit::EditZone`] round trip unchanged: they're carried
 /// forward by [`run_settings_window`] as plain `Vec<String>` data, not as
 /// part of this struct, since this struct itself is fully torn down and
 /// reconstructed by [`run_settings_frame`] on each session.
 struct SettingsApp {
+    /// Where the Zone is persisted immediately on Clear (the overlay-Save
+    /// persist lives in [`run_settings_window`]).
+    config_dir: std::path::PathBuf,
     state: SettingsState,
     monitor: MonitorGeometry,
     exit: Rc<RefCell<Option<SettingsExit>>>,
@@ -1114,8 +1029,8 @@ impl SettingsApp {
                 } else {
                     self.state.start_capture(field);
                     // Steal keyboard focus away from any other focused widget
-                    // (e.g. a custom-preset TextEdit) so the captured key-down
-                    // isn't also delivered to it as an Event::Text.
+                    // so the captured key-down isn't also delivered to it as
+                    // an Event::Text.
                     set_hotkey_response.request_focus();
                 }
             }
@@ -1142,63 +1057,25 @@ impl SettingsApp {
     }
 
     /// Renders the "Games" section: one row per tracked game with its
-    /// display name, a preset dropdown (the three [`PresetKind`] variants),
-    /// a taskbar-auto-hide checkbox, an auto-apply checkbox, and an
-    /// immediate no-confirmation "Remove" button (see
-    /// [`SettingsState::remove_tracked_game`]). A row whose assigned preset
-    /// currently can't be resolved (see [`preset_kind_unavailable_reason`])
-    /// shows a red "Unavailable" label next to the dropdown, mirroring the
-    /// preset-thumbnail row's existing error-surfacing pattern rather than
-    /// silently leaving the user to guess why nothing applies.
+    /// display name, an auto-apply checkbox,
+    /// and an immediate no-confirmation "Remove" button (see
+    /// [`SettingsState::remove_tracked_game`]).
     ///
     /// Removal is deferred until after the loop (rather than mutating
     /// `self.state.tracked_games` while iterating it) to avoid mutating the
     /// `Vec` out from under `iter_mut`'s in-progress borrow.
-    ///
-    /// Also implements issue #33's trigger 1: reassigning a row's preset
-    /// dropdown is a live-re-apply commit point for *that game alone*. The
-    /// changed game is captured (not acted on inline) so the actual
-    /// [`live_reapply_single_game`] call happens once, after the loop, past
-    /// `self.state.tracked_games.iter_mut()`'s borrow -- and so
-    /// [`SettingsApp::pending_status_messages`] is replaced wholesale with
-    /// that single attempt's result, per this issue's "replace, don't
-    /// accumulate" rule.
     fn games_section(&mut self, ui: &mut egui::Ui) {
         if self.state.tracked_games.is_empty() {
             ui.label("No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.");
             return;
         }
 
-        let presets = self.state.to_presets();
-        let monitor = self.monitor;
         let mut to_remove: Option<usize> = None;
-        // Issue #33 trigger 1: reassigning a single game's preset dropdown
-        // live re-applies just that game, using its *new* preset -- captured
-        // here (rather than acted on inline) so the live-apply attempt runs
-        // once, after `self.state.tracked_games`'s mutable borrow below ends.
-        let mut committed_single_game: Option<TrackedGame> = None;
         let last_index = self.state.tracked_games.len() - 1;
         for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(&game.display_name);
 
-                let previous_preset = game.preset;
-                egui::ComboBox::from_id_salt(("tracked_game_preset", index))
-                    .selected_text(preset_kind_label(game.preset))
-                    .show_ui(ui, |ui| {
-                        for kind in PresetKind::ALL {
-                            ui.selectable_value(&mut game.preset, kind, preset_kind_label(kind));
-                        }
-                    });
-                if game.preset != previous_preset {
-                    committed_single_game = Some(game.clone());
-                }
-
-                if let Some(reason) = preset_kind_unavailable_reason(game.preset, &presets, &monitor) {
-                    ui.colored_label(egui::Color32::RED, format!("Unavailable: {reason}"));
-                }
-
-                ui.checkbox(&mut game.taskbar_autohide, "Taskbar auto-hide");
                 ui.checkbox(&mut game.auto_apply, "Auto-apply");
 
                 if ui.button("Remove").clicked() {
@@ -1214,99 +1091,83 @@ impl SettingsApp {
         if let Some(index) = to_remove {
             self.state.remove_tracked_game(index);
         }
-
-        if let Some(game) = committed_single_game {
-            self.pending_status_messages =
-                live_reapply_single_game(&game, &presets, &monitor, self.state.taskbar_hide_mode);
-        }
     }
 
-    /// Renders the graphical thumbnail row: one small monitor-outline
-    /// rectangle per preset (from [`preset_thumbnails`]), with the resolved
-    /// region highlighted inside it.
-    ///
-    /// Each thumbnail is clickable (issue #36): clicking one sets it as the
-    /// new default preset for future newly-tracked games (see
-    /// `CONTEXT.md`'s "Default preset (for new tracked games)" -- kept
-    /// fully separate from any tracked game's own "Active preset", so this
-    /// never touches an already-tracked game's existing assignment). The
-    /// thumbnail matching the current default renders with a distinct
-    /// gold outline, layered independently of the unrelated "unresolvable
-    /// preset" red-X placeholder below so the two states never collide.
-    fn preset_thumbnails_row(&mut self, ui: &mut egui::Ui) {
-        const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(84.0, 48.0);
-        const DEFAULT_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 0);
+    /// Renders the Zone section: a monitor-outline thumbnail with the Zone
+    /// drawn on it (or "No zone set"), a red reason when the Zone can't be
+    /// resolved on the current monitor (see [`zone_view`]), and a
+    /// "Draw zone"/"Edit zone" button that closes Settings to open the
+    /// zone-editor overlay (blank or pre-filled).
+    fn zone_section(&mut self, ui: &mut egui::Ui) {
+        const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(128.0, 72.0);
         let fill_color = egui::Color32::from_rgb(90, 170, 250);
+        let view = zone_view(self.state.zone.as_ref(), &self.monitor);
 
-        let mut newly_clicked_default: Option<PresetKind> = None;
-
-        ui.horizontal_wrapped(|ui| {
-            for thumbnail in preset_thumbnails(&self.state, &self.monitor) {
-                ui.vertical(|ui| {
-                    let (outline_rect, response) =
-                        ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::click());
-                    if response.clicked() {
-                        newly_clicked_default = Some(thumbnail.kind);
-                    }
-                    response.on_hover_text(if thumbnail.is_default {
-                        "Default preset for newly-tracked games"
-                    } else {
-                        "Click to set as the default preset for newly-tracked games"
-                    });
-
-                    let painter = ui.painter();
-                    let (outline_color, outline_width) = if thumbnail.is_default {
-                        (DEFAULT_OUTLINE_COLOR, 3.0)
-                    } else {
-                        (egui::Color32::DARK_GRAY, 1.0)
-                    };
-                    painter.rect_stroke(
-                        outline_rect,
-                        2.0,
-                        egui::Stroke::new(outline_width, outline_color),
-                        egui::StrokeKind::Outside,
+        ui.horizontal(|ui| {
+            let (outline_rect, _response) = ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
+            let painter = ui.painter();
+            painter.rect_stroke(
+                outline_rect,
+                2.0,
+                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                egui::StrokeKind::Outside,
+            );
+            match &view {
+                ZoneView::Resolved(region) => {
+                    let highlight_rect = egui::Rect::from_min_size(
+                        outline_rect.min + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
+                        egui::vec2(region.width * THUMBNAIL_SIZE.x, region.height * THUMBNAIL_SIZE.y),
                     );
+                    painter.rect_filled(highlight_rect, 0.0, fill_color);
+                }
+                ZoneView::Unresolvable(_) => {
+                    // Visible placeholder instead of silently drawing nothing.
+                    painter.line_segment(
+                        [outline_rect.left_top(), outline_rect.right_bottom()],
+                        egui::Stroke::new(1.5, egui::Color32::RED),
+                    );
+                    painter.line_segment(
+                        [outline_rect.right_top(), outline_rect.left_bottom()],
+                        egui::Stroke::new(1.5, egui::Color32::RED),
+                    );
+                }
+                ZoneView::NotSet => {}
+            }
 
-                    match thumbnail.region {
-                        Some(region) => {
-                            let highlight_rect = egui::Rect::from_min_size(
-                                outline_rect.min
-                                    + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
-                                egui::vec2(region.width * THUMBNAIL_SIZE.x, region.height * THUMBNAIL_SIZE.y),
-                            );
-                            painter.rect_filled(highlight_rect, 0.0, fill_color);
-                        }
-                        None => {
-                            // Unresolvable preset (only `Custom` can hit this --
-                            // e.g. coordinates persisted while running on a
-                            // different monitor configuration). Surface a visible
-                            // placeholder instead of silently dropping the entry.
-                            painter.line_segment(
-                                [outline_rect.left_top(), outline_rect.right_bottom()],
-                                egui::Stroke::new(1.5, egui::Color32::RED),
-                            );
-                            painter.line_segment(
-                                [outline_rect.right_top(), outline_rect.left_bottom()],
-                                egui::Stroke::new(1.5, egui::Color32::RED),
-                            );
-                        }
+            ui.vertical(|ui| {
+                match &self.state.zone {
+                    Some(zone) => {
+                        ui.monospace(format!("({}, {}, {}x{})", zone.x, zone.y, zone.width, zone.height));
                     }
-
-                    ui.label(&thumbnail.label);
-                    if let Some(error) = &thumbnail.error {
-                        ui.colored_label(egui::Color32::RED, format!("Unavailable: {error}"))
-                            .on_hover_text(
-                                "This preset's coordinates don't fit the current monitor. \
-                                 Re-set it under Custom below.",
-                            );
+                    None => {
+                        ui.label("No zone set");
+                    }
+                }
+                if let ZoneView::Unresolvable(reason) = &view {
+                    ui.colored_label(egui::Color32::RED, format!("Unavailable: {reason}"))
+                        .on_hover_text("The zone doesn't fit the current monitor. Edit it to fix.");
+                }
+                ui.horizontal(|ui| {
+                    let label = if self.state.zone.is_some() { "Edit zone" } else { "Draw zone" };
+                    if ui.button(label).clicked() {
+                        *self.exit.borrow_mut() =
+                            Some(SettingsExit::EditZone(self.state.clone(), self.pending_status_messages.clone()));
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if self.state.zone.is_some() && ui.button("Clear").clicked() {
+                        // Like an overlay Save, Clear persists immediately so
+                        // disk and Settings never disagree about the Zone.
+                        match persist_zone(&self.config_dir, None) {
+                            Ok(_) => self.state.clear_zone(),
+                            Err(e) => {
+                                eprintln!("failed to clear the zone: {e}");
+                                self.pending_status_messages = vec![format!("couldn't clear the zone: {e}")];
+                            }
+                        }
                     }
                 });
-            }
+            });
         });
-
-        if let Some(kind) = newly_clicked_default {
-            self.state.set_default_for_new_games(kind);
-        }
     }
 
     /// Installs/uninstalls [`Self::keyboard_hook`] to track `state.capturing`'s
@@ -1362,8 +1223,8 @@ impl eframe::App for SettingsApp {
             // Issue #33's non-blocking status line(s): zero or more messages
             // from the most recent commit-triggered live re-apply attempt.
             // Rendered near the top so they're visible without scrolling
-            // regardless of which commit point (dropdown/slider/zone-save)
-            // produced them.
+            // regardless of which commit point (currently only the overlay's
+            // zone Save) produced them.
             if !self.pending_status_messages.is_empty() {
                 for message in &self.pending_status_messages {
                     ui.colored_label(egui::Color32::YELLOW, message);
@@ -1371,61 +1232,8 @@ impl eframe::App for SettingsApp {
                 ui.separator();
             }
 
-            ui.heading("Presets");
-            self.preset_thumbnails_row(ui);
-
-            ui.separator();
-            ui.label("Left depth from edge:");
-            let left_depth_response = ui.add(egui::Slider::new(
-                &mut self.state.left_depth_percent,
-                MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
-            ).suffix("%"));
-            // Issue #33 trigger 2: fires once the slider settles (release,
-            // not every intermediate drag frame) -- see `drag_stopped`'s doc
-            // comment on why a keyboard-only (arrow-key) edit doesn't also
-            // reach this branch, a known minor gap noted in this issue's
-            // summary rather than worked around.
-            if left_depth_response.drag_stopped() {
-                let presets = self.state.to_presets();
-                let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Left);
-                self.pending_status_messages =
-                    live_reapply_cascade(&affected, &presets, PresetKind::Left, &self.monitor, self.state.taskbar_hide_mode);
-            }
-            ui.label("Right depth from edge:");
-            let right_depth_response = ui.add(egui::Slider::new(
-                &mut self.state.right_depth_percent,
-                MIN_DEPTH_PERCENT..=MAX_DEPTH_PERCENT,
-            ).suffix("%"));
-            if right_depth_response.drag_stopped() {
-                let presets = self.state.to_presets();
-                let affected = profile_store::tracked_games_using_preset(&self.state.tracked_games, PresetKind::Right);
-                self.pending_status_messages =
-                    live_reapply_cascade(&affected, &presets, PresetKind::Right, &self.monitor, self.state.taskbar_hide_mode);
-            }
-
-            ui.separator();
-            ui.label("Custom preset:");
-            ui.horizontal(|ui| {
-                match &self.state.custom {
-                    Some(zone) => {
-                        ui.monospace(format!("({}, {}, {}x{})", zone.x, zone.y, zone.width, zone.height));
-                    }
-                    None => {
-                        ui.label("Not set");
-                    }
-                }
-                if ui.button("Edit Custom Zone...").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::EditCustomZone(
-                        self.state.clone(),
-                        self.pending_status_messages.clone(),
-                    ));
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if self.state.custom.is_some() && ui.button("Clear").clicked() {
-                    self.state.clear_custom_preset();
-                }
-            });
-
+            ui.heading("Zone");
+            self.zone_section(ui);
             ui.separator();
             ui.heading("Global hotkeys");
             self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
@@ -1441,6 +1249,10 @@ impl eframe::App for SettingsApp {
 
             ui.separator();
             ui.heading("Taskbar hiding");
+            ui.checkbox(
+                &mut self.state.hide_taskbar_on_apply,
+                "Hide taskbar when the Zone is applied",
+            );
             ui.radio_value(
                 &mut self.state.taskbar_hide_mode,
                 TaskbarHideMode::FullyHidden,
@@ -1483,7 +1295,67 @@ mod tests {
     fn live_apply_failure_message_names_the_game_and_explains_the_fallback() {
         let message = live_apply_failure_message("Thing");
 
-        assert_eq!(message, "couldn't reposition Thing live -- will apply on next launch");
+        assert_eq!(
+            message,
+            "couldn't reposition Thing live -- the saved zone will be used the next time it launches or you apply it"
+        );
+    }
+
+    #[test]
+    fn config_with_zone_replaces_only_the_zone_of_the_on_disk_config() {
+        let mut on_disk = Config::default();
+        on_disk.zone = Some(Zone { x: 1, y: 2, width: 3, height: 4 });
+        on_disk.hotkeys.toggle_borderless = Some("Ctrl+B".to_string());
+        let new_zone = Zone { x: 100, y: 50, width: 800, height: 600 };
+
+        let updated = config_with_zone(on_disk.clone(), Some(new_zone));
+
+        assert_eq!(updated.zone, Some(new_zone));
+        assert_eq!(updated.hotkeys, on_disk.hotkeys);
+        assert_eq!(updated.tracked_games, on_disk.tracked_games);
+        assert_eq!(config_with_zone(on_disk, None).zone, None);
+    }
+
+    #[test]
+    fn persist_zone_writes_the_zone_and_keeps_the_rest_of_the_on_disk_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hotkeys: HotkeyBindings {
+                toggle_borderless: Some("Ctrl+B".to_string()),
+                ..HotkeyBindings::default()
+            },
+            hide_taskbar_on_apply: false,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
+        let zone = Zone { x: 10, y: 20, width: 300, height: 200 };
+
+        let saved = persist_zone(dir, Some(zone)).unwrap();
+
+        let reloaded = profile_store::load(dir).unwrap();
+        assert_eq!(reloaded.zone, Some(zone));
+        assert_eq!(reloaded.hotkeys, config.hotkeys);
+        assert_eq!(
+            saved, reloaded,
+            "persist_zone must return the on-disk config the live re-apply reads"
+        );
+        assert!(!saved.hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn from_config_and_to_config_round_trip_the_global_taskbar_flag() {
+        let mut config = Config::default();
+        assert!(SettingsState::from_config(&config).hide_taskbar_on_apply);
+
+        config.hide_taskbar_on_apply = false;
+        let state = SettingsState::from_config(&config);
+        assert!(!state.hide_taskbar_on_apply);
+        assert!(!state.to_config().hide_taskbar_on_apply);
+
+        let mut state = state;
+        state.hide_taskbar_on_apply = true;
+        assert!(state.to_config().hide_taskbar_on_apply);
     }
 
     #[test]
@@ -1573,42 +1445,33 @@ mod tests {
     }
 
     #[test]
-    fn from_config_of_a_fresh_default_config_shows_unbound_hotkeys_and_default_depth_presets() {
+    fn from_config_of_a_fresh_default_config_shows_unbound_hotkeys_and_no_zone() {
         let config = Config::default();
 
         let state = SettingsState::from_config(&config);
 
-        assert_eq!(state.left_depth_percent, config.presets.left_depth_percent);
-        assert_eq!(state.right_depth_percent, config.presets.right_depth_percent);
-        assert_eq!(state.custom, None);
+        assert_eq!(state.zone, None);
         assert_eq!(state.toggle_borderless, "");
         assert_eq!(state.toggle_taskbar_autohide, "");
         assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
     }
 
     #[test]
-    fn from_config_of_a_saved_config_shows_the_saved_hotkeys_and_presets() {
+    fn from_config_of_a_saved_config_shows_the_saved_hotkeys_and_zone() {
         let config = Config {
-            presets: Presets {
-                left_depth_percent: 20,
-                right_depth_percent: 80,
-                custom: Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }),
-                default_for_new_games: PresetKind::Custom,
-            },
+            zone: Some(Zone { x: 10, y: 10, width: 200, height: 100 }),
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
             },
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
+            hide_taskbar_on_apply: true,
         };
 
         let state = SettingsState::from_config(&config);
 
-        assert_eq!(state.left_depth_percent, 20);
-        assert_eq!(state.right_depth_percent, 80);
-        assert_eq!(state.custom, Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 }));
-        assert_eq!(state.default_for_new_games, PresetKind::Custom);
+        assert_eq!(state.zone, Some(Zone { x: 10, y: 10, width: 200, height: 100 }));
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
         assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
@@ -1642,7 +1505,6 @@ mod tests {
         config.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
-            config.presets.default_for_new_games,
         ));
 
         let state = SettingsState::from_config(&config);
@@ -1656,15 +1518,12 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
-            PresetKind::Right,
         ));
-        state.tracked_games[0].preset = PresetKind::Custom;
         state.tracked_games[0].auto_apply = false;
 
         let config = state.to_config();
 
         assert_eq!(config.tracked_games.len(), 1);
-        assert_eq!(config.tracked_games[0].preset, PresetKind::Custom);
         assert!(!config.tracked_games[0].auto_apply);
     }
 
@@ -1674,12 +1533,10 @@ mod tests {
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\a.exe"),
             "A".to_string(),
-            PresetKind::Right,
         ));
         state.tracked_games.push(TrackedGame::new_default(
             std::path::PathBuf::from("C:\\Games\\b.exe"),
             "B".to_string(),
-            PresetKind::Right,
         ));
 
         state.remove_tracked_game(0);
@@ -1699,57 +1556,44 @@ mod tests {
     }
 
     #[test]
-    fn to_config_carries_the_current_depth_percentages_and_custom_preset() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.left_depth_percent = 15;
-        state.right_depth_percent = 85;
-        state.custom = Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 });
+    fn zone_round_trips_through_from_config_and_to_config() {
+        let zone = Zone { x: 1, y: 2, width: 3, height: 4 };
+        let config = Config { zone: Some(zone), ..Config::default() };
 
-        let config = state.to_config();
+        let round_tripped = SettingsState::from_config(&config).to_config();
 
-        assert_eq!(config.presets.left_depth_percent, 15);
-        assert_eq!(config.presets.right_depth_percent, 85);
-        assert_eq!(config.presets.custom, Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 }));
+        assert_eq!(round_tripped.zone, Some(zone));
+        assert_eq!(SettingsState::from_config(&Config::default()).to_config().zone, None);
     }
 
     #[test]
-    fn to_config_carries_the_current_default_for_new_games() {
+    fn set_zone_sets_the_zone_returned_by_the_zone_editor_overlay() {
         let mut state = SettingsState::from_config(&Config::default());
 
-        state.set_default_for_new_games(PresetKind::Custom);
+        state.set_zone(Zone { x: 100, y: 50, width: 800, height: 600 });
 
-        let config = state.to_config();
-
-        assert_eq!(config.presets.default_for_new_games, PresetKind::Custom);
+        assert_eq!(state.zone, Some(Zone { x: 100, y: 50, width: 800, height: 600 }));
+        assert_eq!(state.to_config().zone, Some(Zone { x: 100, y: 50, width: 800, height: 600 }));
     }
 
     #[test]
-    fn set_custom_preset_sets_the_zone_returned_by_the_zone_editor_overlay() {
+    fn set_zone_replaces_any_previously_set_zone_rather_than_appending() {
         let mut state = SettingsState::from_config(&Config::default());
+        state.zone = Some(Zone { x: 0, y: 0, width: 100, height: 100 });
 
-        state.set_custom_preset(CustomRegion { x: 100, y: 50, width: 800, height: 600 });
+        state.set_zone(Zone { x: 200, y: 200, width: 300, height: 300 });
 
-        assert_eq!(state.custom, Some(CustomRegion { x: 100, y: 50, width: 800, height: 600 }));
+        assert_eq!(state.zone, Some(Zone { x: 200, y: 200, width: 300, height: 300 }));
     }
 
     #[test]
-    fn set_custom_preset_replaces_any_previously_set_custom_preset_rather_than_appending() {
+    fn clear_zone_removes_the_zone() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.custom = Some(CustomRegion { x: 0, y: 0, width: 100, height: 100 });
+        state.zone = Some(Zone { x: 1, y: 2, width: 3, height: 4 });
 
-        state.set_custom_preset(CustomRegion { x: 200, y: 200, width: 300, height: 300 });
+        state.clear_zone();
 
-        assert_eq!(state.custom, Some(CustomRegion { x: 200, y: 200, width: 300, height: 300 }));
-    }
-
-    #[test]
-    fn clear_custom_preset_removes_the_custom_preset() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.custom = Some(CustomRegion { x: 1, y: 2, width: 3, height: 4 });
-
-        state.clear_custom_preset();
-
-        assert_eq!(state.custom, None);
+        assert_eq!(state.zone, None);
     }
 
     #[test]
@@ -1966,23 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn preset_label_renders_human_readable_names_instead_of_debug_formatting() {
-        assert_eq!(preset_label(&Preset::Left { depth_percent: 40 }), "Left (40%)");
-        assert_eq!(preset_label(&Preset::Right { depth_percent: 60 }), "Right (60%)");
-        assert_eq!(
-            preset_label(&Preset::Custom { x: 10, y: 20, width: 300, height: 400 }),
-            "Custom (10, 20, 300x400)"
-        );
-    }
-
-    #[test]
-    fn preset_kind_label_renders_human_readable_names_for_every_kind() {
-        assert_eq!(preset_kind_label(PresetKind::Left), "Left");
-        assert_eq!(preset_kind_label(PresetKind::Right), "Right");
-        assert_eq!(preset_kind_label(PresetKind::Custom), "Custom");
-    }
-
-    #[test]
     fn normalize_region_expresses_a_region_as_proportions_of_the_monitor() {
         let monitor = test_monitor();
         let region = Region { x: 960, y: 0, width: 960, height: 1080 };
@@ -2021,86 +1848,28 @@ mod tests {
     }
 
     #[test]
-    fn preset_thumbnails_lists_only_the_two_base_presets_when_no_custom_is_set() {
-        let state = SettingsState::from_config(&Config::default());
-
-        let thumbnails = preset_thumbnails(&state, &test_monitor());
-
-        assert_eq!(thumbnails.len(), 2);
-        assert_eq!(thumbnails[0].label, preset_label(&Preset::Left { depth_percent: state.left_depth_percent }));
-        assert_eq!(thumbnails[1].label, preset_label(&Preset::Right { depth_percent: state.right_depth_percent }));
+    fn zone_view_is_not_set_when_there_is_no_zone() {
+        assert_eq!(zone_view(None, &test_monitor()), ZoneView::NotSet);
     }
 
     #[test]
-    fn preset_thumbnails_marks_only_the_current_default_for_new_games_thumbnail_as_default() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.default_for_new_games = PresetKind::Right;
+    fn zone_view_normalizes_a_zone_that_fits_the_monitor() {
+        let zone = Zone { x: 960, y: 0, width: 960, height: 1080 };
 
-        let thumbnails = preset_thumbnails(&state, &test_monitor());
+        let view = zone_view(Some(&zone), &test_monitor());
 
-        assert_eq!(thumbnails[0].kind, PresetKind::Left);
-        assert_eq!(thumbnails[1].kind, PresetKind::Right);
-        assert!(!thumbnails[0].is_default);
-        assert!(thumbnails[1].is_default, "Right is the current default and must be marked as such");
+        assert_eq!(view, ZoneView::Resolved(NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 }));
     }
 
     #[test]
-    fn preset_thumbnails_appends_custom_when_one_is_set() {
-        let mut state = SettingsState::from_config(&Config::default());
-        state.custom = Some(CustomRegion { x: 10, y: 10, width: 200, height: 100 });
+    fn zone_view_surfaces_a_reason_for_a_zone_that_does_not_fit_the_monitor() {
+        // Simulates a Zone persisted while GameFrame ran on a different
+        // (e.g. 4K) monitor: its origin lies outside `test_monitor`'s bounds.
+        let zone = Zone { x: 5000, y: 5000, width: 200, height: 100 };
 
-        let thumbnails = preset_thumbnails(&state, &test_monitor());
+        let view = zone_view(Some(&zone), &test_monitor());
 
-        assert_eq!(thumbnails.len(), 3);
-        assert_eq!(thumbnails[2].label, "Custom (10, 10, 200x100)");
-    }
-
-    #[test]
-    fn preset_thumbnails_surfaces_an_error_placeholder_instead_of_dropping_an_unresolvable_custom_preset() {
-        // Simulates a Custom preset persisted while GameFrame ran on a
-        // different (e.g. 4K) monitor: the stored coordinates lie entirely
-        // outside `test_monitor`'s bounds, so `resolve_region` returns
-        // `OutOfBounds`. The base presets always resolve, so only `Custom`
-        // can hit this path (see the doc comment on `preset_thumbnails`).
-        let mut state = SettingsState::from_config(&Config::default());
-        state.custom = Some(CustomRegion { x: 5000, y: 5000, width: 200, height: 100 });
-
-        let thumbnails = preset_thumbnails(&state, &test_monitor());
-
-        assert_eq!(thumbnails.len(), 3, "an unresolvable preset must still be represented, not dropped");
-        let custom_thumbnail = &thumbnails[2];
-        assert_eq!(custom_thumbnail.label, "Custom (5000, 5000, 200x100)");
-        assert_eq!(custom_thumbnail.region, None, "an unresolvable preset has no drawable region");
-        assert!(custom_thumbnail.error.is_some(), "an unresolvable preset must surface an error");
-    }
-
-    #[test]
-    fn preset_kind_unavailable_reason_is_none_for_a_base_preset() {
-        let presets = Presets::default();
-
-        let reason = preset_kind_unavailable_reason(PresetKind::Right, &presets, &test_monitor());
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn preset_kind_unavailable_reason_flags_custom_when_no_custom_preset_is_set() {
-        let presets = Presets::default();
-        assert_eq!(presets.custom, None);
-
-        let reason = preset_kind_unavailable_reason(PresetKind::Custom, &presets, &test_monitor());
-
-        assert!(reason.is_some(), "Custom with no region set must be flagged as unavailable");
-    }
-
-    #[test]
-    fn preset_kind_unavailable_reason_flags_custom_when_its_region_does_not_fit_the_monitor() {
-        let mut presets = Presets::default();
-        presets.custom = Some(CustomRegion { x: 5000, y: 5000, width: 200, height: 100 });
-
-        let reason = preset_kind_unavailable_reason(PresetKind::Custom, &presets, &test_monitor());
-
-        assert!(reason.is_some(), "an out-of-bounds Custom region must be flagged as unavailable");
+        assert!(matches!(view, ZoneView::Unresolvable(ref reason) if !reason.is_empty()), "got {view:?}");
     }
 
     #[test]
@@ -2115,8 +1884,7 @@ mod tests {
 
         // User edits and saves.
         state.toggle_borderless = "Ctrl+Alt+B".to_string();
-        state.left_depth_percent = 25;
-        state.set_custom_preset(CustomRegion { x: 10, y: 10, width: 300, height: 200 });
+        state.set_zone(Zone { x: 10, y: 10, width: 300, height: 200 });
         let to_persist = state.to_config();
         profile_store::save(&config_dir, &to_persist).unwrap();
 
@@ -2125,10 +1893,6 @@ mod tests {
         let reopened_state = SettingsState::from_config(&reloaded_config);
 
         assert_eq!(reopened_state.toggle_borderless, "Ctrl+Alt+B");
-        assert_eq!(reopened_state.left_depth_percent, 25);
-        assert_eq!(
-            reopened_state.custom,
-            Some(CustomRegion { x: 10, y: 10, width: 300, height: 200 })
-        );
+        assert_eq!(reopened_state.zone, Some(Zone { x: 10, y: 10, width: 300, height: 200 }));
     }
 }

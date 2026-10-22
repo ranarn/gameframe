@@ -3,10 +3,10 @@
 //! prototype validated at `examples/zone_overlay_prototype/zone_editor.rs`
 //! (see that file's module doc for the original research question), with
 //! two production differences:
-//! - Uses [`crate::profile_store::CustomRegion`] in place of the
+//! - Uses [`crate::profile_store::Zone`] in place of the
 //!   prototype's own `Zone` type (identical fields: `x`/`y`/`width`/
 //!   `height`, all `i32`) so [`AppState::apply`]'s `Save` output plugs
-//!   directly into `Presets.custom` with no conversion step.
+//!   directly into `Config::zone` with no conversion step.
 //! - Drops the prototype's simulated `TaskbarState` entirely -- the real
 //!   mode-aware taskbar-hide/restore mechanism lives in [`crate::win32`]
 //!   (`hide_taskbar`/`restore_taskbar`) and is driven by the OS-facing
@@ -15,7 +15,7 @@
 //!
 //! No window/OS dependency here -- fully unit tested below.
 
-use crate::profile_store::CustomRegion;
+use crate::profile_store::Zone;
 
 /// A pointer position in the overlay window's own coordinate space (the
 /// overlay is always positioned at the target monitor's origin, so these
@@ -33,21 +33,6 @@ pub struct Monitor {
     pub height: i32,
 }
 
-/// Which of a zone's four edges are pinned to the monitor boundary and
-/// therefore not draggable. Derived from which preset is being edited --
-/// deliberately independent of [`crate::region_calc::Preset`]'s shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PinnedEdges {
-    pub left: bool,
-    pub top: bool,
-    pub right: bool,
-    pub bottom: bool,
-}
-
-impl PinnedEdges {
-    pub const NONE: Self = Self { left: false, top: false, right: false, bottom: false };
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handle {
     N,
@@ -63,22 +48,6 @@ pub enum Handle {
 impl Handle {
     pub const ALL: [Handle; 8] =
         [Handle::N, Handle::S, Handle::E, Handle::W, Handle::Ne, Handle::Nw, Handle::Se, Handle::Sw];
-
-    /// A handle is enabled only if every edge it would move is unpinned --
-    /// an edge handle needs its one edge free, a corner handle needs BOTH
-    /// adjacent edges free.
-    pub fn enabled(self, pinned: PinnedEdges) -> bool {
-        match self {
-            Handle::N => !pinned.top,
-            Handle::S => !pinned.bottom,
-            Handle::E => !pinned.right,
-            Handle::W => !pinned.left,
-            Handle::Ne => !pinned.top && !pinned.right,
-            Handle::Nw => !pinned.top && !pinned.left,
-            Handle::Se => !pinned.bottom && !pinned.right,
-            Handle::Sw => !pinned.bottom && !pinned.left,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,12 +57,11 @@ pub enum EditorState {
     /// Corner-to-corner initial draw, live between the anchor and the
     /// current pointer position.
     Dragging { anchor: Point, current: Point },
-    /// A zone exists and is idle; `pinned` determines which handles render
-    /// as active.
-    Placed { zone: CustomRegion, pinned: PinnedEdges },
+    /// A zone exists and is idle; all eight handles are grabbable.
+    Placed { zone: Zone },
     /// A specific handle is being dragged; `original` is kept so `Cancel`
     /// can discard back to it without needing a separate undo stack.
-    Resizing { original: CustomRegion, pinned: PinnedEdges, handle: Handle, live: CustomRegion },
+    Resizing { original: Zone, handle: Handle, live: Zone },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +87,7 @@ pub enum Action {
 /// session is over once this is returned, so the overlay window can close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOutcome {
-    Saved(CustomRegion),
+    Saved(Zone),
     Cancelled,
 }
 
@@ -134,13 +102,13 @@ impl AppState {
     }
 
     /// Starts an editing session pre-loaded with an existing zone (e.g. the
-    /// already-configured Custom preset), so resizing it doesn't require
+    /// already-configured Zone), so resizing it doesn't require
     /// redrawing from scratch.
-    pub fn new_with_zone(monitor: Monitor, pinned: PinnedEdges, zone: CustomRegion) -> Self {
+    pub fn new_with_zone(monitor: Monitor, zone: Zone) -> Self {
         Self {
             monitor,
-            editor: EditorState::Placed { zone, pinned },
-            last_message: "editing existing zone -- grab an enabled handle".to_string(),
+            editor: EditorState::Placed { zone },
+            last_message: "editing existing zone -- grab a handle".to_string(),
         }
     }
 
@@ -164,8 +132,8 @@ impl AppState {
                         *current = p;
                         self.last_message = "live preview updated".to_string();
                     }
-                    EditorState::Resizing { original, pinned, handle, live } => {
-                        *live = apply_handle_drag(*original, *pinned, *handle, p, self.monitor);
+                    EditorState::Resizing { original, handle, live } => {
+                        *live = apply_handle_drag(*original, *handle, p, self.monitor);
                         self.last_message = "live resize updated".to_string();
                     }
                     _ => self.reject("`drag` needs an active draw or resize"),
@@ -176,11 +144,11 @@ impl AppState {
                 match &self.editor {
                     EditorState::Dragging { anchor, current } => {
                         let zone = normalize(*anchor, *current, self.monitor);
-                        self.editor = EditorState::Placed { zone, pinned: PinnedEdges::NONE };
+                        self.editor = EditorState::Placed { zone };
                         self.last_message = "zone drawn".to_string();
                     }
-                    EditorState::Resizing { pinned, live, .. } => {
-                        self.editor = EditorState::Placed { zone: *live, pinned: *pinned };
+                    EditorState::Resizing { live, .. } => {
+                        self.editor = EditorState::Placed { zone: *live };
                         self.last_message = "resize committed".to_string();
                     }
                     _ => self.reject("nothing to commit"),
@@ -189,18 +157,9 @@ impl AppState {
             }
             Action::Grab(handle) => {
                 match &self.editor {
-                    EditorState::Placed { zone, pinned } => {
-                        if handle.enabled(*pinned) {
-                            self.editor = EditorState::Resizing {
-                                original: *zone,
-                                pinned: *pinned,
-                                handle,
-                                live: *zone,
-                            };
-                            self.last_message = format!("resizing via {handle:?}");
-                        } else {
-                            self.reject(&format!("{handle:?} is locked -- pinned edges for this preset"));
-                        }
+                    EditorState::Placed { zone } => {
+                        self.editor = EditorState::Resizing { original: *zone, handle, live: *zone };
+                        self.last_message = format!("resizing via {handle:?}");
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -246,29 +205,22 @@ fn snap_to_edge(value: i32, edge: i32) -> i32 {
 }
 
 /// Normalizes a two-corner drag into a positive-area zone, clamped to the
-/// monitor. Mirrors `region_calc::resolve_region`'s Custom-preset semantics
+/// monitor. Mirrors `region_calc::resolve_region`'s Zone semantics
 /// (clamp to fit rather than reject) since a live drag has no "invalid
 /// input" concept the way a typed X/Y/width/height field does.
-fn normalize(anchor: Point, current: Point, monitor: Monitor) -> CustomRegion {
+fn normalize(anchor: Point, current: Point, monitor: Monitor) -> Zone {
     let x0 = snap_to_edge(anchor.x.min(current.x).clamp(0, monitor.width), 0);
     let y0 = snap_to_edge(anchor.y.min(current.y).clamp(0, monitor.height), 0);
     let x1 = snap_to_edge(anchor.x.max(current.x).clamp(0, monitor.width), monitor.width);
     let y1 = snap_to_edge(anchor.y.max(current.y).clamp(0, monitor.height), monitor.height);
-    CustomRegion { x: x0, y: y0, width: (x1 - x0).max(1), height: (y1 - y0).max(1) }
+    Zone { x: x0, y: y0, width: (x1 - x0).max(1), height: (y1 - y0).max(1) }
 }
 
 /// Applies a live pointer position to a single handle drag: only the
-/// coordinate(s) that handle's own edges own are allowed to move; pinned
-/// edges (and edges the handle doesn't touch at all) stay put. Each moving
-/// edge is clamped against its opposite edge (min 1px) and the monitor
-/// bounds.
-fn apply_handle_drag(
-    original: CustomRegion,
-    pinned: PinnedEdges,
-    handle: Handle,
-    pointer: Point,
-    monitor: Monitor,
-) -> CustomRegion {
+/// coordinate(s) that handle's own edges own are allowed to move; edges
+/// the handle doesn't touch stay put. Each moving edge is clamped against
+/// its opposite edge (min 1px) and the monitor bounds.
+fn apply_handle_drag(original: Zone, handle: Handle, pointer: Point, monitor: Monitor) -> Zone {
     let mut left = original.x;
     let mut top = original.y;
     let mut right = original.x + original.width;
@@ -279,20 +231,20 @@ fn apply_handle_drag(
     let touches_top = matches!(handle, Handle::N | Handle::Nw | Handle::Ne);
     let touches_bottom = matches!(handle, Handle::S | Handle::Sw | Handle::Se);
 
-    if touches_left && !pinned.left {
+    if touches_left {
         left = snap_to_edge(pointer.x.clamp(0, right - 1), 0);
     }
-    if touches_right && !pinned.right {
+    if touches_right {
         right = snap_to_edge(pointer.x.clamp(left + 1, monitor.width), monitor.width);
     }
-    if touches_top && !pinned.top {
+    if touches_top {
         top = snap_to_edge(pointer.y.clamp(0, bottom - 1), 0);
     }
-    if touches_bottom && !pinned.bottom {
+    if touches_bottom {
         bottom = snap_to_edge(pointer.y.clamp(top + 1, monitor.height), monitor.height);
     }
 
-    CustomRegion { x: left, y: top, width: right - left, height: bottom - top }
+    Zone { x: left, y: top, width: right - left, height: bottom - top }
 }
 
 #[cfg(test)]
@@ -303,8 +255,8 @@ mod tests {
         Monitor { width: 1920, height: 1080 }
     }
 
-    fn placed(zone: CustomRegion, pinned: PinnedEdges) -> AppState {
-        AppState::new_with_zone(monitor(), pinned, zone)
+    fn placed(zone: Zone) -> AppState {
+        AppState::new_with_zone(monitor(), zone)
     }
 
     #[test]
@@ -320,11 +272,10 @@ mod tests {
     }
 
     #[test]
-    fn new_with_zone_starts_placed_with_the_given_zone_and_pinned_edges() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
-        let state = AppState::new_with_zone(monitor(), pinned, zone);
-        assert_eq!(state.editor, EditorState::Placed { zone, pinned });
+    fn new_with_zone_starts_placed_with_the_given_zone() {
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let state = AppState::new_with_zone(monitor(), zone);
+        assert_eq!(state.editor, EditorState::Placed { zone });
     }
 
     #[test]
@@ -340,8 +291,8 @@ mod tests {
 
     #[test]
     fn start_is_illegal_outside_empty_and_leaves_state_unchanged() {
-        let zone = CustomRegion { x: 0, y: 0, width: 100, height: 100 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let mut state = placed(zone);
         let before = state.editor.clone();
 
         let outcome = state.apply(Action::Start(Point { x: 5, y: 5 }));
@@ -372,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_from_dragging_normalizes_into_a_placed_zone_with_no_pinned_edges() {
+    fn commit_from_dragging_normalizes_into_a_placed_zone() {
         let mut state = AppState::new(monitor());
         state.apply(Action::Start(Point { x: 300, y: 250 }));
         state.apply(Action::Drag(Point { x: 100, y: 50 }));
@@ -383,8 +334,7 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: CustomRegion { x: 100, y: 50, width: 200, height: 200 },
-                pinned: PinnedEdges::NONE
+                zone: Zone { x: 100, y: 50, width: 200, height: 200 }
             }
         );
     }
@@ -400,8 +350,7 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: CustomRegion { x: 0, y: 0, width: 800, height: 600 },
-                pinned: PinnedEdges::NONE
+                zone: Zone { x: 0, y: 0, width: 800, height: 600 }
             }
         );
     }
@@ -417,8 +366,7 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: CustomRegion { x: 0, y: 0, width: 1920, height: 1080 },
-                pinned: PinnedEdges::NONE
+                zone: Zone { x: 0, y: 0, width: 1920, height: 1080 }
             }
         );
     }
@@ -434,8 +382,7 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: CustomRegion { x: 21, y: 21, width: 1878, height: 1038 },
-                pinned: PinnedEdges::NONE
+                zone: Zone { x: 21, y: 21, width: 1878, height: 1038 }
             }
         );
     }
@@ -449,34 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn grab_an_enabled_handle_from_placed_transitions_to_resizing() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
-
-        let outcome = state.apply(Action::Grab(Handle::Se));
-
-        assert_eq!(outcome, None);
-        assert_eq!(
-            state.editor,
-            EditorState::Resizing { original: zone, pinned: PinnedEdges::NONE, handle: Handle::Se, live: zone }
-        );
-    }
-
-    #[test]
-    fn grab_a_handle_locked_by_pinned_edges_is_rejected_and_leaves_state_placed() {
-        let zone = CustomRegion { x: 0, y: 0, width: 960, height: 1080 };
-        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
-        let mut state = placed(zone, pinned);
-
-        // West edge is pinned, so W (and both NW/SW corners, which touch W)
-        // must be locked.
-        let outcome = state.apply(Action::Grab(Handle::W));
-
-        assert_eq!(outcome, None);
-        assert_eq!(state.editor, EditorState::Placed { zone, pinned });
-    }
-
-    #[test]
     fn grab_is_illegal_from_empty() {
         let mut state = AppState::new(monitor());
         let outcome = state.apply(Action::Grab(Handle::E));
@@ -486,8 +405,8 @@ mod tests {
 
     #[test]
     fn drag_while_resizing_moves_only_the_grabbed_handles_edges() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
         state.apply(Action::Drag(Point { x: 800, y: 999 }));
@@ -496,42 +415,18 @@ mod tests {
             state.editor,
             EditorState::Resizing {
                 original: zone,
-                pinned: PinnedEdges::NONE,
                 handle: Handle::E,
                 // Only the right edge (E) should move; y-axis pointer motion
                 // is ignored since E doesn't touch top/bottom.
-                live: CustomRegion { x: 100, y: 100, width: 700, height: 300 }
-            }
-        );
-    }
-
-    #[test]
-    fn drag_while_resizing_a_pinned_edge_handle_never_moves_a_pinned_edge() {
-        // Pinning left/top/bottom leaves only E enabled/grabbable, and
-        // dragging it must never move x/y/bottom even if the handle math is
-        // asked to.
-        let zone = CustomRegion { x: 0, y: 0, width: 960, height: 1080 };
-        let pinned = PinnedEdges { left: true, top: true, bottom: true, right: false };
-        let mut state = placed(zone, pinned);
-        state.apply(Action::Grab(Handle::E));
-
-        state.apply(Action::Drag(Point { x: 1500, y: 40 }));
-
-        assert_eq!(
-            state.editor,
-            EditorState::Resizing {
-                original: zone,
-                pinned,
-                handle: Handle::E,
-                live: CustomRegion { x: 0, y: 0, width: 1500, height: 1080 }
+                live: Zone { x: 100, y: 100, width: 700, height: 300 }
             }
         );
     }
 
     #[test]
     fn resize_snaps_the_west_handle_within_threshold_to_the_left_edge() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::W));
 
         state.apply(Action::Drag(Point { x: 15, y: 100 }));
@@ -540,17 +435,16 @@ mod tests {
             state.editor,
             EditorState::Resizing {
                 original: zone,
-                pinned: PinnedEdges::NONE,
                 handle: Handle::W,
-                live: CustomRegion { x: 0, y: 100, width: 500, height: 300 }
+                live: Zone { x: 0, y: 100, width: 500, height: 300 }
             }
         );
     }
 
     #[test]
     fn resize_snaps_the_east_handle_within_threshold_to_the_right_edge() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
         state.apply(Action::Drag(Point { x: 1910, y: 100 }));
@@ -559,17 +453,16 @@ mod tests {
             state.editor,
             EditorState::Resizing {
                 original: zone,
-                pinned: PinnedEdges::NONE,
                 handle: Handle::E,
-                live: CustomRegion { x: 100, y: 100, width: 1820, height: 300 }
+                live: Zone { x: 100, y: 100, width: 1820, height: 300 }
             }
         );
     }
 
     #[test]
     fn resize_does_not_snap_the_grabbed_handle_just_outside_the_edge_threshold() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
         state.apply(Action::Drag(Point { x: 1899, y: 100 }));
@@ -578,17 +471,16 @@ mod tests {
             state.editor,
             EditorState::Resizing {
                 original: zone,
-                pinned: PinnedEdges::NONE,
                 handle: Handle::E,
-                live: CustomRegion { x: 100, y: 100, width: 1799, height: 300 }
+                live: Zone { x: 100, y: 100, width: 1799, height: 300 }
             }
         );
     }
 
     #[test]
     fn commit_from_resizing_moves_back_to_placed_with_the_live_zone() {
-        let zone = CustomRegion { x: 100, y: 100, width: 400, height: 300 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
         state.apply(Action::Drag(Point { x: 800, y: 100 }));
 
@@ -598,16 +490,15 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: CustomRegion { x: 100, y: 100, width: 700, height: 300 },
-                pinned: PinnedEdges::NONE
+                zone: Zone { x: 100, y: 100, width: 700, height: 300 }
             }
         );
     }
 
     #[test]
     fn save_from_placed_returns_the_saved_zone() {
-        let zone = CustomRegion { x: 10, y: 20, width: 300, height: 400 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 10, y: 20, width: 300, height: 400 };
+        let mut state = placed(zone);
 
         let outcome = state.apply(Action::Save);
 
@@ -634,8 +525,8 @@ mod tests {
 
     #[test]
     fn save_is_illegal_from_resizing() {
-        let zone = CustomRegion { x: 0, y: 0, width: 100, height: 100 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
         let outcome = state.apply(Action::Save);
@@ -658,48 +549,33 @@ mod tests {
 
     #[test]
     fn cancel_is_legal_from_placed() {
-        let zone = CustomRegion { x: 0, y: 0, width: 100, height: 100 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let mut state = placed(zone);
         assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
     }
 
     #[test]
     fn cancel_is_legal_from_resizing() {
-        let zone = CustomRegion { x: 0, y: 0, width: 100, height: 100 };
-        let mut state = placed(zone, PinnedEdges::NONE);
+        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
         assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
     }
 
     #[test]
-    fn pinned_edges_none_enables_all_eight_handles() {
+    fn grabbing_any_of_the_eight_handles_on_a_placed_zone_transitions_to_resizing() {
+        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
         for handle in Handle::ALL {
-            assert!(handle.enabled(PinnedEdges::NONE), "{handle:?} should be enabled under PinnedEdges::NONE");
+            let mut state = placed(zone);
+
+            let outcome = state.apply(Action::Grab(handle));
+
+            assert_eq!(outcome, None);
+            assert_eq!(
+                state.editor,
+                EditorState::Resizing { original: zone, handle, live: zone },
+                "{handle:?} should start a resize"
+            );
         }
-    }
-
-    #[test]
-    fn pinned_edges_left_half_enables_only_the_east_edge_handle() {
-        let left_half = PinnedEdges { left: true, top: true, bottom: true, right: false };
-        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(left_half)).collect();
-        assert_eq!(enabled, vec![Handle::E]);
-    }
-
-    #[test]
-    fn pinned_edges_right_half_enables_only_the_west_edge_handle() {
-        let right_half = PinnedEdges { right: true, top: true, bottom: true, left: false };
-        let enabled: Vec<Handle> = Handle::ALL.into_iter().filter(|h| h.enabled(right_half)).collect();
-        assert_eq!(enabled, vec![Handle::W]);
-    }
-
-    #[test]
-    fn a_corner_handle_needs_both_adjacent_edges_free() {
-        // Pin only the top edge: Nw/Ne (which touch top) must be locked, but
-        // Sw/Se (which don't touch top) stay enabled.
-        let pinned = PinnedEdges { top: true, ..PinnedEdges::NONE };
-        assert!(!Handle::Nw.enabled(pinned));
-        assert!(!Handle::Ne.enabled(pinned));
-        assert!(Handle::Sw.enabled(pinned));
-        assert!(Handle::Se.enabled(pinned));
     }
 }

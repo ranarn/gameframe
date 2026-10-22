@@ -1,5 +1,7 @@
+> **Stale-warning (issues #48 and #51, branch feature/single-zone-replaces-presets, based on f3b42d4):** presets are gone. Config now holds `zone: Option<Zone>` (`CustomRegion` renamed `Zone`); `Presets`/`PresetKind`/`region_calc::Preset`/preset thumbnails/per-game preset dropdown/`live_reapply_cascade` no longer exist. `resolve_tracked_apply`/`resolve_auto_apply` return `Option<(TrackedGame, Zone)>` (`None` for untracked, no Zone, or auto-apply off). `SettingsState` has `zone` with `set_zone`/`clear_zone`. #51 removed `PinnedEdges`/`Handle::enabled`/the `pinned` parameters: every resize handle is always enabled. See `CONTEXT.md` and `docs/adr/0003-zone-config-migration.md`. Other bullets below that mention presets or pinned edges describe the pre-#48/#51 design.
+
 Issue #28 added `src/zone_editor.rs` (pure state machine: `Empty -> Dragging -> Placed <-> Resizing`,
-`PinnedEdges`/`Handle::enabled`, `AppState::apply(Action) -> Option<SessionOutcome>`) and
+`AppState::apply(Action) -> Option<SessionOutcome>`) and
 `src/zone_overlay.rs` (OS-facing eframe/wgpu transparent overlay window driving it, lifted from
 `examples/zone_overlay_prototype/zone_editor.rs` + `examples/zone_overlay_visual/main.rs`).
 
@@ -27,14 +29,8 @@ Key decisions:
   `parse_custom_preset`/`parse_field`) were removed from `SettingsState` entirely, superseded by the
   overlay. `SettingsState::set_custom_preset` now takes a `CustomRegion` directly (the overlay's
   output) instead of parsing text fields.
-- Only the Custom preset is wired to the overlay (`PinnedEdges::NONE`, all 8 handles) per #28's
-  acceptance criteria; Left/Right base-preset editing via the overlay is a reasonable future
-  extension but out of scope. The `PinnedEdges::LEFT_HALF`/`RIGHT_HALF` convenience consts that
-  existed for this were removed (2026-09-04, unrelated to #37's `PresetKind::HalfLeft`/`HalfRight`
-  removal) after tripping a `dead_code` build warning -- they were only exercised in tests. If this
-  extension is picked up, reintroduce the pinned-edges literal (`left/top/bottom: true, right:
-  false` for Left, mirrored for Right) inline or as new consts; the `enabled()`/pin-locking logic
-  itself is untouched and still covered by tests using inline `PinnedEdges` literals.
+- The overlay always exposes all 8 resize handles (the old pinned-edges gating for Left/Right
+  preset editing was removed in #51).
 - The overlay's rendering/DX12/DirectComposition setup and the taskbar OS calls are untested by
   convention (no headless GPU/taskbar in CI) — same boundary as `settings_ui::run_settings_window`/
   `tray_ui::Tray::new`/`win32`'s other OS-facing functions.
