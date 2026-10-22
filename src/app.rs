@@ -47,6 +47,7 @@
 //! thread message queue that a headless/CI sandbox can't provide.
 
 use crate::autostart;
+use crate::cursor_overlay::CursorOverlay;
 use crate::hotkeys::{Hotkeys, HotkeyAction};
 use crate::launch_watcher;
 use crate::profile_store;
@@ -88,7 +89,15 @@ pub fn run() -> Result<(), TrayUiError> {
     // its window afterwards (e.g. after an in-game settings change).
     let drift_watcher_hook = launch_watcher::register_drift_watcher();
 
-    run_event_loop(&tray, hotkeys, &config_dir);
+    // The game cursor runs on its own thread so it keeps following the
+    // mouse while this thread is blocked in Settings or the zone editor.
+    let cursor_overlay = CursorOverlay::start(&config_dir);
+
+    run_event_loop(&tray, hotkeys, &config_dir, &cursor_overlay);
+
+    // Stops the game cursor thread, which also restores swapped system
+    // cursors (see `crate::cursor_overlay`).
+    drop(cursor_overlay);
 
     // Issue #43: if a Zone-apply's taskbar hide is still armed when the
     // user quits via the tray "Exit" item, restore it now -- before `tray`
@@ -182,7 +191,7 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
 /// `hotkeys` is owned (not borrowed) specifically so the `ShowSettings`
 /// branch below can reassign it with a freshly re-registered [`Hotkeys`]
 /// after the Settings window closes -- see that branch's comment.
-fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) {
+fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path, cursor_overlay: &CursorOverlay) {
     // Remembers the foreground window's pre-toggle style/region across
     // presses of the borderless hotkey -- `None` means the window (if any)
     // is currently in its normal bordered state; `Some` means the last
@@ -255,6 +264,8 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
                 handle_apply_to_window(config_dir, target_hwnd);
+                // A newly tracked game gets the game cursor right away.
+                cursor_overlay.reload(config_dir);
                 continue;
             }
 
@@ -289,6 +300,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     // so there's no window where both the old and new
                     // bindings are simultaneously held.
                     hotkeys = register_hotkeys(config_dir);
+                    cursor_overlay.reload(config_dir);
                     tray.sync_start_with_windows_check();
                 }
                 Some(TrayAction::ToggleStartWithWindows) => {
@@ -329,6 +341,9 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                 }
                 Some(HotkeyAction::ToggleTaskbarAutohide) => {
                     handle_toggle_taskbar_autohide(config_dir);
+                }
+                Some(HotkeyAction::ToggleGameCursor) => {
+                    handle_toggle_game_cursor(config_dir, cursor_overlay);
                 }
                 None => {}
             }
@@ -858,6 +873,29 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
 
     if let Err(e) = win32::toggle_taskbar_hide(mode) {
         eprintln!("taskbar auto-hide toggle failed: {e}");
+    }
+}
+
+/// Reacts to a press of the game-cursor hotkey: flips the persisted
+/// `cursor.enabled` flag (so Settings and the next start agree with what's on
+/// screen), hands the change to the overlay thread and, when turning it on,
+/// plays the find-my-cursor pulse so the user sees where it is.
+fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) {
+    let mut config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("game cursor toggle: failed to load config: {e}");
+            return;
+        }
+    };
+    config.cursor.enabled = !config.cursor.enabled;
+    if let Err(e) = profile_store::save(config_dir, &config) {
+        eprintln!("game cursor toggle: failed to save config: {e}");
+        return;
+    }
+    cursor_overlay.reload(config_dir);
+    if config.cursor.enabled {
+        cursor_overlay.pulse();
     }
 }
 

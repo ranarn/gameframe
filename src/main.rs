@@ -2,6 +2,8 @@
 
 mod app;
 mod autostart;
+mod cursor_overlay;
+mod cursor_style;
 mod hotkeys;
 mod keyboard_hook;
 mod launch_watcher;
