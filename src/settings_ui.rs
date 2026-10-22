@@ -23,7 +23,6 @@ use crate::region_calc::{resolve_region, MonitorGeometry, Region};
 use crate::autostart::{self, AutostartError};
 use crate::keyboard_hook;
 use crate::win32;
-use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
@@ -867,7 +866,6 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 status_messages = latest_status_messages;
                 match zone_overlay::run_zone_editor_overlay(
                     latest_state.zone,
-                    PinnedEdges::NONE,
                     latest_state.taskbar_hide_mode,
                 ) {
                     Ok(Some(zone)) => {

@@ -55,7 +55,6 @@ use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::win32::{self, RestoreState};
 use crate::window_filter;
-use crate::zone_editor::PinnedEdges;
 use crate::zone_overlay;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
@@ -135,7 +134,7 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
         return;
     }
 
-    match zone_overlay::run_zone_editor_overlay(None, PinnedEdges::NONE, config.taskbar_hide_mode) {
+    match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode) {
         Ok(Some(zone)) => {
             if let Err(e) = settings_ui::persist_zone(config_dir, Some(zone)) {
                 eprintln!("failed to save the zone: {e}");
