@@ -211,7 +211,7 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
-    fn blank(width: u32, height: u32, hotspot_x: i32, hotspot_y: i32) -> Self {
+    pub fn blank(width: u32, height: u32, hotspot_x: i32, hotspot_y: i32) -> Self {
         Bitmap {
             width,
             height,
@@ -244,15 +244,6 @@ impl Bitmap {
         out
     }
 
-    /// The same image as premultiplied BGRA, the layout `UpdateLayeredWindow`
-    /// expects.
-    pub fn to_premultiplied_bgra(&self) -> Vec<u8> {
-        let mut out = self.pixels.clone();
-        for px in out.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
-        }
-        out
-    }
 }
 
 /// The arrow outline in units of its height, tip at the origin, y down --
@@ -881,18 +872,6 @@ mod tests {
         draw_pulse_ring(&mut b, &s, pulse_max_radius(&s), 1.0);
         assert!((0..side).all(|x| b.alpha_at(x, 0) == 0 && b.alpha_at(x, side - 1) == 0));
         assert!(b.pixels.iter().any(|&p| p > 0), "the ring was drawn");
-    }
-
-    #[test]
-    fn premultiplied_bgra_swaps_red_and_blue() {
-        let b = Bitmap {
-            width: 1,
-            height: 1,
-            hotspot_x: 0,
-            hotspot_y: 0,
-            pixels: vec![10, 20, 30, 40],
-        };
-        assert_eq!(b.to_premultiplied_bgra(), vec![30, 20, 10, 40]);
     }
 
     #[test]

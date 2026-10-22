@@ -68,6 +68,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// How often the window follows the cursor while shown (~250 Hz, so it keeps
 /// up with high-refresh monitors).
 const FRAME_INTERVAL: Duration = Duration::from_millis(4);
+/// How often a pulse frame is re-rendered (~60 Hz); between renders the
+/// window only moves.
+const PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often to re-check whether the game cursor should be shown while it
 /// isn't.
 const IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -128,8 +131,9 @@ impl CursorOverlay {
     /// for the life of the app even with the game cursor off (it then only
     /// wakes every [`IDLE_INTERVAL`] to check), so turning it on is instant.
     pub fn start(config_dir: &Path) -> Self {
+        install_panic_restore_hook();
         let shared = Arc::new(Shared {
-            input: Mutex::new(load_input(config_dir)),
+            input: Mutex::new(load_input(config_dir).unwrap_or_default()),
             generation: AtomicU64::new(0),
             pulse: AtomicBool::new(false),
             quit: AtomicBool::new(false),
@@ -145,9 +149,14 @@ impl CursorOverlay {
     }
 
     /// Re-reads the config from disk -- call after anything that may have
-    /// changed the cursor settings or the tracked games.
+    /// changed the cursor settings or the tracked games. A config that fails
+    /// to load keeps the last good settings rather than switching the game
+    /// cursor off.
     pub fn reload(&self, config_dir: &Path) {
-        *self.shared.input.lock().unwrap_or_else(|e| e.into_inner()) = load_input(config_dir);
+        let Some(input) = load_input(config_dir) else {
+            return;
+        };
+        *self.shared.input.lock().unwrap_or_else(|e| e.into_inner()) = input;
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -167,12 +176,12 @@ impl Drop for CursorOverlay {
     }
 }
 
-fn load_input(config_dir: &Path) -> OverlayInput {
+fn load_input(config_dir: &Path) -> Option<OverlayInput> {
     match profile_store::load(config_dir) {
-        Ok(config) => OverlayInput::from_config(&config),
+        Ok(config) => Some(OverlayInput::from_config(&config)),
         Err(e) => {
             eprintln!("game cursor: failed to load config: {e}");
-            OverlayInput::default()
+            None
         }
     }
 }
@@ -195,11 +204,17 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
 
     let mut seen_generation = u64::MAX;
     let mut input = OverlayInput::default();
-    // The pointer as the overlay draws it, rendered lazily after each reload.
+    // The pointer on its tight canvas, rendered lazily after each reload.
     let mut pointer: Option<Bitmap> = None;
-    // Whether the window currently holds exactly `pointer` (so a frame
-    // without a pulse only needs a move).
-    let mut showing_plain_pointer = false;
+    // The pulse's large canvas with (or without, while the system cursor is
+    // swapped) the pointer drawn in, keyed by whether it has the pointer.
+    let mut pulse_base: Option<(bool, Bitmap)> = None;
+    // Reused pulse frame buffer.
+    let mut frame = Bitmap::blank(0, 0, 0, 0);
+    let mut last_pulse_render: Option<Instant> = None;
+    // What the window currently holds (so a frame without new content only
+    // needs a move).
+    let mut content = Content::Nothing;
     let mut swapped = false;
     let mut swap_failed = false;
     let mut foreground: Option<(HWND, bool)> = None;
@@ -210,6 +225,11 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
     while !shared.quit.load(Ordering::SeqCst) {
         pump_messages();
 
+        // Read before `generation`: `pulse()` is called after `reload()`, so
+        // seeing the pulse here guarantees the matching reload is seen below
+        // (otherwise a hotkey "turn on + pulse" could be consumed against the
+        // old, disabled input).
+        let pulse_requested = shared.pulse.swap(false, Ordering::SeqCst);
         let generation = shared.generation.load(Ordering::SeqCst);
         if generation != seen_generation {
             seen_generation = generation;
@@ -219,7 +239,8 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             pointer = None;
-            showing_plain_pointer = false;
+            pulse_base = None;
+            content = Content::Nothing;
             foreground = None;
             swap_failed = false;
             if swapped {
@@ -228,19 +249,23 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
             }
         }
         let settings = &input.settings;
-        let pulse_requested = shared.pulse.swap(false, Ordering::SeqCst);
 
         // Safety: plain query.
         let fg = unsafe { GetForegroundWindow() };
         let fg_has_game_cursor = match foreground {
             Some((hwnd, has)) if hwnd == fg => has,
-            _ => {
-                let has = !fg.is_null()
-                    && window_filter::exe_path_for_window(fg)
-                        .is_some_and(|exe| foreground_has_game_cursor(&input.games, &exe));
-                foreground = Some((fg, has));
-                has
-            }
+            // Nothing to look up while the game cursor is off.
+            _ if !settings.enabled => false,
+            _ => match (!fg.is_null()).then(|| window_filter::exe_path_for_window(fg)).flatten() {
+                Some(exe) => {
+                    let has = foreground_has_game_cursor(&input.games, &exe);
+                    foreground = Some((fg, has));
+                    has
+                }
+                // Not cached: a lookup that failed transiently is retried on
+                // the next tick instead of sticking until focus changes.
+                None => false,
+            },
         };
 
         let cursor = read_cursor();
@@ -272,39 +297,69 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
         // if the swap failed it falls back to drawing the pointer itself.
         let draw_pointer = !swapped;
 
-        let pointer = pointer.get_or_insert_with(|| {
-            let (side, hot) = cursor_style::overlay_canvas(settings);
-            cursor_style::render_pointer(settings, side, side, hot, hot)
-        });
         let pulse =
             pulse_start.and_then(|start| cursor_style::pulse_frame(settings, start.elapsed()));
         if pulse.is_none() {
             pulse_start = None;
         }
-        let pos = (cursor.x - pointer.hotspot_x, cursor.y - pointer.hotspot_y);
 
         match pulse {
             Some((radius, alpha)) => {
-                let mut frame = if draw_pointer {
-                    pointer.clone()
-                } else {
-                    blank_like(pointer)
+                // The pulse needs the large canvas; the pointer is drawn into
+                // it once per pulse-canvas render, then each pulse frame only
+                // copies that base and adds the ring.
+                let base = match &pulse_base {
+                    Some((with_pointer, base)) if *with_pointer == draw_pointer => base,
+                    _ => {
+                        let (side, hot) = cursor_style::overlay_canvas(settings);
+                        let base = if draw_pointer {
+                            cursor_style::render_pointer(settings, side, side, hot, hot)
+                        } else {
+                            Bitmap::blank(side, side, hot, hot)
+                        };
+                        &pulse_base.insert((draw_pointer, base)).1
+                    }
                 };
-                cursor_style::draw_pulse_ring(&mut frame, settings, radius, alpha);
-                window.present(&frame, pos);
-                showing_plain_pointer = false;
-                window.show();
-            }
-            None if draw_pointer => {
-                if showing_plain_pointer {
+                let pos = (cursor.x - base.hotspot_x, cursor.y - base.hotspot_y);
+                let due = last_pulse_render.is_none_or(|t| t.elapsed() >= PULSE_FRAME_INTERVAL);
+                if content == Content::Pulse && !due {
                     window.move_to(pos);
                 } else {
-                    window.present(pointer, pos);
-                    showing_plain_pointer = true;
+                    if frame.pixels.len() == base.pixels.len() {
+                        frame.pixels.copy_from_slice(&base.pixels);
+                        frame.width = base.width;
+                        frame.height = base.height;
+                        frame.hotspot_x = base.hotspot_x;
+                        frame.hotspot_y = base.hotspot_y;
+                    } else {
+                        frame = base.clone();
+                    }
+                    cursor_style::draw_pulse_ring(&mut frame, settings, radius, alpha);
+                    window.present(&frame, pos);
+                    content = Content::Pulse;
+                    last_pulse_render = Some(Instant::now());
                 }
                 window.show();
             }
-            None => window.hide(),
+            None if draw_pointer => {
+                let pointer = pointer.get_or_insert_with(|| {
+                    let (w, h, hx, hy) = cursor_style::cursor_canvas(settings);
+                    cursor_style::render_pointer(settings, w, h, hx, hy)
+                });
+                let pos = (cursor.x - pointer.hotspot_x, cursor.y - pointer.hotspot_y);
+                if content == Content::Pointer {
+                    window.move_to(pos);
+                } else if window.present(pointer, pos) {
+                    content = Content::Pointer;
+                }
+                if content == Content::Pointer {
+                    window.show();
+                }
+            }
+            None => {
+                window.hide();
+                content = Content::Nothing;
+            }
         }
         if window.visible && last_topmost.elapsed() >= TOPMOST_INTERVAL {
             window.raise_topmost();
@@ -320,11 +375,12 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
     }
 }
 
-fn blank_like(bitmap: &Bitmap) -> Bitmap {
-    Bitmap {
-        pixels: vec![0; bitmap.pixels.len()],
-        ..bitmap.clone()
-    }
+/// What the overlay window currently displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Content {
+    Nothing,
+    Pointer,
+    Pulse,
 }
 
 #[derive(Clone, Copy)]
@@ -518,11 +574,11 @@ impl LayeredWindow {
     }
 
     /// Uploads `bitmap` as the window content and places it at `pos`.
-    fn present(&mut self, bitmap: &Bitmap, pos: (i32, i32)) {
-        if !self.ensure_surface(bitmap.width, bitmap.height) {
-            return;
+    /// Returns whether the window now shows it.
+    fn present(&mut self, bitmap: &Bitmap, pos: (i32, i32)) -> bool {
+        if bitmap.width == 0 || bitmap.height == 0 || !self.ensure_surface(bitmap.width, bitmap.height) {
+            return false;
         }
-        let bgra = bitmap.to_premultiplied_bgra();
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -530,28 +586,24 @@ impl LayeredWindow {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         let dst = POINT { x: pos.0, y: pos.1 };
-        let size = SIZE {
-            cx: bitmap.width as i32,
-            cy: bitmap.height as i32,
-        };
+        let size = SIZE { cx: bitmap.width as i32, cy: bitmap.height as i32 };
         let src = POINT { x: 0, y: 0 };
         // Safety: `bits` points at a `width * height * 4`-byte DIB owned by
-        // `self`, matching `bgra`'s length.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bgra.as_ptr(), self.bits, bgra.len());
-            UpdateLayeredWindow(
-                self.hwnd,
-                std::ptr::null_mut(),
-                &dst,
-                &size,
-                self.mem_dc,
-                &src,
-                0,
-                &blend,
-                ULW_ALPHA,
-            );
+        // `self` (just sized to `bitmap` by `ensure_surface`), the same
+        // length as `bitmap.pixels`.
+        let ok = unsafe {
+            let dib = std::slice::from_raw_parts_mut(self.bits, bitmap.pixels.len());
+            // RGBA -> BGRA straight into the DIB, no intermediate buffer.
+            for (dst, src) in dib.as_chunks_mut::<4>().0.iter_mut().zip(bitmap.pixels.as_chunks::<4>().0) {
+                *dst = [src[2], src[1], src[0], src[3]];
+            }
+            UpdateLayeredWindow(self.hwnd, std::ptr::null_mut(), &dst, &size, self.mem_dc, &src, 0, &blend, ULW_ALPHA)
+                != 0
+        };
+        if ok {
+            self.pos = pos;
         }
-        self.pos = pos;
+        ok
     }
 
     fn move_to(&mut self, pos: (i32, i32)) {
@@ -687,12 +739,36 @@ fn create_cursor(settings: &CursorSettings) -> Option<HCURSOR> {
     }
 }
 
+/// Whether the system cursors are currently swapped, for the panic hook.
+static SWAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Restores swapped system cursors if GameFrame panics: the release build
+/// aborts on panic (`panic = "abort"`), so no `Drop` would run. The hook
+/// still runs before the abort. A kill can't be caught; the marker file
+/// covers that on the next start.
+fn install_panic_restore_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SWAP_ACTIVE.load(Ordering::SeqCst) {
+                // Safety: SPI_SETCURSORS takes no parameters.
+                unsafe {
+                    SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
+                }
+            }
+            previous(info);
+        }));
+    });
+}
+
 /// Replaces the arrow and hand system cursors with the game cursor. Returns
 /// whether every swap succeeded (a partial swap is rolled back).
 fn swap_system_cursors(settings: &CursorSettings, marker: &Path) -> bool {
     if let Some(dir) = marker.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    SWAP_ACTIVE.store(true, Ordering::SeqCst);
     let _ = std::fs::write(
         marker,
         b"GameFrame replaced the system cursors; restored on next start.\n",
@@ -724,6 +800,7 @@ fn restore_system_cursors(marker: &Path) {
     unsafe {
         SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
     }
+    SWAP_ACTIVE.store(false, Ordering::SeqCst);
     let _ = std::fs::remove_file(marker);
 }
 

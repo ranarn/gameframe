@@ -266,6 +266,14 @@ pub struct NormalizedRegion {
 /// [`centered_window_position`] so the two never drift apart.
 const SETTINGS_WINDOW_SIZE: [f32; 2] = [560.0, 800.0];
 
+/// [`SETTINGS_WINDOW_SIZE`], shortened to fit `monitor` (leaving room for the
+/// taskbar and title bar) -- the content scrolls, so Save/Cancel stay
+/// reachable on small screens.
+fn settings_window_size(monitor: &MonitorGeometry) -> [f32; 2] {
+    let [width, height] = SETTINGS_WINDOW_SIZE;
+    [width, height.min(monitor.height as f32 - 120.0).max(300.0)]
+}
+
 /// Computes the top-left position that centers a window of `window_size` on
 /// `monitor`. Pure arithmetic, no OS dependency -- mirrors the
 /// `region_calc::resolve_region` / `zone_editor::normalize` pure/OS-facing
@@ -956,8 +964,8 @@ fn run_settings_frame(
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame Settings")
-            .with_inner_size(SETTINGS_WINDOW_SIZE)
-            .with_position(centered_window_position(&monitor, SETTINGS_WINDOW_SIZE))
+            .with_inner_size(settings_window_size(&monitor))
+            .with_position(centered_window_position(&monitor, settings_window_size(&monitor)))
             .with_icon(window_icon()),
         ..Default::default()
     };
