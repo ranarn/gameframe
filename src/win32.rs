@@ -113,10 +113,10 @@ pub enum TaskbarAutohideState {
     AutoHidden,
 }
 
-/// Converts a plain `bool` (a [`crate::profile_store::TrackedGame`]'s
-/// `taskbar_autohide` field) into a [`TaskbarAutohideState`] -- the
-/// interpretation [`set_taskbar_hide_absolute`] applies. Pure logic --
-/// no OS call.
+/// Converts a plain `bool` (the global
+/// [`crate::profile_store::Config::hide_taskbar_on_apply`] setting) into a
+/// [`TaskbarAutohideState`] -- the interpretation [`set_taskbar_hide_absolute`]
+/// applies. Pure logic -- no OS call.
 fn taskbar_autohide_state_from_bool(auto_hide: bool) -> TaskbarAutohideState {
     if auto_hide {
         TaskbarAutohideState::AutoHidden
@@ -896,7 +896,7 @@ fn join_taskbar_hide_session(hwnd: HWND) {
 /// Also used, with `hide == false`, by [`set_taskbar_hide_absolute_armed`]
 /// to disarm `hwnd` when its own apply-path explicitly shows the taskbar
 /// again: without this, a stale armed restore for a window whose
-/// `taskbar_autohide` flag later flips to `false` (e.g. edited live in
+/// `hide_taskbar_on_apply` setting later flips to `false` (e.g. edited live in
 /// Settings) would still fire an incorrect restore when that window
 /// eventually closes.
 ///
@@ -1596,7 +1596,7 @@ pub(crate) enum LiveApplyOutcome {
 pub(crate) fn live_reapply_running_window(
     hwnd: HWND,
     display_name: &str,
-    taskbar_autohide: bool,
+    hide_taskbar: bool,
     mode: TaskbarHideMode,
     target_region: Region,
 ) -> LiveApplyOutcome {
@@ -1604,7 +1604,7 @@ pub(crate) fn live_reapply_running_window(
         return LiveApplyOutcome::Failed(e);
     }
 
-    if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, taskbar_autohide, mode) {
+    if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode) {
         eprintln!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
     }
 

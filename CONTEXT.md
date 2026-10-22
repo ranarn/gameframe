@@ -18,17 +18,17 @@ A tracked game's identity — the full path to its running process's executable.
 **Auto-apply**:
 A per-tracked-game setting: whether the Zone should be applied to this game the moment it launches, versus only on demand via the hotkey or tray menu. Defaults to on for a newly-added tracked game.
 
-**Per-game taskbar auto-hide**:
-A per-tracked-game setting: whether applying the Zone to this game should also hide the Windows taskbar. Defaults to on for a newly-added tracked game. Distinct from the manual, global taskbar auto-hide toggle, which is unrelated to any tracked game. As of issue #43, a Zone-apply hide is auto-restored with no hotkey press required, either when the game window that triggered it closes or when GameFrame itself quits via the tray "Exit" item while a hide is still in effect; the underlying state is reference-counted across every tracked game currently relying on the hide (not just the single most recent one), so the taskbar only actually reappears once every such window has closed. (Issue #49 turns this into a single global setting.)
+**Hide taskbar on apply**:
+A single global setting (config field `hide_taskbar_on_apply`, default on): whether applying the Zone to any tracked game also hides the Windows taskbar. Shown in Settings as "Hide taskbar when the Zone is applied", next to the **Taskbar hide mode** choice. Distinct from the manual, global taskbar auto-hide toggle, which is unrelated to any tracked game. As of issue #43, a Zone-apply hide is auto-restored with no hotkey press required, either when the game window that triggered it closes or when GameFrame itself quits via the tray "Exit" item while a hide is still in effect; the underlying state is reference-counted across every tracked game currently relying on the hide (not just the single most recent one), so the taskbar only actually reappears once every such window has closed. It was a per-game setting before issue #49 (see ADR 0003); a config that still has per-game flags converts on load to on if any game had it on.
 
 **Taskbar hide mode**:
-A global setting (`TaskbarHideMode`, config field `taskbar_hide_mode`) choosing *which technique* is used whenever the taskbar is hidden: **FullyHidden** (the default — the taskbar stays hidden with no hover-reveal, via `ShowWindow`) or **HoverReveal** (Windows' native auto-hide, which reappears on mouse hover near the screen edge, via the appbar auto-hide mechanism). This is a third axis, orthogonal to both **Per-game taskbar auto-hide** and the manual global taskbar auto-hide toggle — both of those decide *whether* the taskbar gets hidden; this setting decides *how* it's hidden once that decision is made.
+A global setting (`TaskbarHideMode`, config field `taskbar_hide_mode`) choosing *which technique* is used whenever the taskbar is hidden: **FullyHidden** (the default — the taskbar stays hidden with no hover-reveal, via `ShowWindow`) or **HoverReveal** (Windows' native auto-hide, which reappears on mouse hover near the screen edge, via the appbar auto-hide mechanism). This is a third axis, orthogonal to both **Hide taskbar on apply** and the manual global taskbar auto-hide toggle — both of those decide *whether* the taskbar gets hidden; this setting decides *how* it's hidden once that decision is made.
 
 ## Relationships
 
 - There is at most one **Zone**, and it is shared by every **tracked game** — a game does not carry its own placement.
 - Saving a new **Zone** in Settings immediately re-applies it to every running tracked game. The Zone is also persisted at that moment (and on "Clear"), independent of Settings' own Save/Cancel, so the on-disk Zone and the live windows never disagree; Cancel discards only the other unsaved fields.
-- Each **tracked game** has its own **auto-apply** and **per-game taskbar auto-hide** settings.
+- Each **tracked game** has its own **auto-apply** setting; **hide taskbar on apply** is global, not per game.
 - Applying the Zone to a window whose process is not a **tracked game** does nothing — there is no untracked fallback.
 - With no **Zone** set, applying does nothing for any game; the hotkey's restore direction still works.
 

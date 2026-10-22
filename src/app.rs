@@ -444,9 +444,9 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// the correct restore later by refocusing the originally-stripped window.
 ///
 /// Taskbar auto-hide is set only on the strip direction, not on restore:
-/// using the same fixed per-game boolean on both directions would leave the
+/// using the same fixed global boolean on both directions would leave the
 /// taskbar auto-hidden after a full strip+restore cycle instead of it coming
-/// back, for the common `taskbar_autohide: true` default (MEDIUM review
+/// back, for the common `hide_taskbar_on_apply: true` default (MEDIUM review
 /// finding, issue #31 iteration 3).
 ///
 /// Returns `true` if GameFrame just relaunched itself elevated and this
@@ -562,9 +562,9 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     }
 
     // Only set taskbar auto-hide on the strip direction -- setting it again
-    // on restore (using the same fixed per-game boolean) would leave the
+    // on restore (using the same fixed global boolean) would leave the
     // taskbar auto-hidden after the user exits borderless/game mode instead
-    // of it coming back, for the common `taskbar_autohide: true` default
+    // of it coming back, for the common `hide_taskbar_on_apply: true` default
     // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
     // about the strip/apply action, not the restore/undo action.
     //
@@ -575,8 +575,15 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // resolved (in the strip direction) from `fg_hwnd` itself above.
     if !is_restoring {
         if let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd) {
-            if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
-                eprintln!("borderless toggle: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+            if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+                hwnd,
+                config.hide_taskbar_on_apply,
+                config.taskbar_hide_mode,
+            ) {
+                eprintln!(
+                    "borderless toggle: failed to set taskbar auto-hide for {}: {e}",
+                    tracked_game.display_name
+                );
             }
         }
     }
@@ -664,8 +671,15 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
     // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
     // automatically restores the taskbar with no hotkey press required.
-    if let Err(e) = win32::set_taskbar_hide_absolute_armed(target_hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
-        eprintln!("apply to window: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+        target_hwnd,
+        config.hide_taskbar_on_apply,
+        config.taskbar_hide_mode,
+    ) {
+        eprintln!(
+            "apply to window: failed to set taskbar auto-hide for {}: {e}",
+            tracked_game.display_name
+        );
     }
 }
 
@@ -674,7 +688,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// matches a tracked game with auto-apply on (see [`resolve_auto_apply`]),
 /// applies the Zone's borderless+reposition treatment to
 /// `hwnd` via [`win32::apply_borderless_to_window`], then, only once that
-/// succeeds, sets the tracked game's taskbar-auto-hide value absolutely --
+/// succeeds, sets the global hide-taskbar-on-apply value absolutely --
 /// exactly mirroring [`handle_apply_to_window`]'s one-shot apply shape
 /// (including its border-apply-must-succeed-first gate on the taskbar step,
 /// per issue #31's HIGH review fix) and [`win32::apply_borderless_to_window`]
@@ -740,8 +754,15 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
     // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
     // automatically restores the taskbar with no hotkey press required.
-    if let Err(e) = win32::set_taskbar_hide_absolute_armed(hwnd, tracked_game.taskbar_autohide, config.taskbar_hide_mode) {
-        eprintln!("launch detection: failed to set taskbar auto-hide for {}: {e}", tracked_game.display_name);
+    if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+        hwnd,
+        config.hide_taskbar_on_apply,
+        config.taskbar_hide_mode,
+    ) {
+        eprintln!(
+            "launch detection: failed to set taskbar auto-hide for {}: {e}",
+            tracked_game.display_name
+        );
     }
 }
 

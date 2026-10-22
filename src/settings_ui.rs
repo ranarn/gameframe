@@ -61,7 +61,7 @@ pub struct SettingsState {
     /// a new capture starts or the current one ends.
     pub duplicate_hotkey_error: Option<String>,
     /// The tracked-games list, editable in place by the Settings "Games"
-    /// section (auto-apply/taskbar-auto-hide per row, and immediate
+    /// section (auto-apply per row, and immediate
     /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
     /// entries are added.
     pub tracked_games: Vec<TrackedGame>,
@@ -71,6 +71,9 @@ pub struct SettingsState {
     /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
     /// the global hotkeys in the Settings window.
     pub taskbar_hide_mode: TaskbarHideMode,
+    /// Whether applying the Zone also hides the taskbar -- the global
+    /// "Hide taskbar when the Zone is applied" checkbox (issue #49).
+    pub hide_taskbar_on_apply: bool,
     /// The "Start with Windows" checkbox. Not part of [`Config`] -- the
     /// registry is its source of truth (see [`crate::autostart`]) -- so
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
@@ -99,6 +102,7 @@ impl SettingsState {
             duplicate_hotkey_error: None,
             tracked_games: config.tracked_games.clone(),
             taskbar_hide_mode: config.taskbar_hide_mode,
+            hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
         }
     }
@@ -114,6 +118,7 @@ impl SettingsState {
             },
             tracked_games: self.tracked_games.clone(),
             taskbar_hide_mode: self.taskbar_hide_mode,
+            hide_taskbar_on_apply: self.hide_taskbar_on_apply,
         }
     }
 
@@ -298,7 +303,9 @@ pub fn zone_view(zone: Option<&Zone>, monitor: &MonitorGeometry) -> ZoneView {
 /// complete isolation from the live re-apply attempt that decides whether to
 /// show it.
 fn live_apply_failure_message(display_name: &str) -> String {
-    format!("couldn't reposition {display_name} live -- the saved zone will apply next time it is applied")
+    format!(
+        "couldn't reposition {display_name} live -- the saved zone will be used the next time it launches or you apply it"
+    )
 }
 
 /// The config to persist when the Zone changes on its own (overlay Save or
@@ -313,9 +320,15 @@ fn config_with_zone(mut config: Config, zone: Option<Zone>) -> Config {
 /// Persists `zone` to `config_dir` immediately (load, replace the Zone, save),
 /// so the on-disk Zone -- which the background re-apply paths read -- never
 /// disagrees with the Zone applied to running windows.
-fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<(), SettingsUiError> {
+///
+/// Returns the config as saved, so callers act on the on-disk taskbar settings
+/// (`hide_taskbar_on_apply`, `taskbar_hide_mode`) rather than on unsaved
+/// Settings state.
+fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<Config, SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
-    profile_store::save(config_dir, &config_with_zone(config, zone)).map_err(SettingsUiError::Config)
+    let updated = config_with_zone(config, zone);
+    profile_store::save(config_dir, &updated).map_err(SettingsUiError::Config)?;
+    Ok(updated)
 }
 
 /// Attempts issue #33's live re-apply for a single tracked game, via
@@ -338,6 +351,7 @@ fn live_reapply_tracked_game(
     game: &TrackedGame,
     zone: &Zone,
     monitor: &MonitorGeometry,
+    hide_taskbar_on_apply: bool,
     taskbar_hide_mode: TaskbarHideMode,
 ) -> Option<String> {
     // Not-running must always short-circuit before region resolution is even
@@ -354,7 +368,13 @@ fn live_reapply_tracked_game(
         }
     };
 
-    match win32::live_reapply_running_window(hwnd, &game.display_name, game.taskbar_autohide, taskbar_hide_mode, region) {
+    match win32::live_reapply_running_window(
+        hwnd,
+        &game.display_name,
+        hide_taskbar_on_apply,
+        taskbar_hide_mode,
+        region,
+    ) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
             eprintln!("live re-apply failed for {}: {e}", game.display_name);
@@ -375,9 +395,21 @@ fn live_reapply_all(
     games: &[TrackedGame],
     zone: &Zone,
     monitor: &MonitorGeometry,
+    hide_taskbar_on_apply: bool,
     taskbar_hide_mode: TaskbarHideMode,
 ) -> Vec<String> {
-    games.iter().filter_map(|game| live_reapply_tracked_game(game, zone, monitor, taskbar_hide_mode)).collect()
+    games
+        .iter()
+        .filter_map(|game| {
+            live_reapply_tracked_game(
+                game,
+                zone,
+                monitor,
+                hide_taskbar_on_apply,
+                taskbar_hide_mode,
+            )
+        })
+        .collect()
 }
 
 /// `true` for egui's eight physical modifier-key variants (Shift/Control/Alt/
@@ -843,13 +875,16 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                         // the drift and launch re-apply paths) must never
                         // disagree with the Zone the windows are placed in.
                         match persist_zone(config_dir, Some(zone)) {
-                            Ok(()) => {
+                            Ok(saved) => {
                                 latest_state.set_zone(zone);
+                                // The on-disk taskbar settings, not the
+                                // unsaved Settings state.
                                 status_messages = live_reapply_all(
-                                    &latest_state.tracked_games,
+                                    &saved.tracked_games,
                                     &zone,
                                     &monitor,
-                                    latest_state.taskbar_hide_mode,
+                                    saved.hide_taskbar_on_apply,
+                                    saved.taskbar_hide_mode,
                                 );
                             }
                             Err(e) => {
@@ -1024,7 +1059,7 @@ impl SettingsApp {
     }
 
     /// Renders the "Games" section: one row per tracked game with its
-    /// display name, a taskbar-auto-hide checkbox, an auto-apply checkbox,
+    /// display name, an auto-apply checkbox,
     /// and an immediate no-confirmation "Remove" button (see
     /// [`SettingsState::remove_tracked_game`]).
     ///
@@ -1043,7 +1078,6 @@ impl SettingsApp {
             ui.horizontal(|ui| {
                 ui.label(&game.display_name);
 
-                ui.checkbox(&mut game.taskbar_autohide, "Taskbar auto-hide");
                 ui.checkbox(&mut game.auto_apply, "Auto-apply");
 
                 if ui.button("Remove").clicked() {
@@ -1126,7 +1160,7 @@ impl SettingsApp {
                         // Like an overlay Save, Clear persists immediately so
                         // disk and Settings never disagree about the Zone.
                         match persist_zone(&self.config_dir, None) {
-                            Ok(()) => self.state.clear_zone(),
+                            Ok(_) => self.state.clear_zone(),
                             Err(e) => {
                                 eprintln!("failed to clear the zone: {e}");
                                 self.pending_status_messages = vec![format!("couldn't clear the zone: {e}")];
@@ -1191,8 +1225,8 @@ impl eframe::App for SettingsApp {
             // Issue #33's non-blocking status line(s): zero or more messages
             // from the most recent commit-triggered live re-apply attempt.
             // Rendered near the top so they're visible without scrolling
-            // regardless of which commit point (dropdown/slider/zone-save)
-            // produced them.
+            // regardless of which commit point (currently only the overlay's
+            // zone Save) produced them.
             if !self.pending_status_messages.is_empty() {
                 for message in &self.pending_status_messages {
                     ui.colored_label(egui::Color32::YELLOW, message);
@@ -1217,6 +1251,10 @@ impl eframe::App for SettingsApp {
 
             ui.separator();
             ui.heading("Taskbar hiding");
+            ui.checkbox(
+                &mut self.state.hide_taskbar_on_apply,
+                "Hide taskbar when the Zone is applied",
+            );
             ui.radio_value(
                 &mut self.state.taskbar_hide_mode,
                 TaskbarHideMode::FullyHidden,
@@ -1259,7 +1297,10 @@ mod tests {
     fn live_apply_failure_message_names_the_game_and_explains_the_fallback() {
         let message = live_apply_failure_message("Thing");
 
-        assert_eq!(message, "couldn't reposition Thing live -- the saved zone will apply next time it is applied");
+        assert_eq!(
+            message,
+            "couldn't reposition Thing live -- the saved zone will be used the next time it launches or you apply it"
+        );
     }
 
     #[test]
@@ -1279,20 +1320,44 @@ mod tests {
 
     #[test]
     fn persist_zone_writes_the_zone_and_keeps_the_rest_of_the_on_disk_config() {
-        let dir = std::env::temp_dir().join(format!("gameframe-persist-zone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut config = Config::default();
-        config.hotkeys.toggle_borderless = Some("Ctrl+B".to_string());
-        profile_store::save(&dir, &config).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hotkeys: HotkeyBindings {
+                toggle_borderless: Some("Ctrl+B".to_string()),
+                ..HotkeyBindings::default()
+            },
+            hide_taskbar_on_apply: false,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
         let zone = Zone { x: 10, y: 20, width: 300, height: 200 };
 
-        persist_zone(&dir, Some(zone)).unwrap();
+        let saved = persist_zone(dir, Some(zone)).unwrap();
 
-        let reloaded = profile_store::load(&dir).unwrap();
+        let reloaded = profile_store::load(dir).unwrap();
         assert_eq!(reloaded.zone, Some(zone));
         assert_eq!(reloaded.hotkeys, config.hotkeys);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            saved, reloaded,
+            "persist_zone must return the on-disk config the live re-apply reads"
+        );
+        assert!(!saved.hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn from_config_and_to_config_round_trip_the_global_taskbar_flag() {
+        let mut config = Config::default();
+        assert!(SettingsState::from_config(&config).hide_taskbar_on_apply);
+
+        config.hide_taskbar_on_apply = false;
+        let state = SettingsState::from_config(&config);
+        assert!(!state.hide_taskbar_on_apply);
+        assert!(!state.to_config().hide_taskbar_on_apply);
+
+        let mut state = state;
+        state.hide_taskbar_on_apply = true;
+        assert!(state.to_config().hide_taskbar_on_apply);
     }
 
     #[test]
@@ -1403,6 +1468,7 @@ mod tests {
             },
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
+            hide_taskbar_on_apply: true,
         };
 
         let state = SettingsState::from_config(&config);
