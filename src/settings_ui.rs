@@ -16,7 +16,7 @@
 //!   particular can only be confirmed by manual/usertest verification on a
 //!   real desktop session.
 
-use crate::cursor_style::{self, CursorMethod, CursorScope, CursorShape};
+use crate::cursor_style::{self, CursorShape};
 use crate::profile_store::{
     self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame, Zone,
 };
@@ -82,6 +82,19 @@ pub struct SettingsState {
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
     /// fills it from the registry; Save writes it back only if it changed.
     pub start_with_windows: bool,
+    /// The open tab. UI-only (never persisted), but kept here rather than on
+    /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
+    pub tab: SettingsTab,
+}
+
+/// The Settings window's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    Games,
+    Cursor,
+    /// Zone, hotkeys, taskbar hiding and startup.
+    General,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
@@ -111,6 +124,7 @@ impl SettingsState {
             taskbar_hide_mode: config.taskbar_hide_mode,
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
+            tab: SettingsTab::default(),
         }
     }
 
@@ -393,7 +407,7 @@ fn live_reapply_tracked_game(
     let region = match resolve_region(zone, monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
+            log!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
             return Some(live_apply_failure_message(&game.display_name));
         }
     };
@@ -407,7 +421,7 @@ fn live_reapply_tracked_game(
     ) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
-            eprintln!("live re-apply failed for {}: {e}", game.display_name);
+            log!("live re-apply failed for {}: {e}", game.display_name);
             Some(live_apply_failure_message(&game.display_name))
         }
     }
@@ -917,13 +931,13 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                                 );
                             }
                             Err(e) => {
-                                eprintln!("failed to save the zone: {e}");
+                                log!("failed to save the zone: {e}");
                                 status_messages = vec![format!("couldn't save the zone: {e}")];
                             }
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
+                    Err(e) => log!("failed to open the zone editor overlay: {e}"),
                 }
                 state = latest_state;
             }
@@ -1175,9 +1189,9 @@ impl SettingsApp {
         });
     }
 
-    /// Renders the "Game cursor" section: pointer variant, size, colors,
-    /// border, glow, a live preview on a dark and a light background, and
-    /// where/how it is shown.
+    /// Renders the "Cursor" tab: pointer variant, size, colors, border,
+    /// glow, a live preview on a dark and a light background, and the
+    /// pulse/hide behavior.
     fn cursor_section(&mut self, ui: &mut egui::Ui) {
         self.refresh_cursor_previews(ui.ctx());
         let Some(previews) = self.cursor_previews.as_ref() else {
@@ -1296,24 +1310,11 @@ impl SettingsApp {
             }
         });
 
-        ui.label("Show it:");
-        ui.radio_value(
-            &mut c.scope,
-            CursorScope::TrackedGames,
-            "Only in tracked games (per-game box under Games)",
-        );
-        ui.radio_value(&mut c.scope, CursorScope::Everywhere, "Everywhere");
-        ui.label("Drawing method:");
-        ui.radio_value(&mut c.method, CursorMethod::Overlay, "Draw on top of the game (works in every game)")
-            .on_hover_text("The game's own cursor stays visible underneath; the drawing trails it by about a frame.");
-        ui.radio_value(
-            &mut c.method,
-            CursorMethod::ReplaceSystemCursor,
-            "Replace the Windows cursor while shown (no lag)",
-        )
-        .on_hover_text(
-            "Only works in games that use the standard Windows cursor. If nothing changes in a game, \
-             switch back to drawing on top. Your normal cursors are restored as soon as you leave the game.",
+        ui.label(
+            egui::RichText::new(
+                "Shown only while the mouse is over a game with \"Game cursor\" ticked on the Games tab.",
+            )
+            .weak(),
         );
         ui.checkbox(
             &mut c.shake_to_find,
@@ -1321,6 +1322,46 @@ impl SettingsApp {
         );
         ui.checkbox(&mut c.hide_when_cursor_hidden, "Hide when the game hides its cursor")
             .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
+    }
+
+    /// Renders the "Zone, hotkeys & taskbar" tab.
+    fn general_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Zone");
+        self.zone_section(ui);
+        ui.separator();
+        ui.heading("Global hotkeys");
+        self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
+        self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+        self.hotkey_row(ui, "Toggle game cursor:", HotkeyField::ToggleGameCursor);
+        // Re-sync immediately after the hotkey rows: a "Set hotkey" click
+        // just above sets `state.capturing = Some(..)` within this same
+        // `ui()` call, but the sync at the top of `ui()` already ran against
+        // the *old* `None` state. Without this second call the hook wouldn't
+        // install until the following frame, leaving a one-frame window
+        // where physical Ctrl+Escape still reaches Windows' Start-menu
+        // shortcut (issue #40 MEDIUM review finding).
+        self.sync_keyboard_hook();
+
+        ui.separator();
+        ui.heading("Taskbar hiding");
+        ui.checkbox(
+            &mut self.state.hide_taskbar_on_apply,
+            "Hide taskbar when the Zone is applied",
+        );
+        ui.radio_value(
+            &mut self.state.taskbar_hide_mode,
+            TaskbarHideMode::FullyHidden,
+            "Fully hidden (no hover-reveal)",
+        );
+        ui.radio_value(
+            &mut self.state.taskbar_hide_mode,
+            TaskbarHideMode::HoverReveal,
+            "Hover to reveal (classic Windows behavior)",
+        );
+
+        ui.separator();
+        ui.heading("Startup");
+        ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
     }
 
     /// Renders the Zone section: a monitor-outline thumbnail with the Zone
@@ -1390,7 +1431,7 @@ impl SettingsApp {
                         match persist_zone(&self.config_dir, None) {
                             Ok(_) => self.state.clear_zone(),
                             Err(e) => {
-                                eprintln!("failed to clear the zone: {e}");
+                                log!("failed to clear the zone: {e}");
                                 self.pending_status_messages = vec![format!("couldn't clear the zone: {e}")];
                             }
                         }
@@ -1449,76 +1490,45 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sync_keyboard_hook();
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                // Issue #33's non-blocking status line(s): zero or more messages
-                // from the most recent commit-triggered live re-apply attempt.
-                // Rendered near the top so they're visible without scrolling
-                // regardless of which commit point (currently only the overlay's
-                // zone Save) produced them.
-                if !self.pending_status_messages.is_empty() {
-                    for message in &self.pending_status_messages {
-                        ui.colored_label(egui::Color32::YELLOW, message);
-                    }
-                    ui.separator();
+        // Save/Cancel stay pinned below whichever tab is open.
+        egui::Panel::bottom("settings_buttons").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config(), self.state.start_with_windows));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                if ui.button("Cancel").clicked() {
+                    *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.add_space(2.0);
+        });
 
-                ui.heading("Zone");
-                self.zone_section(ui);
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Issue #33's non-blocking status line(s): zero or more messages
+            // from the most recent commit-triggered live re-apply attempt.
+            // Rendered above the tabs so they're visible whichever tab is
+            // open.
+            if !self.pending_status_messages.is_empty() {
+                for message in &self.pending_status_messages {
+                    ui.colored_label(egui::Color32::YELLOW, message);
+                }
                 ui.separator();
-                ui.heading("Global hotkeys");
-                self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
-                self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
-                self.hotkey_row(ui, "Toggle game cursor:", HotkeyField::ToggleGameCursor);
-                // Re-sync immediately after the hotkey rows: a "Set hotkey" click
-                // just above sets `state.capturing = Some(..)` within this same
-                // `ui()` call, but the sync at the top of this function already
-                // ran against the *old* `None` state. Without this second call the
-                // hook wouldn't install until the following frame, leaving a
-                // one-frame window where physical Ctrl+Escape still reaches
-                // Windows' Start-menu shortcut (issue #40 MEDIUM review finding).
-                self.sync_keyboard_hook();
+            }
 
-                ui.separator();
-                ui.heading("Taskbar hiding");
-                ui.checkbox(
-                    &mut self.state.hide_taskbar_on_apply,
-                    "Hide taskbar when the Zone is applied",
-                );
-                ui.radio_value(
-                    &mut self.state.taskbar_hide_mode,
-                    TaskbarHideMode::FullyHidden,
-                    "Fully hidden (no hover-reveal)",
-                );
-                ui.radio_value(
-                    &mut self.state.taskbar_hide_mode,
-                    TaskbarHideMode::HoverReveal,
-                    "Hover to reveal (classic Windows behavior)",
-                );
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.state.tab, SettingsTab::Games, "Games");
+                ui.selectable_value(&mut self.state.tab, SettingsTab::Cursor, "Cursor");
+                ui.selectable_value(&mut self.state.tab, SettingsTab::General, "Zone, hotkeys & taskbar");
+            });
+            ui.separator();
 
-                ui.separator();
-                ui.heading("Game cursor");
-                self.cursor_section(ui);
-
-                ui.separator();
-                ui.heading("Games");
-                self.games_section(ui);
-
-                ui.separator();
-                ui.heading("Startup");
-                ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config(), self.state.start_with_windows));
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.state.tab {
+                SettingsTab::Games => self.games_section(ui),
+                SettingsTab::Cursor => self.cursor_section(ui),
+                SettingsTab::General => self.general_section(ui),
             });
         });
     }

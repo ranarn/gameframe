@@ -20,16 +20,16 @@
 //! cursor positions and the window are in physical pixels on every monitor
 //! regardless of the rest of the process's awareness.
 //!
-//! [`CursorMethod::ReplaceSystemCursor`] additionally swaps the Windows arrow
-//! and hand cursors (`SetSystemCursor`) while the game cursor is shown, and
-//! puts the user's scheme back (`SPI_SETCURSORS`) the moment it isn't. A
-//! marker file records an active swap, so if GameFrame dies mid-swap the next
-//! start restores the scheme.
+//! Like YoloMouse, the game cursor exists only in and over the game: it is
+//! shown while the window *under the cursor* (`WindowFromPoint`, which skips
+//! our own click-through window) belongs to a cursor-enabled tracked game --
+//! not merely while the game has focus, which would leave it drawn over
+//! other windows and other monitors.
 //!
 //! Not exercised by automated tests (needs a desktop session), like the other
-//! OS-facing modules; [`foreground_has_game_cursor`] is the pure part.
+//! OS-facing modules; [`is_cursor_game`] is the pure part.
 
-use crate::cursor_style::{self, Bitmap, CursorMethod, CursorSettings, ShakeDetector};
+use crate::cursor_style::{self, Bitmap, CursorSettings, ShakeDetector};
 use crate::profile_store::{self, Config};
 use crate::win32::encode_wide;
 use crate::window_filter;
@@ -42,7 +42,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateBitmap,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
     HGDIOBJ, SelectObject,
 };
@@ -55,14 +55,13 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor,
-    DestroyWindow, DispatchMessageW, GetCursorInfo, GetCursorPos, GetForegroundWindow, HCURSOR,
-    HTTRANSPARENT, HWND_TOPMOST, ICONINFO, MSG, MsgWaitForMultipleObjects, OCR_HAND, OCR_NORMAL,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SPI_SETCURSORS, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetSystemCursor,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, ULW_ALPHA,
-    UpdateLayeredWindow, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CURSOR_SHOWING, CURSORINFO, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GA_ROOT, GetAncestor, GetCursorInfo, GetCursorPos, HTTRANSPARENT, HWND_TOPMOST, MSG,
+    MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_NCHITTEST, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WindowFromPoint,
 };
 
 /// How often the window follows the cursor while shown (~250 Hz, so it keeps
@@ -77,8 +76,6 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(50);
 /// How often to re-assert `HWND_TOPMOST` while shown, in case the game made
 /// its own window topmost after ours.
 const TOPMOST_INTERVAL: Duration = Duration::from_millis(500);
-/// Marker written while the system cursors are swapped; see module docs.
-const SWAP_MARKER_FILE: &str = "cursor-swap.active";
 const WINDOW_CLASS: &str = "GameFrameGameCursor";
 
 /// What the overlay thread needs from the config.
@@ -106,7 +103,7 @@ impl OverlayInput {
 /// Whether `exe` is one of `games` -- the tracked games with the game
 /// cursor on. Same exact-path matching as
 /// [`profile_store::find_tracked_game`].
-fn foreground_has_game_cursor(games: &[PathBuf], exe: &Path) -> bool {
+fn is_cursor_game(games: &[PathBuf], exe: &Path) -> bool {
     games.iter().any(|g| g == exe)
 }
 
@@ -119,8 +116,8 @@ struct Shared {
     quit: AtomicBool,
 }
 
-/// Handle to the running game-cursor thread. Dropping it stops the thread,
-/// hides the window and restores swapped system cursors.
+/// Handle to the running game-cursor thread. Dropping it stops the thread
+/// and hides the window.
 pub struct CursorOverlay {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -131,19 +128,17 @@ impl CursorOverlay {
     /// for the life of the app even with the game cursor off (it then only
     /// wakes every [`IDLE_INTERVAL`] to check), so turning it on is instant.
     pub fn start(config_dir: &Path) -> Self {
-        install_panic_restore_hook();
         let shared = Arc::new(Shared {
             input: Mutex::new(load_input(config_dir).unwrap_or_default()),
             generation: AtomicU64::new(0),
             pulse: AtomicBool::new(false),
             quit: AtomicBool::new(false),
         });
-        let marker = config_dir.join(SWAP_MARKER_FILE);
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("game-cursor".to_string())
-            .spawn(move || run_overlay_thread(&thread_shared, &marker))
-            .map_err(|e| eprintln!("failed to start the game cursor thread: {e}"))
+            .spawn(move || run_overlay_thread(&thread_shared))
+            .map_err(|e| log!("failed to start the game cursor thread: {e}"))
             .ok();
         CursorOverlay { shared, thread }
     }
@@ -180,23 +175,19 @@ fn load_input(config_dir: &Path) -> Option<OverlayInput> {
     match profile_store::load(config_dir) {
         Ok(config) => Some(OverlayInput::from_config(&config)),
         Err(e) => {
-            eprintln!("game cursor: failed to load config: {e}");
+            log!("game cursor: failed to load config: {e}");
             None
         }
     }
 }
 
-/// The thread body: see the module docs.
-fn run_overlay_thread(shared: &Shared, marker: &Path) {
+fn run_overlay_thread(shared: &Shared) {
     // Safety: plain call; affects only this thread.
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    if marker.exists() {
-        restore_system_cursors(marker);
-    }
     let Some(mut window) = LayeredWindow::create() else {
-        eprintln!("game cursor: failed to create the overlay window");
+        log!("game cursor: failed to create the overlay window");
         return;
     };
     let timer = FrameTimer::new();
@@ -206,18 +197,17 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
     let mut input = OverlayInput::default();
     // The pointer on its tight canvas, rendered lazily after each reload.
     let mut pointer: Option<Bitmap> = None;
-    // The pulse's large canvas with (or without, while the system cursor is
-    // swapped) the pointer drawn in, keyed by whether it has the pointer.
-    let mut pulse_base: Option<(bool, Bitmap)> = None;
+    // The pulse's large canvas with the pointer drawn in.
+    let mut pulse_base: Option<Bitmap> = None;
     // Reused pulse frame buffer.
     let mut frame = Bitmap::blank(0, 0, 0, 0);
     let mut last_pulse_render: Option<Instant> = None;
     // What the window currently holds (so a frame without new content only
     // needs a move).
     let mut content = Content::Nothing;
-    let mut swapped = false;
-    let mut swap_failed = false;
-    let mut foreground: Option<(HWND, bool)> = None;
+    // The last top-level window under the cursor and whether it is a
+    // cursor-enabled game, so the exe lookup runs only when it changes.
+    let mut under_cursor: Option<(HWND, bool)> = None;
     let mut shake = ShakeDetector::new();
     let mut pulse_start: Option<Instant> = None;
     let mut last_topmost = Instant::now();
@@ -241,45 +231,40 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
             pointer = None;
             pulse_base = None;
             content = Content::Nothing;
-            foreground = None;
-            swap_failed = false;
-            if swapped {
-                restore_system_cursors(marker);
-                swapped = false;
-            }
+            under_cursor = None;
         }
         let settings = &input.settings;
 
-        // Safety: plain query.
-        let fg = unsafe { GetForegroundWindow() };
-        let fg_has_game_cursor = match foreground {
-            Some((hwnd, has)) if hwnd == fg => has,
-            // Nothing to look up while the game cursor is off.
-            _ if !settings.enabled => false,
-            _ => match (!fg.is_null()).then(|| window_filter::exe_path_for_window(fg)).flatten() {
-                Some(exe) => {
-                    let has = foreground_has_game_cursor(&input.games, &exe);
-                    foreground = Some((fg, has));
-                    has
-                }
-                // Not cached: a lookup that failed transiently is retried on
-                // the next tick instead of sticking until focus changes.
-                None => false,
-            },
-        };
-
         let cursor = read_cursor();
-        let show = cursor
-            .is_some_and(|c| cursor_style::should_show(settings, fg_has_game_cursor, c.showing));
+        let over_game = match cursor {
+            // Nothing to look up while the game cursor is off.
+            Some(c) if settings.enabled => {
+                let root = window_under(c.x, c.y);
+                match under_cursor {
+                    Some((hwnd, is_game)) if hwnd == root => is_game,
+                    _ => match (!root.is_null()).then(|| window_filter::exe_path_for_window(root)).flatten() {
+                        Some(exe) => {
+                            let is_game = is_cursor_game(&input.games, &exe);
+                            under_cursor = Some((root, is_game));
+                            is_game
+                        }
+                        // Not cached: a lookup that failed transiently is
+                        // retried on the next tick.
+                        None => false,
+                    },
+                }
+            }
+            _ => false,
+        };
+        let show = cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
         let Some(cursor) = cursor.filter(|_| show) else {
             window.hide();
-            if swapped {
-                restore_system_cursors(marker);
-                swapped = false;
-            }
+            content = Content::Nothing;
             shake.reset();
             pulse_start = None;
-            timer.wait(IDLE_INTERVAL);
+            // Poll fast while enabled so the pointer appears the moment the
+            // cursor crosses into the game.
+            timer.wait(if settings.enabled { FRAME_INTERVAL } else { IDLE_INTERVAL });
             continue;
         };
 
@@ -288,14 +273,6 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
         {
             pulse_start = Some(Instant::now());
         }
-
-        if settings.method == CursorMethod::ReplaceSystemCursor && !swapped && !swap_failed {
-            swapped = swap_system_cursors(settings, marker);
-            swap_failed = !swapped;
-        }
-        // With the system cursor swapped the overlay only carries the pulse;
-        // if the swap failed it falls back to drawing the pointer itself.
-        let draw_pointer = !swapped;
 
         let pulse =
             pulse_start.and_then(|start| cursor_style::pulse_frame(settings, start.elapsed()));
@@ -308,18 +285,10 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
                 // The pulse needs the large canvas; the pointer is drawn into
                 // it once per pulse-canvas render, then each pulse frame only
                 // copies that base and adds the ring.
-                let base = match &pulse_base {
-                    Some((with_pointer, base)) if *with_pointer == draw_pointer => base,
-                    _ => {
-                        let (side, hot) = cursor_style::overlay_canvas(settings);
-                        let base = if draw_pointer {
-                            cursor_style::render_pointer(settings, side, side, hot, hot)
-                        } else {
-                            Bitmap::blank(side, side, hot, hot)
-                        };
-                        &pulse_base.insert((draw_pointer, base)).1
-                    }
-                };
+                let base = pulse_base.get_or_insert_with(|| {
+                    let (side, hot) = cursor_style::overlay_canvas(settings);
+                    cursor_style::render_pointer(settings, side, side, hot, hot)
+                });
                 let pos = (cursor.x - base.hotspot_x, cursor.y - base.hotspot_y);
                 let due = last_pulse_render.is_none_or(|t| t.elapsed() >= PULSE_FRAME_INTERVAL);
                 if content == Content::Pulse && !due {
@@ -341,7 +310,7 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
                 }
                 window.show();
             }
-            None if draw_pointer => {
+            None => {
                 let pointer = pointer.get_or_insert_with(|| {
                     let (w, h, hx, hy) = cursor_style::cursor_canvas(settings);
                     cursor_style::render_pointer(settings, w, h, hx, hy)
@@ -356,10 +325,6 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
                     window.show();
                 }
             }
-            None => {
-                window.hide();
-                content = Content::Nothing;
-            }
         }
         if window.visible && last_topmost.elapsed() >= TOPMOST_INTERVAL {
             window.raise_topmost();
@@ -370,9 +335,6 @@ fn run_overlay_thread(shared: &Shared, marker: &Path) {
     }
 
     window.hide();
-    if swapped {
-        restore_system_cursors(marker);
-    }
 }
 
 /// What the overlay window currently displays.
@@ -417,6 +379,21 @@ fn pump_messages() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// The top-level window under the screen point `(x, y)`, or null.
+/// `WindowFromPoint` skips hidden, disabled and click-through
+/// (`WS_EX_LAYERED | WS_EX_TRANSPARENT`) windows, so our own overlay never
+/// shadows the game beneath it.
+fn window_under(x: i32, y: i32) -> HWND {
+    // Safety: plain queries; a null handle is passed through as null.
+    unsafe {
+        let hwnd = WindowFromPoint(POINT { x, y });
+        if hwnd.is_null() {
+            return hwnd;
+        }
+        GetAncestor(hwnd, GA_ROOT)
     }
 }
 
@@ -706,104 +683,6 @@ fn create_dib(width: u32, height: u32) -> (HBITMAP, *mut u8) {
     (dib, bits as *mut u8)
 }
 
-/// Builds a Windows cursor from the pointer rendered on its tight canvas.
-fn create_cursor(settings: &CursorSettings) -> Option<HCURSOR> {
-    let (width, height, hx, hy) = cursor_style::cursor_canvas(settings);
-    let bitmap = cursor_style::render_pointer(settings, width, height, hx, hy);
-    let bgra = bitmap.to_straight_bgra();
-    let (color, bits) = create_dib(width, height);
-    if color.is_null() {
-        return None;
-    }
-    // An all-zero AND mask: the color bitmap's alpha decides everything.
-    // Monochrome rows are padded to 16-bit boundaries.
-    let mask_stride = width.div_ceil(16) as usize * 2;
-    let mask_bits = vec![0u8; mask_stride * height as usize];
-    // Safety: `bits` is a `width * height * 4`-byte DIB; the mask buffer
-    // matches CreateBitmap's padded-row layout; both bitmaps are deleted
-    // after CreateIconIndirect copies them.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits, bgra.len());
-        let mask = CreateBitmap(width as i32, height as i32, 1, 1, mask_bits.as_ptr().cast());
-        let icon_info = ICONINFO {
-            fIcon: 0,
-            xHotspot: hx as u32,
-            yHotspot: hy as u32,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let cursor = CreateIconIndirect(&icon_info);
-        DeleteObject(mask);
-        DeleteObject(color);
-        if cursor.is_null() { None } else { Some(cursor) }
-    }
-}
-
-/// Whether the system cursors are currently swapped, for the panic hook.
-static SWAP_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Restores swapped system cursors if GameFrame panics: the release build
-/// aborts on panic (`panic = "abort"`), so no `Drop` would run. The hook
-/// still runs before the abort. A kill can't be caught; the marker file
-/// covers that on the next start.
-fn install_panic_restore_hook() {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if SWAP_ACTIVE.load(Ordering::SeqCst) {
-                // Safety: SPI_SETCURSORS takes no parameters.
-                unsafe {
-                    SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
-                }
-            }
-            previous(info);
-        }));
-    });
-}
-
-/// Replaces the arrow and hand system cursors with the game cursor. Returns
-/// whether every swap succeeded (a partial swap is rolled back).
-fn swap_system_cursors(settings: &CursorSettings, marker: &Path) -> bool {
-    if let Some(dir) = marker.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    SWAP_ACTIVE.store(true, Ordering::SeqCst);
-    let _ = std::fs::write(
-        marker,
-        b"GameFrame replaced the system cursors; restored on next start.\n",
-    );
-    for id in [OCR_NORMAL, OCR_HAND] {
-        let Some(cursor) = create_cursor(settings) else {
-            eprintln!("game cursor: failed to build the replacement cursor");
-            restore_system_cursors(marker);
-            return false;
-        };
-        // Safety: on success SetSystemCursor takes ownership of `cursor`; on
-        // failure we still own it and destroy it.
-        unsafe {
-            if SetSystemCursor(cursor, id) == 0 {
-                DestroyCursor(cursor);
-                eprintln!("game cursor: SetSystemCursor failed");
-                restore_system_cursors(marker);
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Reloads the user's cursor scheme from the registry, undoing
-/// [`swap_system_cursors`].
-fn restore_system_cursors(marker: &Path) {
-    // Safety: SPI_SETCURSORS takes no parameters.
-    unsafe {
-        SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
-    }
-    SWAP_ACTIVE.store(false, Ordering::SeqCst);
-    let _ = std::fs::remove_file(marker);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,11 +703,11 @@ mod tests {
         let input = OverlayInput::from_config(&config);
 
         assert_eq!(input.games, vec![PathBuf::from("C:\\Games\\on.exe")]);
-        assert!(foreground_has_game_cursor(
+        assert!(is_cursor_game(
             &input.games,
             Path::new("C:\\Games\\on.exe")
         ));
-        assert!(!foreground_has_game_cursor(
+        assert!(!is_cursor_game(
             &input.games,
             Path::new("C:\\Games\\off.exe")
         ));

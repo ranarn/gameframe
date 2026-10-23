@@ -10,8 +10,7 @@
 //!   ([`ShakeDetector`]) and the show/hide decision ([`should_show`]) --
 //!   no OS calls, fully unit tested below.
 //! - [`crate::cursor_overlay`] is the OS-facing half: the click-through
-//!   layered window that follows the mouse, and the optional system-cursor
-//!   swap.
+//!   layered window that follows the mouse.
 //!
 //! Every shape is described by a signed distance function (negative inside,
 //! in pixels, relative to the hotspot), which makes the border (the shape
@@ -64,42 +63,14 @@ impl CursorShape {
     }
 }
 
-/// How the game cursor reaches the screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum CursorMethod {
-    /// A click-through, always-on-top window that follows the mouse. Works
-    /// in every borderless/windowed game, whatever cursor the game uses; the
-    /// game's own cursor stays visible underneath, and the drawing trails the
-    /// real cursor by about one frame.
-    #[default]
-    Overlay,
-    /// Swaps the Windows arrow/hand cursors for the game cursor while a
-    /// cursor-enabled game is in the foreground, and restores the user's
-    /// scheme afterwards. No lag and no double cursor, but only visible in
-    /// games that use the standard Windows cursor rather than their own.
-    ReplaceSystemCursor,
-}
-
-/// Where the game cursor is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum CursorScope {
-    /// Only while a tracked game with its "Game cursor" box ticked is the
-    /// foreground window.
-    #[default]
-    TrackedGames,
-    /// Whatever is in the foreground.
-    Everywhere,
-}
-
 /// The persisted game-cursor settings (config table `[cursor]`). Every field
 /// has a default, so a config written before this feature existed -- or one
-/// missing any single field -- loads unchanged.
+/// missing any single field -- loads unchanged. Unknown keys are ignored, so
+/// configs with the since-removed `method`/`scope` keys load too.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CursorSettings {
     pub enabled: bool,
-    pub method: CursorMethod,
-    pub scope: CursorScope,
     pub shape: CursorShape,
     /// Overall size in physical pixels: the diameter of round shapes, the
     /// height of the arrow.
@@ -131,8 +102,6 @@ impl Default for CursorSettings {
     fn default() -> Self {
         CursorSettings {
             enabled: false,
-            method: CursorMethod::default(),
-            scope: CursorScope::default(),
             shape: CursorShape::default(),
             size: 48,
             thickness: 4,
@@ -185,17 +154,12 @@ impl CursorSettings {
 }
 
 /// Decides whether the game cursor should be on screen right now.
-/// `foreground_has_game_cursor` is whether the foreground window belongs to
-/// a tracked game with its per-game "Game cursor" flag on; it is ignored in
-/// [`CursorScope::Everywhere`].
-pub fn should_show(
-    settings: &CursorSettings,
-    foreground_has_game_cursor: bool,
-    cursor_showing: bool,
-) -> bool {
-    settings.enabled
-        && (settings.scope == CursorScope::Everywhere || foreground_has_game_cursor)
-        && (!settings.hide_when_cursor_hidden || cursor_showing)
+/// `over_game` is whether the window under the real cursor belongs to a
+/// tracked game with its per-game "Game cursor" flag on -- like YoloMouse,
+/// the game cursor exists only in and over the game, never over other
+/// windows (whichever window has focus).
+pub fn should_show(settings: &CursorSettings, over_game: bool, cursor_showing: bool) -> bool {
+    settings.enabled && over_game && (!settings.hide_when_cursor_hidden || cursor_showing)
 }
 
 /// A premultiplied-alpha RGBA image with the pixel the real cursor position
@@ -224,24 +188,6 @@ impl Bitmap {
     #[cfg(test)]
     pub fn alpha_at(&self, x: u32, y: u32) -> u8 {
         self.pixels[((y * self.width + x) * 4 + 3) as usize]
-    }
-
-    /// The same image as straight (non-premultiplied) BGRA, the layout a
-    /// 32-bit Windows cursor's color bitmap expects.
-    pub fn to_straight_bgra(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.pixels.len());
-        for px in self.pixels.as_chunks::<4>().0 {
-            let a = px[3];
-            let un = |c: u8| {
-                if a == 0 {
-                    0
-                } else {
-                    ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8
-                }
-            };
-            out.extend_from_slice(&[un(px[2]), un(px[1]), un(px[0]), a]);
-        }
-        out
     }
 
 }
@@ -301,8 +247,8 @@ pub fn overlay_canvas(settings: &CursorSettings) -> (u32, i32) {
     ((half * 2) as u32, half)
 }
 
-/// The tight canvas for a system-cursor bitmap: just the shape plus its
-/// border/glow. Returns `(width, height, hotspot_x, hotspot_y)`.
+/// The tight canvas for the pointer alone (the overlay outside a pulse, and
+/// the Settings previews): just the shape plus its border/glow. Returns `(width, height, hotspot_x, hotspot_y)`.
 pub fn cursor_canvas(settings: &CursorSettings) -> (u32, u32, i32, i32) {
     let (min_x, min_y, max_x, max_y) = shape_bounds(settings);
     let m = decoration_margin(settings);
@@ -659,8 +605,6 @@ mod tests {
     fn settings_round_trip_through_toml() {
         let s = CursorSettings {
             enabled: true,
-            method: CursorMethod::ReplaceSystemCursor,
-            scope: CursorScope::Everywhere,
             shape: CursorShape::Reticle,
             color: [1, 2, 3],
             ..CursorSettings::default()
@@ -697,19 +641,20 @@ mod tests {
     }
 
     #[test]
-    fn should_show_in_tracked_games_scope_follows_the_foreground_game() {
+    fn should_show_only_over_a_game() {
         let s = settings(CursorShape::Ring);
         assert!(should_show(&s, true, true));
         assert!(!should_show(&s, false, true));
     }
 
     #[test]
-    fn should_show_everywhere_ignores_the_foreground_game() {
-        let s = CursorSettings {
-            scope: CursorScope::Everywhere,
-            ..settings(CursorShape::Ring)
-        };
-        assert!(should_show(&s, false, true));
+    fn a_config_with_the_removed_method_and_scope_keys_still_loads() {
+        let parsed: CursorSettings = toml::from_str(
+            "enabled = true\nmethod = \"ReplaceSystemCursor\"\nscope = \"Everywhere\"\nsize = 64",
+        )
+        .unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.size, 64);
     }
 
     #[test]
@@ -874,17 +819,6 @@ mod tests {
         assert!(b.pixels.iter().any(|&p| p > 0), "the ring was drawn");
     }
 
-    #[test]
-    fn straight_bgra_unpremultiplies() {
-        let b = Bitmap {
-            width: 1,
-            height: 1,
-            hotspot_x: 0,
-            hotspot_y: 0,
-            pixels: vec![64, 0, 128, 128],
-        };
-        assert_eq!(b.to_straight_bgra(), vec![255, 0, 128, 128]);
-    }
 
     #[test]
     fn pulse_contracts_onto_the_pointer_and_ends() {
