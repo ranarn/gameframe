@@ -106,10 +106,6 @@ pub struct CursorSettings {
     /// it captures the mouse for camera control). Off by default: a game
     /// that draws its own software cursor hides the real one permanently.
     pub hide_when_cursor_hidden: bool,
-    /// [`CursorShape::GameOwn`]: draw the enlarged copy as a solid shape in
-    /// `color` instead of the game's picture, so it reads as an aura behind
-    /// the game's cursor rather than a second cursor.
-    pub game_own_silhouette: bool,
 }
 
 impl Default for CursorSettings {
@@ -130,7 +126,6 @@ impl Default for CursorSettings {
             glow_strength: 60,
             shake_to_find: true,
             hide_when_cursor_hidden: false,
-            game_own_silhouette: false,
         }
     }
 }
@@ -144,9 +139,9 @@ pub const GLOW_STRENGTH_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
 
 impl CursorSettings {
     /// Whether `color` changes the pointer ([`CursorShape::GameOwn`] keeps the
-    /// game's own colors unless drawn as a silhouette).
+    /// game's own colors).
     pub fn uses_color(&self) -> bool {
-        self.shape != CursorShape::GameOwn || self.game_own_silhouette
+        self.shape != CursorShape::GameOwn
     }
 
     /// A copy with every numeric field clamped into the range Settings
@@ -452,13 +447,7 @@ pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
                 }
             }
             if scale > 1.0 {
-                let src = if s.game_own_silhouette {
-                    let a = copy[i][3] * opacity;
-                    let [r, g, b] = s.color.map(|c| c as f32 / 255.0 * a);
-                    [r, g, b, a]
-                } else {
-                    copy[i].map(|c| c * opacity)
-                };
+                let src = copy[i].map(|c| c * opacity);
                 let inv = 1.0 - src[3];
                 for c in 0..4 {
                     out[c] = src[c] + out[c] * inv;
@@ -1307,42 +1296,19 @@ mod tests {
     }
 
     #[test]
-    fn game_own_silhouette_fills_the_copy_with_the_color() {
-        let s = CursorSettings {
-            shape: CursorShape::GameOwn,
-            size: 64,
-            opacity: 100,
-            color: [0, 255, 0],
-            border: false,
-            glow: false,
-            game_own_silhouette: true,
-            ..CursorSettings::default()
-        };
-        assert!(s.uses_color());
-        let out = render_game_own(&s, &square_cursor([0, 0, 255]));
-        let m = decoration_margin(&s).ceil() as u32;
-        let i = (((m + 32) * out.width + m + 32) * 4) as usize;
-        assert_eq!(&out.pixels[i..i + 4], &[0, 255, 0, 255]);
-    }
-
-    #[test]
     fn the_game_own_preview_puts_the_game_cursor_on_top() {
         let s = CursorSettings {
             shape: CursorShape::GameOwn,
             size: 64,
-            opacity: 100,
-            game_own_silhouette: true,
-            color: [0, 255, 0],
+            opacity: 50,
             ..CursorSettings::default()
         };
         let game = square_cursor([0, 0, 255]); // red, 16 px
         let preview = render_preview(&s, Some(&game));
-        // Inside the real cursor's 16 px: its red; beyond it: the green copy.
-        let at = |x: i32, y: i32| {
-            let i = (((preview.hotspot_y + y) as u32 * preview.width + (preview.hotspot_x + x) as u32) * 4) as usize;
-            preview.pixels[i..i + 4].to_vec()
-        };
-        assert_eq!(at(8, 8), vec![255, 0, 0, 255]);
-        assert_eq!(at(40, 40), vec![0, 255, 0, 255]);
+        let alpha = |x: i32, y: i32| preview.alpha_at((preview.hotspot_x + x) as u32, (preview.hotspot_y + y) as u32);
+        // Inside the real cursor's 16 px: it, fully opaque; beyond it: the
+        // half-transparent enlarged copy.
+        assert_eq!(alpha(8, 8), 255);
+        assert!((120..=135).contains(&alpha(40, 40)), "{}", alpha(40, 40));
     }
 }

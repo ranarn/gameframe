@@ -1251,15 +1251,6 @@ impl SettingsApp {
                     ui.end_row();
                 }
 
-                if c.shape == CursorShape::GameOwn {
-                    ui.label("Enlarged copy");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut c.game_own_silhouette, false, "Picture");
-                        ui.radio_value(&mut c.game_own_silhouette, true, "Silhouette");
-                    });
-                    ui.end_row();
-                }
-
                 if c.uses_color() {
                     ui.label("Color");
                     ui.color_edit_button_srgb(&mut c.color);
