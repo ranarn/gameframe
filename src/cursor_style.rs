@@ -394,6 +394,20 @@ pub fn cursor_image(
     image
 }
 
+/// Where in its hotspot pixel [`render_game_own`] enlarges the game's cursor
+/// around, as a fraction of a pixel right and down from the pixel's top-left
+/// corner -- here its bottom-right corner, so the enlarged hotspot pixel
+/// ends where the real one does.
+///
+/// For an arrow whose tip is the hotspot (Last Epoch: a 1-pixel dark edge
+/// along its left and top), that puts the game's cursor on the inside of the
+/// enlarged copy's edge, like the tip of a bigger pen, on the left and top
+/// as on the right; the copy reaches `scale - 1` pixels past those edges.
+/// Tried in game: the top-left corner (0.0) kept every edge through it in
+/// place, so the game's cursor sat on the copy's left edge; the center (0.5)
+/// was better but still one step short.
+const TIP_PIVOT: f32 = 1.0;
+
 /// Renders [`CursorShape::GameOwn`] around the game's current cursor
 /// `image` (from [`cursor_image`]): the image enlarged to `size` pixels tall
 /// (never shrunk -- at or below its own height only the decoration is drawn,
@@ -401,13 +415,8 @@ pub fn cursor_image(
 /// following its outline. Both stay strictly outside the outline, so the
 /// game's cursor on top is never tinted.
 ///
-/// The image is enlarged around the *center* of its hotspot pixel, which
-/// lands on the center of the canvas hotspot pixel. Enlarging around the
-/// pixel's corner instead would keep every edge through that corner in
-/// place -- for an arrow whose tip is the hotspot, its left and top edges --
-/// so the game's own cursor would sit right on the enlarged copy's edge
-/// there instead of inside it (seen in Last Epoch). Around the center, the
-/// copy reaches `(scale - 1) / 2` pixels beyond those edges as well.
+/// The image is enlarged around [`TIP_PIVOT`] in its hotspot pixel, which
+/// lands on the same point of the canvas hotspot pixel.
 pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
     let s = settings.sanitized();
     let scale = (s.size as f32 / image.height.max(1) as f32).max(1.0);
@@ -415,22 +424,26 @@ pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
     let pad = decoration_margin(&s).ceil() as i32 + (scale / 2.0).ceil() as i32;
     // Per axis: the canvas hotspot pixel and the canvas length.
     let axis = |len: u32, hot: i32| {
-        let pivot = hot as f32 + 0.5;
-        let canvas_hot = pad + (pivot * scale - 0.5).ceil() as i32;
-        let end = canvas_hot as f32 + 0.5 + (len as f32 - pivot) * scale;
+        let pivot = hot as f32 + TIP_PIVOT;
+        let canvas_hot = pad + (pivot * scale - TIP_PIVOT).ceil() as i32;
+        let end = canvas_hot as f32 + TIP_PIVOT + (len as f32 - pivot) * scale;
         (canvas_hot, (end.ceil() as i32 + pad) as u32)
     };
     let (hotspot_x, width) = axis(image.width, image.hotspot_x);
     let (hotspot_y, height) = axis(image.height, image.hotspot_y);
     let mut bitmap = Bitmap::blank(width, height, hotspot_x, hotspot_y);
 
+    // Canvas pixel center -> image texel-center coordinates, the pivots
+    // aligned.
+    let to_image = |canvas: u32, canvas_hot: i32, hot: i32| {
+        let offset = canvas as f32 + 0.5 - (canvas_hot as f32 + TIP_PIVOT);
+        hot as f32 + TIP_PIVOT + offset / scale - 0.5
+    };
     let copy: Vec<[f32; 4]> = (0..height)
         .flat_map(|y| (0..width).map(move |x| (x, y)))
         .map(|(x, y)| {
-            // Texel-center coordinates: canvas hotspot pixel <-> image
-            // hotspot pixel, centers aligned.
-            let ix = image.hotspot_x as f32 + (x as f32 - hotspot_x as f32) / scale;
-            let iy = image.hotspot_y as f32 + (y as f32 - hotspot_y as f32) / scale;
+            let ix = to_image(x, hotspot_x, image.hotspot_x);
+            let iy = to_image(y, hotspot_y, image.hotspot_y);
             sample_bilinear(image, ix, iy)
         })
         .collect();
@@ -1221,21 +1234,22 @@ mod tests {
             let i = (((out.hotspot_y + dy) as u32 * out.width + (out.hotspot_x + dx) as u32) * 4) as usize;
             out.pixels[i..i + 4].to_vec()
         };
-        // The red copy, 64 px from the hotspot on.
+        // The red copy, 64 px wide around the hotspot.
         assert_eq!(at(32, 32), vec![255, 0, 0, 255]);
-        assert_eq!(at(60, 10), vec![255, 0, 0, 255]);
+        assert_eq!(at(58, 10), vec![255, 0, 0, 255]);
         // Past its far edge, bilinear magnification only leaves a soft edge
         // fading out within a couple of pixels, inside the canvas.
         assert!(at(64, 10)[3] < 64);
-        assert!(out.width as i32 > out.hotspot_x + 66);
+        let last = out.width as i32 - 1 - out.hotspot_x;
+        assert_eq!(at(last, 10)[3], 0);
     }
 
     #[test]
     fn game_own_reaches_past_the_left_and_top_of_a_hotspot_in_the_corner() {
         // A corner hotspot (an arrow's tip): enlarged around the hotspot
-        // pixel's center, the copy reaches (4 - 1) / 2 = 1.5 px left of and
-        // above it, so the game's cursor on top sits inside the copy there
-        // too, not on its edge.
+        // pixel's bottom-right corner, the copy reaches 4 - 1 = 3 px left of
+        // and above it, so the game's cursor on top sits inside the copy's
+        // edge there too, not on it.
         let s = CursorSettings {
             shape: CursorShape::GameOwn,
             size: 64,
@@ -1246,9 +1260,9 @@ mod tests {
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
         let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
-        assert!(alpha(-1, 10) > 128, "left: {}", alpha(-1, 10));
-        assert!(alpha(10, -1) > 128, "top: {}", alpha(10, -1));
-        assert_eq!(alpha(-4, 10), 0);
+        assert!(alpha(-2, 10) > 128, "left: {}", alpha(-2, 10));
+        assert!(alpha(10, -2) > 128, "top: {}", alpha(10, -2));
+        assert_eq!(alpha(-6, 10), 0);
     }
 
     #[test]
