@@ -54,6 +54,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
+use windows_sys::Win32::UI::Magnification::{MagInitialize, MagShowSystemCursor, MagUninitialize};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GA_ROOT, GetAncestor, GetCursorInfo, GetCursorPos, HTTRANSPARENT, HWND_TOPMOST, MSG,
@@ -191,6 +192,7 @@ fn run_overlay_thread(shared: &Shared) {
         return;
     };
     let timer = FrameTimer::new();
+    let mut real_cursor = RealCursorHider::new();
     let clock = Instant::now();
 
     let mut seen_generation = u64::MAX;
@@ -258,6 +260,7 @@ fn run_overlay_thread(shared: &Shared) {
         };
         let show = cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
         let Some(cursor) = cursor.filter(|_| show) else {
+            real_cursor.set_hidden(false);
             window.hide();
             content = Content::Nothing;
             shake.reset();
@@ -326,6 +329,9 @@ fn run_overlay_thread(shared: &Shared) {
                 }
             }
         }
+        // Only once ours is on screen, so there is never a moment with no
+        // cursor at all.
+        real_cursor.set_hidden(settings.hide_real_cursor && window.visible);
         if window.visible && last_topmost.elapsed() >= TOPMOST_INTERVAL {
             window.raise_topmost();
             last_topmost = Instant::now();
@@ -394,6 +400,55 @@ fn window_under(x: i32, y: i32) -> HWND {
             return hwnd;
         }
         GetAncestor(hwnd, GA_ROOT)
+    }
+}
+
+/// Hides the real (hardware) cursor while the game cursor is shown, so a
+/// game's own cursor -- which Windows draws above every window, ours
+/// included -- isn't on top of it. Uses the Magnification API's
+/// `MagShowSystemCursor`, the global switch screen magnifiers use to draw
+/// their own pointer: nothing touches the game process. Verified in Last
+/// Epoch, and Windows shows the cursor again by itself when the process
+/// exits, so a crash can't leave it hidden.
+struct RealCursorHider {
+    initialized: bool,
+    hidden: bool,
+}
+
+impl RealCursorHider {
+    fn new() -> Self {
+        Self { initialized: false, hidden: false }
+    }
+
+    /// Hides or shows the real cursor; a no-op unless that changes.
+    fn set_hidden(&mut self, hide: bool) {
+        if hide == self.hidden {
+            return;
+        }
+        if hide && !self.initialized {
+            // Safety: plain call, paired with `MagUninitialize` in `Drop`.
+            self.initialized = unsafe { MagInitialize() } != 0;
+            if !self.initialized {
+                log!("game cursor: MagInitialize failed, the real cursor stays visible");
+                return;
+            }
+        }
+        // Safety: plain call.
+        if unsafe { MagShowSystemCursor(if hide { 0 } else { 1 }) } != 0 {
+            self.hidden = hide;
+        } else {
+            log!("game cursor: MagShowSystemCursor({}) failed", !hide);
+        }
+    }
+}
+
+impl Drop for RealCursorHider {
+    fn drop(&mut self) {
+        self.set_hidden(false);
+        if self.initialized {
+            // Safety: matches the successful `MagInitialize` above.
+            unsafe { MagUninitialize() };
+        }
     }
 }
 

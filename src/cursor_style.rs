@@ -96,6 +96,10 @@ pub struct CursorSettings {
     /// it captures the mouse for camera control). Off by default: a game
     /// that draws its own software cursor hides the real one permanently.
     pub hide_when_cursor_hidden: bool,
+    /// Hide the real (hardware) cursor while the game cursor is shown, so a
+    /// game's own cursor isn't drawn on top of it. On by default; off leaves
+    /// both visible, e.g. a ring around the game's own cursor.
+    pub hide_real_cursor: bool,
 }
 
 impl Default for CursorSettings {
@@ -116,6 +120,7 @@ impl Default for CursorSettings {
             glow_strength: 60,
             shake_to_find: true,
             hide_when_cursor_hidden: false,
+            hide_real_cursor: true,
         }
     }
 }

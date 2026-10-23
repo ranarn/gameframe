@@ -1322,6 +1322,8 @@ impl SettingsApp {
         );
         ui.checkbox(&mut c.hide_when_cursor_hidden, "Hide when the game hides its cursor")
             .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
+        ui.checkbox(&mut c.hide_real_cursor, "Hide the game's own cursor")
+            .on_hover_text("Turn off to see both, e.g. a ring around the game's own cursor.");
     }
 
     /// Renders the "Zone, hotkeys & taskbar" tab.
