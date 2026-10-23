@@ -18,6 +18,15 @@ MVP complete. GameFrame runs as a tray-resident background process with:
     moves/resizes it to the Zone; pressing it again restores the window's original
     style and position.
   - Taskbar auto-hide toggle — flips the Windows taskbar between always-visible and auto-hide.
+  - Game cursor toggle — turns the game cursor (below) on/off.
+- **Game cursor** — a large, high-contrast pointer for games whose own cursor gets lost (a
+  YoloMouse replacement that never touches the game process): seven shapes, or "Game's own" —
+  an enlarged copy of the game's own cursor, with border and glow following its outline —
+  plus size, color, opacity, border and glow, shown only while the mouse is over a tracked
+  game, drawn as a click-through overlay. Shake the mouse to make it pulse. See
+  `docs/adr/0004-game-cursor-without-injection.md`.
+- **Log file** — `%APPDATA%\GameFrame\gameframe.log` (capped at 1 MB, previous file kept as
+  `gameframe.old.log`): errors, plus the taskbar's real state on every taskbar-hotkey press.
 - **Settings window** (`egui`, opened on demand from the tray menu, not resident at idle) for
   drawing/editing the Zone (the single screen region games are placed into) and
   binding the two global hotkeys.

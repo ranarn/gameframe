@@ -47,6 +47,7 @@
 //! thread message queue that a headless/CI sandbox can't provide.
 
 use crate::autostart;
+use crate::cursor_overlay::CursorOverlay;
 use crate::hotkeys::{Hotkeys, HotkeyAction};
 use crate::launch_watcher;
 use crate::profile_store;
@@ -64,8 +65,10 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
 pub fn run() -> Result<(), TrayUiError> {
-    let tray = Tray::new()?;
     let config_dir = config_dir();
+    crate::logging::init(&config_dir);
+    log!("GameFrame {} started", env!("CARGO_PKG_VERSION"));
+    let tray = Tray::new()?;
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
@@ -88,7 +91,15 @@ pub fn run() -> Result<(), TrayUiError> {
     // its window afterwards (e.g. after an in-game settings change).
     let drift_watcher_hook = launch_watcher::register_drift_watcher();
 
-    run_event_loop(&tray, hotkeys, &config_dir);
+    // The game cursor runs on its own thread so it keeps following the
+    // mouse while this thread is blocked in Settings or the zone editor.
+    let cursor_overlay = CursorOverlay::start(&config_dir);
+
+    run_event_loop(&tray, hotkeys, &config_dir, &cursor_overlay);
+
+    // Stops the game cursor thread, which also restores swapped system
+    // cursors (see `crate::cursor_overlay`).
+    drop(cursor_overlay);
 
     // Issue #43: if a Zone-apply's taskbar hide is still armed when the
     // user quits via the tray "Exit" item, restore it now -- before `tray`
@@ -98,7 +109,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // instance left to bring it back.
     if let Some(restore) = win32::take_any_armed_taskbar_restore() {
         if let Err(e) = win32::restore_taskbar(restore) {
-            eprintln!("failed to restore taskbar on exit: {e}");
+            log!("failed to restore taskbar on exit: {e}");
         }
     }
 
@@ -126,7 +137,7 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("failed to load config for the first-run zone prompt: {e}");
+            log!("failed to load config for the first-run zone prompt: {e}");
             return;
         }
     };
@@ -137,11 +148,11 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
     match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode) {
         Ok(Some(zone)) => {
             if let Err(e) = settings_ui::persist_zone(config_dir, Some(zone)) {
-                eprintln!("failed to save the zone: {e}");
+                log!("failed to save the zone: {e}");
             }
         }
         Ok(None) => {}
-        Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
+        Err(e) => log!("failed to open the zone editor overlay: {e}"),
     }
 }
 
@@ -155,7 +166,7 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("failed to load config for hotkey registration: {e}");
+            log!("failed to load config for hotkey registration: {e}");
             return None;
         }
     };
@@ -163,7 +174,7 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
     match Hotkeys::register(&config.hotkeys) {
         Ok(hotkeys) => Some(hotkeys),
         Err(e) => {
-            eprintln!("failed to register global hotkeys: {e}");
+            log!("failed to register global hotkeys: {e}");
             None
         }
     }
@@ -182,7 +193,7 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
 /// `hotkeys` is owned (not borrowed) specifically so the `ShowSettings`
 /// branch below can reassign it with a freshly re-registered [`Hotkeys`]
 /// after the Settings window closes -- see that branch's comment.
-fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) {
+fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path, cursor_overlay: &CursorOverlay) {
     // Remembers the foreground window's pre-toggle style/region across
     // presses of the borderless hotkey -- `None` means the window (if any)
     // is currently in its normal bordered state; `Some` means the last
@@ -255,6 +266,8 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
                 handle_apply_to_window(config_dir, target_hwnd);
+                // A newly tracked game gets the game cursor right away.
+                cursor_overlay.reload(config_dir);
                 continue;
             }
 
@@ -273,7 +286,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     // context it used is fully dropped and we resume
                     // pumping tray messages right where we left off.
                     if let Err(e) = open_settings(config_dir) {
-                        eprintln!("failed to open Settings: {e}");
+                        log!("failed to open Settings: {e}");
                     }
 
                     // Settings may have changed the hotkey bindings on
@@ -281,14 +294,16 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     // re-register from the freshly saved config so a
                     // newly bound/changed/removed hotkey takes effect
                     // immediately, without requiring a full app
-                    // restart. Assigning over `hotkeys` drops the old
-                    // `Hotkeys` first (its `Drop` impl destroys the old
-                    // `GlobalHotKeyManager`'s hidden window, which the OS
-                    // uses to automatically unregister every hotkey that
-                    // was bound to it) before the new one registers,
-                    // so there's no window where both the old and new
-                    // bindings are simultaneously held.
+                    // restart. The old `Hotkeys` must be dropped *before*
+                    // registering again (its `Drop` destroys the manager's
+                    // hidden window, which releases its hotkeys): a plain
+                    // `hotkeys = register_hotkeys(..)` evaluates the right
+                    // side first, so every unchanged key failed with
+                    // "already registered" and all hotkeys went dead after
+                    // any Settings visit (#52).
+                    drop(hotkeys.take());
                     hotkeys = register_hotkeys(config_dir);
+                    cursor_overlay.reload(config_dir);
                     tray.sync_start_with_windows_check();
                 }
                 Some(TrayAction::ToggleStartWithWindows) => {
@@ -297,7 +312,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                     // toggle what the registry says, then re-sync the check
                     // so a failed write doesn't leave it showing a lie.
                     if let Err(e) = autostart::set_enabled(!autostart::is_enabled()) {
-                        eprintln!("failed to change Start with Windows: {e}");
+                        log!("failed to change Start with Windows: {e}");
                     }
                     tray.sync_start_with_windows_check();
                 }
@@ -329,6 +344,9 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path) 
                 }
                 Some(HotkeyAction::ToggleTaskbarAutohide) => {
                     handle_toggle_taskbar_autohide(config_dir);
+                }
+                Some(HotkeyAction::ToggleGameCursor) => {
+                    handle_toggle_game_cursor(config_dir, cursor_overlay);
                 }
                 None => {}
             }
@@ -500,7 +518,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("borderless toggle: failed to load config: {e}");
+            log!("borderless toggle: failed to load config: {e}");
             return false;
         }
     };
@@ -519,7 +537,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 
     if is_restoring {
         if !should_allow_restore(fg_hwnd, *stripped_hwnd) {
-            eprintln!(
+            log!(
                 "borderless toggle: a pending restore exists for a different window; ignoring press until that window is focused again"
             );
             // Deliberately do NOT clear `toggle_state`/`stripped_hwnd` here --
@@ -535,7 +553,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
         .and_then(|exe_path| resolve_tracked_apply(&config, &exe_path));
 
     if should_block_untracked_toggle(is_restoring, tracked.is_some()) {
-        eprintln!("borderless toggle: not applying ({}); ignoring", no_apply_reason(&config));
+        log!("borderless toggle: not applying ({}); ignoring", no_apply_reason(&config));
         return false;
     }
 
@@ -545,7 +563,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
             match resolve_region(zone, &monitor) {
                 Ok(region) => region,
                 Err(e) => {
-                    eprintln!("borderless toggle: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
+                    log!("borderless toggle: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
                     return false;
                 }
             }
@@ -577,13 +595,13 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 
     if let Err(e) = win32::toggle_borderless_on_foreground_window(toggle_state, target_region) {
         if e.is_access_denied() {
-            eprintln!("borderless toggle failed (access denied); requesting elevation");
+            log!("borderless toggle failed (access denied); requesting elevation");
             match win32::relaunch_elevated() {
                 Ok(()) => return true,
-                Err(relaunch_err) => eprintln!("failed to relaunch elevated: {relaunch_err}"),
+                Err(relaunch_err) => log!("failed to relaunch elevated: {relaunch_err}"),
             }
         } else {
-            eprintln!("borderless toggle failed: {e}");
+            log!("borderless toggle failed: {e}");
         }
         return false;
     }
@@ -615,7 +633,7 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
                 config.hide_taskbar_on_apply,
                 config.taskbar_hide_mode,
             ) {
-                eprintln!(
+                log!(
                     "borderless toggle: failed to set taskbar auto-hide for {}: {e}",
                     tracked_game.display_name
                 );
@@ -660,13 +678,13 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     let mut config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("apply to window: failed to load config: {e}");
+            log!("apply to window: failed to load config: {e}");
             return;
         }
     };
 
     let Some(exe_path) = window_filter::exe_path_for_window(target_hwnd) else {
-        eprintln!("apply to window: could not resolve the target window's executable path");
+        log!("apply to window: could not resolve the target window's executable path");
         return;
     };
 
@@ -680,11 +698,11 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     // itself failing) never costs the user the "this window is now tracked"
     // outcome that "Apply to Window" is documented to guarantee.
     if let Err(e) = profile_store::save(config_dir, &config) {
-        eprintln!("apply to window: failed to save tracked game {}: {e}", tracked_game.display_name);
+        log!("apply to window: failed to save tracked game {}: {e}", tracked_game.display_name);
     }
 
     let Some(zone) = config.zone else {
-        eprintln!("apply to window: no Zone is set; {} is tracked but nothing was applied", tracked_game.display_name);
+        log!("apply to window: no Zone is set; {} is tracked but nothing was applied", tracked_game.display_name);
         return;
     };
 
@@ -692,13 +710,13 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     let target_region = match resolve_region(&zone, &monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("apply to window: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
+            log!("apply to window: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
             return;
         }
     };
 
     if let Err(e) = win32::apply_borderless_to_window(target_hwnd, target_region) {
-        eprintln!("apply to window failed: {e}");
+        log!("apply to window failed: {e}");
         return;
     }
     win32::remember_applied_window(target_hwnd);
@@ -711,7 +729,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
     ) {
-        eprintln!(
+        log!(
             "apply to window: failed to set taskbar auto-hide for {}: {e}",
             tracked_game.display_name
         );
@@ -749,7 +767,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("launch detection: failed to load config: {e}");
+            log!("launch detection: failed to load config: {e}");
             return;
         }
     };
@@ -764,7 +782,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         if config.zone.is_none()
             && profile_store::find_tracked_game(&config.tracked_games, &exe_path).is_some_and(|g| g.auto_apply)
         {
-            eprintln!("launch detection: not applying to a tracked game ({})", no_apply_reason(&config));
+            log!("launch detection: not applying to a tracked game ({})", no_apply_reason(&config));
         }
         return;
     };
@@ -773,13 +791,13 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     let target_region = match resolve_region(&zone, &monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("launch detection: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
+            log!("launch detection: failed to resolve the Zone for {}: {e}", tracked_game.display_name);
             return;
         }
     };
 
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        eprintln!("launch detection: failed to apply borderless treatment to {}: {e}", tracked_game.display_name);
+        log!("launch detection: failed to apply borderless treatment to {}: {e}", tracked_game.display_name);
         return;
     }
     // Lets the location-change watcher re-apply if the game later resizes
@@ -794,7 +812,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
     ) {
-        eprintln!(
+        log!(
             "launch detection: failed to set taskbar auto-hide for {}: {e}",
             tracked_game.display_name
         );
@@ -826,7 +844,7 @@ pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
         return;
     }
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        eprintln!("drift re-apply: failed for {}: {e}", tracked_game.display_name);
+        log!("drift re-apply: failed for {}: {e}", tracked_game.display_name);
     }
 }
 
@@ -851,13 +869,36 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
     let mode = match profile_store::load(config_dir) {
         Ok(config) => config.taskbar_hide_mode,
         Err(e) => {
-            eprintln!("taskbar auto-hide toggle: failed to load config: {e}");
+            log!("taskbar auto-hide toggle: failed to load config: {e}");
             return;
         }
     };
 
     if let Err(e) = win32::toggle_taskbar_hide(mode) {
-        eprintln!("taskbar auto-hide toggle failed: {e}");
+        log!("taskbar auto-hide toggle failed: {e}");
+    }
+}
+
+/// Reacts to a press of the game-cursor hotkey: flips the persisted
+/// `cursor.enabled` flag (so Settings and the next start agree with what's on
+/// screen), hands the change to the overlay thread and, when turning it on,
+/// plays the find-my-cursor pulse so the user sees where it is.
+fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) {
+    let mut config = match profile_store::load(config_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            log!("game cursor toggle: failed to load config: {e}");
+            return;
+        }
+    };
+    config.cursor.enabled = !config.cursor.enabled;
+    if let Err(e) = profile_store::save(config_dir, &config) {
+        log!("game cursor toggle: failed to save config: {e}");
+        return;
+    }
+    cursor_overlay.reload(config_dir);
+    if config.cursor.enabled {
+        cursor_overlay.pulse();
     }
 }
 

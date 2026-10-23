@@ -16,6 +16,7 @@ use global_hotkey::GlobalHotKeyManager;
 
 /// Actions GameFrame can bind a global hotkey to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // every action is a toggle
 pub enum HotkeyAction {
     ToggleBorderless,
     /// Toggles the taskbar hidden/visible, using whichever technique
@@ -24,6 +25,9 @@ pub enum HotkeyAction {
     /// [`HotkeyAction::ToggleBorderless`]'s state; either can be pressed
     /// without the other having been used first.
     ToggleTaskbarAutohide,
+    /// Turns the game cursor on/off (see [`crate::cursor_style`]),
+    /// persisting the choice.
+    ToggleGameCursor,
 }
 
 /// A hotkey binding resolved from its stored string into the parsed
@@ -58,6 +62,10 @@ pub fn resolve_bindings(bindings: &HotkeyBindings) -> Result<Vec<ResolvedBinding
     if let Some(raw) = &bindings.toggle_taskbar_autohide {
         let hotkey: HotKey = raw.parse()?;
         resolved.push(ResolvedBinding { action: HotkeyAction::ToggleTaskbarAutohide, hotkey });
+    }
+    if let Some(raw) = &bindings.toggle_game_cursor {
+        let hotkey: HotKey = raw.parse()?;
+        resolved.push(ResolvedBinding { action: HotkeyAction::ToggleGameCursor, hotkey });
     }
     Ok(resolved)
 }
@@ -142,7 +150,7 @@ mod tests {
 
     #[test]
     fn resolve_bindings_with_no_hotkeys_bound_resolves_to_an_empty_list() {
-        let bindings = HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None };
+        let bindings = HotkeyBindings::default();
 
         let resolved = resolve_bindings(&bindings).unwrap();
 
@@ -154,6 +162,7 @@ mod tests {
         let bindings = HotkeyBindings {
             toggle_borderless: Some("Ctrl+Alt+B".to_string()),
             toggle_taskbar_autohide: None,
+            toggle_game_cursor: None,
         };
 
         let resolved = resolve_bindings(&bindings).unwrap();
@@ -168,6 +177,7 @@ mod tests {
         let bindings = HotkeyBindings {
             toggle_borderless: None,
             toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+            toggle_game_cursor: None,
         };
 
         let resolved = resolve_bindings(&bindings).unwrap();
@@ -178,10 +188,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bindings_parses_a_bound_toggle_game_cursor_hotkey() {
+        let bindings = HotkeyBindings { toggle_game_cursor: Some("Ctrl+Alt+M".to_string()), ..HotkeyBindings::default() };
+
+        let resolved = resolve_bindings(&bindings).unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].action, HotkeyAction::ToggleGameCursor);
+        assert_eq!(resolved[0].hotkey, "Ctrl+Alt+M".parse::<HotKey>().unwrap());
+    }
+
+    #[test]
     fn resolve_bindings_resolves_both_bindings_independently_when_both_are_bound() {
         let bindings = HotkeyBindings {
             toggle_borderless: Some("Ctrl+Alt+B".to_string()),
             toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+            toggle_game_cursor: None,
         };
 
         let resolved = resolve_bindings(&bindings).unwrap();
@@ -202,6 +224,7 @@ mod tests {
         let bindings = HotkeyBindings {
             toggle_borderless: Some("not a real hotkey format!!".to_string()),
             toggle_taskbar_autohide: None,
+            toggle_game_cursor: None,
         };
 
         let result = resolve_bindings(&bindings);

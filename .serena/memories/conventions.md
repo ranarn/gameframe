@@ -1,4 +1,5 @@
-No code-style conventions established yet (scaffold only, single `println!` in `main.rs`).
+Code conventions:
+- **Diagnostics go through `log!`, never `eprintln!`** (as of the commit adding `src/logging.rs`). The release build has no console, so `eprintln!` output was lost; `log!` writes a timestamped `[thread]` line to `%APPDATA%\GameFrame\gameframe.log` (1 MB cap, rotates to `gameframe.old.log`) and to stderr. The macro is `#[macro_use]`-imported crate-wide from `main.rs`; it writes to stderr only before `logging::init` and in tests. Issue #52's taskbar-hotkey trace (`win32::taskbar_debug_state`) is the first user.
 
 Process conventions (from `.claude/project/`):
 - **Issue tracker**: GitHub issues in `ranarn/gameframe`, tracked on GitHub Project #4. Use `gh`

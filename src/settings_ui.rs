@@ -16,8 +16,9 @@
 //!   particular can only be confirmed by manual/usertest verification on a
 //!   real desktop session.
 
+use crate::cursor_style::{self, CursorShape};
 use crate::profile_store::{
-    self, Config, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame, Zone,
+    self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame, Zone,
 };
 use crate::region_calc::{resolve_region, MonitorGeometry, Region};
 use crate::autostart::{self, AutostartError};
@@ -43,6 +44,9 @@ pub struct SettingsState {
     pub zone: Option<Zone>,
     pub toggle_borderless: String,
     pub toggle_taskbar_autohide: String,
+    pub toggle_game_cursor: String,
+    /// The game cursor's settings, edited by the "Game cursor" section.
+    pub cursor: CursorSettings,
     /// `Some(field)` while a press-to-bind capture is in progress for that
     /// hotkey field (waiting for the next non-modifier key-down); `None`
     /// otherwise. See [`Self::start_capture`]/[`Self::handle_key_event`].
@@ -78,14 +82,29 @@ pub struct SettingsState {
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
     /// fills it from the registry; Save writes it back only if it changed.
     pub start_with_windows: bool,
+    /// The open tab. UI-only (never persisted), but kept here rather than on
+    /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
+    pub tab: SettingsTab,
+}
+
+/// The Settings window's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    Games,
+    Cursor,
+    /// Zone, hotkeys, taskbar hiding and startup.
+    General,
 }
 
 /// Which of GameFrame's two hotkey fields a press-to-bind capture applies
 /// to. See [`SettingsState::capturing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // mirrors `hotkeys::HotkeyAction`
 pub enum HotkeyField {
     ToggleBorderless,
     ToggleTaskbarAutohide,
+    ToggleGameCursor,
 }
 
 impl SettingsState {
@@ -96,6 +115,8 @@ impl SettingsState {
             zone: config.zone,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
             toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
+            toggle_game_cursor: config.hotkeys.toggle_game_cursor.clone().unwrap_or_default(),
+            cursor: config.cursor.clone(),
             capturing: None,
             unsupported_key_pressed: false,
             duplicate_hotkey_error: None,
@@ -103,6 +124,7 @@ impl SettingsState {
             taskbar_hide_mode: config.taskbar_hide_mode,
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
+            tab: SettingsTab::default(),
         }
     }
 
@@ -114,10 +136,12 @@ impl SettingsState {
             hotkeys: HotkeyBindings {
                 toggle_borderless: non_empty(&self.toggle_borderless),
                 toggle_taskbar_autohide: non_empty(&self.toggle_taskbar_autohide),
+                toggle_game_cursor: non_empty(&self.toggle_game_cursor),
             },
             tracked_games: self.tracked_games.clone(),
             taskbar_hide_mode: self.taskbar_hide_mode,
             hide_taskbar_on_apply: self.hide_taskbar_on_apply,
+            cursor: self.cursor.clone(),
         }
     }
 
@@ -171,20 +195,19 @@ impl SettingsState {
             return;
         };
 
-        let other_binding = match field {
-            HotkeyField::ToggleBorderless => &self.toggle_taskbar_autohide,
-            HotkeyField::ToggleTaskbarAutohide => &self.toggle_borderless,
-        };
-        if !other_binding.is_empty() && *other_binding == combo {
-            self.duplicate_hotkey_error =
-                Some(format!("{combo} is already bound to the other hotkey"));
+        let already_bound = [
+            (HotkeyField::ToggleBorderless, &self.toggle_borderless),
+            (HotkeyField::ToggleTaskbarAutohide, &self.toggle_taskbar_autohide),
+            (HotkeyField::ToggleGameCursor, &self.toggle_game_cursor),
+        ]
+        .into_iter()
+        .any(|(other, binding)| other != field && !binding.is_empty() && *binding == combo);
+        if already_bound {
+            self.duplicate_hotkey_error = Some(format!("{combo} is already bound to another hotkey"));
             return;
         }
 
-        match field {
-            HotkeyField::ToggleBorderless => self.toggle_borderless = combo,
-            HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide = combo,
-        }
+        *self.binding_mut(field) = combo;
         self.cancel_capture();
     }
 
@@ -216,11 +239,25 @@ impl SettingsState {
         }
     }
 
-    pub fn clear_hotkey(&mut self, field: HotkeyField) {
+    /// The stored binding string behind `field`.
+    pub fn binding(&self, field: HotkeyField) -> &str {
         match field {
-            HotkeyField::ToggleBorderless => self.toggle_borderless.clear(),
-            HotkeyField::ToggleTaskbarAutohide => self.toggle_taskbar_autohide.clear(),
+            HotkeyField::ToggleBorderless => &self.toggle_borderless,
+            HotkeyField::ToggleTaskbarAutohide => &self.toggle_taskbar_autohide,
+            HotkeyField::ToggleGameCursor => &self.toggle_game_cursor,
         }
+    }
+
+    fn binding_mut(&mut self, field: HotkeyField) -> &mut String {
+        match field {
+            HotkeyField::ToggleBorderless => &mut self.toggle_borderless,
+            HotkeyField::ToggleTaskbarAutohide => &mut self.toggle_taskbar_autohide,
+            HotkeyField::ToggleGameCursor => &mut self.toggle_game_cursor,
+        }
+    }
+
+    pub fn clear_hotkey(&mut self, field: HotkeyField) {
+        self.binding_mut(field).clear();
         if self.capturing == Some(field) {
             self.cancel_capture();
         }
@@ -241,7 +278,15 @@ pub struct NormalizedRegion {
 /// The Settings window's fixed inner size, shared between the
 /// `ViewportBuilder`'s `.with_inner_size(...)` call and
 /// [`centered_window_position`] so the two never drift apart.
-const SETTINGS_WINDOW_SIZE: [f32; 2] = [440.0, 560.0];
+const SETTINGS_WINDOW_SIZE: [f32; 2] = [560.0, 800.0];
+
+/// [`SETTINGS_WINDOW_SIZE`], shortened to fit `monitor` (leaving room for the
+/// taskbar and title bar) -- the content scrolls, so Save/Cancel stay
+/// reachable on small screens.
+fn settings_window_size(monitor: &MonitorGeometry) -> [f32; 2] {
+    let [width, height] = SETTINGS_WINDOW_SIZE;
+    [width, height.min(monitor.height as f32 - 120.0).max(300.0)]
+}
 
 /// Computes the top-left position that centers a window of `window_size` on
 /// `monitor`. Pure arithmetic, no OS dependency -- mirrors the
@@ -362,7 +407,7 @@ fn live_reapply_tracked_game(
     let region = match resolve_region(zone, monitor) {
         Ok(region) => region,
         Err(e) => {
-            eprintln!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
+            log!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
             return Some(live_apply_failure_message(&game.display_name));
         }
     };
@@ -376,7 +421,7 @@ fn live_reapply_tracked_game(
     ) {
         win32::LiveApplyOutcome::Applied => None,
         win32::LiveApplyOutcome::Failed(e) => {
-            eprintln!("live re-apply failed for {}: {e}", game.display_name);
+            log!("live re-apply failed for {}: {e}", game.display_name);
             Some(live_apply_failure_message(&game.display_name))
         }
     }
@@ -886,13 +931,13 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                                 );
                             }
                             Err(e) => {
-                                eprintln!("failed to save the zone: {e}");
+                                log!("failed to save the zone: {e}");
                                 status_messages = vec![format!("couldn't save the zone: {e}")];
                             }
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("failed to open the zone editor overlay: {e}"),
+                    Err(e) => log!("failed to open the zone editor overlay: {e}"),
                 }
                 state = latest_state;
             }
@@ -933,8 +978,8 @@ fn run_settings_frame(
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame Settings")
-            .with_inner_size(SETTINGS_WINDOW_SIZE)
-            .with_position(centered_window_position(&monitor, SETTINGS_WINDOW_SIZE))
+            .with_inner_size(settings_window_size(&monitor))
+            .with_position(centered_window_position(&monitor, settings_window_size(&monitor)))
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -950,6 +995,7 @@ fn run_settings_frame(
                 exit: exit_for_app,
                 pending_status_messages: initial_status_messages,
                 keyboard_hook: None,
+                cursor_previews: None,
             }))
         }),
     )
@@ -1003,6 +1049,17 @@ struct SettingsApp {
     /// itself being torn down when the Settings window closes) uninstalls
     /// the hook, per [`keyboard_hook::KeyboardHookGuard`]'s RAII contract.
     keyboard_hook: Option<keyboard_hook::KeyboardHookGuard>,
+    /// Textures for the "Game cursor" section, re-rendered only when the
+    /// cursor settings change (see [`Self::refresh_cursor_previews`]).
+    cursor_previews: Option<CursorPreviews>,
+}
+
+/// The rendered game-cursor preview and variant icons, plus the settings
+/// they were rendered from.
+struct CursorPreviews {
+    settings: CursorSettings,
+    preview: egui::TextureHandle,
+    shapes: Vec<(CursorShape, egui::TextureHandle)>,
 }
 
 impl SettingsApp {
@@ -1015,11 +1072,8 @@ impl SettingsApp {
             if is_capturing {
                 ui.colored_label(egui::Color32::YELLOW, "Press a key... (Esc to cancel)");
             } else {
-                let bound = match field {
-                    HotkeyField::ToggleBorderless => &self.state.toggle_borderless,
-                    HotkeyField::ToggleTaskbarAutohide => &self.state.toggle_taskbar_autohide,
-                };
-                ui.monospace(if bound.is_empty() { "Not bound" } else { bound.as_str() });
+                let bound = self.state.binding(field);
+                ui.monospace(if bound.is_empty() { "Not bound" } else { bound });
             }
 
             let set_hotkey_response = ui.button(if is_capturing { "Cancel" } else { "Set hotkey" });
@@ -1077,6 +1131,7 @@ impl SettingsApp {
                 ui.label(&game.display_name);
 
                 ui.checkbox(&mut game.auto_apply, "Auto-apply");
+                ui.checkbox(&mut game.game_cursor, "Game cursor");
 
                 if ui.button("Remove").clicked() {
                     to_remove = Some(index);
@@ -1091,6 +1146,233 @@ impl SettingsApp {
         if let Some(index) = to_remove {
             self.state.remove_tracked_game(index);
         }
+    }
+
+    /// Re-renders the variant icons and the preview whenever the cursor
+    /// settings changed since the last frame -- with the same rasterizer the
+    /// overlay uses, so the preview is exactly what appears in game.
+    fn refresh_cursor_previews(&mut self, ctx: &egui::Context) {
+        let settings = self.state.cursor.sanitized();
+        if self
+            .cursor_previews
+            .as_ref()
+            .is_some_and(|p| p.settings == settings)
+        {
+            return;
+        }
+        let game_cursor = crate::cursor_overlay::last_game_cursor();
+        let to_texture = |name: String, s: &CursorSettings| {
+            let bitmap = cursor_style::render_preview(s, game_cursor.as_ref());
+            let size = [bitmap.width as usize, bitmap.height as usize];
+            let image = egui::ColorImage::from_rgba_premultiplied(size, &bitmap.pixels);
+            ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+        };
+        let shapes = CursorShape::ALL
+            .into_iter()
+            .map(|shape| {
+                let icon = CursorSettings {
+                    shape,
+                    size: 30,
+                    thickness: settings.thickness.clamp(2, 4),
+                    border_width: settings.border_width.min(2),
+                    glow_size: settings.glow_size.min(5),
+                    ..settings.clone()
+                };
+                (shape, to_texture(format!("cursor-icon-{shape:?}"), &icon))
+            })
+            .collect();
+        let preview = to_texture("cursor-preview".to_string(), &settings);
+        self.cursor_previews = Some(CursorPreviews {
+            settings,
+            preview,
+            shapes,
+        });
+    }
+
+    /// Renders the "Cursor" tab: pointer variant, size, colors, border,
+    /// glow, a live preview on a dark and a light background, and the
+    /// pulse/hide behavior.
+    fn cursor_section(&mut self, ui: &mut egui::Ui) {
+        self.refresh_cursor_previews(ui.ctx());
+        let Some(previews) = self.cursor_previews.as_ref() else {
+            return;
+        };
+        let c = &mut self.state.cursor;
+
+        ui.checkbox(&mut c.enabled, "Show the game cursor");
+        ui.label(
+            egui::RichText::new(
+                "A big, high-contrast pointer for games whose own cursor gets lost in the action. \
+                 Shake the mouse to make it pulse.",
+            )
+            .weak(),
+        );
+
+        ui.label("Pointer:");
+        ui.horizontal_wrapped(|ui| {
+            for (shape, texture) in &previews.shapes {
+                let image = egui::Image::from_texture(egui::load::SizedTexture::new(
+                    texture.id(),
+                    texture.size_vec2(),
+                ))
+                .fit_to_exact_size(egui::vec2(32.0, 32.0));
+                let button =
+                    egui::Button::image_and_text(image, shape.label()).selected(c.shape == *shape);
+                if ui.add(button).clicked() {
+                    c.shape = *shape;
+                }
+            }
+        });
+        if c.shape == CursorShape::GameOwn {
+            ui.label(
+                egui::RichText::new(
+                    "Builds on the game's own cursor: an enlarged copy behind it (Size; at 32 px or less, \
+                     only the border and glow), following its outline and switching with it. The \
+                     preview shows the last cursor seen in a game (an arrow until then).",
+                )
+                .weak(),
+            );
+        }
+
+        egui::Grid::new("game_cursor_style")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Size");
+                ui.add(egui::Slider::new(&mut c.size, cursor_style::SIZE_RANGE).suffix(" px"));
+                ui.end_row();
+
+                if c.shape.uses_thickness() {
+                    ui.label("Thickness");
+                    ui.add(
+                        egui::Slider::new(&mut c.thickness, cursor_style::THICKNESS_RANGE)
+                            .suffix(" px"),
+                    );
+                    ui.end_row();
+                }
+
+                if c.uses_color() {
+                    ui.label("Color");
+                    ui.color_edit_button_srgb(&mut c.color);
+                    ui.end_row();
+                }
+
+                ui.label("Opacity");
+                ui.add(egui::Slider::new(&mut c.opacity, cursor_style::OPACITY_RANGE).suffix(" %"));
+                ui.end_row();
+
+                ui.checkbox(&mut c.border, "Border");
+                ui.add_enabled_ui(c.border, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgb(&mut c.border_color);
+                        ui.add(
+                            egui::Slider::new(
+                                &mut c.border_width,
+                                cursor_style::BORDER_WIDTH_RANGE,
+                            )
+                            .suffix(" px"),
+                        );
+                    });
+                });
+                ui.end_row();
+
+                ui.checkbox(&mut c.glow, "Glow");
+                ui.add_enabled_ui(c.glow, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgb(&mut c.glow_color);
+                        ui.add(
+                            egui::Slider::new(&mut c.glow_size, cursor_style::GLOW_SIZE_RANGE)
+                                .suffix(" px"),
+                        );
+                    });
+                });
+                ui.end_row();
+
+                ui.label("");
+                ui.add_enabled_ui(c.glow, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut c.glow_strength, cursor_style::GLOW_STRENGTH_RANGE)
+                            .text("glow strength %"),
+                    );
+                });
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            for background in [egui::Color32::from_gray(24), egui::Color32::from_gray(225)] {
+                const BOX: f32 = 150.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(BOX, BOX), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 4.0, background);
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, egui::Color32::GRAY),
+                    egui::StrokeKind::Inside,
+                );
+                let size = previews.preview.size_vec2();
+                let scale = (BOX - 10.0) / size.x.max(size.y);
+                let shown = if scale < 1.0 { size * scale } else { size };
+                let image_rect = egui::Rect::from_center_size(rect.center(), shown);
+                ui.painter().image(
+                    previews.preview.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+
+        ui.label(
+            egui::RichText::new(
+                "Shown only while the mouse is over a game with \"Game cursor\" ticked on the Games tab.",
+            )
+            .weak(),
+        );
+        ui.checkbox(
+            &mut c.shake_to_find,
+            "Shake the mouse to make the cursor pulse",
+        );
+        ui.checkbox(&mut c.hide_when_cursor_hidden, "Hide when the game hides its cursor")
+            .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");    }
+
+    /// Renders the "Zone, hotkeys & taskbar" tab.
+    fn general_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Zone");
+        self.zone_section(ui);
+        ui.separator();
+        ui.heading("Global hotkeys");
+        self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
+        self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+        self.hotkey_row(ui, "Toggle game cursor:", HotkeyField::ToggleGameCursor);
+        // Re-sync immediately after the hotkey rows: a "Set hotkey" click
+        // just above sets `state.capturing = Some(..)` within this same
+        // `ui()` call, but the sync at the top of `ui()` already ran against
+        // the *old* `None` state. Without this second call the hook wouldn't
+        // install until the following frame, leaving a one-frame window
+        // where physical Ctrl+Escape still reaches Windows' Start-menu
+        // shortcut (issue #40 MEDIUM review finding).
+        self.sync_keyboard_hook();
+
+        ui.separator();
+        ui.heading("Taskbar hiding");
+        ui.checkbox(
+            &mut self.state.hide_taskbar_on_apply,
+            "Hide taskbar when the Zone is applied",
+        );
+        ui.radio_value(
+            &mut self.state.taskbar_hide_mode,
+            TaskbarHideMode::FullyHidden,
+            "Fully hidden (no hover-reveal)",
+        );
+        ui.radio_value(
+            &mut self.state.taskbar_hide_mode,
+            TaskbarHideMode::HoverReveal,
+            "Hover to reveal (classic Windows behavior)",
+        );
+
+        ui.separator();
+        ui.heading("Startup");
+        ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
     }
 
     /// Renders the Zone section: a monitor-outline thumbnail with the Zone
@@ -1160,7 +1442,7 @@ impl SettingsApp {
                         match persist_zone(&self.config_dir, None) {
                             Ok(_) => self.state.clear_zone(),
                             Err(e) => {
-                                eprintln!("failed to clear the zone: {e}");
+                                log!("failed to clear the zone: {e}");
                                 self.pending_status_messages = vec![format!("couldn't clear the zone: {e}")];
                             }
                         }
@@ -1219,60 +1501,9 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sync_keyboard_hook();
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // Issue #33's non-blocking status line(s): zero or more messages
-            // from the most recent commit-triggered live re-apply attempt.
-            // Rendered near the top so they're visible without scrolling
-            // regardless of which commit point (currently only the overlay's
-            // zone Save) produced them.
-            if !self.pending_status_messages.is_empty() {
-                for message in &self.pending_status_messages {
-                    ui.colored_label(egui::Color32::YELLOW, message);
-                }
-                ui.separator();
-            }
-
-            ui.heading("Zone");
-            self.zone_section(ui);
-            ui.separator();
-            ui.heading("Global hotkeys");
-            self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
-            self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
-            // Re-sync immediately after both hotkey rows: a "Set hotkey" click
-            // just above sets `state.capturing = Some(..)` within this same
-            // `ui()` call, but the sync at the top of this function already
-            // ran against the *old* `None` state. Without this second call the
-            // hook wouldn't install until the following frame, leaving a
-            // one-frame window where physical Ctrl+Escape still reaches
-            // Windows' Start-menu shortcut (issue #40 MEDIUM review finding).
-            self.sync_keyboard_hook();
-
-            ui.separator();
-            ui.heading("Taskbar hiding");
-            ui.checkbox(
-                &mut self.state.hide_taskbar_on_apply,
-                "Hide taskbar when the Zone is applied",
-            );
-            ui.radio_value(
-                &mut self.state.taskbar_hide_mode,
-                TaskbarHideMode::FullyHidden,
-                "Fully hidden (no hover-reveal)",
-            );
-            ui.radio_value(
-                &mut self.state.taskbar_hide_mode,
-                TaskbarHideMode::HoverReveal,
-                "Hover to reveal (classic Windows behavior)",
-            );
-
-            ui.separator();
-            ui.heading("Games");
-            self.games_section(ui);
-
-            ui.separator();
-            ui.heading("Startup");
-            ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
-
-            ui.separator();
+        // Save/Cancel stay pinned below whichever tab is open.
+        egui::Panel::bottom("settings_buttons").show(ui, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config(), self.state.start_with_windows));
@@ -1282,6 +1513,33 @@ impl eframe::App for SettingsApp {
                     *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            });
+            ui.add_space(2.0);
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Issue #33's non-blocking status line(s): zero or more messages
+            // from the most recent commit-triggered live re-apply attempt.
+            // Rendered above the tabs so they're visible whichever tab is
+            // open.
+            if !self.pending_status_messages.is_empty() {
+                for message in &self.pending_status_messages {
+                    ui.colored_label(egui::Color32::YELLOW, message);
+                }
+                ui.separator();
+            }
+
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.state.tab, SettingsTab::Games, "Games");
+                ui.selectable_value(&mut self.state.tab, SettingsTab::Cursor, "Cursor");
+                ui.selectable_value(&mut self.state.tab, SettingsTab::General, "Zone, hotkeys & taskbar");
+            });
+            ui.separator();
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.state.tab {
+                SettingsTab::Games => self.games_section(ui),
+                SettingsTab::Cursor => self.cursor_section(ui),
+                SettingsTab::General => self.general_section(ui),
             });
         });
     }
@@ -1463,10 +1721,12 @@ mod tests {
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+                toggle_game_cursor: Some("Ctrl+Alt+M".to_string()),
             },
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
             hide_taskbar_on_apply: true,
+            cursor: CursorSettings { enabled: true, size: 72, ..CursorSettings::default() },
         };
 
         let state = SettingsState::from_config(&config);
@@ -1474,7 +1734,34 @@ mod tests {
         assert_eq!(state.zone, Some(Zone { x: 10, y: 10, width: 200, height: 100 }));
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
+        assert_eq!(state.toggle_game_cursor, "Ctrl+Alt+M");
         assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
+        assert_eq!(state.to_config(), config, "game cursor settings round-trip through Settings");
+    }
+
+    #[test]
+    fn a_combo_bound_to_any_other_hotkey_is_rejected() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_game_cursor = "Ctrl+Alt+M".to_string();
+        state.start_capture(HotkeyField::ToggleBorderless);
+
+        state.handle_key_event(egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }, egui::Key::M);
+
+        assert_eq!(state.toggle_borderless, "");
+        assert_eq!(state.duplicate_hotkey_error, Some("Ctrl+Alt+M is already bound to another hotkey".to_string()));
+    }
+
+    #[test]
+    fn the_game_cursor_hotkey_can_be_captured_and_cleared() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.start_capture(HotkeyField::ToggleGameCursor);
+
+        state.handle_key_event(egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }, egui::Key::M);
+        assert_eq!(state.toggle_game_cursor, "Ctrl+Alt+M");
+        assert_eq!(state.to_config().hotkeys.toggle_game_cursor, Some("Ctrl+Alt+M".to_string()));
+
+        state.clear_hotkey(HotkeyField::ToggleGameCursor);
+        assert_eq!(state.to_config().hotkeys.toggle_game_cursor, None);
     }
 
     #[test]
@@ -1733,7 +2020,7 @@ mod tests {
         state.start_capture(HotkeyField::ToggleBorderless);
         state.unsupported_key_pressed = true;
         state.duplicate_hotkey_error =
-            Some("Ctrl+Alt+B is already bound to the other hotkey".to_string());
+            Some("Ctrl+Alt+B is already bound to another hotkey".to_string());
 
         state.cancel_capture();
 
@@ -1833,7 +2120,7 @@ mod tests {
     fn centered_window_position_centers_a_window_within_the_monitor() {
         let monitor = test_monitor();
 
-        let position = centered_window_position(&monitor, SETTINGS_WINDOW_SIZE);
+        let position = centered_window_position(&monitor, [440.0, 560.0]);
 
         assert_eq!(position, [740.0, 260.0]);
     }
@@ -1842,7 +2129,7 @@ mod tests {
     fn centered_window_position_accounts_for_a_monitor_with_a_non_zero_origin() {
         let monitor = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
 
-        let position = centered_window_position(&monitor, SETTINGS_WINDOW_SIZE);
+        let position = centered_window_position(&monitor, [440.0, 560.0]);
 
         assert_eq!(position, [-1500.0, 440.0]);
     }

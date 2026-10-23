@@ -24,6 +24,10 @@ A single global setting (config field `hide_taskbar_on_apply`, default on): whet
 **Taskbar hide mode**:
 A global setting (`TaskbarHideMode`, config field `taskbar_hide_mode`) choosing *which technique* is used whenever the taskbar is hidden: **FullyHidden** (the default — the taskbar stays hidden with no hover-reveal, via `ShowWindow`) or **HoverReveal** (Windows' native auto-hide, which reappears on mouse hover near the screen edge, via the appbar auto-hide mechanism). This is a third axis, orthogonal to both **Hide taskbar on apply** and the manual global taskbar auto-hide toggle — both of those decide *whether* the taskbar gets hidden; this setting decides *how* it's hidden once that decision is made.
 
+**Game cursor**:
+A large, high-contrast pointer GameFrame shows for games whose own cursor is easy to lose: one of several shapes (ring, ring + dot, arrow, crosshair, reticle, disc, dot, or **"Game's own"** — an enlarged copy of the game's current cursor behind it, which the game's own cursor stays on top of) with a size, color, opacity, optional border and optional glow. It is global (config table `[cursor]`, off by default) and shown only while the mouse is over a **tracked game** with its per-game "Game cursor" flag on (default on), whichever window has focus. The game's own cursor is never hidden: Windows draws it above every window. It is drawn by a click-through overlay that follows the mouse (see `docs/adr/0004-game-cursor-without-injection.md`). Shaking the mouse, or turning it on with its hotkey, plays the **find-my-cursor pulse**: a ring that contracts onto the pointer.
+_Avoid_: Cursor highlight, YoloMouse (the third-party tool it replaces), crosshair (only one of the shapes).
+
 ## Relationships
 
 - There is at most one **Zone**, and it is shared by every **tracked game** — a game does not carry its own placement.

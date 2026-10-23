@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub use crate::cursor_style::CursorSettings;
 pub use crate::region_calc::Zone;
 
 /// The config file name written inside the injected config directory.
@@ -14,11 +15,15 @@ pub const CONFIG_FILE_NAME: &str = "config.toml";
 /// means the action is currently unbound.
 pub type HotkeyBinding = Option<String>;
 
-/// The two global hotkey bindings GameFrame supports.
+/// The global hotkey bindings GameFrame supports.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HotkeyBindings {
     pub toggle_borderless: HotkeyBinding,
     pub toggle_taskbar_autohide: HotkeyBinding,
+    /// Turns the game cursor on/off (see [`crate::cursor_style`]). Absent in
+    /// configs written before it existed, hence the default.
+    #[serde(default)]
+    pub toggle_game_cursor: HotkeyBinding,
 }
 
 /// A process, identified by its executable path, that has been added to
@@ -39,13 +44,22 @@ pub struct TrackedGame {
     /// Whether the Zone should be applied the moment the game launches,
     /// versus only on demand via the hotkey or tray menu.
     pub auto_apply: bool,
+    /// Whether the game cursor is shown while this game is in the
+    /// foreground (when the cursor's scope is "tracked games"). Defaults to
+    /// on, including for games tracked before the game cursor existed.
+    #[serde(default = "default_true")]
+    pub game_cursor: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl TrackedGame {
     /// Builds a freshly-added tracked game with the specified defaults:
-    /// auto-apply on.
+    /// auto-apply on, game cursor on.
     pub fn new_default(exe_path: PathBuf, display_name: String) -> Self {
-        TrackedGame { exe_path, display_name, auto_apply: true }
+        TrackedGame { exe_path, display_name, auto_apply: true, game_cursor: true }
     }
 }
 
@@ -125,6 +139,9 @@ pub struct Config {
     /// `taskbar_hide_mode`).
     #[serde(default = "default_hide_taskbar_on_apply")]
     pub hide_taskbar_on_apply: bool,
+    /// The game cursor's settings (config table `[cursor]`).
+    #[serde(default)]
+    pub cursor: CursorSettings,
 }
 
 fn default_hide_taskbar_on_apply() -> bool {
@@ -142,6 +159,7 @@ impl Default for Config {
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::default(),
             hide_taskbar_on_apply: true,
+            cursor: CursorSettings::default(),
         }
     }
 }
@@ -260,6 +278,7 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
         tracked_games: legacy.tracked_games,
         taskbar_hide_mode: legacy.taskbar_hide_mode,
         hide_taskbar_on_apply: legacy.hide_taskbar_on_apply,
+        cursor: CursorSettings::default(),
     })
 }
 
@@ -305,7 +324,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
                     // A failed write-back (read-only file, AV lock) must not
                     // make every caller fail; the config is valid in memory.
                     if let Err(e) = save(config_dir, &config) {
-                        eprintln!("GameFrame: could not write back migrated config: {e}");
+                        log!("GameFrame: could not write back migrated config: {e}");
                     }
                 }
                 Ok(config)
@@ -322,7 +341,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     match table.try_into::<Config>() {
         Ok(config) => {
             if folded && let Err(e) = save(config_dir, &config) {
-                eprintln!("GameFrame: could not write back migrated config: {e}");
+                log!("GameFrame: could not write back migrated config: {e}");
             }
             Ok(config)
         }
@@ -381,7 +400,7 @@ fn keep_pre_zone_backup(config_dir: &Path, contents: &str) -> bool {
     let base = config_dir.join(format!("{CONFIG_FILE_NAME}.pre-zone.bak"));
     match write_free_backup(contents, &base) {
         Ok(Some(backup)) => {
-            eprintln!(
+            log!(
                 "GameFrame: migrated config to the Zone shape, original kept at {}",
                 backup.display()
             );
@@ -389,7 +408,7 @@ fn keep_pre_zone_backup(config_dir: &Path, contents: &str) -> bool {
         }
         Ok(None) => true,
         Err(e) => {
-            eprintln!("GameFrame: could not back up the config before migrating: {e}");
+            log!("GameFrame: could not back up the config before migrating: {e}");
             false
         }
     }
@@ -403,7 +422,7 @@ fn back_up_unreadable_config(config_dir: &Path, contents: &str) -> bool {
     let base = config_dir.join(format!("{CONFIG_FILE_NAME}.bak"));
     match write_free_backup(contents, &base) {
         Ok(Some(backup)) => {
-            eprintln!(
+            log!(
                 "GameFrame: config could not be read; reset to defaults, original kept at {}",
                 backup.display()
             );
@@ -411,7 +430,7 @@ fn back_up_unreadable_config(config_dir: &Path, contents: &str) -> bool {
         }
         Ok(None) => true,
         Err(e) => {
-            eprintln!("GameFrame: config could not be read and backup failed: {e}");
+            log!("GameFrame: config could not be read and backup failed: {e}");
             false
         }
     }
@@ -486,10 +505,11 @@ mod tests {
             config,
             Config {
                 zone: None,
-                hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None },
+                hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None, toggle_game_cursor: None },
                 tracked_games: Vec::new(),
                 taskbar_hide_mode: TaskbarHideMode::FullyHidden,
                 hide_taskbar_on_apply: true,
+                cursor: CursorSettings::default(),
             }
         );
         assert!(config_dir.join(CONFIG_FILE_NAME).exists());
@@ -504,14 +524,17 @@ mod tests {
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+                toggle_game_cursor: Some("Ctrl+Alt+M".to_string()),
             },
             tracked_games: vec![TrackedGame {
                 exe_path: PathBuf::from("C:\\Games\\thing.exe"),
                 display_name: "Thing".to_string(),
                 auto_apply: false,
+                game_cursor: false,
             }],
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
             hide_taskbar_on_apply: false,
+            cursor: CursorSettings { enabled: true, size: 80, ..CursorSettings::default() },
         };
         save(&config_dir, &written).unwrap();
 
@@ -586,11 +609,13 @@ mod tests {
                     exe_path: PathBuf::from("C:\\Games\\thing.exe"),
                     display_name: "Thing".to_string(),
                     auto_apply: false,
+                    game_cursor: true,
                 },
                 TrackedGame {
                     exe_path: PathBuf::from("C:\\Games\\other.exe"),
                     display_name: "Other".to_string(),
                     auto_apply: true,
+                    game_cursor: true,
                 },
             ]
         );

@@ -152,7 +152,7 @@ impl TaskbarRestoreGuard {
 impl Drop for TaskbarRestoreGuard {
     fn drop(&mut self) {
         if let Err(e) = win32::restore_taskbar(self.remembered) {
-            eprintln!("zone editor: failed to restore taskbar state: {e}");
+            log!("zone editor: failed to restore taskbar state: {e}");
         }
     }
 }
