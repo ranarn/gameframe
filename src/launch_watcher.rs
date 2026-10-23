@@ -248,8 +248,9 @@ unsafe extern "system" fn window_destroy_callback(
     crate::win32::forget_applied_window(hwnd);
 
     if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
+        log!("taskbar auto-restore: armed window {hwnd:?} closed, restoring {restore:?}");
         if let Err(e) = crate::win32::restore_taskbar(restore) {
-            eprintln!("taskbar auto-restore on window close failed: {e}");
+            log!("taskbar auto-restore on window close failed: {e}");
         }
     }
 }

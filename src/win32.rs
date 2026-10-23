@@ -272,7 +272,7 @@ impl std::error::Error for Win32Error {
 
 use crate::window_filter::{self, WindowRank};
 use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
 };
@@ -283,7 +283,7 @@ use windows_sys::Win32::UI::Shell::{
     ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    EnumWindows, FindWindowW, GetAncestor, GetForegroundWindow, WindowFromPoint, GA_ROOT, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     GWL_STYLE, SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNORMAL,
     WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
@@ -1001,11 +1001,15 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 pub fn set_taskbar_hide_absolute_armed(hwnd: HWND, hide: bool, mode: TaskbarHideMode) -> Result<(), Win32Error> {
     if hide {
         if is_taskbar_hide_session_active() {
+            // Issue #52 finding 3: no OS call here, so a taskbar the hotkey
+            // showed in the meantime stays visible.
+            log!("taskbar hide for {hwnd:?}: joining the active session (no OS call); {}", taskbar_debug_state());
             join_taskbar_hide_session(hwnd);
             Ok(())
         } else {
             let restore = hide_taskbar(mode)?;
             start_taskbar_hide_session(hwnd, restore);
+            log!("taskbar hide for {hwnd:?}: started a session ({mode:?}); {}", taskbar_debug_state());
             Ok(())
         }
     } else if is_last_armed_window(hwnd) {
@@ -1071,8 +1075,50 @@ fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
 /// `ShowWindow`/`SHAppBarMessage` call. Not exercised by this crate's
 /// automated tests -- see module docs.
 pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
+    // Issue #52: the hotkey sometimes does nothing after long uptime. Log
+    // what it saw and what it left behind so a report comes with evidence.
+    log!("taskbar hotkey ({mode:?}): before: {}", taskbar_debug_state());
     let hidden = is_taskbar_hidden(mode)?;
-    set_taskbar_hide_absolute(!hidden, mode)
+    let result = set_taskbar_hide_absolute(!hidden, mode);
+    log!(
+        "taskbar hotkey: judged hidden={hidden}, so {} -> {result:?}; after: {}",
+        if hidden { "showing" } else { "hiding" },
+        taskbar_debug_state()
+    );
+    result
+}
+
+/// One line describing the taskbar's real state, for the log (issue #52):
+/// `WS_VISIBLE`, the appbar flags, its rect, whether it is actually the
+/// topmost window at its own center (it can be `WS_VISIBLE` yet covered),
+/// the foreground window, and the armed hide session.
+pub fn taskbar_debug_state() -> String {
+    let Ok(taskbar) = find_taskbar_window() else {
+        return "Shell_TrayWnd not found".to_string();
+    };
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // Safety: plain queries on live handles with valid out-pointers.
+    let (visible, on_top, foreground) = unsafe {
+        GetWindowRect(taskbar, &mut rect);
+        let center = POINT { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+        let at_center = WindowFromPoint(center);
+        let on_top = !at_center.is_null() && GetAncestor(at_center, GA_ROOT) == taskbar;
+        (IsWindowVisible(taskbar) != 0, on_top, GetForegroundWindow())
+    };
+    let flags = read_appbar_flags(taskbar);
+    let foreground_exe = if foreground.is_null() {
+        "none".to_string()
+    } else {
+        window_filter::exe_path_for_window(foreground)
+            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let (armed, has_restore) = with_armed_taskbar_windows(|s| (s.windows.len(), s.restore.is_some()));
+    format!(
+        "visible={visible} appbar_flags={flags:#x} rect=({},{})-({},{}) on_top_at_center={on_top} \
+         foreground={foreground:?} ({foreground_exe}) armed_windows={armed} armed_restore={has_restore}",
+        rect.left, rect.top, rect.right, rect.bottom
+    )
 }
 
 /// Locates the taskbar's own window (class name `Shell_TrayWnd`, per the
@@ -1605,7 +1651,7 @@ pub(crate) fn live_reapply_running_window(
     }
 
     if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode) {
-        eprintln!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
+        log!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
     }
 
     LiveApplyOutcome::Applied

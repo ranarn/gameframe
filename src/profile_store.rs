@@ -324,7 +324,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
                     // A failed write-back (read-only file, AV lock) must not
                     // make every caller fail; the config is valid in memory.
                     if let Err(e) = save(config_dir, &config) {
-                        eprintln!("GameFrame: could not write back migrated config: {e}");
+                        log!("GameFrame: could not write back migrated config: {e}");
                     }
                 }
                 Ok(config)
@@ -341,7 +341,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     match table.try_into::<Config>() {
         Ok(config) => {
             if folded && let Err(e) = save(config_dir, &config) {
-                eprintln!("GameFrame: could not write back migrated config: {e}");
+                log!("GameFrame: could not write back migrated config: {e}");
             }
             Ok(config)
         }
@@ -400,7 +400,7 @@ fn keep_pre_zone_backup(config_dir: &Path, contents: &str) -> bool {
     let base = config_dir.join(format!("{CONFIG_FILE_NAME}.pre-zone.bak"));
     match write_free_backup(contents, &base) {
         Ok(Some(backup)) => {
-            eprintln!(
+            log!(
                 "GameFrame: migrated config to the Zone shape, original kept at {}",
                 backup.display()
             );
@@ -408,7 +408,7 @@ fn keep_pre_zone_backup(config_dir: &Path, contents: &str) -> bool {
         }
         Ok(None) => true,
         Err(e) => {
-            eprintln!("GameFrame: could not back up the config before migrating: {e}");
+            log!("GameFrame: could not back up the config before migrating: {e}");
             false
         }
     }
@@ -422,7 +422,7 @@ fn back_up_unreadable_config(config_dir: &Path, contents: &str) -> bool {
     let base = config_dir.join(format!("{CONFIG_FILE_NAME}.bak"));
     match write_free_backup(contents, &base) {
         Ok(Some(backup)) => {
-            eprintln!(
+            log!(
                 "GameFrame: config could not be read; reset to defaults, original kept at {}",
                 backup.display()
             );
@@ -430,7 +430,7 @@ fn back_up_unreadable_config(config_dir: &Path, contents: &str) -> bool {
         }
         Ok(None) => true,
         Err(e) => {
-            eprintln!("GameFrame: config could not be read and backup failed: {e}");
+            log!("GameFrame: config could not be read and backup failed: {e}");
             false
         }
     }

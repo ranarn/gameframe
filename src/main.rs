@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// First, so the `log!` macro is in scope in every module below.
+#[macro_use]
+mod logging;
+
 mod app;
 mod autostart;
 mod cursor_overlay;
@@ -22,7 +26,7 @@ fn main() {
         return;
     }
     if let Err(e) = app::run() {
-        eprintln!("gameframe failed to start: {e}");
+        log!("gameframe failed to start: {e}");
         std::process::exit(1);
     }
 }
