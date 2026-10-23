@@ -1161,10 +1161,9 @@ impl SettingsApp {
             return;
         }
         let to_texture = |name: String, s: &CursorSettings| {
-            let (w, h, hx, hy) = cursor_style::cursor_canvas(s);
-            let bitmap = cursor_style::render_pointer(s, w, h, hx, hy);
-            let image =
-                egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &bitmap.pixels);
+            let bitmap = cursor_style::render_preview(s);
+            let size = [bitmap.width as usize, bitmap.height as usize];
+            let image = egui::ColorImage::from_rgba_premultiplied(size, &bitmap.pixels);
             ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
         };
         let shapes = CursorShape::ALL
@@ -1223,6 +1222,16 @@ impl SettingsApp {
                 }
             }
         });
+        if c.shape == CursorShape::GameOwn {
+            ui.label(
+                egui::RichText::new(
+                    "Builds on the game's own cursor: an enlarged copy behind it (Size), with the border \
+                     and glow following its outline. Follows the game when it switches cursors. The \
+                     preview uses a stand-in arrow.",
+                )
+                .weak(),
+            );
+        }
 
         egui::Grid::new("game_cursor_style")
             .num_columns(2)
@@ -1241,9 +1250,11 @@ impl SettingsApp {
                     ui.end_row();
                 }
 
-                ui.label("Color");
-                ui.color_edit_button_srgb(&mut c.color);
-                ui.end_row();
+                if c.shape.uses_color() {
+                    ui.label("Color");
+                    ui.color_edit_button_srgb(&mut c.color);
+                    ui.end_row();
+                }
 
                 ui.label("Opacity");
                 ui.add(egui::Slider::new(&mut c.opacity, cursor_style::OPACITY_RANGE).suffix(" %"));
@@ -1321,10 +1332,7 @@ impl SettingsApp {
             "Shake the mouse to make the cursor pulse",
         );
         ui.checkbox(&mut c.hide_when_cursor_hidden, "Hide when the game hides its cursor")
-            .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
-        ui.checkbox(&mut c.hide_real_cursor, "Hide the game's own cursor")
-            .on_hover_text("Turn off to see both, e.g. a ring around the game's own cursor.");
-    }
+            .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");    }
 
     /// Renders the "Zone, hotkeys & taskbar" tab.
     fn general_section(&mut self, ui: &mut egui::Ui) {

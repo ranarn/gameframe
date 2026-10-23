@@ -21,9 +21,17 @@ use std::time::Duration;
 
 /// The pointer variants a user can pick. The hotspot (where the real
 /// cursor position lands) is the arrow's tip for [`CursorShape::Arrow`] and
-/// the center for every other shape.
+/// the center for every other drawn shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CursorShape {
+    /// Builds on the game's own cursor instead of drawing a separate one: an
+    /// enlarged copy of its current image behind it, with the border and
+    /// glow following its outline (see [`render_game_own`]). A game's own
+    /// cursor is a hardware cursor Windows draws above every window, so it
+    /// stays on top as the core of the enlarged one rather than fighting a
+    /// different shape. Outside the game (the Settings previews) the arrow
+    /// stands in for it.
+    GameOwn,
     #[default]
     Ring,
     RingDot,
@@ -35,7 +43,8 @@ pub enum CursorShape {
 }
 
 impl CursorShape {
-    pub const ALL: [CursorShape; 7] = [
+    pub const ALL: [CursorShape; 8] = [
+        CursorShape::GameOwn,
         CursorShape::Ring,
         CursorShape::RingDot,
         CursorShape::Arrow,
@@ -47,6 +56,7 @@ impl CursorShape {
 
     pub fn label(self) -> &'static str {
         match self {
+            CursorShape::GameOwn => "Game's own",
             CursorShape::Ring => "Ring",
             CursorShape::RingDot => "Ring + dot",
             CursorShape::Arrow => "Arrow",
@@ -59,7 +69,13 @@ impl CursorShape {
 
     /// Whether `thickness` changes this shape (the filled shapes ignore it).
     pub fn uses_thickness(self) -> bool {
-        !matches!(self, CursorShape::Arrow | CursorShape::Dot)
+        !matches!(self, CursorShape::Arrow | CursorShape::Dot | CursorShape::GameOwn)
+    }
+
+    /// Whether `color` changes this shape ([`CursorShape::GameOwn`] keeps the
+    /// game's own colors).
+    pub fn uses_color(self) -> bool {
+        self != CursorShape::GameOwn
     }
 }
 
@@ -96,10 +112,6 @@ pub struct CursorSettings {
     /// it captures the mouse for camera control). Off by default: a game
     /// that draws its own software cursor hides the real one permanently.
     pub hide_when_cursor_hidden: bool,
-    /// Hide the real (hardware) cursor while the game cursor is shown, so a
-    /// game's own cursor isn't drawn on top of it. On by default; off leaves
-    /// both visible, e.g. a ring around the game's own cursor.
-    pub hide_real_cursor: bool,
 }
 
 impl Default for CursorSettings {
@@ -120,7 +132,6 @@ impl Default for CursorSettings {
             glow_strength: 60,
             shake_to_find: true,
             hide_when_cursor_hidden: false,
-            hide_real_cursor: true,
         }
     }
 }
@@ -219,7 +230,7 @@ pub fn pulse_max_radius(settings: &CursorSettings) -> f32 {
 fn shape_bounds(settings: &CursorSettings) -> (f32, f32, f32, f32) {
     let s = settings.size as f32;
     match settings.shape {
-        CursorShape::Arrow => (0.0, 0.0, 0.57 * s, 0.94 * s),
+        CursorShape::Arrow | CursorShape::GameOwn => (0.0, 0.0, 0.57 * s, 0.94 * s),
         _ => (-s / 2.0, -s / 2.0, s / 2.0, s / 2.0),
     }
 }
@@ -350,6 +361,243 @@ pub fn draw_pulse_ring(bitmap: &mut Bitmap, settings: &CursorSettings, radius: f
     }
 }
 
+/// Builds a premultiplied [`Bitmap`] from a cursor image as Windows hands it
+/// over: `bgra` is 32-bit top-down BGRA with straight alpha. Cursors without
+/// an alpha channel (every alpha byte 0) take their transparency from
+/// `and_mask` (same layout; a set pixel is transparent) -- that also covers
+/// monochrome cursors, passed with their XOR half as `bgra`.
+pub fn cursor_image(
+    width: u32,
+    height: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+    bgra: &[u8],
+    and_mask: Option<&[u8]>,
+) -> Bitmap {
+    let mut image = Bitmap::blank(width, height, hotspot_x, hotspot_y);
+    let n = ((width * height) as usize).min(bgra.len() / 4);
+    let has_alpha = bgra[..n * 4].chunks_exact(4).any(|p| p[3] != 0);
+    for i in 0..n {
+        let p = &bgra[i * 4..i * 4 + 4];
+        let alpha = if has_alpha {
+            p[3]
+        } else {
+            match and_mask.and_then(|m| m.get(i * 4)) {
+                Some(&and) if and != 0 => 0,
+                _ => 255,
+            }
+        };
+        let premultiply = |c: u8| ((c as u32 * alpha as u32 + 127) / 255) as u8;
+        image.pixels[i * 4..i * 4 + 4]
+            .copy_from_slice(&[premultiply(p[2]), premultiply(p[1]), premultiply(p[0]), alpha]);
+    }
+    image
+}
+
+/// Renders [`CursorShape::GameOwn`] around the game's current cursor
+/// `image` (from [`cursor_image`]): the image enlarged to `size` pixels tall
+/// (never shrunk -- at or below its own height only the decoration is drawn,
+/// since the real cursor already shows the image), with the border and glow
+/// following its outline. Both stay strictly outside the outline, so the
+/// game's cursor on top is never tinted. The hotspot lands on the image's own
+/// hotspot.
+pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
+    let s = settings.sanitized();
+    let scale = (s.size as f32 / image.height.max(1) as f32).max(1.0);
+    let margin = decoration_margin(&s).ceil() as u32;
+    let width = (image.width as f32 * scale).ceil() as u32 + 2 * margin;
+    let height = (image.height as f32 * scale).ceil() as u32 + 2 * margin;
+    let hotspot_x = margin as i32 + (image.hotspot_x as f32 * scale).round() as i32;
+    let hotspot_y = margin as i32 + (image.hotspot_y as f32 * scale).round() as i32;
+    let mut bitmap = Bitmap::blank(width, height, hotspot_x, hotspot_y);
+
+    let copy: Vec<[f32; 4]> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let ix = (x as f32 + 0.5 - margin as f32) / scale - 0.5;
+            let iy = (y as f32 + 0.5 - margin as f32) / scale - 0.5;
+            sample_bilinear(image, ix, iy)
+        })
+        .collect();
+    let inside: Vec<bool> = copy.iter().map(|p| p[3] >= 0.5).collect();
+    let distance2 = distance_transform(&inside, width, height);
+
+    let opacity = s.opacity as f32 / 100.0;
+    let border_w = if s.border { s.border_width as f32 } else { 0.0 };
+    let glow_strength = if s.glow {
+        s.glow_strength as f32 / 100.0
+    } else {
+        0.0
+    };
+    let glow_size = s.glow_size as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as usize;
+            let mut out = [0.0f32; 4];
+            if !inside[i] {
+                // Distance from this pixel's edge to the outline.
+                let sd = distance2[i].sqrt() - 0.5;
+                if glow_strength > 0.0 {
+                    let outside = (sd - border_w).max(0.0);
+                    let falloff = (1.0 - outside / glow_size).clamp(0.0, 1.0);
+                    blend_over(&mut out, s.glow_color, glow_strength * falloff * falloff * opacity);
+                }
+                if border_w > 0.0 {
+                    blend_over(&mut out, s.border_color, coverage(sd - border_w) * opacity);
+                }
+            }
+            if scale > 1.0 {
+                let src = copy[i].map(|c| c * opacity);
+                let inv = 1.0 - src[3];
+                for c in 0..4 {
+                    out[c] = src[c] + out[c] * inv;
+                }
+            }
+            write_pixel(&mut bitmap, x, y, out);
+        }
+    }
+    bitmap
+}
+
+/// `pointer` centered (by hotspot) on a square canvas big enough for it and
+/// for the largest pulse ring -- the pulse base for a pointer that wasn't
+/// rendered from the settings alone ([`CursorShape::GameOwn`]).
+pub fn pulse_canvas_for(settings: &CursorSettings, pointer: &Bitmap) -> Bitmap {
+    let (_, pulse_half) = overlay_canvas(settings);
+    let reach = [
+        pointer.hotspot_x,
+        pointer.hotspot_y,
+        pointer.width as i32 - pointer.hotspot_x,
+        pointer.height as i32 - pointer.hotspot_y,
+    ]
+    .into_iter()
+    .fold(pulse_half, i32::max);
+    let side = (reach * 2) as u32;
+    let mut canvas = Bitmap::blank(side, side, reach, reach);
+    let (dx, dy) = (reach - pointer.hotspot_x, reach - pointer.hotspot_y);
+    for y in 0..pointer.height {
+        let src = (y * pointer.width * 4) as usize;
+        let dst = (((y as i32 + dy) as u32 * side + dx as u32) * 4) as usize;
+        let row = (pointer.width * 4) as usize;
+        canvas.pixels[dst..dst + row].copy_from_slice(&pointer.pixels[src..src + row]);
+    }
+    canvas
+}
+
+/// The pointer as the Settings previews show it: [`render_pointer`] on its
+/// tight canvas, or for [`CursorShape::GameOwn`] -- which needs a game's
+/// cursor to build on -- [`render_game_own`] around [`sample_game_cursor`].
+pub fn render_preview(settings: &CursorSettings) -> Bitmap {
+    if settings.shape == CursorShape::GameOwn {
+        return render_game_own(settings, &sample_game_cursor());
+    }
+    let (w, h, hx, hy) = cursor_canvas(settings);
+    render_pointer(settings, w, h, hx, hy)
+}
+
+/// A stand-in for a game's own cursor in the previews: the classic white
+/// arrow with a black edge at a typical 32-pixel cursor size.
+fn sample_game_cursor() -> Bitmap {
+    let arrow = CursorSettings {
+        shape: CursorShape::Arrow,
+        size: 28,
+        color: [255, 255, 255],
+        opacity: 100,
+        border: true,
+        border_color: [0, 0, 0],
+        border_width: 1,
+        glow: false,
+        ..CursorSettings::default()
+    };
+    let (w, h, hx, hy) = cursor_canvas(&arrow);
+    render_pointer(&arrow, w, h, hx, hy)
+}
+
+/// Bilinear sample of a premultiplied image at pixel-center coordinates
+/// (`x`, `y`) as 0..=1 components; transparent outside the image.
+fn sample_bilinear(image: &Bitmap, x: f32, y: f32) -> [f32; 4] {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let texel = |tx: i32, ty: i32| -> [f32; 4] {
+        if tx < 0 || ty < 0 || tx >= image.width as i32 || ty >= image.height as i32 {
+            return [0.0; 4];
+        }
+        read_pixel(image, tx as u32, ty as u32)
+    };
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let (a, b, c, d) = (texel(x0, y0), texel(x0 + 1, y0), texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
+    std::array::from_fn(|k| {
+        let top = a[k] + (b[k] - a[k]) * fx;
+        let bottom = c[k] + (d[k] - c[k]) * fx;
+        top + (bottom - top) * fy
+    })
+}
+
+/// Squared Euclidean distance from each pixel to the nearest `inside` pixel
+/// (0 for inside pixels) -- Felzenszwalb & Huttenlocher's linear-time
+/// two-pass transform, columns then rows.
+fn distance_transform(inside: &[bool], width: u32, height: u32) -> Vec<f32> {
+    const FAR: f32 = 1.0e12;
+    let (w, h) = (width as usize, height as usize);
+    let mut grid: Vec<f32> = inside.iter().map(|&i| if i { 0.0 } else { FAR }).collect();
+    let mut f = vec![0.0f32; w.max(h)];
+    let mut d = vec![0.0f32; w.max(h)];
+    for x in 0..w {
+        for y in 0..h {
+            f[y] = grid[y * w + x];
+        }
+        distance_transform_1d(&f[..h], &mut d[..h]);
+        for y in 0..h {
+            grid[y * w + x] = d[y];
+        }
+    }
+    for y in 0..h {
+        f[..w].copy_from_slice(&grid[y * w..(y + 1) * w]);
+        distance_transform_1d(&f[..w], &mut d[..w]);
+        grid[y * w..(y + 1) * w].copy_from_slice(&d[..w]);
+    }
+    grid
+}
+
+fn distance_transform_1d(f: &[f32], d: &mut [f32]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    // Where parabola `q` overtakes parabola `p` (f64: `f` holds huge values
+    // for "no inside pixel yet", which would swamp f32 precision).
+    let intersect = |q: usize, p: usize| {
+        let (fq, fp) = (f[q] as f64, f[p] as f64);
+        ((fq + (q * q) as f64) - (fp + (p * p) as f64)) / (2.0 * (q - p) as f64)
+    };
+    let mut v = vec![0usize; n];
+    let mut z = vec![0.0f64; n + 1];
+    let mut k = 0;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n {
+        // Terminates: nothing is <= z[0] = -inf.
+        let mut s = intersect(q, v[k]);
+        while s <= z[k] {
+            k -= 1;
+            s = intersect(q, v[k]);
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    k = 0;
+    for (q, out) in d.iter_mut().enumerate() {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        let p = v[k];
+        let dq = q as f32 - p as f32;
+        *out = dq * dq + f[p];
+    }
+}
+
 /// The main shape's signed distance at (`px`, `py`) relative to the hotspot,
 /// plus [`CursorShape::Disc`]'s separate interior-fill distance.
 fn shape_sdf(s: &CursorSettings, px: f32, py: f32) -> (f32, Option<f32>) {
@@ -392,7 +640,8 @@ fn shape_sdf(s: &CursorSettings, px: f32, py: f32) -> (f32, Option<f32>) {
             let dot = d - (size * 0.05).max(1.5);
             (ring.min(tick).min(dot), None)
         }
-        CursorShape::Arrow => {
+        // The arrow stands in for the game's own cursor where there is none.
+        CursorShape::Arrow | CursorShape::GameOwn => {
             let points = ARROW.map(|(x, y)| (x * size, y * size));
             (polygon_sdf(&points, px, py), None)
         }
@@ -889,5 +1138,132 @@ mod tests {
         }
         // 30 strokes over 1.2s -- continuous shaking yields one pulse per cooldown.
         assert_eq!(hits, 1);
+    }
+
+    /// A solid 16x16 square cursor of `bgr` with full alpha, hotspot top-left.
+    fn square_cursor(bgr: [u8; 3]) -> Bitmap {
+        let bgra: Vec<u8> = (0..256).flat_map(|_| [bgr[0], bgr[1], bgr[2], 255]).collect();
+        cursor_image(16, 16, 0, 0, &bgra, None)
+    }
+
+    #[test]
+    fn cursor_image_premultiplies_and_swaps_to_rgba() {
+        // One half-transparent pure-blue pixel (BGRA).
+        let image = cursor_image(1, 1, 0, 0, &[255, 0, 0, 128], None);
+        assert_eq!(image.pixels, vec![0, 0, 128, 128]);
+    }
+
+    #[test]
+    fn cursor_image_without_alpha_takes_transparency_from_the_and_mask() {
+        // Two white pixels, no alpha; the AND mask makes the second clear.
+        let bgra = [255, 255, 255, 0, 255, 255, 255, 0];
+        let and = [0, 0, 0, 0, 255, 255, 255, 0];
+        let image = cursor_image(2, 1, 0, 0, &bgra, Some(&and));
+        assert_eq!(image.alpha_at(0, 0), 255);
+        assert_eq!(image.alpha_at(1, 0), 0);
+    }
+
+    #[test]
+    fn game_own_enlarges_the_image_onto_its_hotspot() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 64, // 4x the 16-pixel square
+            opacity: 100,
+            border: false,
+            glow: false,
+            ..CursorSettings::default()
+        };
+        let out = render_game_own(&s, &square_cursor([0, 0, 255]));
+        let m = decoration_margin(&s).ceil() as u32;
+        assert_eq!((out.width, out.height), (64 + 2 * m, 64 + 2 * m));
+        assert_eq!((out.hotspot_x, out.hotspot_y), (m as i32, m as i32));
+        // Red copy inside; outside, bilinear magnification only leaves a
+        // soft edge fading out within a couple of pixels.
+        let i = (((m + 32) * out.width + m + 32) * 4) as usize;
+        assert_eq!(&out.pixels[i..i + 4], &[255, 0, 0, 255]);
+        assert!(out.alpha_at(m + 65, m + 32) < 64);
+    }
+
+    #[test]
+    fn game_own_at_its_own_size_draws_only_the_decoration_outside_the_outline() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 16, // the image's own height: no enlarged copy
+            opacity: 100,
+            border: true,
+            border_width: 2,
+            border_color: [0, 0, 0],
+            glow: false,
+            ..CursorSettings::default()
+        };
+        let out = render_game_own(&s, &square_cursor([0, 0, 255]));
+        let m = decoration_margin(&s).ceil() as u32;
+        // Inside the outline: untouched, so the game's cursor isn't tinted.
+        assert_eq!(out.alpha_at(m + 8, m + 8), 0);
+        // Just outside it: the border.
+        assert_eq!(out.alpha_at(m + 16, m + 8), 255);
+        // Beyond the border: clear.
+        assert_eq!(out.alpha_at(m + 16 + 4, m + 8), 0);
+    }
+
+    #[test]
+    fn game_own_glow_follows_the_outline_and_fades() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 16,
+            border: false,
+            glow: true,
+            glow_size: 10,
+            glow_strength: 100,
+            ..CursorSettings::default()
+        };
+        let out = render_game_own(&s, &square_cursor([255, 255, 255]));
+        let m = decoration_margin(&s).ceil() as u32;
+        let near = out.alpha_at(m + 17, m + 8);
+        let far = out.alpha_at(m + 23, m + 8);
+        assert!(near > far && far > 0, "near {near}, far {far}");
+    }
+
+    #[test]
+    fn distance_transform_measures_to_the_nearest_inside_pixel() {
+        // 5x1 row with the middle pixel inside.
+        let d = distance_transform(&[false, false, true, false, false], 5, 1);
+        assert_eq!(d, vec![4.0, 1.0, 0.0, 1.0, 4.0]);
+        // 3x3 with the center inside: corners are sqrt(2) away.
+        let mut inside = [false; 9];
+        inside[4] = true;
+        let d = distance_transform(&inside, 3, 3);
+        assert_eq!(d[0], 2.0);
+        assert_eq!(d[1], 1.0);
+    }
+
+    #[test]
+    fn pulse_canvas_for_keeps_the_pointer_on_the_hotspot() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            ..CursorSettings::default()
+        };
+        let pointer = render_game_own(&s, &square_cursor([0, 0, 255]));
+        let canvas = pulse_canvas_for(&s, &pointer);
+        let (_, pulse_half) = overlay_canvas(&s);
+        assert!(canvas.hotspot_x >= pulse_half);
+        assert_eq!(canvas.width as i32, canvas.hotspot_x * 2);
+        // The pixel at the hotspot is the pointer's hotspot pixel.
+        let at = |b: &Bitmap, x: i32, y: i32| b.alpha_at(x as u32, y as u32);
+        assert_eq!(
+            at(&canvas, canvas.hotspot_x + 2, canvas.hotspot_y + 2),
+            at(&pointer, pointer.hotspot_x + 2, pointer.hotspot_y + 2)
+        );
+    }
+
+    #[test]
+    fn the_game_own_preview_renders_around_the_stand_in() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 64,
+            ..CursorSettings::default()
+        };
+        let preview = render_preview(&s);
+        assert!(preview.width > 64 && preview.pixels.iter().any(|&p| p != 0));
     }
 }

@@ -29,10 +29,11 @@
 //! Not exercised by automated tests (needs a desktop session), like the other
 //! OS-facing modules; [`is_cursor_game`] is the pure part.
 
-use crate::cursor_style::{self, Bitmap, CursorSettings, ShakeDetector};
+use crate::cursor_style::{self, Bitmap, CursorSettings, CursorShape, ShakeDetector};
 use crate::profile_store::{self, Config};
 use crate::win32::encode_wide;
 use crate::window_filter;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,9 +43,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
-    HGDIOBJ, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
@@ -54,10 +55,10 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Magnification::{MagInitialize, MagShowSystemCursor, MagUninitialize};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GA_ROOT, GetAncestor, GetCursorInfo, GetCursorPos, HTTRANSPARENT, HWND_TOPMOST, MSG,
+    GA_ROOT, GetAncestor, GetCursorInfo, GetCursorPos, GetIconInfo, HCURSOR, HTTRANSPARENT,
+    HWND_TOPMOST, ICONINFO, MSG,
     MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
     ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_NCHITTEST, WNDCLASSEXW,
@@ -192,7 +193,6 @@ fn run_overlay_thread(shared: &Shared) {
         return;
     };
     let timer = FrameTimer::new();
-    let mut real_cursor = RealCursorHider::new();
     let clock = Instant::now();
 
     let mut seen_generation = u64::MAX;
@@ -213,6 +213,11 @@ fn run_overlay_thread(shared: &Shared) {
     let mut shake = ShakeDetector::new();
     let mut pulse_start: Option<Instant> = None;
     let mut last_topmost = Instant::now();
+    // `CursorShape::GameOwn`: the game's cursor handle `pointer` was rendered
+    // from, and the rendering per handle (games switch between a handful of
+    // cursors, e.g. on hover; `None` = unreadable).
+    let mut game_own_handle: HCURSOR = std::ptr::null_mut();
+    let mut game_own_cache: HashMap<usize, Option<Bitmap>> = HashMap::new();
 
     while !shared.quit.load(Ordering::SeqCst) {
         pump_messages();
@@ -234,8 +239,11 @@ fn run_overlay_thread(shared: &Shared) {
             pulse_base = None;
             content = Content::Nothing;
             under_cursor = None;
+            game_own_handle = std::ptr::null_mut();
+            game_own_cache.clear();
         }
         let settings = &input.settings;
+        let game_own = settings.shape == CursorShape::GameOwn;
 
         let cursor = read_cursor();
         let over_game = match cursor {
@@ -259,8 +267,24 @@ fn run_overlay_thread(shared: &Shared) {
             _ => false,
         };
         let show = cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
+        if let Some(c) = cursor.filter(|c| show && game_own && c.handle != game_own_handle) {
+            // The game switched cursors: follow it.
+            game_own_handle = c.handle;
+            if game_own_cache.len() > 32 {
+                game_own_cache.clear();
+            }
+            pointer = game_own_cache
+                .entry(c.handle as usize)
+                .or_insert_with(|| {
+                    read_cursor_image(c.handle).map(|image| cursor_style::render_game_own(settings, &image))
+                })
+                .clone();
+            pulse_base = None;
+            content = Content::Nothing;
+        }
+        // Nothing to build on while the game shows no (readable) cursor.
+        let show = show && !(game_own && pointer.is_none());
         let Some(cursor) = cursor.filter(|_| show) else {
-            real_cursor.set_hidden(false);
             window.hide();
             content = Content::Nothing;
             shake.reset();
@@ -288,9 +312,12 @@ fn run_overlay_thread(shared: &Shared) {
                 // The pulse needs the large canvas; the pointer is drawn into
                 // it once per pulse-canvas render, then each pulse frame only
                 // copies that base and adds the ring.
-                let base = pulse_base.get_or_insert_with(|| {
-                    let (side, hot) = cursor_style::overlay_canvas(settings);
-                    cursor_style::render_pointer(settings, side, side, hot, hot)
+                let base = pulse_base.get_or_insert_with(|| match &pointer {
+                    Some(own) if game_own => cursor_style::pulse_canvas_for(settings, own),
+                    _ => {
+                        let (side, hot) = cursor_style::overlay_canvas(settings);
+                        cursor_style::render_pointer(settings, side, side, hot, hot)
+                    }
                 });
                 let pos = (cursor.x - base.hotspot_x, cursor.y - base.hotspot_y);
                 let due = last_pulse_render.is_none_or(|t| t.elapsed() >= PULSE_FRAME_INTERVAL);
@@ -329,9 +356,6 @@ fn run_overlay_thread(shared: &Shared) {
                 }
             }
         }
-        // Only once ours is on screen, so there is never a moment with no
-        // cursor at all.
-        real_cursor.set_hidden(settings.hide_real_cursor && window.visible);
         if window.visible && last_topmost.elapsed() >= TOPMOST_INTERVAL {
             window.raise_topmost();
             last_topmost = Instant::now();
@@ -356,10 +380,13 @@ struct CursorState {
     x: i32,
     y: i32,
     showing: bool,
+    /// The cursor currently shown (null while hidden).
+    handle: HCURSOR,
 }
 
-/// The cursor's physical position and whether the foreground app currently
-/// shows it; `None` if it can't be read (e.g. on the secure desktop).
+/// The cursor's physical position, whether the foreground app currently
+/// shows it and which cursor; `None` if it can't be read (e.g. on the secure
+/// desktop).
 fn read_cursor() -> Option<CursorState> {
     let mut pt = POINT { x: 0, y: 0 };
     let mut info: CURSORINFO = unsafe { std::mem::zeroed() };
@@ -374,6 +401,7 @@ fn read_cursor() -> Option<CursorState> {
         x: pt.x,
         y: pt.y,
         showing: info.flags & CURSOR_SHOWING != 0,
+        handle: info.hCursor,
     })
 }
 
@@ -403,53 +431,75 @@ fn window_under(x: i32, y: i32) -> HWND {
     }
 }
 
-/// Hides the real (hardware) cursor while the game cursor is shown, so a
-/// game's own cursor -- which Windows draws above every window, ours
-/// included -- isn't on top of it. Uses the Magnification API's
-/// `MagShowSystemCursor`, the global switch screen magnifiers use to draw
-/// their own pointer: nothing touches the game process. Verified in Last
-/// Epoch, and Windows shows the cursor again by itself when the process
-/// exits, so a crash can't leave it hidden.
-struct RealCursorHider {
-    initialized: bool,
-    hidden: bool,
-}
-
-impl RealCursorHider {
-    fn new() -> Self {
-        Self { initialized: false, hidden: false }
+/// Reads the image of the cursor `handle` -- typically a game's own cursor,
+/// which belongs to the game process; cursor handles are session-wide, so
+/// this works without touching the game. Handles both cursor kinds: 32-bit
+/// color with alpha (or without, using the AND mask) and old monochrome
+/// cursors (AND mask on top of XOR mask in one double-height bitmap).
+fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
+    let mut info: ICONINFO = unsafe { std::mem::zeroed() };
+    // Safety: valid out-pointer; on success we own (and delete below) the
+    // two bitmaps it returns.
+    if unsafe { GetIconInfo(handle, &mut info) } == 0 {
+        return None;
     }
-
-    /// Hides or shows the real cursor; a no-op unless that changes.
-    fn set_hidden(&mut self, hide: bool) {
-        if hide == self.hidden {
-            return;
-        }
-        if hide && !self.initialized {
-            // Safety: plain call, paired with `MagUninitialize` in `Drop`.
-            self.initialized = unsafe { MagInitialize() } != 0;
-            if !self.initialized {
-                log!("game cursor: MagInitialize failed, the real cursor stays visible");
-                return;
-            }
-        }
-        // Safety: plain call.
-        if unsafe { MagShowSystemCursor(if hide { 0 } else { 1 }) } != 0 {
-            self.hidden = hide;
+    let image = (|| {
+        let mask = read_bitmap_bgra(info.hbmMask)?;
+        let (hot_x, hot_y) = (info.xHotspot as i32, info.yHotspot as i32);
+        if info.hbmColor.is_null() {
+            // Monochrome: the top half is the AND mask, the bottom the XOR.
+            let (width, height) = (mask.0, mask.1 / 2);
+            let half = (width * height * 4) as usize;
+            let (and, xor) = mask.2.split_at(half);
+            Some(cursor_style::cursor_image(width, height, hot_x, hot_y, xor, Some(and)))
         } else {
-            log!("game cursor: MagShowSystemCursor({}) failed", !hide);
+            let (width, height, bgra) = read_bitmap_bgra(info.hbmColor)?;
+            let and = (mask.0 == width && mask.1 >= height).then(|| &mask.2[..(width * height * 4) as usize]);
+            Some(cursor_style::cursor_image(width, height, hot_x, hot_y, &bgra, and))
+        }
+    })();
+    // Safety: GetIconInfo handed us these bitmaps to delete.
+    unsafe {
+        DeleteObject(info.hbmMask as HGDIOBJ);
+        if !info.hbmColor.is_null() {
+            DeleteObject(info.hbmColor as HGDIOBJ);
         }
     }
+    image
 }
 
-impl Drop for RealCursorHider {
-    fn drop(&mut self) {
-        self.set_hidden(false);
-        if self.initialized {
-            // Safety: matches the successful `MagInitialize` above.
-            unsafe { MagUninitialize() };
-        }
+/// A bitmap's pixels as 32-bit top-down BGRA: `(width, height, bytes)`.
+fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
+    let mut bm: BITMAP = unsafe { std::mem::zeroed() };
+    // Safety: valid out-pointer sized per the API contract.
+    let size = std::mem::size_of::<BITMAP>() as i32;
+    if unsafe { GetObjectW(bitmap as HGDIOBJ, size, (&raw mut bm).cast()) } == 0 {
+        return None;
     }
+    let (width, height) = (bm.bmWidth.max(0) as u32, bm.bmHeight.max(0) as u32);
+    if width == 0 || height == 0 || width > 256 || height > 512 {
+        return None;
+    }
+    let mut header: BITMAPINFO = unsafe { std::mem::zeroed() };
+    header.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width as i32,
+        biHeight: -(height as i32), // top-down
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    // Safety: the screen DC is released below; `pixels` holds exactly
+    // `height` rows of 32-bit pixels as `header` describes.
+    let rows = unsafe {
+        let dc = GetDC(std::ptr::null_mut());
+        let rows = GetDIBits(dc, bitmap, 0, height, pixels.as_mut_ptr().cast(), &mut header, DIB_RGB_COLORS);
+        ReleaseDC(std::ptr::null_mut(), dc);
+        rows
+    };
+    (rows == height as i32).then_some((width, height, pixels))
 }
 
 /// Sleeps for a short interval with sub-millisecond precision (the default
