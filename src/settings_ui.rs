@@ -1160,8 +1160,9 @@ impl SettingsApp {
         {
             return;
         }
+        let game_cursor = crate::cursor_overlay::last_game_cursor();
         let to_texture = |name: String, s: &CursorSettings| {
-            let bitmap = cursor_style::render_preview(s);
+            let bitmap = cursor_style::render_preview(s, game_cursor.as_ref());
             let size = [bitmap.width as usize, bitmap.height as usize];
             let image = egui::ColorImage::from_rgba_premultiplied(size, &bitmap.pixels);
             ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
@@ -1225,9 +1226,9 @@ impl SettingsApp {
         if c.shape == CursorShape::GameOwn {
             ui.label(
                 egui::RichText::new(
-                    "Builds on the game's own cursor: an enlarged copy behind it (Size), with the border \
-                     and glow following its outline. Follows the game when it switches cursors. The \
-                     preview uses a stand-in arrow.",
+                    "Builds on the game's own cursor: an enlarged copy behind it (Size; at 32 px or less, \
+                     only the border and glow), following its outline and switching with it. The \
+                     preview shows the last cursor seen in a game (an arrow until then).",
                 )
                 .weak(),
             );
@@ -1250,7 +1251,16 @@ impl SettingsApp {
                     ui.end_row();
                 }
 
-                if c.shape.uses_color() {
+                if c.shape == CursorShape::GameOwn {
+                    ui.label("Enlarged copy");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut c.game_own_silhouette, false, "Picture");
+                        ui.radio_value(&mut c.game_own_silhouette, true, "Silhouette");
+                    });
+                    ui.end_row();
+                }
+
+                if c.uses_color() {
                     ui.label("Color");
                     ui.color_edit_button_srgb(&mut c.color);
                     ui.end_row();

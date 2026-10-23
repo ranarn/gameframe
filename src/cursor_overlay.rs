@@ -213,9 +213,10 @@ fn run_overlay_thread(shared: &Shared) {
     let mut shake = ShakeDetector::new();
     let mut pulse_start: Option<Instant> = None;
     let mut last_topmost = Instant::now();
-    // `CursorShape::GameOwn`: the game's cursor handle `pointer` was rendered
-    // from, and the rendering per handle (games switch between a handful of
-    // cursors, e.g. on hover; `None` = unreadable).
+    // The game's cursor handle last read (for `CursorShape::GameOwn`, the
+    // one `pointer` was rendered from), and its image per handle (games
+    // switch between a handful of cursors, e.g. on hover; `None` =
+    // unreadable).
     let mut game_own_handle: HCURSOR = std::ptr::null_mut();
     let mut game_own_cache: HashMap<usize, Option<Bitmap>> = HashMap::new();
 
@@ -267,20 +268,24 @@ fn run_overlay_thread(shared: &Shared) {
             _ => false,
         };
         let show = cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
-        if let Some(c) = cursor.filter(|c| show && game_own && c.handle != game_own_handle) {
-            // The game switched cursors: follow it.
+        if let Some(c) = cursor.filter(|c| show && c.handle != game_own_handle) {
+            // The game switched cursors: read it (also for the Settings
+            // preview, whatever the shape) and, for `GameOwn`, follow it.
             game_own_handle = c.handle;
             if game_own_cache.len() > 32 {
                 game_own_cache.clear();
             }
-            pointer = game_own_cache
+            let image = game_own_cache
                 .entry(c.handle as usize)
-                .or_insert_with(|| {
-                    read_cursor_image(c.handle).map(|image| cursor_style::render_game_own(settings, &image))
-                })
-                .clone();
-            pulse_base = None;
-            content = Content::Nothing;
+                .or_insert_with(|| read_cursor_image(c.handle));
+            if let Some(image) = image {
+                *LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(image.clone());
+            }
+            if game_own {
+                pointer = image.as_ref().map(|image| cursor_style::render_game_own(settings, image));
+                pulse_base = None;
+                content = Content::Nothing;
+            }
         }
         // Nothing to build on while the game shows no (readable) cursor.
         let show = show && !(game_own && pointer.is_none());
@@ -429,6 +434,15 @@ fn window_under(x: i32, y: i32) -> HWND {
         }
         GetAncestor(hwnd, GA_ROOT)
     }
+}
+
+/// The last cursor image read over a game, for the Settings preview of
+/// [`CursorShape::GameOwn`].
+static LAST_GAME_CURSOR: Mutex<Option<Bitmap>> = Mutex::new(None);
+
+/// The last cursor image read over a game, if any yet.
+pub fn last_game_cursor() -> Option<Bitmap> {
+    LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Reads the image of the cursor `handle` -- typically a game's own cursor,

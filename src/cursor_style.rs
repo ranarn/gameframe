@@ -71,12 +71,6 @@ impl CursorShape {
     pub fn uses_thickness(self) -> bool {
         !matches!(self, CursorShape::Arrow | CursorShape::Dot | CursorShape::GameOwn)
     }
-
-    /// Whether `color` changes this shape ([`CursorShape::GameOwn`] keeps the
-    /// game's own colors).
-    pub fn uses_color(self) -> bool {
-        self != CursorShape::GameOwn
-    }
 }
 
 /// The persisted game-cursor settings (config table `[cursor]`). Every field
@@ -112,6 +106,10 @@ pub struct CursorSettings {
     /// it captures the mouse for camera control). Off by default: a game
     /// that draws its own software cursor hides the real one permanently.
     pub hide_when_cursor_hidden: bool,
+    /// [`CursorShape::GameOwn`]: draw the enlarged copy as a solid shape in
+    /// `color` instead of the game's picture, so it reads as an aura behind
+    /// the game's cursor rather than a second cursor.
+    pub game_own_silhouette: bool,
 }
 
 impl Default for CursorSettings {
@@ -132,6 +130,7 @@ impl Default for CursorSettings {
             glow_strength: 60,
             shake_to_find: true,
             hide_when_cursor_hidden: false,
+            game_own_silhouette: false,
         }
     }
 }
@@ -144,6 +143,12 @@ pub const GLOW_SIZE_RANGE: std::ops::RangeInclusive<u32> = 2..=48;
 pub const GLOW_STRENGTH_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
 
 impl CursorSettings {
+    /// Whether `color` changes the pointer ([`CursorShape::GameOwn`] keeps the
+    /// game's own colors unless drawn as a silhouette).
+    pub fn uses_color(&self) -> bool {
+        self.shape != CursorShape::GameOwn || self.game_own_silhouette
+    }
+
     /// A copy with every numeric field clamped into the range Settings
     /// offers, so a hand-edited config can't produce a zero-sized or
     /// screen-filling canvas.
@@ -447,7 +452,13 @@ pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
                 }
             }
             if scale > 1.0 {
-                let src = copy[i].map(|c| c * opacity);
+                let src = if s.game_own_silhouette {
+                    let a = copy[i][3] * opacity;
+                    let [r, g, b] = s.color.map(|c| c as f32 / 255.0 * a);
+                    [r, g, b, a]
+                } else {
+                    copy[i].map(|c| c * opacity)
+                };
                 let inv = 1.0 - src[3];
                 for c in 0..4 {
                     out[c] = src[c] + out[c] * inv;
@@ -485,11 +496,39 @@ pub fn pulse_canvas_for(settings: &CursorSettings, pointer: &Bitmap) -> Bitmap {
 }
 
 /// The pointer as the Settings previews show it: [`render_pointer`] on its
-/// tight canvas, or for [`CursorShape::GameOwn`] -- which needs a game's
-/// cursor to build on -- [`render_game_own`] around [`sample_game_cursor`].
-pub fn render_preview(settings: &CursorSettings) -> Bitmap {
+/// tight canvas, or for [`CursorShape::GameOwn`] what the game shows --
+/// [`render_game_own`] with the game's own cursor on top -- built on
+/// `game_cursor` (the last one read from a game) or, before any was,
+/// [`sample_game_cursor`].
+pub fn render_preview(settings: &CursorSettings, game_cursor: Option<&Bitmap>) -> Bitmap {
     if settings.shape == CursorShape::GameOwn {
-        return render_game_own(settings, &sample_game_cursor());
+        let sample;
+        let image = match game_cursor {
+            Some(image) => image,
+            None => {
+                sample = sample_game_cursor();
+                &sample
+            }
+        };
+        let mut out = render_game_own(settings, image);
+        // The real cursor, drawn by Windows above the overlay in game.
+        let (dx, dy) = (out.hotspot_x - image.hotspot_x, out.hotspot_y - image.hotspot_y);
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let (tx, ty) = (x as i32 + dx, y as i32 + dy);
+                if tx < 0 || ty < 0 || tx >= out.width as i32 || ty >= out.height as i32 {
+                    continue;
+                }
+                let src = read_pixel(image, x, y);
+                let mut dst = read_pixel(&out, tx as u32, ty as u32);
+                let inv = 1.0 - src[3];
+                for c in 0..4 {
+                    dst[c] = src[c] + dst[c] * inv;
+                }
+                write_pixel(&mut out, tx as u32, ty as u32, dst);
+            }
+        }
+        return out;
     }
     let (w, h, hx, hy) = cursor_canvas(settings);
     render_pointer(settings, w, h, hx, hy)
@@ -1263,7 +1302,47 @@ mod tests {
             size: 64,
             ..CursorSettings::default()
         };
-        let preview = render_preview(&s);
+        let preview = render_preview(&s, None);
         assert!(preview.width > 64 && preview.pixels.iter().any(|&p| p != 0));
+    }
+
+    #[test]
+    fn game_own_silhouette_fills_the_copy_with_the_color() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 64,
+            opacity: 100,
+            color: [0, 255, 0],
+            border: false,
+            glow: false,
+            game_own_silhouette: true,
+            ..CursorSettings::default()
+        };
+        assert!(s.uses_color());
+        let out = render_game_own(&s, &square_cursor([0, 0, 255]));
+        let m = decoration_margin(&s).ceil() as u32;
+        let i = (((m + 32) * out.width + m + 32) * 4) as usize;
+        assert_eq!(&out.pixels[i..i + 4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn the_game_own_preview_puts_the_game_cursor_on_top() {
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 64,
+            opacity: 100,
+            game_own_silhouette: true,
+            color: [0, 255, 0],
+            ..CursorSettings::default()
+        };
+        let game = square_cursor([0, 0, 255]); // red, 16 px
+        let preview = render_preview(&s, Some(&game));
+        // Inside the real cursor's 16 px: its red; beyond it: the green copy.
+        let at = |x: i32, y: i32| {
+            let i = (((preview.hotspot_y + y) as u32 * preview.width + (preview.hotspot_x + x) as u32) * 4) as usize;
+            preview.pixels[i..i + 4].to_vec()
+        };
+        assert_eq!(at(8, 8), vec![255, 0, 0, 255]);
+        assert_eq!(at(40, 40), vec![0, 255, 0, 255]);
     }
 }
