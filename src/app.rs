@@ -294,13 +294,14 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path, 
                     // re-register from the freshly saved config so a
                     // newly bound/changed/removed hotkey takes effect
                     // immediately, without requiring a full app
-                    // restart. Assigning over `hotkeys` drops the old
-                    // `Hotkeys` first (its `Drop` impl destroys the old
-                    // `GlobalHotKeyManager`'s hidden window, which the OS
-                    // uses to automatically unregister every hotkey that
-                    // was bound to it) before the new one registers,
-                    // so there's no window where both the old and new
-                    // bindings are simultaneously held.
+                    // restart. The old `Hotkeys` must be dropped *before*
+                    // registering again (its `Drop` destroys the manager's
+                    // hidden window, which releases its hotkeys): a plain
+                    // `hotkeys = register_hotkeys(..)` evaluates the right
+                    // side first, so every unchanged key failed with
+                    // "already registered" and all hotkeys went dead after
+                    // any Settings visit (#52).
+                    drop(hotkeys.take());
                     hotkeys = register_hotkeys(config_dir);
                     cursor_overlay.reload(config_dir);
                     tray.sync_start_with_windows_check();
