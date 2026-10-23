@@ -399,23 +399,38 @@ pub fn cursor_image(
 /// (never shrunk -- at or below its own height only the decoration is drawn,
 /// since the real cursor already shows the image), with the border and glow
 /// following its outline. Both stay strictly outside the outline, so the
-/// game's cursor on top is never tinted. The hotspot lands on the image's own
-/// hotspot.
+/// game's cursor on top is never tinted.
+///
+/// The image is enlarged around the *center* of its hotspot pixel, which
+/// lands on the center of the canvas hotspot pixel. Enlarging around the
+/// pixel's corner instead would keep every edge through that corner in
+/// place -- for an arrow whose tip is the hotspot, its left and top edges --
+/// so the game's own cursor would sit right on the enlarged copy's edge
+/// there instead of inside it (seen in Last Epoch). Around the center, the
+/// copy reaches `(scale - 1) / 2` pixels beyond those edges as well.
 pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
     let s = settings.sanitized();
     let scale = (s.size as f32 / image.height.max(1) as f32).max(1.0);
-    let margin = decoration_margin(&s).ceil() as u32;
-    let width = (image.width as f32 * scale).ceil() as u32 + 2 * margin;
-    let height = (image.height as f32 * scale).ceil() as u32 + 2 * margin;
-    let hotspot_x = margin as i32 + (image.hotspot_x as f32 * scale).round() as i32;
-    let hotspot_y = margin as i32 + (image.hotspot_y as f32 * scale).round() as i32;
+    // Room for the decoration plus bilinear magnification's soft edge.
+    let pad = decoration_margin(&s).ceil() as i32 + (scale / 2.0).ceil() as i32;
+    // Per axis: the canvas hotspot pixel and the canvas length.
+    let axis = |len: u32, hot: i32| {
+        let pivot = hot as f32 + 0.5;
+        let canvas_hot = pad + (pivot * scale - 0.5).ceil() as i32;
+        let end = canvas_hot as f32 + 0.5 + (len as f32 - pivot) * scale;
+        (canvas_hot, (end.ceil() as i32 + pad) as u32)
+    };
+    let (hotspot_x, width) = axis(image.width, image.hotspot_x);
+    let (hotspot_y, height) = axis(image.height, image.hotspot_y);
     let mut bitmap = Bitmap::blank(width, height, hotspot_x, hotspot_y);
 
     let copy: Vec<[f32; 4]> = (0..height)
         .flat_map(|y| (0..width).map(move |x| (x, y)))
         .map(|(x, y)| {
-            let ix = (x as f32 + 0.5 - margin as f32) / scale - 0.5;
-            let iy = (y as f32 + 0.5 - margin as f32) / scale - 0.5;
+            // Texel-center coordinates: canvas hotspot pixel <-> image
+            // hotspot pixel, centers aligned.
+            let ix = image.hotspot_x as f32 + (x as f32 - hotspot_x as f32) / scale;
+            let iy = image.hotspot_y as f32 + (y as f32 - hotspot_y as f32) / scale;
             sample_bilinear(image, ix, iy)
         })
         .collect();
@@ -1202,14 +1217,38 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
-        let m = decoration_margin(&s).ceil() as u32;
-        assert_eq!((out.width, out.height), (64 + 2 * m, 64 + 2 * m));
-        assert_eq!((out.hotspot_x, out.hotspot_y), (m as i32, m as i32));
-        // Red copy inside; outside, bilinear magnification only leaves a
-        // soft edge fading out within a couple of pixels.
-        let i = (((m + 32) * out.width + m + 32) * 4) as usize;
-        assert_eq!(&out.pixels[i..i + 4], &[255, 0, 0, 255]);
-        assert!(out.alpha_at(m + 65, m + 32) < 64);
+        let at = |dx: i32, dy: i32| {
+            let i = (((out.hotspot_y + dy) as u32 * out.width + (out.hotspot_x + dx) as u32) * 4) as usize;
+            out.pixels[i..i + 4].to_vec()
+        };
+        // The red copy, 64 px from the hotspot on.
+        assert_eq!(at(32, 32), vec![255, 0, 0, 255]);
+        assert_eq!(at(60, 10), vec![255, 0, 0, 255]);
+        // Past its far edge, bilinear magnification only leaves a soft edge
+        // fading out within a couple of pixels, inside the canvas.
+        assert!(at(64, 10)[3] < 64);
+        assert!(out.width as i32 > out.hotspot_x + 66);
+    }
+
+    #[test]
+    fn game_own_reaches_past_the_left_and_top_of_a_hotspot_in_the_corner() {
+        // A corner hotspot (an arrow's tip): enlarged around the hotspot
+        // pixel's center, the copy reaches (4 - 1) / 2 = 1.5 px left of and
+        // above it, so the game's cursor on top sits inside the copy there
+        // too, not on its edge.
+        let s = CursorSettings {
+            shape: CursorShape::GameOwn,
+            size: 64,
+            opacity: 100,
+            border: false,
+            glow: false,
+            ..CursorSettings::default()
+        };
+        let out = render_game_own(&s, &square_cursor([0, 0, 255]));
+        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
+        assert!(alpha(-1, 10) > 128, "left: {}", alpha(-1, 10));
+        assert!(alpha(10, -1) > 128, "top: {}", alpha(10, -1));
+        assert_eq!(alpha(-4, 10), 0);
     }
 
     #[test]
@@ -1225,13 +1264,14 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
-        let m = decoration_margin(&s).ceil() as u32;
+        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
         // Inside the outline: untouched, so the game's cursor isn't tinted.
-        assert_eq!(out.alpha_at(m + 8, m + 8), 0);
-        // Just outside it: the border.
-        assert_eq!(out.alpha_at(m + 16, m + 8), 255);
+        assert_eq!(alpha(8, 8), 0);
+        // Just outside it, on either side: the border.
+        assert_eq!(alpha(16, 8), 255);
+        assert_eq!(alpha(-1, 8), 255);
         // Beyond the border: clear.
-        assert_eq!(out.alpha_at(m + 16 + 4, m + 8), 0);
+        assert_eq!(alpha(16 + 4, 8), 0);
     }
 
     #[test]
@@ -1246,9 +1286,9 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([255, 255, 255]));
-        let m = decoration_margin(&s).ceil() as u32;
-        let near = out.alpha_at(m + 17, m + 8);
-        let far = out.alpha_at(m + 23, m + 8);
+        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
+        let near = alpha(17, 8);
+        let far = alpha(23, 8);
         assert!(near > far && far > 0, "near {near}, far {far}");
     }
 
