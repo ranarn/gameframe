@@ -5,16 +5,13 @@
 //! Zone interactively instead of typing X/Y/width/height
 //! by hand.
 //!
-//! Lifts the verified rendering/platform setup from
-//! `examples/zone_overlay_visual/main.rs`: the DX12 + DirectComposition
+//! Rendering setup: the DX12 + DirectComposition
 //! (`Dx12SwapchainKind::DxgiFromVisual`)-backed swapchain is required for
-//! true per-pixel transparency on this project's tested hardware --
+//! true per-pixel transparency on the tested hardware --
 //! `ViewportBuilder::with_transparent(true)` alone renders opaque without
 //! it -- and the `clear_color` override is required because eframe/wgpu
 //! otherwise paints an opaque background behind the egui content regardless
-//! of the viewport's transparency flag. See that example's module doc for
-//! the full writeup; this is a lift of a verified mechanism, not a
-//! re-derivation.
+//! of the viewport's transparency flag.
 //!
 //! Drives [`crate::zone_editor::AppState`] from real pointer input, and
 //! hides the taskbar for the duration of the editing session via
@@ -163,8 +160,6 @@ fn native_options(monitor: &MonitorGeometry) -> eframe::NativeOptions {
     // swapchain on this project's tested hardware -- true per-pixel window
     // transparency on Windows requires the swapchain to be bound to an
     // `IDCompositionVisual` (DirectComposition) instead of the raw HWND.
-    // See `examples/zone_overlay_visual/main.rs`'s module doc for the full
-    // writeup.
     let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
     wgpu_setup.instance_descriptor.backend_options.dx12.presentation_system =
@@ -322,18 +317,16 @@ impl OverlayApp {
                         ui.horizontal(|ui| {
                             let save_button =
                                 control_button("Save", egui::Color32::from_rgb(34, 160, 60));
-                            if ui.add_enabled(can_save, save_button).clicked() {
-                                if let Some(outcome) = self.state.apply(Action::Save) {
+                            if ui.add_enabled(can_save, save_button).clicked()
+                                && let Some(outcome) = self.state.apply(Action::Save) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
-                            }
                             let cancel_button =
                                 control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
-                            if ui.add(cancel_button).clicked() {
-                                if let Some(outcome) = self.state.apply(Action::Cancel) {
+                            if ui.add(cancel_button).clicked()
+                                && let Some(outcome) = self.state.apply(Action::Cancel) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
-                            }
                         });
                         ui.vertical_centered(|ui| {
                             ui.label(

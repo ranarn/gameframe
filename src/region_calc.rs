@@ -2,8 +2,7 @@
 //! into a concrete pixel [`Region`]. No OS calls, no I/O.
 
 /// The Zone: the single optional user-drawn area, in absolute screen
-/// coordinates, that every tracked game's window is placed into -- see
-/// `CONTEXT.md`'s "Zone".
+/// coordinates, that every tracked game's window is placed into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Zone {
     pub x: i32,

@@ -1,0 +1,114 @@
+name: Release
+
+# Started by hand (Actions -> Release -> Run workflow) on main. Release Pilot
+# derives the next version from the conventional commits since the last tag
+# (feat -> minor, fix -> patch, `!` -> major); the installer is built with
+# that version and attached to a draft GitHub release, which the maintainer
+# reviews and publishes. Only commits whose main.yml push run is green are
+# released, and nothing is tagged if the build fails.
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only show the next version and changelog
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - name: Require a green main build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          run=$(gh run list --workflow main.yml --event push --commit "$SHA" --limit 1 --json status,conclusion,url)
+          echo "$run"
+          if [ "$(jq -r '.[0].conclusion' <<<"$run")" != "success" ]; then
+            echo "::error::main.yml has no successful push run for $SHA yet"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: next
+        uses: ranarn/release-pilot@0810e9f937aebbe4553ec095205640f6e620a824 # v1.0.9
+        with:
+          dry-run: true
+          default-bump: none
+
+      - name: Require something to release
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            echo "::error::No feat or fix commits since the last release"
+            exit 1
+          fi
+          echo "Next version: $VERSION"
+
+  build:
+    needs: plan
+    if: ${{ !inputs.dry-run }}
+    uses: $/.github/workflows/build.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Release Pilot pushes the tag with git, so the checkout keeps its
+      # credentials in this job only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installer
+          path: dist
+
+      - id: release
+        uses: ranarn/release-pilot@0810e9f937aebbe4553ec095205640f6e620a824 # v1.0.9
+        with:
+          default-bump: none
+          commit-sha: ${{ github.sha }}
+          create-release: true
+          release-draft: true
+          release-title: GameFrame {{tag}}
+
+      - name: Attach the installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PLANNED: ${{ needs.plan.outputs.tag }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if [ "$TAG" != "$PLANNED" ]; then
+            echo "::error::Release Pilot tagged $TAG, but the installer was built as $PLANNED"
+            exit 1
+          fi
+          gh release upload "$TAG" dist/*

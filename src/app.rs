@@ -107,11 +107,10 @@ pub fn run() -> Result<(), TrayUiError> {
     // on the taskbar) and before the process actually exits, so the desktop
     // is never left with the taskbar hidden and no running GameFrame
     // instance left to bring it back.
-    if let Some(restore) = win32::take_any_armed_taskbar_restore() {
-        if let Err(e) = win32::restore_taskbar(restore) {
+    if let Some(restore) = win32::take_any_armed_taskbar_restore()
+        && let Err(e) = win32::restore_taskbar(restore) {
             log!("failed to restore taskbar on exit: {e}");
         }
-    }
 
     if let Some(hook) = launch_watcher_hook {
         launch_watcher::unregister(hook);
@@ -474,13 +473,12 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// pending for *this same window* -- see below), applies (or reverts) the
 /// border-strip via [`win32::toggle_borderless_on_foreground_window`], then,
 /// on a successful strip only, sets the tracked game's taskbar-auto-hide
-/// value absolutely (see
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`).
+/// value absolutely.
 ///
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
-/// strip (per this issue's acceptance criteria and `CONTEXT.md`'s "Applying
-/// the Zone to a window whose process is not a tracked game does nothing"),
+/// strip (applying the Zone to a window whose process is not a tracked game
+/// does nothing),
 /// but never blocks a pending *restore* purely because the untracked window
 /// happens to be the one now in the foreground -- see that function's doc
 /// comment for the full reasoning.
@@ -535,8 +533,8 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // second, separate `GetForegroundWindow()` call.
     let fg_hwnd = win32::foreground_window();
 
-    if is_restoring {
-        if !should_allow_restore(fg_hwnd, *stripped_hwnd) {
+    if is_restoring
+        && !should_allow_restore(fg_hwnd, *stripped_hwnd) {
             log!(
                 "borderless toggle: a pending restore exists for a different window; ignoring press until that window is focused again"
             );
@@ -546,7 +544,6 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
             // issue #31 iteration 3).
             return false;
         }
-    }
 
     let tracked = fg_hwnd
         .and_then(window_filter::exe_path_for_window)
@@ -618,17 +615,18 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // on restore (using the same fixed global boolean) would leave the
     // taskbar auto-hidden after the user exits borderless/game mode instead
     // of it coming back, for the common `hide_taskbar_on_apply: true` default
-    // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
-    // about the strip/apply action, not the restore/undo action.
+    // (MEDIUM review finding, issue #31 iteration 3). Coupling taskbar hide
+    // to the Zone apply is about the strip/apply action, not the
+    // restore/undo action.
     //
     // Uses `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
     // later automatically restores the taskbar with no hotkey press
     // required. `fg_hwnd` is guaranteed `Some` here: `tracked` was only
     // resolved (in the strip direction) from `fg_hwnd` itself above.
-    if !is_restoring {
-        if let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd) {
-            if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+    if !is_restoring
+        && let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd)
+            && let Err(e) = win32::set_taskbar_hide_absolute_armed(
                 hwnd,
                 config.hide_taskbar_on_apply,
                 config.taskbar_hide_mode,
@@ -638,8 +636,6 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
                     tracked_game.display_name
                 );
             }
-        }
-    }
 
     false
 }
@@ -654,13 +650,12 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// which may not be the foreground window at all, that's the whole point of
 /// this tray-menu path -- via [`win32::apply_borderless_to_window`], and,
 /// only once that border-apply succeeds, sets the tracked game's
-/// taskbar-auto-hide value absolutely (see
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`). A
+/// taskbar-auto-hide value absolutely. A
 /// border-apply failure (e.g. the target window is minimized) returns early
 /// without touching the taskbar at all -- mirroring
 /// [`handle_toggle_borderless`]'s equivalent gating -- since forcing the
 /// taskbar into auto-hide for a window that was never actually stripped
-/// would contradict ADR 0002's whole rationale for coupling the two.
+/// would contradict the whole point of coupling the two.
 ///
 /// A one-shot action, not a toggle: there is no remembered restore state for
 /// this path (see this module's doc comment for the scope decision), so

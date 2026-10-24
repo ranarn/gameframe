@@ -27,7 +27,7 @@ pub struct HotkeyBindings {
 }
 
 /// A process, identified by its executable path, that has been added to
-/// GameFrame's per-game list -- see `CONTEXT.md`'s "Tracked game". Added
+/// GameFrame's per-game list. Added
 /// only through "Apply to Window": picking a window applies the Zone
 /// immediately and adds it to this list if it isn't already present (see
 /// [`upsert_tracked_game`]).
@@ -174,9 +174,7 @@ pub fn should_prompt_for_zone(config: &Config) -> bool {
 ///
 /// There is no `Malformed`/invalid-TOML variant: [`load`] never surfaces a
 /// malformed or incompatible-schema config file as an error -- it discards
-/// it and replaces it with defaults instead (see
-/// `docs/adr/0001-preset-fixed-structure-no-migration.md` and
-/// `docs/adr/0003-zone-config-migration.md`).
+/// it and replaces it with defaults instead.
 #[derive(Debug)]
 pub enum ProfileStoreError {
     /// A filesystem operation (read, write, or directory creation) failed.
@@ -292,8 +290,7 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
 /// folded into the global setting ([`fold_per_game_taskbar_flags`]) and is
 /// written back too; anything else (corrupt TOML, unrecognised shape) is
 /// replaced with a freshly written default config rather than returned as an
-/// error -- see
-/// `docs/adr/0003-zone-config-migration.md`.
+/// error.
 pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     let path = config_dir.join(CONFIG_FILE_NAME);
 

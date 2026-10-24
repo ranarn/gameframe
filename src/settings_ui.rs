@@ -590,9 +590,7 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
 /// Maps a physical, non-modifier `egui::Key` to its `global_hotkey::hotkey::Code`
 /// counterpart (a `keyboard_types::Code` re-export) -- exactly the same
 /// vocabulary [`key_display_name`] accepts, so the two lookups never drift
-/// apart on which physical keys GameFrame's capture widget supports. See
-/// `docs/research/hotkey-capture-widget.md` section 3 for the egui-`Key`-vs-
-/// `Code` cross-reference this table is built from. Returns `None` for keys
+/// apart on which physical keys GameFrame's capture widget supports. Returns `None` for keys
 /// outside that vocabulary (including `Enter`/`Space`, excluded from
 /// `key_display_name` for the reason documented there).
 fn key_to_code(key: egui::Key) -> Option<Code> {
@@ -735,8 +733,7 @@ fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<H
 ///
 /// Deliberately NOT `HotKey::Display`, whose `into_string()` round-trips to
 /// a different, lowercase, spelled-out format (`"control+alt+keyb"`) that
-/// doesn't match what `profile_store`/`resolve_bindings` already expect --
-/// see `docs/research/hotkey-capture-widget.md`. Returns `None` if `key` is
+/// doesn't match what `profile_store`/`resolve_bindings` already expect. Returns `None` if `key` is
 /// itself a physical modifier key (a modifier-only press never completes a
 /// capture) or has no known name in GameFrame's hotkey vocabulary.
 ///
@@ -1561,8 +1558,7 @@ mod tests {
 
     #[test]
     fn config_with_zone_replaces_only_the_zone_of_the_on_disk_config() {
-        let mut on_disk = Config::default();
-        on_disk.zone = Some(Zone { x: 1, y: 2, width: 3, height: 4 });
+        let mut on_disk = Config { zone: Some(Zone { x: 1, y: 2, width: 3, height: 4 }), ..Config::default() };
         on_disk.hotkeys.toggle_borderless = Some("Ctrl+B".to_string());
         let new_zone = Zone { x: 100, y: 50, width: 800, height: 600 };
 

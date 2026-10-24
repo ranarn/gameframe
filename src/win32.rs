@@ -11,8 +11,7 @@
 //! unchanged). Also owns the "Apply to Window" picker's `EnumWindows` call
 //! ([`list_visible_windows`]/`enum_windows_callback`), which calls into
 //! [`crate::window_filter`] for the actual two-layer game-window
-//! filtering/ranking decision logic (see
-//! `docs/research/game-window-filtering.md` for the full rationale).
+//! filtering/ranking decision logic.
 //!
 //! Split the same way as [`crate::settings_ui`]:
 //! - Pure decision logic ([`strip_border_style`], [`plan_toggle`],
@@ -762,8 +761,7 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
 /// safe.
 ///
 /// Fully independent of [`toggle_taskbar_hide`] (which keeps no remembered
-/// state of its own at all -- see its doc comment): per
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`, the manual
+/// state of its own at all -- see its doc comment): the manual
 /// global taskbar-autohide hotkey's own toggle must stay independent from
 /// the Zone-apply paths' taskbar handling, and this static is never read
 /// or written by [`toggle_taskbar_hide`] or the zone editor's own
@@ -943,8 +941,8 @@ pub(crate) fn take_any_armed_taskbar_restore() -> Option<TaskbarHideRestore> {
 /// Deliberately independent of [`toggle_taskbar_hide`]/its state above: this
 /// never reads or writes a caller-tracked [`TaskbarHideRestore`] variable, so
 /// it can't drift out of sync with (or be confused for) the existing global
-/// taskbar-autohide hotkey's own toggle mechanic, which ADR 0002 explicitly
-/// keeps untouched and independent.
+/// taskbar-autohide hotkey's own toggle mechanic, which must stay untouched and
+/// independent of the Zone-apply paths.
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow`/`SHAppBarMessage` call depending on `mode`. Not exercised by
@@ -1067,8 +1065,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
 /// `RestoreState`, and of [`set_taskbar_hide_absolute_armed`]'s
 /// `ARMED_TASKBAR_RESTORE` bookkeeping -- this reads only the taskbar's real
 /// OS-level visibility, never any tracked-game config or armed-window state,
-/// so it remains independent of tracked-game state per
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`, just no
+/// so it remains independent of tracked-game state, just no
 /// longer independent of *reality*.
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
@@ -1278,13 +1275,13 @@ pub fn list_visible_windows() -> Vec<(HWND, String)> {
     unsafe {
         EnumWindows(Some(enum_windows_callback), std::ptr::addr_of_mut!(state) as isize);
     }
-    // Layer 2 (see `docs/research/game-window-filtering.md`): a stable sort
+    // Layer 2: a stable sort
     // by descending `WindowRank` surfaces likely games first in the picker,
     // without ever removing a window ranked `WindowRank::Unknown` -- ranking
-    // only ever reorders, it never filters. `Vec::sort_by` is a stable sort,
-    // so windows that tie on rank keep the relative order `EnumWindows`
+    // only ever reorders, it never filters. `Vec::sort_by_key` is a stable
+    // sort, so windows that tie on rank keep the relative order `EnumWindows`
     // produced them in (roughly Z-order).
-    state.windows.sort_by(|a, b| b.2.cmp(&a.2));
+    state.windows.sort_by_key(|w| std::cmp::Reverse(w.2));
     state.windows.into_iter().map(|(hwnd, title, _rank)| (hwnd, title)).collect()
 }
 

@@ -1,3 +1,13 @@
 /target
 
 .agent/
+
+# Local agent tooling: kept on the maintainer's machine, not published.
+/CLAUDE.md
+/.claude/
+/.serena/
+
+# Design docs, domain glossary, research notes and prototypes: kept on the
+# maintainer's machine, not published.
+/docs/
+/CONTEXT.md

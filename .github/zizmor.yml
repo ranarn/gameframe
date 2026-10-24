@@ -1,0 +1,6 @@
+# zizmor configuration, picked up automatically from .github/.
+rules:
+  dependabot-cooldown:
+    config:
+      # Matches .github/dependabot.yml (zizmor's default minimum is 7).
+      days: 3

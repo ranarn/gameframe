@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Wait 3 days before proposing a new release: compromised versions are
+  # usually caught and yanked within days.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 3

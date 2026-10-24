@@ -24,6 +24,10 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=Jonas Ranerfors
+AppPublisherURL=https://github.com/ranarn/gameframe
+AppSupportURL=https://github.com/ranarn/gameframe/issues
+AppUpdatesURL=https://github.com/ranarn/gameframe/releases
+AppCopyright=Copyright (C) 2026 Jonas Ranerfors
 PrivilegesRequired=lowest
 DefaultDirName={autopf}\{#AppName}
 DisableDirPage=auto
@@ -48,6 +52,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
