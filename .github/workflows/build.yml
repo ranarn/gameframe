@@ -1,0 +1,72 @@
+name: Build
+
+# Release exe + Inno Setup installer, uploaded as the `installer` artifact.
+# Called by main.yml (unversioned 0.0.0 build) and release.yml (stamped with
+# the release version).
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to stamp into Cargo.toml; empty keeps the repo's 0.0.0.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  INNO_SETUP_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
+  INNO_SETUP_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Stamp version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+$') { throw "not a plain x.y.z version: $env:VERSION" }
+          # The first `version =` line in Cargo.toml is [package]'s.
+          $toml = Get-Content Cargo.toml -Raw
+          $toml = ([regex]'(?m)^version = "[^"]*"').Replace($toml, "version = `"$env:VERSION`"", 1)
+          Set-Content Cargo.toml $toml -NoNewline
+          cargo update --package gameframe --offline
+          $built = (cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json).packages[0].version
+          if ($built -ne $env:VERSION) { throw "Cargo.toml says $built, expected $env:VERSION" }
+
+      - name: Install Inno Setup 7
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          Invoke-WebRequest $env:INNO_SETUP_URL -OutFile $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:INNO_SETUP_SHA256) { throw "Inno Setup checksum mismatch: $hash" }
+          Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER' -Wait
+
+      - name: Build installer
+        run: ./installer/build.ps1
+
+      - name: Checksum
+        run: |
+          Get-ChildItem target/installer/*.exe | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" | Set-Content "$($_.FullName).sha256"
+          }
+          Get-Content target/installer/*.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer
+          path: target/installer/GameFrame-Setup-*
+          if-no-files-found: error
