@@ -477,8 +477,8 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 ///
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
-/// strip (per this issue's acceptance criteria and `CONTEXT.md`'s "Applying
-/// the Zone to a window whose process is not a tracked game does nothing"),
+/// strip (applying the Zone to a window whose process is not a tracked game
+/// does nothing),
 /// but never blocks a pending *restore* purely because the untracked window
 /// happens to be the one now in the foreground -- see that function's doc
 /// comment for the full reasoning.

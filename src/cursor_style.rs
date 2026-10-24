@@ -1,5 +1,5 @@
 //! The **game cursor** -- a large, high-contrast pointer GameFrame draws for
-//! tracked games whose own cursor is easy to lose (see `CONTEXT.md`).
+//! tracked games whose own cursor is easy to lose.
 //!
 //! Pure half of the feature, split the same way as [`crate::zone_editor`] /
 //! [`crate::zone_overlay`]:

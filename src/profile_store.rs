@@ -27,7 +27,7 @@ pub struct HotkeyBindings {
 }
 
 /// A process, identified by its executable path, that has been added to
-/// GameFrame's per-game list -- see `CONTEXT.md`'s "Tracked game". Added
+/// GameFrame's per-game list. Added
 /// only through "Apply to Window": picking a window applies the Zone
 /// immediately and adds it to this list if it isn't already present (see
 /// [`upsert_tracked_game`]).
