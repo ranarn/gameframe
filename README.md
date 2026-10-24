@@ -110,3 +110,19 @@ Measured on a Windows 11 development sandbox (not dedicated gaming hardware):
   attributable to the baseline Rust/CRT process footprint plus the `tray-icon` and `global-hotkey`
   runtime dependencies, but that has not been confirmed by profiling. Re-measuring on real
   end-user hardware, and profiling to pin down the actual source, is recommended.
+
+## Support
+
+GameFrame is free and open source. If it's useful to you and you'd like to support its
+development, you can [donate via PayPal](https://www.paypal.com/donate/?hosted_button_id=YPDPUVMSDQLJQ) —
+entirely voluntary, and every feature stays free either way.
+
+## License
+
+Copyright (C) 2026 Jonas Ranerfors
+
+GameFrame is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE).
+
+Security issues: see [`SECURITY.md`](SECURITY.md).
