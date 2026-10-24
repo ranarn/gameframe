@@ -1,13 +1,8 @@
 //! Pure state machine for the zone-editor overlay's drag-and-draw / resize
-//! interaction model (issue #28). Lifted directly from the throwaway
-//! prototype validated at `examples/zone_overlay_prototype/zone_editor.rs`
-//! (see that file's module doc for the original research question), with
-//! two production differences:
-//! - Uses [`crate::profile_store::Zone`] in place of the
-//!   prototype's own `Zone` type (identical fields: `x`/`y`/`width`/
-//!   `height`, all `i32`) so [`AppState::apply`]'s `Save` output plugs
-//!   directly into `Config::zone` with no conversion step.
-//! - Drops the prototype's simulated `TaskbarState` entirely -- the real
+//! interaction model. Notes:
+//! - Uses [`crate::profile_store::Zone`] directly, so [`AppState::apply`]'s
+//!   `Save` output plugs into `Config::zone` with no conversion step.
+//! - Holds no taskbar state -- the real
 //!   mode-aware taskbar-hide/restore mechanism lives in [`crate::win32`]
 //!   (`hide_taskbar`/`restore_taskbar`) and is driven by the OS-facing
 //!   overlay window ([`crate::zone_overlay`]) around the editing session,

@@ -1272,7 +1272,6 @@ dependencies = [
  "egui",
  "global-hotkey",
  "image",
- "log",
  "muda",
  "serde",
  "steamlocate",

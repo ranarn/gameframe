@@ -4,7 +4,8 @@ A Windows system-tray utility that makes a game/app window borderless and reposi
 defined screen region, and toggles taskbar auto-hide via a global hotkey. Replaces two separate
 background tools (Windowed Borderless Gaming + a standalone Hide Taskbar utility) with one process.
 
-Full problem statement, research, and design decisions: [`Project Ideas/gameframe.md`](../Project%20Ideas/gameframe.md).
+Design decisions: [`docs/adr/`](docs/adr/); background research: [`docs/research/`](docs/research/);
+domain vocabulary: [`CONTEXT.md`](CONTEXT.md).
 
 ## Status
 

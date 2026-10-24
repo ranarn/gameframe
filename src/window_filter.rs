@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn matches_known_install_rejects_an_exe_outside_every_known_install_dir() {
         let install_dir = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper");
-        let exe_path = std::path::PathBuf::from(r"C:\Users\jonas\Downloads\SomeIndieGame\game.exe");
+        let exe_path = std::path::PathBuf::from(r"C:\Users\Player\Downloads\SomeIndieGame\game.exe");
         assert!(!matches_known_install(&exe_path, &[install_dir]));
     }
 }
