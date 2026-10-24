@@ -1,3 +1,8 @@
 /target
 
 .agent/
+
+# Local agent tooling: kept on the maintainer's machine, not published.
+/CLAUDE.md
+/.claude/
+/.serena/
