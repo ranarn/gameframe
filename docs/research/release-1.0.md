@@ -18,8 +18,9 @@ private today and goes public, open source under GPL-3.0, before 1.0.
 | # | Decision | Outcome |
 |---|----------|---------|
 | P1 | Where releases are published | **`ranarn/gameframe` goes public, open source**; releases are published in the same repo. An installed app can't read a private repo's releases without shipping a token, while public release assets and `GET /repos/{o}/{r}/releases/latest` need no auth (60 unauthenticated requests/hour per IP — far more than one check per start). Public also makes Actions minutes free and enables branch protection. |
-| P2 | License | **GPL-3.0** (`GPL-3.0-or-later` or `-only` — see §7). Every dependency is under a permissive license (MIT, Apache-2.0, BSD, Zlib, ISC, BSL-1.0, Unicode-3.0, OFL-1.1/Ubuntu-font for egui's bundled fonts — checked via `cargo metadata`, 2026-10-24), all GPL-3.0-compatible. Their notices must ship with the binary (§5 M7). |
-| P2b | Funding | **Voluntary, via PayPal.** GameFrame is free with no paywalled features; a "Support GameFrame" link (§4) and a `.github/FUNDING.yml` `custom:` entry point at the PayPal link. |
+| P2 | License | **GPL-3.0-or-later** (`LICENSE` = the official text from gnu.org). Every dependency is under a permissive license (MIT, Apache-2.0, BSD, Zlib, ISC, BSL-1.0, Unicode-3.0, OFL-1.1/Ubuntu-font for egui's bundled fonts — checked via `cargo metadata`, 2026-10-24), all GPL-3.0-compatible. Their notices must ship with the binary (§5 M7). |
+| P2b | Funding | **Voluntary, via PayPal** (`https://www.paypal.com/donate/?hosted_button_id=YPDPUVMSDQLJQ`). GameFrame is free with no paywalled features; the link is in `.github/FUNDING.yml`, the README, and later Settings > About (§4). |
+| P2c | Public footprint | The commit email stays as is. `CLAUDE.md`, `.claude/` and `.serena/` are untracked and gitignored from now on; their earlier versions stay in the history and in old PR diffs (accepted — a scan found nothing secret). Issues and PR texts become public (accepted). |
 | P3 | Updater approach | **Option A** — Inno Setup + a small built-in updater (§3). |
 | P4 | Update UX | **Both, as a setting** — install automatically at start (default) or "Ask me" via a tray item (§4). |
 | — | Open bug #52 | **Ships as a known issue** in 1.0, fixed in a 1.0.x patch. |
@@ -182,6 +183,9 @@ There is no panic hook, and the installer's `taskkill /F` (every upgrade and
 uninstall) skips all cleanup. `FullyHidden` (`ShowWindow(SW_HIDE)`) lasts until
 Explorer restarts; `HoverReveal` (`ABS_AUTOHIDE`) is **persistent** — the user's
 taskbar stays auto-hide for good. Auto-update makes this frequent.
+The zone editor's `TaskbarRestoreGuard` doc claims a panic unwinding through
+`eframe::run_native` restores the taskbar, but the release profile is
+`panic = "abort"`, so no `Drop` runs on a panic in a shipped build.
 *Fix*: graceful shutdown before installing (§3 step 5); a `std::panic::set_hook`
 that logs the panic to `gameframe.log` (today panics vanish: no console,
 `panic = "abort"`) and restores an armed taskbar hide; optionally handle
@@ -308,60 +312,64 @@ flowing from `Cargo.toml`, and a solid unit-test layer around the pure logic.
 
 ## 6. Proposed 1.0 work, in order
 
-1. **Hygiene** — L1–L5, L7, M4, M6: comments, dead code, prototypes, clippy, metadata. No behavior change.
+0. **Public-repo readiness — done** on branch `chore/prepare-public-repo`:
+   agent tooling untracked and gitignored; local paths and personal references
+   removed (docs.rs links instead of `file:///C:/Users/...`); prototypes in
+   `examples/` deleted (L5); `LICENSE` (GPL-3.0-or-later), `Cargo.toml`, exe and
+   installer metadata (M6); `SECURITY.md`, `.github/FUNDING.yml`,
+   `dependabot.yml`, bug report template; `cargo audit` clean (tokio
+   RUSTSEC-2026-0384 bumped, yanked clipboard-win bumped; 4 "unmaintained"
+   warnings remain — `ttf-parser` via egui, and Linux-only `zbus` crates); clippy
+   clean (M4) and `ci.yml` gating clippy `-D warnings`, tests and audit; README
+   Support and License sections. Once merged, the repo is safe to make public;
+   the rest of the 1.0 work can happen in the open.
+1. **Hygiene** — L1–L4, L7: history comments, wrong comments, dead code, legacy migration, Serena memories. No behavior change.
 2. **Robustness** — H1, H2 (panic hook + graceful shutdown), M1 (manifest), M3, M5.
 3. **Installer** — H3, wait for the mutex before `taskkill`, `[Run]` relaunch after a silent update.
-4. **Open-source packaging** — `LICENSE` (GPL-3.0), `Cargo.toml` metadata, third-party notices (M7), `.github/FUNDING.yml`, `CONTRIBUTING.md` (short: issues welcome, how to build), issue templates (bug report asks for `gameframe.log`).
-5. **CI and release** — `ci.yml`, `release.yml`, `CHANGELOG.md`, version 1.0.0-rc.1 as a pre-release.
+4. **Open-source packaging** — third-party notices (M7), `CONTRIBUTING.md` (issues welcome, how to build).
+5. **Release pipeline** — `release.yml`, `CHANGELOG.md`, version 1.0.0-rc.1 as a pre-release.
 6. **Updater + About/Support** — §3 option A plus §4, tested end to end from `1.0.0-rc.1` → `1.0.0-rc.2` (pre-releases, invisible to `releases/latest`, so the test points the updater at the full release list or a test repo).
-7. **Docs** — README (L6), SmartScreen and AV note, "Support" section.
-8. **Make the repo public** (§7) — after steps 1–7 are merged, so the first public impression is the cleaned-up code.
-9. **Release 1.0.0.**
+7. **Docs** — README rewrite (L6), SmartScreen and AV note.
+8. **Release 1.0.0.**
 
 ---
 
 ## 7. Manual steps for the owner
 
-Things only the repo owner can do, in order:
+Already decided: GPL-3.0-or-later, the PayPal link, the commit email stays,
+agent files untracked. What's left for you, in order:
 
-1. **GPL variant** — `GPL-3.0-or-later` (lets the project move to a future GPL
-   version; the common choice) or `GPL-3.0-only`. Say which; the `LICENSE` file and
-   `Cargo.toml` follow in §6 step 4.
-2. **PayPal link** — create a donation link (paypal.me/<name> or a PayPal
-   "Donate" button link) and hand it over. It goes into `.github/FUNDING.yml`
-   (`custom: ["https://paypal.me/<name>"]`), the README and Settings > About.
-   Note: PayPal may treat recurring donations as income — check what applies to
-   you with Skatteverket if the amounts grow.
-3. **Decide on the public commit email.** Every commit carries
-   `jonas.ranerfors@gmail.com`; once public, it's harvestable. Either accept it, or
-   switch future commits to the GitHub noreply address
-   (`git config user.email <id>+ranarn@users.noreply.github.com`, and GitHub →
-   Settings → Emails → "Keep my email addresses private"). Rewriting existing
-   history is possible but not worth it.
-4. **Decide what of `.claude/`, `.serena/` and `CLAUDE.md` stays tracked.** They
-   become public: board field IDs, pipeline config, agent memories. Nothing secret
-   was found (history scanned for `ghp_`, `github_pat_`, `password=`, `api_key`,
-   `secret=` on 2026-10-24 — no hits), but it's your call whether they belong in a
-   public repo.
-5. **Make the repo public** — after §6 steps 1–7 are merged: `ranarn/gameframe` →
-   Settings → General → Danger Zone → Change visibility → Public. Add a description,
-   topics (`windows`, `gaming`, `borderless`, `rust`) and the website field.
-6. **Actions permissions** — Settings → Actions → General → Workflow permissions →
-   "Read and write", so `release.yml` can create releases with `GITHUB_TOKEN`.
-   Also "Fork pull request workflows" → require approval for first-time contributors.
-7. **Branch protection on `main`** — Settings → Branches (or Rules) → require the
-   CI check to pass before merge.
-8. **Turn on** Settings → Code security → Private vulnerability reporting and
-   Dependabot alerts (Dependabot is already opening PRs).
-9. **Code signing (optional, later).** Unsigned, the first download shows
+1. **Review and merge the `chore/prepare-public-repo` PR.** The new CI runs on it —
+   check that both jobs (`check`, `audit`) go green on GitHub's runners.
+2. **Delete the 8 old remote branches** (all squash-merged via PRs #44–#58;
+   each can be restored from its PR page):
+   `git push origin --delete chore/dependency-updates feat/installer-autostart feature/cursor-highlight feature/post-testing-ux-and-windows-integration-fixes feature/single-zone-replaces-presets fix/drop-gtk-deps fix/game-own-pivot fix/game-own-tip-pivot`
+   Then turn on Settings → General → "Automatically delete head branches".
+3. **Make the repo public** — `ranarn/gameframe` → Settings → General → Danger
+   Zone → Change visibility → Public. Add a description, topics (`windows`,
+   `gaming`, `borderless`, `rust`) and the website field.
+4. **Security settings** (available once public) — Settings → Code security:
+   turn on Private vulnerability reporting (`SECURITY.md` points there), Dependabot
+   alerts and security updates, Secret scanning and Push protection.
+5. **Actions settings** — Settings → Actions → General: Workflow permissions →
+   "Read and write" (for the coming `release.yml`); Fork pull request workflows →
+   "Require approval for first-time contributors".
+6. **Protect `main`** — Settings → Rules → Rulesets → New branch ruleset for
+   `main`: require a pull request, require the status checks `check` and `audit`,
+   block force pushes and deletion.
+7. **Funding button** — once `.github/FUNDING.yml` is on `main`, GitHub shows a
+   "Sponsor" button with the PayPal link (Settings → General → Features →
+   "Sponsorships" must be ticked). Donations may count as income — check with
+   Skatteverket if the amounts grow.
+8. **Code signing (optional, later).** Unsigned, the first download shows
    SmartScreen's "Windows protected your PC" until the file builds reputation.
    Updates GameFrame downloads itself don't carry the Mark-of-the-Web, so they
    don't trigger SmartScreen. Now that it's open source, **SignPath Foundation**
    (free code signing for OSS under an OSI license — GPL-3.0 qualifies) is an
    option; apply once the repo is public and has a release. Alternative: Azure
    Artifact Signing (monthly fee; check eligibility for individuals in Sweden).
-10. **Per release**: bump the version, update `CHANGELOG.md`, tag `vX.Y.Z`, push the
-    tag, check the release page. (Fully scripted after §6 step 5.)
-11. **Smoke test each release on a clean Windows user** (or Windows Sandbox):
-   download → SmartScreen → install → draw Zone → apply to a game → update from
-   the previous version → uninstall (taskbar visible, autostart gone, config kept).
+9. **Per release**: bump the version, update `CHANGELOG.md`, tag `vX.Y.Z`, push the
+   tag, check the release page. (Fully scripted after §6 step 5.)
+10. **Smoke test each release on a clean Windows user** (or Windows Sandbox):
+    download → SmartScreen → install → draw Zone → apply to a game → update from
+    the previous version → uninstall (taskbar visible, autostart gone, config kept).
