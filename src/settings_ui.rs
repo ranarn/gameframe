@@ -1561,8 +1561,7 @@ mod tests {
 
     #[test]
     fn config_with_zone_replaces_only_the_zone_of_the_on_disk_config() {
-        let mut on_disk = Config::default();
-        on_disk.zone = Some(Zone { x: 1, y: 2, width: 3, height: 4 });
+        let mut on_disk = Config { zone: Some(Zone { x: 1, y: 2, width: 3, height: 4 }), ..Config::default() };
         on_disk.hotkeys.toggle_borderless = Some("Ctrl+B".to_string());
         let new_zone = Zone { x: 100, y: 50, width: 800, height: 600 };
 

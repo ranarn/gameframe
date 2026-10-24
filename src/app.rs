@@ -107,11 +107,10 @@ pub fn run() -> Result<(), TrayUiError> {
     // on the taskbar) and before the process actually exits, so the desktop
     // is never left with the taskbar hidden and no running GameFrame
     // instance left to bring it back.
-    if let Some(restore) = win32::take_any_armed_taskbar_restore() {
-        if let Err(e) = win32::restore_taskbar(restore) {
+    if let Some(restore) = win32::take_any_armed_taskbar_restore()
+        && let Err(e) = win32::restore_taskbar(restore) {
             log!("failed to restore taskbar on exit: {e}");
         }
-    }
 
     if let Some(hook) = launch_watcher_hook {
         launch_watcher::unregister(hook);
@@ -535,8 +534,8 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // second, separate `GetForegroundWindow()` call.
     let fg_hwnd = win32::foreground_window();
 
-    if is_restoring {
-        if !should_allow_restore(fg_hwnd, *stripped_hwnd) {
+    if is_restoring
+        && !should_allow_restore(fg_hwnd, *stripped_hwnd) {
             log!(
                 "borderless toggle: a pending restore exists for a different window; ignoring press until that window is focused again"
             );
@@ -546,7 +545,6 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
             // issue #31 iteration 3).
             return false;
         }
-    }
 
     let tracked = fg_hwnd
         .and_then(window_filter::exe_path_for_window)
@@ -626,9 +624,9 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // later automatically restores the taskbar with no hotkey press
     // required. `fg_hwnd` is guaranteed `Some` here: `tracked` was only
     // resolved (in the strip direction) from `fg_hwnd` itself above.
-    if !is_restoring {
-        if let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd) {
-            if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+    if !is_restoring
+        && let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd)
+            && let Err(e) = win32::set_taskbar_hide_absolute_armed(
                 hwnd,
                 config.hide_taskbar_on_apply,
                 config.taskbar_hide_mode,
@@ -638,8 +636,6 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
                     tracked_game.display_name
                 );
             }
-        }
-    }
 
     false
 }

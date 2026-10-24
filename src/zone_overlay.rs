@@ -317,18 +317,16 @@ impl OverlayApp {
                         ui.horizontal(|ui| {
                             let save_button =
                                 control_button("Save", egui::Color32::from_rgb(34, 160, 60));
-                            if ui.add_enabled(can_save, save_button).clicked() {
-                                if let Some(outcome) = self.state.apply(Action::Save) {
+                            if ui.add_enabled(can_save, save_button).clicked()
+                                && let Some(outcome) = self.state.apply(Action::Save) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
-                            }
                             let cancel_button =
                                 control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
-                            if ui.add(cancel_button).clicked() {
-                                if let Some(outcome) = self.state.apply(Action::Cancel) {
+                            if ui.add(cancel_button).clicked()
+                                && let Some(outcome) = self.state.apply(Action::Cancel) {
                                     *self.outcome.borrow_mut() = Some(outcome);
                                 }
-                            }
                         });
                         ui.vertical_centered(|ui| {
                             ui.label(

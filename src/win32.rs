@@ -1281,10 +1281,10 @@ pub fn list_visible_windows() -> Vec<(HWND, String)> {
     // Layer 2 (see `docs/research/game-window-filtering.md`): a stable sort
     // by descending `WindowRank` surfaces likely games first in the picker,
     // without ever removing a window ranked `WindowRank::Unknown` -- ranking
-    // only ever reorders, it never filters. `Vec::sort_by` is a stable sort,
-    // so windows that tie on rank keep the relative order `EnumWindows`
+    // only ever reorders, it never filters. `Vec::sort_by_key` is a stable
+    // sort, so windows that tie on rank keep the relative order `EnumWindows`
     // produced them in (roughly Z-order).
-    state.windows.sort_by(|a, b| b.2.cmp(&a.2));
+    state.windows.sort_by_key(|w| std::cmp::Reverse(w.2));
     state.windows.into_iter().map(|(hwnd, title, _rank)| (hwnd, title)).collect()
 }
 

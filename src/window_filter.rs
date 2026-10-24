@@ -405,12 +405,14 @@ fn loaded_module_names(pid: u32) -> Vec<String> {
     names
 }
 
+/// When a Steam-install-directory scan ran, and what it found.
+type SteamInstallDirsSnapshot = (std::time::Instant, Vec<std::path::PathBuf>);
+
 /// The cached snapshot of known Steam install directories, refreshed lazily
 /// (see [`known_steam_install_dirs`]) rather than on every
 /// `crate::win32::list_visible_windows` call.
-fn steam_install_dirs_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, Vec<std::path::PathBuf>)>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<std::path::PathBuf>)>>> =
-        std::sync::OnceLock::new();
+fn steam_install_dirs_cache() -> &'static std::sync::Mutex<Option<SteamInstallDirsSnapshot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<SteamInstallDirsSnapshot>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -433,11 +435,10 @@ const STEAM_INSTALL_DIRS_CACHE_TTL: std::time::Duration = std::time::Duration::f
 fn known_steam_install_dirs() -> Vec<std::path::PathBuf> {
     let cache = steam_install_dirs_cache();
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((cached_at, dirs)) = guard.as_ref() {
-        if cached_at.elapsed() < STEAM_INSTALL_DIRS_CACHE_TTL {
+    if let Some((cached_at, dirs)) = guard.as_ref()
+        && cached_at.elapsed() < STEAM_INSTALL_DIRS_CACHE_TTL {
             return dirs.clone();
         }
-    }
 
     let dirs = scan_steam_install_dirs();
     *guard = Some((std::time::Instant::now(), dirs.clone()));

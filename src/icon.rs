@@ -73,13 +73,13 @@ fn in_bracket(x: f32, y: f32, hi: f32, margin: f32, arm_len: f32, thickness: f32
         (margin, far, 1.0, -1.0),
         (far, far, -1.0, -1.0),
     ];
-    corners.iter().any(|&(cx, cy, dx, dy)| in_arm_pair(x, y, cx, cy, dx, dy, arm_len, thickness))
+    corners.iter().any(|&corner| in_arm_pair(x, y, corner, arm_len, thickness))
 }
 
 /// One corner's two arms: a horizontal band running along the corner's row
 /// and a vertical band running along its column, both `thickness` wide and
 /// `arm_len` long, extending from `(cx, cy)` toward the center by `(dx, dy)`.
-fn in_arm_pair(x: f32, y: f32, cx: f32, cy: f32, dx: f32, dy: f32, arm_len: f32, thickness: f32) -> bool {
+fn in_arm_pair(x: f32, y: f32, (cx, cy, dx, dy): (f32, f32, f32, f32), arm_len: f32, thickness: f32) -> bool {
     let in_range = |v: f32, a: f32, b: f32| v >= a.min(b) && v <= a.max(b);
 
     let horizontal = in_range(x, cx, cx + dx * arm_len) && in_range(y, cy, cy + dy * thickness);
@@ -155,7 +155,7 @@ mod tests {
         // At 16x16 the minimum-thickness clamp must still produce visible,
         // non-degenerate brackets rather than vanishing entirely.
         let rgba = mark_rgba(16);
-        let opaque_pixel_count = rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
+        let opaque_pixel_count = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
         assert!(opaque_pixel_count > 8, "brackets should not disappear at 16x16, got {opaque_pixel_count} opaque pixels");
     }
 }

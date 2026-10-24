@@ -376,7 +376,7 @@ pub fn cursor_image(
 ) -> Bitmap {
     let mut image = Bitmap::blank(width, height, hotspot_x, hotspot_y);
     let n = ((width * height) as usize).min(bgra.len() / 4);
-    let has_alpha = bgra[..n * 4].chunks_exact(4).any(|p| p[3] != 0);
+    let has_alpha = bgra[..n * 4].as_chunks::<4>().0.iter().any(|p| p[3] != 0);
     for i in 0..n {
         let p = &bgra[i * 4..i * 4 + 4];
         let alpha = if has_alpha {
