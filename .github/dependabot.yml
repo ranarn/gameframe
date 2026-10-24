@@ -1,9 +1,13 @@
 version: 2
 updates:
+  # A week's cooldown before proposing a new release: compromised versions
+  # are usually caught and yanked within days.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       cargo:
         patterns: ["*"]
@@ -11,3 +15,5 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7

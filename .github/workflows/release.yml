@@ -51,7 +51,7 @@ jobs:
           persist-credentials: false
 
       - id: next
-        uses: ranarn/release-pilot@256256fd1d98f9a6006c6a5b461825fbb3fb0c00 # v1.0.8
+        uses: ranarn/release-pilot@0810e9f937aebbe4553ec095205640f6e620a824 # v1.0.9
         with:
           dry-run: true
           default-bump: none
@@ -92,7 +92,7 @@ jobs:
           path: dist
 
       - id: release
-        uses: ranarn/release-pilot@256256fd1d98f9a6006c6a5b461825fbb3fb0c00 # v1.0.8
+        uses: ranarn/release-pilot@0810e9f937aebbe4553ec095205640f6e620a824 # v1.0.9
         with:
           default-bump: none
           commit-sha: ${{ github.sha }}
