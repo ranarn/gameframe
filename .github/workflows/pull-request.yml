@@ -1,15 +1,14 @@
-name: CI
+name: Pull request
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 # Actions are pinned to commit SHAs (tag in the comment); Dependabot's
-# github-actions updates keep the pins current.
+# github-actions updates keep the pins current. The job names `check` and
+# `audit` are the required status checks of the `main` ruleset.
 jobs:
   check:
     runs-on: windows-latest
@@ -30,7 +29,6 @@ jobs:
     permissions:
       contents: read
       checks: write
-      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
