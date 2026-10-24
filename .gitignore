@@ -6,3 +6,7 @@
 /CLAUDE.md
 /.claude/
 /.serena/
+
+# Design docs, research notes and prototypes: kept on the maintainer's
+# machine, not published.
+/docs/

@@ -473,8 +473,7 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// pending for *this same window* -- see below), applies (or reverts) the
 /// border-strip via [`win32::toggle_borderless_on_foreground_window`], then,
 /// on a successful strip only, sets the tracked game's taskbar-auto-hide
-/// value absolutely (see
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`).
+/// value absolutely.
 ///
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
@@ -616,8 +615,9 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
     // on restore (using the same fixed global boolean) would leave the
     // taskbar auto-hidden after the user exits borderless/game mode instead
     // of it coming back, for the common `hide_taskbar_on_apply: true` default
-    // (MEDIUM review finding, issue #31 iteration 3). ADR 0002's coupling is
-    // about the strip/apply action, not the restore/undo action.
+    // (MEDIUM review finding, issue #31 iteration 3). Coupling taskbar hide
+    // to the Zone apply is about the strip/apply action, not the
+    // restore/undo action.
     //
     // Uses `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
@@ -650,13 +650,12 @@ fn handle_toggle_borderless(config_dir: &Path, toggle_state: &mut Option<Restore
 /// which may not be the foreground window at all, that's the whole point of
 /// this tray-menu path -- via [`win32::apply_borderless_to_window`], and,
 /// only once that border-apply succeeds, sets the tracked game's
-/// taskbar-auto-hide value absolutely (see
-/// `docs/adr/0002-taskbar-autohide-coupled-to-preset-apply.md`). A
+/// taskbar-auto-hide value absolutely. A
 /// border-apply failure (e.g. the target window is minimized) returns early
 /// without touching the taskbar at all -- mirroring
 /// [`handle_toggle_borderless`]'s equivalent gating -- since forcing the
 /// taskbar into auto-hide for a window that was never actually stripped
-/// would contradict ADR 0002's whole rationale for coupling the two.
+/// would contradict the whole point of coupling the two.
 ///
 /// A one-shot action, not a toggle: there is no remembered restore state for
 /// this path (see this module's doc comment for the scope decision), so

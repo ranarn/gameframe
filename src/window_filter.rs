@@ -1,6 +1,5 @@
 //! The tray menu's "Apply to Window" picker's two-layer game-window
-//! filtering/ranking (see `docs/research/game-window-filtering.md` for the
-//! full rationale):
+//! filtering/ranking:
 //!
 //! - Layer 1 ([`is_listable_window`]) hard-filters cloaked/owned/tool windows
 //!   out of the list entirely.
@@ -37,8 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Decides whether a window is worth offering in the tray menu's "Apply to
-/// Window" picker -- Layer 1 of the game-window filtering documented in
-/// `docs/research/game-window-filtering.md`: hard filters that unconditionally
+/// Window" picker -- Layer 1 of the game-window filtering: hard filters that unconditionally
 /// exclude a window, as opposed to Layer 2's ranking-only signals (see
 /// [`rank_window`]) which never hide a window.
 ///
@@ -83,8 +81,8 @@ pub(crate) fn is_listable_window(
 /// - it's currently visible;
 /// - it isn't cloaked (`DWMWA_CLOAKED` -- DWM-hidden windows, e.g. a
 ///   suspended UWP/Store-app window on another virtual desktop, that still
-///   report `IsWindowVisible() == TRUE` with a stale title; see the Old New
-///   Thing post cited in the research doc);
+///   report `IsWindowVisible() == TRUE` with a stale title; see Raymond
+///   Chen's "The Old New Thing");
 /// - it is its own root owner's current last-active-visible-popup (per the
 ///   documented Alt-Tab algorithm: `GetAncestor(hwnd, GA_ROOTOWNER)` +
 ///   `GetLastActivePopup`), which collapses owner/owned window chains (a
@@ -113,8 +111,7 @@ pub(crate) fn is_canonical_window(
         && (has_app_window_style || (is_root_owner_or_last_active_popup && !has_tool_window_style))
 }
 
-/// Layer 2 of the game-window filtering documented in
-/// `docs/research/game-window-filtering.md`: how confidently a window looks
+/// Layer 2 of the game-window filtering: how confidently a window looks
 /// like a game, from weakest to strongest signal (declaration order doubles
 /// as `Ord`/`PartialOrd` ranking, lowest variant first) -- used only to sort
 /// the "Apply to Window" picker's list and/or badge an entry; unlike
@@ -163,8 +160,7 @@ pub(crate) fn rank_window(is_launcher_match: bool, has_graphics_module: bool, ha
     }
 }
 
-/// The Layer-2 window-class heuristic list from
-/// `docs/research/game-window-filtering.md`: a small, explicitly-known set of
+/// The Layer-2 window-class heuristic list: a small, explicitly-known set of
 /// game-engine window classes, used only as the weakest tie-breaker signal in
 /// [`rank_window`] -- never as an exclusion.
 const KNOWN_ENGINE_WINDOW_CLASSES: &[&str] = &["UnrealWindow", "Direct3DWindowClass", "YYGameMakerYY"];
@@ -175,8 +171,7 @@ const KNOWN_ENGINE_WINDOW_CLASSES: &[&str] = &["UnrealWindow", "Direct3DWindowCl
 const KNOWN_ENGINE_WINDOW_CLASS_PREFIXES: &[&str] = &["SDL_app", "GLFW"];
 
 /// Whether `class_name` (a window's `GetClassNameW` result) matches one of
-/// the small, explicitly-known game-engine window classes documented in
-/// `docs/research/game-window-filtering.md`. Pure string matching -- no OS
+/// the small, explicitly-known game-engine window classes. Pure string matching -- no OS
 /// dependency -- so it's unit testable in isolation from the real
 /// `GetClassNameW` call that supplies `class_name`.
 fn is_known_engine_window_class(class_name: &str) -> bool {
@@ -184,8 +179,7 @@ fn is_known_engine_window_class(class_name: &str) -> bool {
         || KNOWN_ENGINE_WINDOW_CLASS_PREFIXES.iter().any(|prefix| class_name.starts_with(prefix))
 }
 
-/// The Layer-2 loaded-graphics-module list from
-/// `docs/research/game-window-filtering.md`: DLLs whose presence in a
+/// The Layer-2 loaded-graphics-module list: DLLs whose presence in a
 /// process's already-loaded module list is a medium-confidence "this process
 /// talks to a graphics API" signal for [`rank_window`] -- never an exclusion.
 const KNOWN_GRAPHICS_MODULES: &[&str] = &["d3d9.dll", "d3d11.dll", "dxgi.dll", "d3d12.dll", "opengl32.dll", "vulkan-1.dll"];
@@ -206,7 +200,7 @@ fn has_known_graphics_module(loaded_module_names: &[String]) -> bool {
 /// resolved via `QueryFullProcessImageNameW`) sits inside one of
 /// `known_install_dirs` -- a cached snapshot of known launcher (Steam, via
 /// the `steamlocate` crate) install directories. The strongest of the three
-/// Layer-2 signals per `docs/research/game-window-filtering.md`: a match
+/// Layer-2 signals: a match
 /// essentially never false-positives, since it doesn't depend on window
 /// styles or graphics APIs at all.
 ///
@@ -367,7 +361,7 @@ pub(crate) fn exe_path_for_window(hwnd: HWND) -> Option<std::path::PathBuf> {
 /// Layer-2 signal exists to help rank, since they often lack a launcher-
 /// install match) still ship 32-bit executables. Returns an empty list on any
 /// failure (documented as possible if the target's loader state is
-/// transiently inconsistent -- see `docs/research/game-window-filtering.md`)
+/// transiently inconsistent)
 /// -- treated as "unknown," not "not a game," since this only ever feeds a
 /// ranking signal, never an exclusion.
 ///
@@ -420,8 +414,7 @@ fn steam_install_dirs_cache() -> &'static std::sync::Mutex<Option<SteamInstallDi
 /// [`known_steam_install_dirs`] rescans -- installed games don't change
 /// per-frame, so this is refreshed lazily (e.g. roughly once per tray-menu
 /// open at typical interaction cadence) rather than on every
-/// `crate::win32::list_visible_windows` call, per
-/// `docs/research/game-window-filtering.md`.
+/// `crate::win32::list_visible_windows` call.
 const STEAM_INSTALL_DIRS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Returns the cached snapshot of known Steam install directories (via the
@@ -488,7 +481,7 @@ pub(crate) fn window_ex_style(hwnd: HWND) -> u32 {
 }
 
 /// Implements the documented Alt-Tab "which windows appear in the list?"
-/// algorithm (see `docs/research/game-window-filtering.md`): walks to
+/// algorithm: walks to
 /// `hwnd`'s root owner via `GetAncestor(hwnd, GA_ROOTOWNER)`, then finds that
 /// owner's current last-active-visible-popup via `GetLastActivePopup` --
 /// `hwnd` qualifies only if it *is* that computed representative window. This
@@ -510,8 +503,7 @@ pub(crate) fn is_root_owner_or_last_active_popup(hwnd: HWND) -> bool {
 /// Queries `DWMWA_CLOAKED` for `hwnd` -- true if DWM is currently hiding the
 /// window from the screen despite it reporting `IsWindowVisible() == TRUE`
 /// (e.g. a suspended UWP/Store-app window sitting on another virtual
-/// desktop). Per the Old New Thing post cited in
-/// `docs/research/game-window-filtering.md`, a failed/erroring
+/// desktop). Per Raymond Chen's "The Old New Thing", a failed/erroring
 /// `DwmGetWindowAttribute` call is treated the same as "not cloaked" --
 /// cloaking is an opt-in extra signal, not something whose absence should be
 /// assumed on query failure.

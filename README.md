@@ -4,8 +4,7 @@ A Windows system-tray utility that makes a game/app window borderless and reposi
 defined screen region, and toggles taskbar auto-hide via a global hotkey. Replaces two separate
 background tools (Windowed Borderless Gaming + a standalone Hide Taskbar utility) with one process.
 
-Design decisions: [`docs/adr/`](docs/adr/); background research: [`docs/research/`](docs/research/);
-domain vocabulary: [`CONTEXT.md`](CONTEXT.md).
+Domain vocabulary: [`CONTEXT.md`](CONTEXT.md).
 
 ## Status
 
@@ -24,8 +23,7 @@ MVP complete. GameFrame runs as a tray-resident background process with:
   YoloMouse replacement that never touches the game process): seven shapes, or "Game's own" —
   an enlarged copy of the game's own cursor, with border and glow following its outline —
   plus size, color, opacity, border and glow, shown only while the mouse is over a tracked
-  game, drawn as a click-through overlay. Shake the mouse to make it pulse. See
-  `docs/adr/0004-game-cursor-without-injection.md`.
+  game, drawn as a click-through overlay. Shake the mouse to make it pulse.
 - **Log file** — `%APPDATA%\GameFrame\gameframe.log` (capped at 1 MB, previous file kept as
   `gameframe.old.log`): errors, plus the taskbar's real state on every taskbar-hotkey press.
 - **Settings window** (`egui`, opened on demand from the tray menu, not resident at idle) for

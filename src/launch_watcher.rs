@@ -2,10 +2,8 @@
 //! a `SetWinEventHook(WINEVENT_OUTOFCONTEXT)` registration on
 //! `EVENT_SYSTEM_FOREGROUND`, and reacts by applying the Zone and
 //! taskbar-auto-hide state the same way the hotkey/tray "Apply to Window"
-//! paths do -- with no hotkey press required. See issue #32 and
-//! `docs/research/idle-game-launch-detection.md` for the comparison
-//! rationale behind choosing this mechanism over a toolhelp poll loop or a
-//! WMI process-creation subscription.
+//! paths do -- with no hotkey press required. This mechanism was chosen over a toolhelp poll loop or a WMI
+//! process-creation subscription (see issue #32).
 //!
 //! # Registration
 //!
@@ -41,8 +39,8 @@
 //!
 //! # Feature-flag correction
 //!
-//! `docs/research/idle-game-launch-detection.md` (and this issue's own
-//! brief) assumed `SetWinEventHook`/`UnhookWinEvent`/`HWINEVENTHOOK` live in
+//! The original design research (and this issue's own brief) assumed
+//! `SetWinEventHook`/`UnhookWinEvent`/`HWINEVENTHOOK` live in
 //! `windows_sys::Win32::UI::WindowsAndMessaging`, the same module as
 //! `EVENT_SYSTEM_FOREGROUND`/`WINEVENT_OUTOFCONTEXT` -- verified empirically
 //! (per this issue's own instruction to check the locally-cached
