@@ -1,7 +1,7 @@
-//! Owns the system tray icon and its three top-level context menu items
-//! ("Show Settings", "Apply to Window", "Exit"), plus the id -> action
-//! mapping that lets `app`'s event loop recognize a click on "Exit" and
-//! start the clean-shutdown path.
+//! Owns the system tray icon and its five top-level context menu items
+//! ("Show Settings", "Apply to Window", "Start with Windows", "Check for
+//! Updates Now", "Exit"), plus the id -> action mapping that lets `app`'s
+//! event loop recognize a click on "Exit" and start the clean-shutdown path.
 //!
 //! "Apply to Window" is itself a live [`Submenu`] of currently-visible
 //! top-level windows (see [`Tray::refresh_apply_to_window_menu`] for the
@@ -40,16 +40,18 @@ use windows_sys::Win32::Foundation::HWND;
 pub enum TrayAction {
     ShowSettings,
     ToggleStartWithWindows,
+    CheckForUpdates,
     Exit,
 }
 
 const SHOW_SETTINGS_ID: &str = "gameframe-show-settings";
 const APPLY_TO_WINDOW_ID: &str = "gameframe-apply-to-window";
 const START_WITH_WINDOWS_ID: &str = "gameframe-start-with-windows";
+const CHECK_FOR_UPDATES_ID: &str = "gameframe-check-for-updates";
 const EXIT_ID: &str = "gameframe-exit";
 
 /// Prefix for the dynamically-generated "Apply to Window" submenu items'
-/// ids, distinguishing them from the three fixed top-level menu items above.
+/// ids, distinguishing them from the five fixed top-level menu items above.
 ///
 /// Id-encoding scheme: a window-picker item's id is this prefix followed by
 /// the target `HWND`'s numeric value (`hwnd as isize`, decimal), e.g.
@@ -68,7 +70,7 @@ fn encode_window_item_id(hwnd: HWND) -> MenuId {
 
 /// Recovers the target `HWND` encoded by [`encode_window_item_id`] from a
 /// `MenuEvent`'s id, or `None` if `id` isn't one of this shape (e.g. it's one
-/// of the three fixed top-level menu items, or garbage) -- lets `app`'s
+/// of the five fixed top-level menu items, or garbage) -- lets `app`'s
 /// dispatch loop tell "this is a window-picker click" apart from the fixed
 /// actions ([`TrayMenuIds::action_for`]) without either mechanism knowing
 /// about the other's id format.
@@ -80,7 +82,7 @@ pub fn decode_window_item_id(id: &MenuId) -> Option<HWND> {
         .map(|value| value as HWND)
 }
 
-/// The three tray menu items' ids, and the mapping back from an id to
+/// The five tray menu items' ids, and the mapping back from an id to
 /// the [`TrayAction`] it represents. Pure data -- no OS calls -- so
 /// it's testable without a live tray icon.
 #[derive(Debug, Clone)]
@@ -88,6 +90,7 @@ pub struct TrayMenuIds {
     show_settings: MenuId,
     apply_to_window: MenuId,
     start_with_windows: MenuId,
+    check_for_updates: MenuId,
     exit: MenuId,
 }
 
@@ -97,6 +100,7 @@ impl TrayMenuIds {
             show_settings: MenuId::new(SHOW_SETTINGS_ID),
             apply_to_window: MenuId::new(APPLY_TO_WINDOW_ID),
             start_with_windows: MenuId::new(START_WITH_WINDOWS_ID),
+            check_for_updates: MenuId::new(CHECK_FOR_UPDATES_ID),
             exit: MenuId::new(EXIT_ID),
         }
     }
@@ -114,6 +118,8 @@ impl TrayMenuIds {
             Some(TrayAction::ShowSettings)
         } else if *id == self.start_with_windows {
             Some(TrayAction::ToggleStartWithWindows)
+        } else if *id == self.check_for_updates {
+            Some(TrayAction::CheckForUpdates)
         } else if *id == self.exit {
             Some(TrayAction::Exit)
         } else {
@@ -131,7 +137,7 @@ impl Default for TrayMenuIds {
 /// Reasons building the OS tray icon or its menu can fail.
 #[derive(Debug)]
 pub enum TrayUiError {
-    /// Building the placeholder tray icon image failed.
+    /// Building the tray icon image failed.
     Icon(tray_icon::BadIcon),
     /// Appending an item to the tray's context menu failed.
     Menu(tray_icon::menu::Error),
@@ -174,10 +180,10 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Builds and shows the real OS tray icon with its three top-level menu
-    /// items ("Show Settings", "Apply to Window", "Exit"), where "Apply to
-    /// Window" is itself a [`Submenu`] populated with one item per
-    /// currently-visible top-level window (see
+    /// Builds and shows the real OS tray icon with its five top-level menu
+    /// items ("Show Settings", "Apply to Window", "Start with Windows",
+    /// "Check for Updates Now", "Exit"), where "Apply to Window" is itself a [`Submenu`] populated with
+    /// one item per currently-visible top-level window (see
     /// [`rebuild_apply_to_window_items`]).
     ///
     /// OS-facing: requires a live Win32 event loop pumping on this
@@ -211,6 +217,14 @@ impl Tray {
         menu.append(&start_with_windows_item)
             .map_err(TrayUiError::Menu)?;
 
+        menu.append(&MenuItem::with_id(
+            ids.check_for_updates.clone(),
+            "Check for Updates Now",
+            true,
+            None,
+        ))
+        .map_err(TrayUiError::Menu)?;
+
         menu.append(&MenuItem::with_id(ids.exit.clone(), "Exit", true, None))
             .map_err(TrayUiError::Menu)?;
 
@@ -231,7 +245,7 @@ impl Tray {
         })
     }
 
-    /// The id -> action mapping for this tray's three fixed top-level menu
+    /// The id -> action mapping for this tray's five fixed top-level menu
     /// items.
     pub fn ids(&self) -> &TrayMenuIds {
         &self.ids
@@ -252,16 +266,14 @@ impl Tray {
     /// [`tray_icon::TrayIconEvent::receiver`] -- i.e. right before the user
     /// is actually about to see the menu, since (per `tray-icon`'s Windows
     /// backend) the mouse must hover onto the tray icon (`Enter`) before a
-    /// click on it (`Click`) can open the context menu. An earlier revision
-    /// called this unconditionally before dispatching *every* pumped
-    /// message; that was replaced primarily because `tray-icon` sets a 15ms
-    /// `WM_TIMER` while the mouse merely rests near the icon, which would
-    /// otherwise have driven a full `EnumWindows` + per-window
-    /// `GetWindowTextW` + submenu rebuild (real Win32 syscalls) up to ~66
-    /// times/second just from the cursor resting nearby -- needlessly
-    /// expensive on this process's one and only message loop regardless of
-    /// any hang risk. A secondary, less certain consideration also
-    /// motivated moving the refresh off the hot path: per the documented
+    /// click on it (`Click`) can open the context menu. It is deliberately not
+    /// called before every pumped message: `tray-icon` sets a 15ms `WM_TIMER`
+    /// while the mouse merely rests near the icon, which would drive a full
+    /// `EnumWindows` + per-window `GetWindowTextW` + submenu rebuild (real
+    /// Win32 syscalls) up to ~66 times/second just from the cursor resting
+    /// nearby -- needlessly expensive on this process's one and only message
+    /// loop. A secondary, less certain consideration also favors keeping the
+    /// refresh off the hot path: per the documented
     /// `GetWindowText`/`GetWindowTextW` contract, a *same-process* target
     /// window causes a `WM_GETTEXT` to be sent via `SendMessage` (which can
     /// block if that window's own message handling is stuck), whereas a
@@ -273,8 +285,7 @@ impl Tray {
     /// desktop" -- it's closer to "one of GameFrame's own top-level windows
     /// (e.g. an open Settings window) getting stuck", which is a real but
     /// much smaller surface. Gating on `Enter`/`Click` avoids that residual
-    /// risk too, at effectively no cost, so it's kept even though the
-    /// hover-performance concern alone already justifies the change.
+    /// risk too, at effectively no cost.
     ///
     /// OS-facing: enumerates real windows and mutates a real `muda` submenu.
     /// Not exercised by this crate's automated tests -- see module docs.
@@ -360,6 +371,16 @@ mod tests {
     }
 
     #[test]
+    fn action_for_maps_the_check_for_updates_id_to_the_check_for_updates_action() {
+        let ids = TrayMenuIds::new();
+
+        assert_eq!(
+            ids.action_for(&MenuId::new(CHECK_FOR_UPDATES_ID)),
+            Some(TrayAction::CheckForUpdates)
+        );
+    }
+
+    #[test]
     fn action_for_maps_the_show_settings_id_to_the_show_settings_action() {
         let ids = TrayMenuIds::new();
 
@@ -414,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_window_item_id_rejects_one_of_the_three_fixed_top_level_menu_ids() {
+    fn decode_window_item_id_rejects_one_of_the_fixed_top_level_menu_ids() {
         assert_eq!(
             decode_window_item_id(&MenuId::new(APPLY_TO_WINDOW_ID)),
             None

@@ -17,6 +17,20 @@ fn main() {
         "LegalCopyright",
         "Copyright (C) 2026 Jonas Ranerfors. Licensed under GPL-3.0-or-later.",
     );
+    // Per-Monitor V2 DPI awareness from the first instruction, so every Win32
+    // coordinate (monitor geometry, window rects, SetWindowPos) is in physical
+    // pixels regardless of when winit/eframe first runs. `dpiAware` is the
+    // fallback for pre-Windows-10-1703 loaders, which ignore `dpiAwareness`.
+    resource.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>"#,
+    );
     resource
         .compile()
         .expect("failed to embed the Windows app icon resource (assets/icon.ico)");

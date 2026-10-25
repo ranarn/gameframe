@@ -8,6 +8,9 @@
 //!   overlay window ([`crate::zone_overlay`]) around the editing session,
 //!   not modeled as part of this pure state machine.
 //!
+//! - Works entirely in physical pixels; [`points_to_pixels`] and friends
+//!   convert at the egui boundary in [`crate::zone_overlay`].
+//!
 //! No window/OS dependency here -- fully unit tested below.
 
 use crate::profile_store::Zone;
@@ -217,6 +220,32 @@ impl AppState {
 /// edge without meaning to be flush with it.
 const EDGE_SNAP_PX: i32 = 20;
 
+/// The scale factor (egui points to physical pixels) for a monitor DPI;
+/// 96 DPI is 100 %.
+pub fn scale_from_dpi(dpi: u32) -> f32 {
+    dpi as f32 / 96.0
+}
+
+/// Converts a length or coordinate in egui points to physical pixels,
+/// rounding to the nearest pixel (halves away from zero).
+pub fn points_to_pixels(points: f32, scale: f32) -> i32 {
+    (points * scale).round() as i32
+}
+
+/// Converts physical pixels to egui points. Inverse of [`points_to_pixels`]:
+/// `points_to_pixels(pixels_to_points(px, s), s) == px`.
+pub fn pixels_to_points(pixels: i32, scale: f32) -> f32 {
+    pixels as f32 / scale
+}
+
+/// Converts an egui pointer position (points) to a pixel [`Point`].
+pub fn point_from_points(x: f32, y: f32, scale: f32) -> Point {
+    Point {
+        x: points_to_pixels(x, scale),
+        y: points_to_pixels(y, scale),
+    }
+}
+
 /// Snaps `value` to `edge` when within [`EDGE_SNAP_PX`] of it.
 fn snap_to_edge(value: i32, edge: i32) -> i32 {
     if (value - edge).abs() <= EDGE_SNAP_PX {
@@ -288,6 +317,61 @@ fn apply_handle_drag(original: Zone, handle: Handle, pointer: Point, monitor: Mo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCALES: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
+
+    #[test]
+    fn scale_from_dpi_is_dpi_over_96() {
+        assert_eq!(scale_from_dpi(96), 1.0);
+        assert_eq!(scale_from_dpi(120), 1.25);
+        assert_eq!(scale_from_dpi(144), 1.5);
+        assert_eq!(scale_from_dpi(192), 2.0);
+    }
+
+    #[test]
+    fn points_to_pixels_multiplies_by_scale_and_rounds_to_nearest() {
+        assert_eq!(points_to_pixels(100.0, 1.0), 100);
+        assert_eq!(points_to_pixels(100.0, 1.25), 125);
+        assert_eq!(points_to_pixels(100.0, 1.5), 150);
+        assert_eq!(points_to_pixels(100.0, 2.0), 200);
+        // Odd results round to the nearest pixel.
+        assert_eq!(points_to_pixels(101.0, 1.25), 126); // 126.25
+        assert_eq!(points_to_pixels(101.0, 1.5), 152); // 151.5
+        assert_eq!(points_to_pixels(0.3, 1.25), 0); // 0.375
+        assert_eq!(points_to_pixels(-10.0, 1.5), -15);
+    }
+
+    #[test]
+    fn pixels_to_points_divides_by_scale() {
+        assert_eq!(pixels_to_points(1920, 1.0), 1920.0);
+        assert_eq!(pixels_to_points(1920, 1.25), 1536.0);
+        assert_eq!(pixels_to_points(1920, 1.5), 1280.0);
+        assert_eq!(pixels_to_points(1920, 2.0), 960.0);
+        assert_eq!(pixels_to_points(1081, 2.0), 540.5);
+    }
+
+    #[test]
+    fn pixels_survive_a_round_trip_through_points_at_every_scale() {
+        for scale in SCALES {
+            for px in (-3000..=8000).chain([1, 3, 1079, 1081, 2559, 3839]) {
+                assert_eq!(
+                    points_to_pixels(pixels_to_points(px, scale), scale),
+                    px,
+                    "px {px} at scale {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_drawn_zone_converts_to_the_pixels_it_was_drawn_over_at_150_percent() {
+        // Dragging from point (100, 50) to (500, 350) at 150 % covers
+        // physical pixels (150, 75) to (750, 525).
+        let a = point_from_points(100.0, 50.0, 1.5);
+        let b = point_from_points(500.0, 350.0, 1.5);
+        assert_eq!(a, Point { x: 150, y: 75 });
+        assert_eq!(b, Point { x: 750, y: 525 });
+    }
 
     fn monitor() -> Monitor {
         Monitor {

@@ -17,8 +17,10 @@
 //! to it only through [`CursorOverlay`]'s shared state.
 //!
 //! The thread is per-monitor-DPI-aware (`SetThreadDpiAwarenessContext`), so
-//! cursor positions and the window are in physical pixels on every monitor
-//! regardless of the rest of the process's awareness.
+//! cursor positions and the window are in physical pixels on every monitor.
+//! The application manifest already declares Per-Monitor V2 for the whole
+//! process, so the call is redundant; it is kept so the thread stays correct
+//! even if the manifest changes.
 //!
 //! Like YoloMouse, the game cursor exists only in and over the game: it is
 //! shown while the window *under the cursor* (`WindowFromPoint`, which skips
@@ -74,6 +76,10 @@ const PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often to re-check whether the game cursor should be shown while it
 /// isn't.
 const IDLE_INTERVAL: Duration = Duration::from_millis(50);
+/// How often to check whether the pointer has entered a game while the game
+/// cursor is on but the pointer is elsewhere (~30 Hz: entering a game shows
+/// the cursor within ~33 ms).
+const SEARCH_INTERVAL: Duration = Duration::from_millis(33);
 /// How often to re-assert `HWND_TOPMOST` while shown, in case the game made
 /// its own window topmost after ours.
 const TOPMOST_INTERVAL: Duration = Duration::from_millis(500);
@@ -299,13 +305,7 @@ fn run_overlay_thread(shared: &Shared) {
             content = Content::Nothing;
             shake.reset();
             pulse_start = None;
-            // Poll fast while enabled so the pointer appears the moment the
-            // cursor crosses into the game.
-            timer.wait(if settings.enabled {
-                FRAME_INTERVAL
-            } else {
-                IDLE_INTERVAL
-            });
+            timer.wait(poll_interval(settings.enabled, over_game, false));
             continue;
         };
 
@@ -375,10 +375,28 @@ fn run_overlay_thread(shared: &Shared) {
             last_topmost = Instant::now();
         }
 
-        timer.wait(FRAME_INTERVAL);
+        timer.wait(poll_interval(
+            settings.enabled,
+            over_game,
+            pulse_start.is_some(),
+        ));
     }
 
     window.hide();
+}
+
+/// How long the overlay thread waits before its next tick. Full rate while
+/// the pointer is over a cursor-enabled game (or a pulse is playing), a
+/// slower search rate while the game cursor is on but the pointer is
+/// elsewhere, and the idle rate while it is off.
+fn poll_interval(enabled: bool, over_game: bool, pulsing: bool) -> Duration {
+    if !enabled {
+        IDLE_INTERVAL
+    } else if over_game || pulsing {
+        FRAME_INTERVAL
+    } else {
+        SEARCH_INTERVAL
+    }
 }
 
 /// What the overlay window currently displays.
@@ -877,6 +895,29 @@ mod tests {
             &input.games,
             Path::new("C:\\Games\\off.exe")
         ));
+    }
+
+    #[test]
+    fn poll_interval_is_fast_over_a_game_or_while_pulsing() {
+        assert_eq!(poll_interval(true, true, false), FRAME_INTERVAL);
+        assert_eq!(poll_interval(true, false, true), FRAME_INTERVAL);
+        assert_eq!(poll_interval(true, true, true), FRAME_INTERVAL);
+    }
+
+    #[test]
+    fn poll_interval_is_slow_while_searching_for_a_game() {
+        assert_eq!(poll_interval(true, false, false), SEARCH_INTERVAL);
+        assert!(SEARCH_INTERVAL > FRAME_INTERVAL);
+        assert!(SEARCH_INTERVAL < IDLE_INTERVAL);
+    }
+
+    #[test]
+    fn poll_interval_is_idle_when_disabled() {
+        for over_game in [false, true] {
+            for pulsing in [false, true] {
+                assert_eq!(poll_interval(false, over_game, pulsing), IDLE_INTERVAL);
+            }
+        }
     }
 
     #[test]

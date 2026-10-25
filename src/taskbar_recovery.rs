@@ -1,4 +1,4 @@
-//! Taskbar recovery after a crash or kill (issue #68).
+//! Taskbar recovery after a crash or kill.
 //!
 //! The release profile is `panic = "abort"`, so RAII guards never run on a
 //! panic, and a killed process runs nothing at all. A taskbar hidden with

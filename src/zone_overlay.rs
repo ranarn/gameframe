@@ -15,7 +15,7 @@
 //!
 //! Drives [`crate::zone_editor::AppState`] from real pointer input, and
 //! hides the taskbar for the duration of the editing session via
-//! [`crate::win32::hide_taskbar`] (mode-aware as of issue #42 -- see
+//! [`crate::win32::hide_taskbar`] (mode-aware -- see
 //! [`crate::profile_store::TaskbarHideMode`]), restoring exactly the
 //! previous state via [`crate::win32::restore_taskbar`] once the session
 //! ends -- Save, Cancel, or the window being closed any other way (an RAII
@@ -38,10 +38,16 @@
 use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
 use crate::win32;
-use crate::zone_editor::{Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome};
+use crate::zone_editor::{
+    Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome, pixels_to_points,
+    point_from_points, scale_from_dpi,
+};
 use eframe::egui;
 use std::cell::RefCell;
 use std::rc::Rc;
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
 /// afterward) can fail.
@@ -113,7 +119,8 @@ pub fn run_zone_editor_overlay(
     let outcome: Rc<RefCell<Option<SessionOutcome>>> = Rc::new(RefCell::new(None));
     let outcome_for_app = Rc::clone(&outcome);
 
-    let native_options = native_options(&monitor_geometry);
+    let scale = primary_monitor_scale();
+    let native_options = native_options(&monitor_geometry, scale);
 
     let run_result = eframe::run_native(
         "GameFrame zone editor",
@@ -162,7 +169,38 @@ impl Drop for TaskbarRestoreGuard {
     }
 }
 
-fn native_options(monitor: &MonitorGeometry) -> eframe::NativeOptions {
+/// The primary monitor's live DPI as a points-to-pixels factor, for placing
+/// the viewport before a window (and so a `Context`) exists. Winit derives
+/// the window's scale factor, and so egui's `pixels_per_point`, from the same
+/// monitor DPI; every conversion after startup goes through [`scale_of`].
+/// Falls back to 100 % if the query fails.
+fn primary_monitor_scale() -> f32 {
+    // Safety: `MonitorFromPoint` takes a point by value; `GetDpiForMonitor`
+    // writes only to the two `u32` out-params, which outlive the call.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+        let hr = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        if hr == 0 && dpi_x > 0 {
+            scale_from_dpi(dpi_x)
+        } else {
+            log!(
+                "zone editor: GetDpiForMonitor failed (hr={hr}, dpi={dpi_x}); assuming 100 % scale"
+            );
+            1.0
+        }
+    }
+}
+
+/// The single scale source for pointer and drawing conversions once the
+/// overlay is running.
+fn scale_of(ctx: &egui::Context) -> f32 {
+    ctx.pixels_per_point()
+}
+
+/// `scale` is the primary monitor's points-to-pixels factor: the viewport is
+/// specified in egui points, the monitor geometry is in physical pixels.
+fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOptions {
     // The default wgpu adapter/backend reports only
     // `CompositeAlphaMode::Opaque` for a plain top-level-window-bound
     // swapchain on this project's tested hardware -- true per-pixel window
@@ -177,14 +215,21 @@ fn native_options(monitor: &MonitorGeometry) -> eframe::NativeOptions {
         .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
 
     eframe::NativeOptions {
+        persist_window: false,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
         },
         viewport: egui::ViewportBuilder::default()
             .with_title("GameFrame zone editor")
-            .with_position([monitor.x as f32, monitor.y as f32])
-            .with_inner_size([monitor.width as f32, monitor.height as f32])
+            .with_position([
+                pixels_to_points(monitor.x, scale),
+                pixels_to_points(monitor.y, scale),
+            ])
+            .with_inner_size([
+                pixels_to_points(monitor.width, scale),
+                pixels_to_points(monitor.height, scale),
+            ])
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -222,6 +267,13 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         self.control_panel(&ctx);
 
+        // A Quit (installer/updater) ends the session like Cancel so the
+        // taskbar is restored and the graceful exit can run.
+        if crate::instance_channel::quit_pending() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(crate::instance_channel::QUIT_POLL);
+
         if self.outcome.borrow().is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -231,18 +283,20 @@ impl eframe::App for OverlayApp {
 impl OverlayApp {
     /// Dims the whole desktop, then draws the current/live zone as a
     /// brighter cutout with an outline, plus one small colored square per
-    /// resize handle. Deliberately unpolished: visual polish (dim/handle
-    /// styling, hover cursors) is out of scope per issue #28.
+    /// resize handle. Deliberately plain: no hover cursors or other styling.
     fn draw_dim_and_zone(&self, ui: &egui::Ui) {
         let painter = ui.painter();
         let screen = ui.max_rect();
+        let scale = scale_of(ui.ctx());
         painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
 
         let live_rect = match &self.state.editor {
             EditorState::Empty => None,
-            EditorState::Dragging { anchor, current } => Some(rect_from_points(*anchor, *current)),
-            EditorState::Placed { zone, .. } => Some(rect_from_zone(zone)),
-            EditorState::Resizing { live, .. } => Some(rect_from_zone(live)),
+            EditorState::Dragging { anchor, current } => {
+                Some(rect_from_points(*anchor, *current, scale))
+            }
+            EditorState::Placed { zone, .. } => Some(rect_from_zone(zone, scale)),
+            EditorState::Resizing { live, .. } => Some(rect_from_zone(live, scale)),
         };
 
         if let Some(rect) = live_rect {
@@ -263,7 +317,7 @@ impl OverlayApp {
             &self.state.editor
         {
             for handle in Handle::ALL {
-                let center = handle_center(zone, handle);
+                let center = handle_center(zone, handle, scale);
                 let color = egui::Color32::from_rgb(80, 200, 255);
                 painter.rect_filled(
                     egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0)),
@@ -291,10 +345,7 @@ impl OverlayApp {
         let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
-        let point = Point {
-            x: pos.x as i32,
-            y: pos.y as i32,
-        };
+        let point = point_from_points(pos.x, pos.y, scale_of(ui.ctx()));
 
         if response.drag_started() {
             self.state.apply(Action::Start(point));
@@ -314,8 +365,9 @@ impl OverlayApp {
             _ => return,
         };
 
+        let scale = scale_of(ui.ctx());
         for handle in Handle::ALL {
-            let center = handle_center(&zone, handle);
+            let center = handle_center(&zone, handle, scale);
             let rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
             let response = ui.interact(
                 rect,
@@ -325,10 +377,7 @@ impl OverlayApp {
             let Some(pos) = response.interact_pointer_pos() else {
                 continue;
             };
-            let point = Point {
-                x: pos.x as i32,
-                y: pos.y as i32,
-            };
+            let point = point_from_points(pos.x, pos.y, scale);
 
             if response.drag_started() {
                 self.state.apply(Action::Grab(handle));
@@ -340,17 +389,17 @@ impl OverlayApp {
         }
     }
 
-    /// The overlay's own modal Save/Cancel controls (issue #28: "fully
-    /// modal for its editing session with its own Save/Cancel controls").
+    /// The overlay's own Save/Cancel controls; the overlay is fully modal for
+    /// its editing session.
     fn control_panel(&mut self, ctx: &egui::Context) {
         // "Save" is disabled outside `Placed` rather than silently rejected,
         // since there's no separate settings window backdrop to surface a
         // rejection message against here.
         let can_save = matches!(self.state.editor, EditorState::Placed { .. });
 
-        // issue #39: buttons enlarged/color-coded and moved further down
-        // from the top edge, and the hint label enlarged/centered, so the
-        // controls are impossible to miss against the darkened overlay.
+        // Large, color-coded buttons placed well below the top edge, with an
+        // enlarged centered hint label, so the controls are impossible to
+        // miss against the darkened overlay.
         egui::Area::new(egui::Id::unique("zone-editor-controls"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0))
             .show(ctx, |ui| {
@@ -388,7 +437,7 @@ impl OverlayApp {
 }
 
 /// Builds a Save/Cancel control button with the enlarged size and
-/// color-coded fill used by the zone editor's control panel (issue #39).
+/// color-coded fill used by the zone editor's control panel.
 fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     egui::Button::new(
         egui::RichText::new(text)
@@ -399,26 +448,34 @@ fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     .min_size(egui::vec2(140.0, 56.0))
 }
 
-fn rect_from_points(a: Point, b: Point) -> egui::Rect {
+/// The helpers below convert pixel-space editor state to the egui points the
+/// overlay draws in (see [`crate::zone_editor::pixels_to_points`]).
+fn rect_from_points(a: Point, b: Point, scale: f32) -> egui::Rect {
     egui::Rect::from_two_pos(
-        egui::pos2(a.x as f32, a.y as f32),
-        egui::pos2(b.x as f32, b.y as f32),
+        egui::pos2(pixels_to_points(a.x, scale), pixels_to_points(a.y, scale)),
+        egui::pos2(pixels_to_points(b.x, scale), pixels_to_points(b.y, scale)),
     )
 }
 
-fn rect_from_zone(zone: &Zone) -> egui::Rect {
+fn rect_from_zone(zone: &Zone, scale: f32) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::pos2(zone.x as f32, zone.y as f32),
-        egui::vec2(zone.width as f32, zone.height as f32),
+        egui::pos2(
+            pixels_to_points(zone.x, scale),
+            pixels_to_points(zone.y, scale),
+        ),
+        egui::vec2(
+            pixels_to_points(zone.width, scale),
+            pixels_to_points(zone.height, scale),
+        ),
     )
 }
 
-fn handle_center(zone: &Zone, handle: Handle) -> egui::Pos2 {
+fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
     let (x, y, w, h) = (
-        zone.x as f32,
-        zone.y as f32,
-        zone.width as f32,
-        zone.height as f32,
+        pixels_to_points(zone.x, scale),
+        pixels_to_points(zone.y, scale),
+        pixels_to_points(zone.width, scale),
+        pixels_to_points(zone.height, scale),
     );
     match handle {
         Handle::N => egui::pos2(x + w / 2.0, y),

@@ -266,7 +266,8 @@ pub fn overlay_canvas(settings: &CursorSettings) -> (u32, i32) {
 }
 
 /// The tight canvas for the pointer alone (the overlay outside a pulse, and
-/// the Settings previews): just the shape plus its border/glow. Returns `(width, height, hotspot_x, hotspot_y)`.
+/// the Settings previews): just the shape plus its border/glow. Returns
+/// `(width, height, hotspot_x, hotspot_y)`.
 pub fn cursor_canvas(settings: &CursorSettings) -> (u32, u32, i32, i32) {
     let (min_x, min_y, max_x, max_y) = shape_bounds(settings);
     let m = decoration_margin(settings);

@@ -1,7 +1,7 @@
 //! Low-level keyboard hook that suppresses the physical Ctrl+Escape
 //! combination while a Settings hotkey capture is in progress, so Windows
 //! doesn't steal it for the Start menu before GameFrame's own window ever
-//! sees the key-down event (issue #40).
+//! sees the key-down event.
 //!
 //! Split the same way as `crate::win32`/`crate::hotkeys`:
 //! - [`should_suppress`] is the pure decision -- given a virtual-key code and
@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// directly instead of waiting for an `egui::Event::Key` that will never
 /// arrive for this specific combo -- the hook swallows Ctrl+Escape before
 /// Windows ever turns it into a window message, so it never reaches egui's
-/// normal event pipeline at all (issue #40 CRITICAL review finding).
+/// normal event pipeline at all.
 ///
 /// Plain global state, not per-hook-instance: safe here because this app
 /// never has more than one `KeyboardHookGuard` (and therefore more than one
@@ -164,7 +164,7 @@ impl Drop for KeyboardHookGuard {
     // `UnhookWindowsHookEx` here. Not a real leak in practice: Windows itself
     // unregisters every hook owned by a process the moment that process
     // terminates, abort or not -- so there is nothing left dangling for a
-    // future reader to worry about (issue #40 review finding).
+    // future reader to worry about.
     fn drop(&mut self) {
         // Safety: `self.hook` was returned by a successful `SetWindowsHookExW`
         // call in `install` and has not been unhooked before (this is the

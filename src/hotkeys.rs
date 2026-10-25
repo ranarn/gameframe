@@ -12,7 +12,7 @@
 
 use crate::profile_store::HotkeyBindings;
 use global_hotkey::GlobalHotKeyManager;
-use global_hotkey::hotkey::{HotKey, HotKeyParseError};
+use global_hotkey::hotkey::HotKey;
 
 /// Actions GameFrame can bind a global hotkey to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,16 @@ pub enum HotkeyAction {
     ToggleGameCursor,
 }
 
+impl HotkeyAction {
+    fn label(self) -> &'static str {
+        match self {
+            HotkeyAction::ToggleBorderless => "toggle borderless",
+            HotkeyAction::ToggleTaskbarAutohide => "toggle taskbar auto-hide",
+            HotkeyAction::ToggleGameCursor => "toggle game cursor",
+        }
+    }
+}
+
 /// A hotkey binding resolved from its stored string into the parsed
 /// [`HotKey`] the `global-hotkey` crate needs, paired with the action it
 /// should trigger.
@@ -37,48 +47,6 @@ pub enum HotkeyAction {
 pub struct ResolvedBinding {
     pub action: HotkeyAction,
     pub hotkey: HotKey,
-}
-
-/// Resolves every bound hotkey (the borderless toggle and/or the taskbar
-/// auto-hide toggle -- either, both, or neither) from `bindings` into
-/// [`ResolvedBinding`]s.
-///
-/// Free-text hotkey strings (as entered via Settings -- issue #5's Settings
-/// UI does no format validation) are parsed with `global_hotkey::hotkey::HotKey`'s
-/// own `FromStr` implementation, which already accepts the `"Ctrl+Alt+B"`-style
-/// syntax Settings stores (modifiers joined by `+`, main key last -- see the
-/// `global-hotkey` crate's own `hotkey` module docs). An unbound hotkey
-/// (`None`) is simply skipped rather than erroring -- pressing keys on a
-/// fresh install where nothing is bound must not do anything (and can't
-/// crash, since nothing gets registered). The two bindings are resolved
-/// fully independently of each other -- either, both, or neither may be
-/// bound, in any combination.
-pub fn resolve_bindings(
-    bindings: &HotkeyBindings,
-) -> Result<Vec<ResolvedBinding>, HotKeyParseError> {
-    let mut resolved = Vec::new();
-    if let Some(raw) = &bindings.toggle_borderless {
-        let hotkey: HotKey = raw.parse()?;
-        resolved.push(ResolvedBinding {
-            action: HotkeyAction::ToggleBorderless,
-            hotkey,
-        });
-    }
-    if let Some(raw) = &bindings.toggle_taskbar_autohide {
-        let hotkey: HotKey = raw.parse()?;
-        resolved.push(ResolvedBinding {
-            action: HotkeyAction::ToggleTaskbarAutohide,
-            hotkey,
-        });
-    }
-    if let Some(raw) = &bindings.toggle_game_cursor {
-        let hotkey: HotKey = raw.parse()?;
-        resolved.push(ResolvedBinding {
-            action: HotkeyAction::ToggleGameCursor,
-            hotkey,
-        });
-    }
-    Ok(resolved)
 }
 
 /// Returns the [`HotkeyAction`] a registered hotkey id maps to, or `None` if
@@ -91,32 +59,85 @@ pub fn action_for(bindings: &[ResolvedBinding], id: u32) -> Option<HotkeyAction>
         .map(|b| b.action)
 }
 
-/// Reasons registering GameFrame's global hotkeys can fail: either the
-/// stored binding string wasn't valid `global-hotkey` syntax, or the OS
-/// itself refused the registration (e.g. another application already holds
-/// that exact key combination).
-#[derive(Debug)]
-pub enum HotkeysError {
-    Parse(HotKeyParseError),
-    Register(global_hotkey::Error),
+/// What happened to one non-empty binding when registering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingOutcome {
+    Registered,
+    /// Human-readable reason, shown in Settings next to the binding.
+    Failed(String),
 }
 
-impl std::fmt::Display for HotkeysError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HotkeysError::Parse(e) => write!(f, "invalid hotkey binding: {e}"),
-            HotkeysError::Register(e) => write!(f, "failed to register hotkey with the OS: {e}"),
+/// The outcome for one non-empty binding, with the binding string it was
+/// for (so Settings can tell whether the user has since changed it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingReport {
+    pub action: HotkeyAction,
+    pub binding: String,
+    pub outcome: BindingOutcome,
+}
+
+/// Human-readable reason an OS registration failed.
+fn registration_failure_reason(error: &global_hotkey::Error) -> String {
+    match error {
+        global_hotkey::Error::AlreadyRegistered(_) => {
+            "already in use by another program".to_string()
         }
+        other => format!("the OS refused the hotkey: {other}"),
     }
 }
 
-impl std::error::Error for HotkeysError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            HotkeysError::Parse(e) => Some(e),
-            HotkeysError::Register(e) => Some(e),
-        }
+/// Registers every non-empty binding on its own through `register`. Binding
+/// strings (free text from Settings) are parsed with `HotKey`'s `FromStr`,
+/// which accepts the `"Ctrl+Alt+B"` syntax Settings stores. A parse
+/// or registration failure of one binding is reported for that binding only
+/// and never blocks the others. Returns the bindings that registered (for
+/// [`action_for`]) and one report per non-empty binding. Empty (unbound)
+/// bindings are skipped, not failures.
+///
+/// `register` abstracts the OS call so this logic is testable.
+pub(crate) fn register_each(
+    bindings: &HotkeyBindings,
+    mut register: impl FnMut(HotKey) -> Result<(), String>,
+) -> (Vec<ResolvedBinding>, Vec<BindingReport>) {
+    let candidates = [
+        (HotkeyAction::ToggleBorderless, &bindings.toggle_borderless),
+        (
+            HotkeyAction::ToggleTaskbarAutohide,
+            &bindings.toggle_taskbar_autohide,
+        ),
+        (HotkeyAction::ToggleGameCursor, &bindings.toggle_game_cursor),
+    ];
+    let mut registered: Vec<ResolvedBinding> = Vec::new();
+    let mut reports = Vec::new();
+    for (action, raw) in candidates {
+        let Some(raw) = raw.as_ref().filter(|r| !r.trim().is_empty()) else {
+            continue;
+        };
+        let outcome = match raw.parse::<HotKey>() {
+            Err(e) => BindingOutcome::Failed(format!("not a valid hotkey: {e}")),
+            // Same combination already held by GameFrame's own earlier binding
+            // (hand-edited config): say so rather than blaming another program.
+            Ok(hotkey) => match registered.iter().find(|b| b.hotkey == hotkey) {
+                Some(other) => BindingOutcome::Failed(format!(
+                    "already bound to another GameFrame action ({})",
+                    other.action.label()
+                )),
+                None => match register(hotkey) {
+                    Ok(()) => {
+                        registered.push(ResolvedBinding { action, hotkey });
+                        BindingOutcome::Registered
+                    }
+                    Err(reason) => BindingOutcome::Failed(reason),
+                },
+            },
+        };
+        reports.push(BindingReport {
+            action,
+            binding: raw.clone(),
+            outcome,
+        });
     }
+    (registered, reports)
 }
 
 /// Owns the live global-hotkey registration for GameFrame's bound actions.
@@ -125,8 +146,9 @@ impl std::error::Error for HotkeysError {
 /// which per the `global-hotkey` crate's own docs requires a live Win32
 /// event loop pumping on this thread (see [`crate::app::run_event_loop`]) --
 /// a headless/CI sandbox has no such loop, so this is NOT exercised by this
-/// crate's automated tests. The id -> action lookup it delegates to
-/// ([`action_for`]) is exercised above in isolation from the OS call.
+/// crate's automated tests. The per-binding logic it delegates to
+/// ([`register_each`]) and the id -> action lookup ([`action_for`]) are
+/// exercised in isolation from the OS call.
 pub struct Hotkeys {
     // Kept alive for its `Drop` impl, which unregisters every hotkey and
     // tears down the manager's hidden window -- never read directly.
@@ -135,24 +157,34 @@ pub struct Hotkeys {
 }
 
 impl Hotkeys {
-    /// Parses and registers every bound hotkey in `bindings` with the OS.
-    /// With nothing bound, still creates the manager but registers nothing
-    /// -- pressing keys triggers no action and cannot crash, since no
-    /// `WM_HOTKEY` for any id will ever be delivered.
-    pub fn register(bindings: &HotkeyBindings) -> Result<Self, HotkeysError> {
-        let resolved = resolve_bindings(bindings).map_err(HotkeysError::Parse)?;
-
-        let manager = GlobalHotKeyManager::new().map_err(HotkeysError::Register)?;
-        for binding in &resolved {
-            manager
-                .register(binding.hotkey)
-                .map_err(HotkeysError::Register)?;
+    /// Registers every bound hotkey in `bindings` with the OS, each on its
+    /// own (see [`register_each`]). Only the bindings that registered
+    /// resolve in [`Self::action_for`]; the report says what happened to each.
+    /// If the OS hotkey manager can't be created, no `Hotkeys` is returned and
+    /// every non-empty binding is reported as failed with that reason, so
+    /// Settings still shows it.
+    pub fn register(bindings: &HotkeyBindings) -> (Option<Self>, Vec<BindingReport>) {
+        match GlobalHotKeyManager::new() {
+            Ok(manager) => {
+                let (registered, reports) = register_each(bindings, |hotkey| {
+                    manager
+                        .register(hotkey)
+                        .map_err(|e| registration_failure_reason(&e))
+                });
+                (
+                    Some(Self {
+                        _manager: manager,
+                        bindings: registered,
+                    }),
+                    reports,
+                )
+            }
+            Err(e) => {
+                let reason = format!("the hotkey manager could not be created: {e}");
+                let (_, reports) = register_each(bindings, |_| Err(reason.clone()));
+                (None, reports)
+            }
         }
-
-        Ok(Self {
-            _manager: manager,
-            bindings: resolved,
-        })
     }
 
     /// The action a received [`global_hotkey::GlobalHotKeyEvent`]'s id maps
@@ -168,94 +200,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_bindings_with_no_hotkeys_bound_resolves_to_an_empty_list() {
-        let bindings = HotkeyBindings::default();
+    fn register_each_maps_each_binding_to_its_own_action() {
+        for (bindings, action, key) in [
+            (
+                HotkeyBindings {
+                    toggle_borderless: Some("Ctrl+Alt+B".to_string()),
+                    ..HotkeyBindings::default()
+                },
+                HotkeyAction::ToggleBorderless,
+                "Ctrl+Alt+B",
+            ),
+            (
+                HotkeyBindings {
+                    toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+                    ..HotkeyBindings::default()
+                },
+                HotkeyAction::ToggleTaskbarAutohide,
+                "Ctrl+Alt+T",
+            ),
+            (
+                HotkeyBindings {
+                    toggle_game_cursor: Some("Ctrl+Alt+M".to_string()),
+                    ..HotkeyBindings::default()
+                },
+                HotkeyAction::ToggleGameCursor,
+                "Ctrl+Alt+M",
+            ),
+        ] {
+            let (registered, _) = register_each(&bindings, |_| Ok(()));
 
-        let resolved = resolve_bindings(&bindings).unwrap();
-
-        assert_eq!(resolved, vec![]);
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].action, action);
+            assert_eq!(registered[0].hotkey, key.parse::<HotKey>().unwrap());
+        }
     }
 
     #[test]
-    fn resolve_bindings_parses_a_bound_toggle_borderless_hotkey() {
-        let bindings = HotkeyBindings {
-            toggle_borderless: Some("Ctrl+Alt+B".to_string()),
-            toggle_taskbar_autohide: None,
-            toggle_game_cursor: None,
-        };
+    fn register_each_with_nothing_bound_registers_nothing() {
+        let (registered, reports) = register_each(&HotkeyBindings::default(), |_| Ok(()));
 
-        let resolved = resolve_bindings(&bindings).unwrap();
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].action, HotkeyAction::ToggleBorderless);
-        assert_eq!(resolved[0].hotkey, "Ctrl+Alt+B".parse::<HotKey>().unwrap());
-    }
-
-    #[test]
-    fn resolve_bindings_parses_a_bound_toggle_taskbar_autohide_hotkey() {
-        let bindings = HotkeyBindings {
-            toggle_borderless: None,
-            toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
-            toggle_game_cursor: None,
-        };
-
-        let resolved = resolve_bindings(&bindings).unwrap();
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].action, HotkeyAction::ToggleTaskbarAutohide);
-        assert_eq!(resolved[0].hotkey, "Ctrl+Alt+T".parse::<HotKey>().unwrap());
-    }
-
-    #[test]
-    fn resolve_bindings_parses_a_bound_toggle_game_cursor_hotkey() {
-        let bindings = HotkeyBindings {
-            toggle_game_cursor: Some("Ctrl+Alt+M".to_string()),
-            ..HotkeyBindings::default()
-        };
-
-        let resolved = resolve_bindings(&bindings).unwrap();
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].action, HotkeyAction::ToggleGameCursor);
-        assert_eq!(resolved[0].hotkey, "Ctrl+Alt+M".parse::<HotKey>().unwrap());
-    }
-
-    #[test]
-    fn resolve_bindings_resolves_both_bindings_independently_when_both_are_bound() {
-        let bindings = HotkeyBindings {
-            toggle_borderless: Some("Ctrl+Alt+B".to_string()),
-            toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
-            toggle_game_cursor: None,
-        };
-
-        let resolved = resolve_bindings(&bindings).unwrap();
-
-        assert_eq!(resolved.len(), 2);
-        assert!(
-            resolved
-                .iter()
-                .any(|b| b.action == HotkeyAction::ToggleBorderless
-                    && b.hotkey == "Ctrl+Alt+B".parse::<HotKey>().unwrap())
-        );
-        assert!(
-            resolved
-                .iter()
-                .any(|b| b.action == HotkeyAction::ToggleTaskbarAutohide
-                    && b.hotkey == "Ctrl+Alt+T".parse::<HotKey>().unwrap())
-        );
-    }
-
-    #[test]
-    fn resolve_bindings_with_an_unparsable_hotkey_string_returns_an_error() {
-        let bindings = HotkeyBindings {
-            toggle_borderless: Some("not a real hotkey format!!".to_string()),
-            toggle_taskbar_autohide: None,
-            toggle_game_cursor: None,
-        };
-
-        let result = resolve_bindings(&bindings);
-
-        assert!(result.is_err());
+        assert!(registered.is_empty());
+        assert!(reports.is_empty());
     }
 
     #[test]
@@ -317,20 +302,164 @@ mod tests {
         assert_eq!(action_for(&[], 42), None);
     }
 
-    #[test]
-    fn hotkeys_error_implements_display_and_std_error() {
-        fn assert_is_std_error<E: std::error::Error>(_: &E) {}
+    fn all_three() -> HotkeyBindings {
+        HotkeyBindings {
+            toggle_borderless: Some("Ctrl+Alt+B".to_string()),
+            toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+            toggle_game_cursor: Some("Ctrl+Alt+M".to_string()),
+        }
+    }
 
-        let parse_err = match "not a real hotkey!!".parse::<HotKey>() {
-            Err(e) => HotkeysError::Parse(e),
-            Ok(_) => panic!("expected an invalid hotkey string to fail parsing"),
+    fn outcome_of(reports: &[BindingReport], action: HotkeyAction) -> &BindingOutcome {
+        &reports.iter().find(|r| r.action == action).unwrap().outcome
+    }
+
+    #[test]
+    fn register_each_registers_every_binding_when_all_succeed() {
+        let (registered, reports) = register_each(&all_three(), |_| Ok(()));
+
+        assert_eq!(registered.len(), 3);
+        assert_eq!(reports.len(), 3);
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.outcome == BindingOutcome::Registered)
+        );
+    }
+
+    #[test]
+    fn register_each_one_failure_leaves_the_others_registered_and_dispatchable() {
+        let taken: HotKey = "Ctrl+Alt+T".parse().unwrap();
+        let (registered, reports) = register_each(&all_three(), |hotkey| {
+            if hotkey == taken {
+                Err("already in use by another program".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(
+            outcome_of(&reports, HotkeyAction::ToggleTaskbarAutohide),
+            &BindingOutcome::Failed("already in use by another program".to_string())
+        );
+        assert_eq!(
+            outcome_of(&reports, HotkeyAction::ToggleBorderless),
+            &BindingOutcome::Registered
+        );
+        assert_eq!(
+            outcome_of(&reports, HotkeyAction::ToggleGameCursor),
+            &BindingOutcome::Registered
+        );
+        assert_eq!(registered.len(), 2);
+        assert_eq!(action_for(&registered, taken.id()), None);
+        let borderless: HotKey = "Ctrl+Alt+B".parse().unwrap();
+        assert_eq!(
+            action_for(&registered, borderless.id()),
+            Some(HotkeyAction::ToggleBorderless)
+        );
+    }
+
+    #[test]
+    fn register_each_reports_every_binding_failed_when_all_fail() {
+        let (registered, reports) = register_each(&all_three(), |_| Err("nope".to_string()));
+
+        assert!(registered.is_empty());
+        assert_eq!(reports.len(), 3);
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.outcome == BindingOutcome::Failed("nope".to_string()))
+        );
+    }
+
+    #[test]
+    fn register_each_unparseable_binding_fails_alone_without_calling_the_os() {
+        let bindings = HotkeyBindings {
+            toggle_borderless: Some("not a real hotkey format!!".to_string()),
+            toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
+            toggle_game_cursor: None,
+        };
+        let mut os_calls = 0;
+
+        let (registered, reports) = register_each(&bindings, |_| {
+            os_calls += 1;
+            Ok(())
+        });
+
+        assert_eq!(os_calls, 1);
+        assert!(matches!(
+            outcome_of(&reports, HotkeyAction::ToggleBorderless),
+            BindingOutcome::Failed(reason) if reason.starts_with("not a valid hotkey")
+        ));
+        assert_eq!(
+            outcome_of(&reports, HotkeyAction::ToggleTaskbarAutohide),
+            &BindingOutcome::Registered
+        );
+        assert_eq!(registered.len(), 1);
+    }
+
+    #[test]
+    fn register_each_same_combo_on_two_actions_blames_the_earlier_gameframe_binding() {
+        let bindings = HotkeyBindings {
+            toggle_borderless: Some("Ctrl+Alt+B".to_string()),
+            toggle_game_cursor: Some("Ctrl+Alt+B".to_string()),
+            ..HotkeyBindings::default()
+        };
+        let mut os_calls = 0;
+
+        let (registered, reports) = register_each(&bindings, |_| {
+            os_calls += 1;
+            Ok(())
+        });
+
+        assert_eq!(os_calls, 1);
+        assert_eq!(registered.len(), 1);
+        assert!(matches!(
+            outcome_of(&reports, HotkeyAction::ToggleGameCursor),
+            BindingOutcome::Failed(reason) if reason.contains("another GameFrame action")
+        ));
+    }
+
+    #[test]
+    fn register_each_skips_empty_bindings_without_reporting_them() {
+        let bindings = HotkeyBindings {
+            toggle_borderless: Some("  ".to_string()),
+            ..HotkeyBindings::default()
         };
 
-        assert_is_std_error(&parse_err);
-        assert!(
-            parse_err
-                .to_string()
-                .starts_with("invalid hotkey binding: ")
+        let (registered, reports) = register_each(&bindings, |_| Ok(()));
+
+        assert!(registered.is_empty());
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn report_records_the_binding_string_it_was_for() {
+        let (_, reports) = register_each(&all_three(), |_| Ok(()));
+
+        assert_eq!(
+            reports
+                .iter()
+                .find(|r| r.action == HotkeyAction::ToggleBorderless)
+                .unwrap()
+                .binding,
+            "Ctrl+Alt+B"
         );
+    }
+
+    #[test]
+    fn already_registered_is_described_as_in_use_by_another_program() {
+        let hotkey: HotKey = "Ctrl+Alt+B".parse().unwrap();
+
+        let reason = registration_failure_reason(&global_hotkey::Error::AlreadyRegistered(hotkey));
+
+        assert_eq!(reason, "already in use by another program");
+    }
+
+    #[test]
+    fn other_os_errors_are_described_as_an_os_refusal() {
+        let err = global_hotkey::Error::OsError(std::io::Error::other("boom"));
+
+        assert!(registration_failure_reason(&err).starts_with("the OS refused the hotkey"));
     }
 }

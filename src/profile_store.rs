@@ -3,6 +3,7 @@
 //! module never resolves `%APPDATA%` itself -- the caller passes in the
 //! directory to use.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub use crate::cursor_style::CursorSettings;
@@ -20,8 +21,8 @@ pub type HotkeyBinding = Option<String>;
 pub struct HotkeyBindings {
     pub toggle_borderless: HotkeyBinding,
     pub toggle_taskbar_autohide: HotkeyBinding,
-    /// Turns the game cursor on/off (see [`crate::cursor_style`]). Absent in
-    /// configs written before it existed, hence the default.
+    /// Turns the game cursor on/off (see [`crate::cursor_style`]). Optional in
+    /// the file, so configs without it still load.
     #[serde(default)]
     pub toggle_game_cursor: HotkeyBinding,
 }
@@ -109,17 +110,16 @@ pub fn find_tracked_game<'a>(games: &'a [TrackedGame], exe_path: &Path) -> Optio
     games.iter().find(|g| g.exe_path == exe_path)
 }
 
-/// Which technique GameFrame uses to hide the taskbar (issue #42) -- applies
+/// Which technique GameFrame uses to hide the taskbar -- applies
 /// wherever a call site hides the taskbar (the borderless-toggle strip
 /// direction, the tray "Apply to Window"/launch-detection apply paths, the
 /// manual taskbar-autohide-toggle hotkey, and the zone-editor overlay's
 /// force-on session), via `win32::plan_taskbar_hide`/`win32::hide_taskbar`.
 ///
-/// `#[default]` is `FullyHidden` -- this issue's new default -- so
-/// `#[serde(default)]` on [`Config::taskbar_hide_mode`] resolves a config
-/// file written before this field existed to `FullyHidden` rather than
-/// erroring, mirroring [`Config::tracked_games`]'s own backward-compat
-/// pattern.
+/// `#[default]` is `FullyHidden`, so `#[serde(default)]` on
+/// [`Config::taskbar_hide_mode`] resolves a config file without this field to
+/// `FullyHidden` rather than erroring, mirroring [`Config::tracked_games`]'s
+/// own backward-compat pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TaskbarHideMode {
     /// The taskbar is hidden via `ShowWindow(Shell_TrayWnd, SW_HIDE)` and
@@ -127,18 +127,20 @@ pub enum TaskbarHideMode {
     #[default]
     FullyHidden,
     /// The taskbar is hidden via the native `SHAppBarMessage`/`ABS_AUTOHIDE`
-    /// mechanism -- today's pre-#42 behavior, preserved unchanged: hovering
-    /// the mouse near the screen edge reveals it.
+    /// mechanism: hovering the mouse near the screen edge reveals it.
     HoverReveal,
 }
 
-/// GameFrame's persisted config: the optional Zone, the two global hotkey
-/// bindings, and the per-game tracked-games list.
+/// GameFrame's persisted config: the optional Zone, the three global hotkey
+/// bindings, the tracked-games list, the taskbar settings and the game cursor
+/// settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     /// The single optional Zone. `None` until the user draws one.
     #[serde(default)]
     pub zone: Option<Zone>,
+    /// All unbound when the `[hotkeys]` table is missing.
+    #[serde(default)]
     pub hotkeys: HotkeyBindings,
     #[serde(default)]
     pub tracked_games: Vec<TrackedGame>,
@@ -158,7 +160,7 @@ fn default_hide_taskbar_on_apply() -> bool {
 }
 
 impl Default for Config {
-    /// The starter config written on first run: no Zone, both hotkeys
+    /// The starter config written on first run: no Zone, all hotkeys
     /// unbound, no tracked games yet, and the taskbar hidden fully (no
     /// hover-reveal) once the Zone is applied.
     fn default() -> Self {
@@ -233,11 +235,11 @@ struct LegacyPresets {
     custom: Option<Zone>,
 }
 
-/// Key of the per-game taskbar flag that issue #49 folded into the global
-/// [`Config::hide_taskbar_on_apply`].
+/// Key of the legacy per-game taskbar flag, which is folded into the global
+/// [`Config::hide_taskbar_on_apply`] when an old config is loaded.
 const PER_GAME_TASKBAR_KEY: &str = "taskbar_autohide";
 
-/// Folds per-game `taskbar_autohide` flags (present in preset-era and #48-era
+/// Folds per-game `taskbar_autohide` flags (present in older
 /// configs) into the global `hide_taskbar_on_apply` key: true if any game had
 /// it on, false if every game had it off. The no-games case does reach this
 /// fold but changes nothing (the value then comes from
@@ -295,12 +297,44 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
 /// Order: a config already in the Zone shape loads as-is; a legacy
 /// (preset-era, has a `[presets]` table) config is converted via
 /// [`convert_legacy_config`] and the new shape is written back immediately; a
-/// #48-era config still carrying per-game `taskbar_autohide` flags has them
+/// config still carrying per-game `taskbar_autohide` flags has them
 /// folded into the global setting ([`fold_per_game_taskbar_flags`]) and is
 /// written back too; anything else (corrupt TOML, unrecognised shape) is
 /// replaced with a freshly written default config rather than returned as an
 /// error.
+///
+/// The result is cached in memory per config directory: the first call reads
+/// the file, later calls are served from memory, and [`save`] refreshes the
+/// cache with what it wrote. Edits made to the file by hand while GameFrame is
+/// running are therefore not picked up until the next start.
 pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
+    if let Some(config) = lock_cache().get(config_dir) {
+        return Ok(config.clone());
+    }
+    // The disk read runs without the lock. A save that landed meanwhile has
+    // already filled the cache and wins over the older config read here.
+    // Errors are not cached, so a transient read failure does not stick.
+    let config = load_from_disk(config_dir)?;
+    Ok(lock_cache()
+        .entry(config_dir.to_path_buf())
+        .or_insert(config)
+        .clone())
+}
+
+/// The in-memory copy of each config directory's config, see [`load`].
+static CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, Config>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Locks the cache. A panic while the lock was held cannot leave the map
+/// half-updated (every operation is one insert or lookup), so a poisoned lock
+/// is used as-is.
+fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Config>> {
+    CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reads the config file (see [`load`] for the migration and reset rules),
+/// bypassing the cache.
+fn load_from_disk(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     let path = config_dir.join(CONFIG_FILE_NAME);
 
     let contents = match std::fs::read_to_string(&path) {
@@ -339,7 +373,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
         };
     }
 
-    // A #48-era config still carries per-game taskbar flags: fold them into
+    // An older config may still carry per-game taskbar flags: fold them into
     // the global setting and write the new shape back.
     let mut table = table;
     let folded = fold_per_game_taskbar_flags(&mut table);
@@ -474,7 +508,10 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
     let temp_path = config_dir.join(format!("{CONFIG_FILE_NAME}.tmp"));
 
     std::fs::write(&temp_path, contents).map_err(ProfileStoreError::Io)?;
-    std::fs::rename(&temp_path, &final_path).map_err(ProfileStoreError::Io)
+    std::fs::rename(&temp_path, &final_path).map_err(ProfileStoreError::Io)?;
+
+    lock_cache().insert(config_dir.to_path_buf(), config.clone());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -510,7 +547,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(
             config,
@@ -562,7 +599,7 @@ mod tests {
         };
         save(&config_dir, &written).unwrap();
 
-        let loaded = load(&config_dir).unwrap();
+        let loaded = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(loaded, written);
     }
@@ -573,7 +610,7 @@ mod tests {
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, "this is not { valid toml : : :");
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(config, Config::default());
         assert_eq!(config.zone, None);
@@ -620,7 +657,7 @@ mod tests {
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(
             config.zone,
@@ -682,7 +719,7 @@ mod tests {
             "#,
         );
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(config.zone, None);
         assert_eq!(
@@ -701,7 +738,7 @@ mod tests {
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
 
-        let migrated = load(&config_dir).unwrap();
+        let migrated = load_from_disk(&config_dir).unwrap();
 
         let on_disk = std::fs::read_to_string(config_dir.join(CONFIG_FILE_NAME)).unwrap();
         assert!(
@@ -716,12 +753,12 @@ mod tests {
             on_disk.contains("[zone]"),
             "the zone must be written: {on_disk}"
         );
-        let second = load(&config_dir).unwrap();
+        let second = load_from_disk(&config_dir).unwrap();
         assert_eq!(second, migrated);
     }
 
-    /// Builds config TOML (legacy or #48 shape) with one tracked game per
-    /// entry of `flags`, each carrying that per-game taskbar flag.
+    /// Builds config TOML (legacy preset shape or Zone shape) with one tracked
+    /// game per entry of `flags`, each carrying that per-game taskbar flag.
     fn config_with_game_flags(legacy: bool, flags: &[bool]) -> String {
         let mut s = String::new();
         if legacy {
@@ -744,7 +781,7 @@ mod tests {
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, &config_with_game_flags(legacy, flags));
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(
             config.hide_taskbar_on_apply, expected,
@@ -763,7 +800,7 @@ mod tests {
             "{on_disk}"
         );
         assert_eq!(
-            load(&config_dir).unwrap(),
+            load_from_disk(&config_dir).unwrap(),
             config,
             "the written-back file must read back identically"
         );
@@ -787,7 +824,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, "[hotkeys]\n");
-        assert!(load(&config_dir).unwrap().hide_taskbar_on_apply);
+        assert!(load_from_disk(&config_dir).unwrap().hide_taskbar_on_apply);
     }
 
     #[test]
@@ -802,7 +839,7 @@ mod tests {
             ),
         );
 
-        assert!(!load(&config_dir).unwrap().hide_taskbar_on_apply);
+        assert!(!load_from_disk(&config_dir).unwrap().hide_taskbar_on_apply);
     }
 
     #[test]
@@ -812,7 +849,7 @@ mod tests {
         write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
         let backup = config_dir.join("config.toml.pre-zone.bak");
 
-        load(&config_dir).unwrap();
+        load_from_disk(&config_dir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&backup).unwrap(),
@@ -823,7 +860,7 @@ mod tests {
         // clobber the first backup, and its own original must be kept too.
         let second = config_with_game_flags(true, &[true]);
         write_config_file(&config_dir, &second);
-        load(&config_dir).unwrap();
+        load_from_disk(&config_dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(&backup).unwrap(),
             LEGACY_WITH_CUSTOM
@@ -839,10 +876,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, "first { broken");
-        load(&config_dir).unwrap();
+        load_from_disk(&config_dir).unwrap();
         write_config_file(&config_dir, "second { broken");
 
-        load(&config_dir).unwrap();
+        load_from_disk(&config_dir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(config_dir.join("config.toml.bak")).unwrap(),
@@ -878,7 +915,7 @@ mod tests {
         block_saves(&config_dir);
 
         for _ in 0..3 {
-            load(&config_dir).unwrap();
+            load_from_disk(&config_dir).unwrap();
         }
 
         assert_eq!(backup_files(&config_dir), ["config.toml.pre-zone.bak"]);
@@ -892,7 +929,7 @@ mod tests {
         block_saves(&config_dir);
 
         for _ in 0..3 {
-            let _ = load(&config_dir);
+            let _ = load_from_disk(&config_dir);
         }
 
         assert_eq!(backup_files(&config_dir), ["config.toml.bak"]);
@@ -900,7 +937,7 @@ mod tests {
 
     #[test]
     fn load_of_an_unconvertible_old_shape_config_resets_to_defaults() {
-        // The pre-#26 shape (`presets` as an array of tagged variants) is
+        // An old shape (`presets` as an array of tagged variants) is
         // not convertible -- it is discarded and replaced with defaults.
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
@@ -916,10 +953,10 @@ mod tests {
             "#,
         );
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(config, Config::default());
-        assert_eq!(load(&config_dir).unwrap(), Config::default());
+        assert_eq!(load_from_disk(&config_dir).unwrap(), Config::default());
         let backup = std::fs::read_to_string(config_dir.join("config.toml.bak")).unwrap();
         assert!(backup.contains("LeftHalf"));
     }
@@ -936,7 +973,7 @@ mod tests {
             "#,
         );
 
-        let config = load(&config_dir).unwrap();
+        let config = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(config.zone, None);
         assert_eq!(config.tracked_games, Vec::new());
@@ -945,6 +982,109 @@ mod tests {
             config.hotkeys.toggle_borderless,
             Some("Ctrl+Alt+B".to_string())
         );
+    }
+
+    #[test]
+    fn a_config_without_a_hotkeys_table_keeps_its_zone_and_tracked_games() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(
+            &config_dir,
+            r#"
+            [zone]
+            x = 10
+            y = 20
+            width = 800
+            height = 600
+
+            [[tracked_games]]
+            exe_path = "C:\\Games\\thing.exe"
+            display_name = "Thing"
+            auto_apply = false
+            "#,
+        );
+
+        let config = load(&config_dir).unwrap();
+
+        assert_eq!(config.hotkeys, HotkeyBindings::default());
+        assert_eq!(
+            config.zone,
+            Some(Zone {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600
+            })
+        );
+        assert_eq!(config.tracked_games.len(), 1);
+        assert_eq!(config.tracked_games[0].display_name, "Thing");
+        assert!(backup_files(&config_dir).is_empty());
+    }
+
+    #[test]
+    fn later_loads_are_served_from_memory_without_reading_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        let first = load(&config_dir).unwrap();
+
+        std::fs::remove_file(config_dir.join(CONFIG_FILE_NAME)).unwrap();
+
+        assert_eq!(load(&config_dir).unwrap(), first);
+        assert!(!config_dir.join(CONFIG_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn load_serves_a_migrated_config_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, LEGACY_WITH_CUSTOM);
+        let migrated = load(&config_dir).unwrap();
+        assert!(migrated.zone.is_some());
+
+        write_config_file(&config_dir, "not { toml");
+
+        assert_eq!(load(&config_dir).unwrap(), migrated);
+        assert_eq!(backup_files(&config_dir), ["config.toml.pre-zone.bak"]);
+    }
+
+    #[test]
+    fn load_serves_a_reset_default_config_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, "first { broken");
+        assert_eq!(load(&config_dir).unwrap(), Config::default());
+
+        write_config_file(&config_dir, "second { broken");
+
+        assert_eq!(load(&config_dir).unwrap(), Config::default());
+        assert_eq!(backup_files(&config_dir), ["config.toml.bak"]);
+    }
+
+    #[test]
+    fn save_refreshes_what_load_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        let mut config = load(&config_dir).unwrap();
+        config.hide_taskbar_on_apply = false;
+        config.hotkeys.toggle_borderless = Some("Ctrl+Alt+B".to_string());
+
+        save(&config_dir, &config).unwrap();
+
+        assert_eq!(load(&config_dir).unwrap(), config);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_cached_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        let original = load(&config_dir).unwrap();
+        block_saves(&config_dir);
+        let mut changed = original.clone();
+        changed.hide_taskbar_on_apply = !original.hide_taskbar_on_apply;
+
+        assert!(save(&config_dir, &changed).is_err());
+
+        assert_eq!(load(&config_dir).unwrap(), original);
     }
 
     #[test]

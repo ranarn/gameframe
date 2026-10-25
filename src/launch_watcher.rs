@@ -2,8 +2,8 @@
 //! a `SetWinEventHook(WINEVENT_OUTOFCONTEXT)` registration on
 //! `EVENT_SYSTEM_FOREGROUND`, and reacts by applying the Zone and
 //! taskbar-auto-hide state the same way the hotkey/tray "Apply to Window"
-//! paths do -- with no hotkey press required. This mechanism was chosen over a toolhelp poll loop or a WMI
-//! process-creation subscription (see issue #32).
+//! paths do -- with no hotkey press required. A WinEvent hook is used
+//! rather than a toolhelp poll loop or a WMI process-creation subscription.
 //!
 //! # Registration
 //!
@@ -31,38 +31,30 @@
 //! pointer. Instead, the config directory (which never changes during the
 //! process's lifetime) is stashed once, in [`register`], into a
 //! process-wide [`OnceLock`], and read back by the callback on every event.
-//! The config itself is deliberately *not* cached anywhere -- the callback
-//! reloads it fresh from disk on every foreground-change event, matching
-//! this codebase's existing "reload from disk on every trigger" convention
-//! (see [`crate::app::handle_toggle_borderless`]/
-//! [`crate::app::handle_apply_to_window`]'s own doc comments).
+//! The config itself is deliberately *not* stored here -- the callback
+//! reads the current (cached) config on every foreground-change event (via
+//! `profile_store::load`), as [`crate::app::handle_toggle_borderless`] and
+//! [`crate::app::handle_apply_to_window`] do on each trigger.
 //!
-//! # Feature-flag correction
+//! # Cargo features
 //!
-//! The original design research (and this issue's own brief) assumed
 //! `SetWinEventHook`/`UnhookWinEvent`/`HWINEVENTHOOK` live in
-//! `windows_sys::Win32::UI::WindowsAndMessaging`, the same module as
-//! `EVENT_SYSTEM_FOREGROUND`/`WINEVENT_OUTOFCONTEXT` -- verified empirically
-//! (per this issue's own instruction to check the locally-cached
-//! `windows-sys` 0.61.2 source rather than trust that assumption) to be
-//! wrong: they actually live in `windows_sys::Win32::UI::Accessibility`,
-//! gated by a *different* Cargo feature, `Win32_UI_Accessibility`, which
-//! was not yet enabled and has been added to `Cargo.toml` for this issue.
-//! The event constants (`EVENT_SYSTEM_FOREGROUND`, `WINEVENT_OUTOFCONTEXT`)
-//! remain in `Win32_UI_WindowsAndMessaging`, already enabled.
+//! `windows_sys::Win32::UI::Accessibility`, gated by the
+//! `Win32_UI_Accessibility` Cargo feature. The event constants
+//! (`EVENT_SYSTEM_FOREGROUND`, `WINEVENT_OUTOFCONTEXT`) live in
+//! `Win32_UI_WindowsAndMessaging`.
 //!
 //! # Testing
 //!
 //! OS-facing throughout (`SetWinEventHook`/`UnhookWinEvent` registration and
 //! the real callback) -- not exercised by this crate's automated tests, per
-//! this crate's established convention (manual usertest only, see
-//! `mem:gotchas/window_filter_module_split`-equivalent modules like
-//! `tray_ui`/`app`). The match-against-tracked-games decision the callback
-//! delegates to ([`crate::app::resolve_auto_apply`], via
+//! this crate's convention for OS-facing modules like `tray_ui`/`app`
+//! (verified by hand only). The match-against-tracked-games decision the
+//! callback delegates to ([`crate::app::resolve_auto_apply`], via
 //! [`crate::app::handle_auto_apply_launch`]) is the pure, unit-tested part
 //! -- see that function's own doc comment and tests in `crate::app::tests`.
 //!
-//! # Taskbar auto-restore on window close (issue #43)
+//! # Taskbar auto-restore on window close
 //!
 //! [`register_taskbar_restore_watcher`] registers a **second**,
 //! independent `SetWinEventHook` scoped to exactly `EVENT_OBJECT_DESTROY`,
@@ -73,8 +65,7 @@
 //! delivers every event *in that whole numeric range*, not just the two
 //! endpoints -- widening would flood the callback with a large number of
 //! unrelated events it would then have to filter, extra dispatch overhead
-//! this feature's own acceptance criteria explicitly rule out ("no
-//! measurable added CPU cost" for an unrelated window closing). A second,
+//! that an unrelated window closing must not cause. A second,
 //! narrowly-scoped hook (mirroring [`register`]'s own single-event
 //! `hEventMin == hEventMax` range) avoids that entirely.
 //!
@@ -103,10 +94,10 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    KillTimer, OBJID_WINDOW, SetTimer, WINEVENT_OUTOFCONTEXT,
 };
 
-/// The config directory the callback reloads the config from on every
+/// The config directory the callback reads the config from on every
 /// foreground-change event -- set once, from [`register`], before the hook
 /// is registered; never mutated afterward. See module docs ("No user-data
 /// parameter") for why this is a `static` rather than a parameter threaded
@@ -167,7 +158,7 @@ pub fn unregister(hook: HWINEVENTHOOK) {
 }
 
 /// Registers the `EVENT_OBJECT_DESTROY` WinEvent hook on the calling
-/// thread -- issue #43's auto-restore-on-close watcher. Must be called
+/// thread -- the auto-restore-on-close watcher. Must be called
 /// before that thread enters its `GetMessageW` pump, same requirement (and
 /// same reasoning) as [`register`]; [`crate::app::run`] calls this
 /// alongside [`register`], both before [`crate::app::run_event_loop`].
@@ -220,12 +211,10 @@ pub fn register_taskbar_restore_watcher() -> Option<HWINEVENTHOOK> {
 /// [`crate::win32::take_armed_taskbar_restore_for_window`]/
 /// [`crate::win32::restore_taskbar`] -- an unrelated window's destroy event
 /// costs one mutex lock and one pointer comparison inside that call, no
-/// real Win32 call at all, satisfying this issue's "no measurable added
-/// cost" acceptance criterion for the common case.
+/// real Win32 call at all, so the common case adds no measurable cost.
 ///
-/// OS-facing, and the exact real-hook-delivery path this issue's
-/// acceptance criteria call out as manual-usertest-only -- not exercised by
-/// this crate's automated tests (see
+/// OS-facing, and the real hook-delivery path is verified by hand only --
+/// not exercised by this crate's automated tests (see
 /// `crate::win32::tests`' `set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_restores_the_real_taskbar_on_a_simulated_window_close`
 /// for the closest automated equivalent: it exercises the exact same two
 /// calls this callback makes, against the real taskbar, without needing a
@@ -244,6 +233,7 @@ unsafe extern "system" fn window_destroy_callback(
     }
 
     crate::win32::forget_applied_window(hwnd);
+    cancel_drift_recheck(hwnd);
 
     if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
         log!("taskbar auto-restore: armed window {hwnd:?} closed, restoring {restore:?}");
@@ -295,7 +285,75 @@ unsafe extern "system" fn drift_callback(
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };
-    crate::app::handle_applied_window_drift(config_dir, hwnd);
+    check_applied_window_drift(config_dir, hwnd);
+}
+
+/// Window handle -> thread timer id of the one pending deferred drift re-check.
+static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Runs the drift handler for `hwnd`; if it was only rate-limited, schedules
+/// one re-check for when the limit expires (at most one pending per window).
+fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
+    let Some(retry_in) = crate::app::handle_applied_window_drift(config_dir, hwnd) else {
+        return;
+    };
+    let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.contains_key(&(hwnd as isize)) {
+        return;
+    }
+    let delay_ms = u32::try_from(retry_in.as_millis())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    // Safety: a null window makes this a thread timer on the message-loop
+    // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
+    if timer == 0 {
+        log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
+    } else {
+        pending.insert(hwnd as isize, timer);
+    }
+}
+
+/// Drops `hwnd`'s pending deferred drift re-check, if any.
+fn cancel_drift_recheck(hwnd: HWND) {
+    let timer = DRIFT_RECHECKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&(hwnd as isize));
+    if let Some(timer) = timer {
+        // Safety: `timer` is a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
+}
+
+/// `TIMERPROC` for a deferred drift re-check: re-runs the drift decision for
+/// the window the timer was scheduled for. OS-facing; not unit tested.
+unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usize, _time: u32) {
+    // Safety: `timer` is a thread timer id this module created.
+    unsafe {
+        KillTimer(std::ptr::null_mut(), timer);
+    }
+    let hwnd = {
+        let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(window) = pending
+            .iter()
+            .find_map(|(window, id)| (*id == timer).then_some(*window))
+        else {
+            return;
+        };
+        pending.remove(&window);
+        window as HWND
+    };
+    if !crate::win32::is_applied_window(hwnd) {
+        return;
+    }
+    let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
+        return;
+    };
+    check_applied_window_drift(config_dir, hwnd);
 }
 
 /// The real `WINEVENTPROC` Windows calls on every `EVENT_SYSTEM_FOREGROUND`
@@ -311,9 +369,8 @@ unsafe extern "system" fn drift_callback(
 /// OBJID_WINDOW` check is needed here -- this event is already scoped to
 /// real top-level windows.
 ///
-/// OS-facing, and the exact real-hook-delivery path this issue's acceptance
-/// criteria call out as manual-usertest-only -- not exercised by this
-/// crate's automated tests.
+/// OS-facing, and the real hook-delivery path is verified by hand only --
+/// not exercised by this crate's automated tests.
 unsafe extern "system" fn win_event_callback(
     _hwineventhook: HWINEVENTHOOK,
     _event: u32,

@@ -20,10 +20,14 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 
 /// Same GUID as the installer's `AppId`, so the name can't collide with
 /// another app's mutex.
-const MUTEX_NAME: &str = "Local\\GameFrame-5C28E192-0AB5-4FA5-8874-88144D010E3B";
+pub(crate) const MUTEX_NAME: &str = "Local\\GameFrame-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
 /// Command-line flag passed to the elevated child by `relaunch_elevated`.
 pub const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
+
+/// Command-line flag that asks the running instance to quit, see
+/// [`is_quit_request`].
+pub const QUIT_FLAG: &str = "--quit";
 
 /// How long an elevated relaunch waits for the old instance to exit.
 pub const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
@@ -65,6 +69,17 @@ where
     args.into_iter()
         .skip(1)
         .any(|a| a.as_ref() == ELEVATED_RELAUNCH_FLAG)
+}
+
+/// Whether the process arguments (program name first) are a request to quit
+/// the running instance (`gameframe.exe --quit`): the process sends `Quit` and
+/// exits without taking the instance. Used by hand and by the updater.
+pub fn is_quit_request<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().skip(1).any(|a| a.as_ref() == QUIT_FLAG)
 }
 
 /// Returns `true` if this process is the only running GameFrame, `false` if
@@ -162,6 +177,14 @@ mod tests {
         for _ in 0..3 {
             assert!(!try_acquire(&name));
         }
+    }
+
+    #[test]
+    fn quit_flag_is_detected_after_program_name_only() {
+        assert!(is_quit_request(["gameframe.exe", "--quit"]));
+        assert!(!is_quit_request(["gameframe.exe"]));
+        assert!(!is_quit_request(["--quit"]));
+        assert!(!is_quit_request(["gameframe.exe", "--elevated-relaunch"]));
     }
 
     #[test]

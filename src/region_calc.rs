@@ -3,6 +3,11 @@
 
 /// The Zone: the single optional user-drawn area, in absolute screen
 /// coordinates, that every tracked game's window is placed into.
+///
+/// All four fields are in **physical screen pixels** (the process is
+/// Per-Monitor V2 DPI aware, so they match what Win32 reports). The zone
+/// editor converts from egui points at its boundary; Zones saved by older
+/// versions load unchanged and are re-saved in pixels on the next edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Zone {
     pub x: i32,

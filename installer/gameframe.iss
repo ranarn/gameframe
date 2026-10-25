@@ -18,6 +18,14 @@
 ; Never change AppGuid: it is the AppId, i.e. how an upgrade finds the existing install.
 #define AppGuid "5C28E192-0AB5-4FA5-8874-88144D010E3B"
 #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{" + AppGuid + "}_is1"
+; Must match src/single_instance.rs (mutex) and src/instance_channel.rs (class,
+; restricted message, Quit's wParam code).
+#define MutexName "Local\GameFrame-" + AppGuid
+#define CommandClass "GameFrame.CommandChannel-" + AppGuid
+#define QuitMessage "GameFrame.RestrictedCommand-" + AppGuid
+#define QuitWParam "2"
+; How long to wait for GameFrame to exit after the quit request before killing it.
+#define QuitWaitMs "10000"
 #define StartupApprovedKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 [Setup]
@@ -30,6 +38,9 @@ AppPublisher=Jonas Ranerfors
 AppPublisherURL=https://github.com/ranarn/gameframe
 AppSupportURL=https://github.com/ranarn/gameframe/issues
 AppUpdatesURL=https://github.com/ranarn/gameframe/releases
+; One setup at a time: a second setup started while the first still runs reports
+; "Setup is already running" and exits (silently under /SUPPRESSMSGBOXES).
+SetupMutex=GameFrame-Setup-{#AppGuid}
 AppCopyright=Copyright (C) 2026 Jonas Ranerfors
 PrivilegesRequired=lowest
 DefaultDirName={autopf}\{#AppName}
@@ -74,8 +85,23 @@ Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueName: "{#AppName}"; ValueType:
 ; Unchecked: remove a registration (a no-op when the value is already absent).
 Root: HKCU; Subkey: "{#RunKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: not startup
 
+[InstallDelete]
+; The same stray folders, so an upgrade cleans them up too.
+Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
+Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
+
+[UninstallDelete]
+; Earlier versions let eframe persist window geometry under
+; %APPDATA%\<window title>\data; remove those stray folders.
+Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
+Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
+
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; An update started by GameFrame itself passes /RELAUNCH (src/update_install.rs) and has no
+; wizard to tick the box above, so it starts the app here. A plain silent install
+; leaves the app stopped.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]
 var
@@ -88,12 +114,59 @@ var
   // the user's own tick/untick survives going Back and Next.
   StartupApplied: Boolean;
 
+// Win32 calls for the quit request. Setup is a 32-bit process, so window
+// handles fit a Longint.
+function FindWindowEx(Parent, ChildAfter: Longint; ClassName, WindowName: String): Longint;
+  external 'FindWindowExW@user32.dll stdcall';
+function RegisterWindowMessage(Name: String): Longint;
+  external 'RegisterWindowMessageW@user32.dll stdcall';
+function PostMessage(Wnd, Msg, WParam, LParam: Longint): Longint;
+  external 'PostMessageW@user32.dll stdcall';
+
+function GameFrameRunning: Boolean;
+begin
+  Result := CheckForMutexes('{#MutexName}');
+end;
+
+// Posts GameFrame's restricted Quit command (see src/instance_channel.rs) to
+// its message-only window. A no-op for a build without that window.
+procedure RequestGameFrameQuit;
+var
+  Wnd: Longint;
+begin
+  Wnd := FindWindowEx(-3 { HWND_MESSAGE }, 0, '{#CommandClass}', '');
+  if Wnd = 0 then
+    Log('quit request: no GameFrame command window found')
+  else if PostMessage(Wnd, RegisterWindowMessage('{#QuitMessage}'), {#QuitWParam}, 0) = 0 then
+    Log('quit request: could not post the quit message')
+  else
+    Log('quit request: posted');
+end;
+
 procedure StopGameFrame;
 var
-  ResultCode: Integer;
+  ResultCode, Waited: Integer;
 begin
-  // A running gameframe.exe locks the file being replaced/removed.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // A running gameframe.exe locks the file being replaced/removed. Ask it to
+  // exit through its normal path (restores the taskbar and borderless
+  // windows, removes the tray icon) and wait for its single-instance mutex to
+  // go; force-kill only if it does not. Nothing to do when it is not running.
+  if not GameFrameRunning then
+    Exit;
+  RequestGameFrameQuit;
+  Waited := 0;
+  while GameFrameRunning and (Waited < {#QuitWaitMs}) do
+  begin
+    Sleep(100);
+    Waited := Waited + 100;
+  end;
+  if GameFrameRunning then
+  begin
+    Log('GameFrame did not quit in time; force-killing it');
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else
+    Log('GameFrame quit cleanly');
 end;
 
 procedure SelectStartupFromRegistry;
@@ -124,7 +197,8 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 begin
   // Upgrade: override Inno's remembered selection with the real
-  // Run value, once, when the Tasks page first appears (Inno raises this for\n  // the page even in silent runs, after its restore).
+  // Run value, once, when the Tasks page first appears (Inno raises this for
+  // the page even in silent runs, after its restore).
   if (CurPageID = wpSelectTasks) and ShouldApplyRegistryStartup then
     SelectStartupFromRegistry;
   Log(Format('startup-task: page=%d installed=%d registry=%d selected=%d applied=%d', [
@@ -140,6 +214,17 @@ begin
     Ord(WasInstalled), Ord(InitialStartup), Ord(WizardIsTaskSelected('startup')), Ord(StartupApplied)]));
   StopGameFrame;
   Result := '';
+end;
+
+// Whether setup was started with the bare /RELAUNCH switch.
+function RelaunchRequested: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+      Result := True;
 end;
 
 function StartupChoiceChanged: Boolean;
