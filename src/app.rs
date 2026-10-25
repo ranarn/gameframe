@@ -228,6 +228,12 @@ fn run_event_loop(
     // `should_allow_restore`; HIGH review finding, issue #31 iteration 3).
     let mut stripped_hwnd: Option<HWND> = None;
 
+    // A Quit received during the first-run zone prompt (before this pump
+    // existed) must not wait for the next message.
+    if instance_channel::quit_pending() {
+        return;
+    }
+
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
         // 0 (WM_QUIT) or -1 (error) both mean: stop pumping.
@@ -242,11 +248,23 @@ fn run_event_loop(
 
         // Commands from a second launch (see crate::instance_channel); the
         // channel's window is dispatched by this pump, so they are queued by now.
-        for command in instance_channel::drain() {
+        let commands = instance_channel::drain();
+        if instance_channel::wants_quit(&commands) {
+            // Same clean-shutdown path as the tray's Exit item below.
+            return;
+        }
+        for command in commands {
             match command {
                 Command::OpenSettings => {
-                    show_settings(tray, &mut hotkeys, config_dir, cursor_overlay)
+                    show_settings(tray, &mut hotkeys, config_dir, cursor_overlay);
+                    // A Quit that arrived while Settings was open closed it
+                    // and is waiting in the queue.
+                    if instance_channel::quit_pending() {
+                        return;
+                    }
                 }
+                // Handled above.
+                Command::Quit => return,
             }
         }
 
@@ -316,6 +334,9 @@ fn run_event_loop(
                 }
                 Some(TrayAction::ShowSettings) => {
                     show_settings(tray, &mut hotkeys, config_dir, cursor_overlay);
+                    if instance_channel::quit_pending() {
+                        return;
+                    }
                 }
                 Some(TrayAction::ToggleStartWithWindows) => {
                     // `muda` has already flipped the check mark, but the

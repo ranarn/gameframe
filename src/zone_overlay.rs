@@ -222,6 +222,13 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         self.control_panel(&ctx);
 
+        // A Quit (installer/updater) ends the session like Cancel so the
+        // taskbar is restored and the graceful exit can run.
+        if crate::instance_channel::quit_pending() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(crate::instance_channel::QUIT_POLL);
+
         if self.outcome.borrow().is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

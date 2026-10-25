@@ -976,6 +976,11 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                     Ok(None) => {}
                     Err(e) => log!("failed to open the zone editor overlay: {e}"),
                 }
+                // A Quit that arrived during the overlay ended it; do not
+                // reopen Settings, let the main loop exit.
+                if crate::instance_channel::quit_pending() {
+                    return Ok(());
+                }
                 state = latest_state;
             }
         }
@@ -1577,6 +1582,15 @@ impl SettingsApp {
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sync_keyboard_hook();
+
+        // A Quit (installer/updater) closes Settings as Cancel does. Polled
+        // here, not only via the window procedure's WM_CLOSE, so a Quit that
+        // arrived before this window existed is not lost.
+        if crate::instance_channel::quit_pending() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ui.ctx()
+            .request_repaint_after(crate::instance_channel::QUIT_POLL);
 
         // Save/Cancel stay pinned below whichever tab is open.
         egui::Panel::bottom("settings_buttons").show(ui, |ui| {

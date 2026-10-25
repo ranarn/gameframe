@@ -24,6 +24,18 @@ mod zone_editor;
 mod zone_overlay;
 
 fn main() {
+    if single_instance::is_quit_request(std::env::args()) {
+        // Never takes the instance: just asks the running one to exit. One
+        // attempt only, so "not running" returns at once.
+        logging::init(&app::config_dir());
+        if instance_channel::send_within(instance_channel::Command::Quit, std::time::Duration::ZERO)
+        {
+            log!("--quit: asked the running instance to quit");
+        } else {
+            log!("--quit: no running instance reachable");
+        }
+        return;
+    }
     let wait = single_instance::is_elevated_relaunch(std::env::args())
         .then_some(single_instance::RELAUNCH_WAIT);
     if wait.is_some() {
