@@ -97,7 +97,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     KillTimer, OBJID_WINDOW, SetTimer, WINEVENT_OUTOFCONTEXT,
 };
 
-/// The config directory the callback reloads the config from on every
+/// The config directory the callback reads the config from on every
 /// foreground-change event -- set once, from [`register`], before the hook
 /// is registered; never mutated afterward. See module docs ("No user-data
 /// parameter") for why this is a `static` rather than a parameter threaded
@@ -308,7 +308,9 @@ fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
     // Safety: a null window makes this a thread timer on the message-loop
     // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
     let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
-    if timer != 0 {
+    if timer == 0 {
+        log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
+    } else {
         pending.insert(hwnd as isize, timer);
     }
 }

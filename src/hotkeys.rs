@@ -95,7 +95,7 @@ fn registration_failure_reason(error: &global_hotkey::Error) -> String {
 /// bindings are skipped, not failures.
 ///
 /// `register` abstracts the OS call so this logic is testable.
-pub fn register_each(
+pub(crate) fn register_each(
     bindings: &HotkeyBindings,
     mut register: impl FnMut(HotKey) -> Result<(), String>,
 ) -> (Vec<ResolvedBinding>, Vec<BindingReport>) {
@@ -117,19 +117,18 @@ pub fn register_each(
             Err(e) => BindingOutcome::Failed(format!("not a valid hotkey: {e}")),
             // Same combination already held by GameFrame's own earlier binding
             // (hand-edited config): say so rather than blaming another program.
-            Ok(hotkey) if registered.iter().any(|b| b.hotkey == hotkey) => {
-                let other = registered.iter().find(|b| b.hotkey == hotkey).unwrap();
-                BindingOutcome::Failed(format!(
+            Ok(hotkey) => match registered.iter().find(|b| b.hotkey == hotkey) {
+                Some(other) => BindingOutcome::Failed(format!(
                     "already bound to another GameFrame action ({})",
                     other.action.label()
-                ))
-            }
-            Ok(hotkey) => match register(hotkey) {
-                Ok(()) => {
-                    registered.push(ResolvedBinding { action, hotkey });
-                    BindingOutcome::Registered
-                }
-                Err(reason) => BindingOutcome::Failed(reason),
+                )),
+                None => match register(hotkey) {
+                    Ok(()) => {
+                        registered.push(ResolvedBinding { action, hotkey });
+                        BindingOutcome::Registered
+                    }
+                    Err(reason) => BindingOutcome::Failed(reason),
+                },
             },
         };
         reports.push(BindingReport {

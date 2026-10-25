@@ -1,7 +1,7 @@
 //! The tray menu's "Apply to Window" picker's two-layer game-window
 //! filtering/ranking:
 //!
-//! - Layer 1 ([`check_eligibility`]) hard-filters system-process, dialog,
+//! - Layer 1 ([`eligibility_for_hwnd`]) hard-filters system-process, dialog,
 //!   cloaked, owned and tool windows out of the list entirely.
 //! - Layer 2 ([`rank_window`]) only ever reorders the remaining list by how
 //!   confidently a window looks like a game (launcher install match, then
@@ -9,7 +9,8 @@
 //!   window, so an unrecognized one stays fully pickable.
 //!
 //! Split the same way as [`crate::win32`]:
-//! - Pure decision logic ([`check_eligibility`], [`rank_window`],
+//! - Pure decision logic ([`check_eligibility`], [`check_window_traits`],
+//!   [`check_executable`], [`rank_window`],
 //!   [`is_known_engine_window_class`], [`has_known_graphics_module`],
 //!   `matches_known_install`) has no `HWND`/OS dependency and is fully unit
 //!   tested below.
@@ -40,7 +41,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// The Layer 1 canonical-window boolean formula: the visibility, cloaking,
-/// owner-chain and tool-window rules [check_eligibility] builds on.
+/// owner-chain and tool-window rules [`eligibility_for_hwnd`] builds on.
 ///
 /// A window is canonical if:
 /// - it's currently visible;
@@ -100,7 +101,7 @@ const SYSTEM_PROCESS_DENYLIST: &[&str] = &[
 /// The window class of standard Win32 dialog boxes.
 const DIALOG_WINDOW_CLASS: &str = "#32770";
 
-/// The per-window signals [`check_eligibility`] decides on.
+/// The per-window signals [`eligibility_for_hwnd`] decides on.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WindowTraits<'a> {
     pub is_visible: bool,
@@ -115,8 +116,8 @@ pub(crate) struct WindowTraits<'a> {
     pub class_name: &'a str,
 }
 
-/// Why [`check_eligibility`] refused a window; its `Display` text is what gets
-/// logged.
+/// Why [`eligibility_for_hwnd`] refused a window; its `Display` text is what
+/// gets logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     UnknownExecutable,
@@ -142,21 +143,13 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// Decides whether a window may be tracked, auto-applied to or stripped.
+/// Refuses, in order: a window whose executable is unknown; GameFrame's own
+/// windows; windows of a [`SYSTEM_PROCESS_DENYLIST`] process.
 ///
-/// Refuses, in this order: a window whose executable is unknown; GameFrame's
-/// own windows; windows of a [`SYSTEM_PROCESS_DENYLIST`] process; dialogs (the
-/// `#32770` class or `WS_EX_DLGMODALFRAME`, even with `WS_EX_APPWINDOW`);
-/// owned windows without `WS_EX_APPWINDOW`; and anything that is not
-/// [`is_canonical_window`] (hidden, cloaked, tool windows, non-representative
-/// popups).
-///
-/// Pure logic -- no `HWND`/OS dependency; [`eligibility_for_hwnd`] gathers the
-/// signals.
-pub(crate) fn check_eligibility(
+/// Pure logic -- no `HWND`/OS dependency.
+fn check_executable(
     exe_file_name: Option<&str>,
     own_exe_file_name: Option<&str>,
-    window: &WindowTraits<'_>,
 ) -> Result<(), Refusal> {
     let Some(exe_file_name) = exe_file_name else {
         return Err(Refusal::UnknownExecutable);
@@ -170,11 +163,15 @@ pub(crate) fn check_eligibility(
     {
         return Err(Refusal::SystemProcess(exe_file_name.to_owned()));
     }
-    check_window_traits(window)
+    Ok(())
 }
 
-/// The executable-independent part of [`check_eligibility`]: dialogs, owned
-/// windows and anything that is not [`is_canonical_window`].
+/// Refuses dialogs (the `#32770` class or `WS_EX_DLGMODALFRAME`, even with
+/// `WS_EX_APPWINDOW`), owned windows without `WS_EX_APPWINDOW` and anything
+/// that is not [`is_canonical_window`] (hidden, cloaked, tool windows,
+/// non-representative popups).
+///
+/// Pure logic -- no `HWND`/OS dependency.
 fn check_window_traits(window: &WindowTraits<'_>) -> Result<(), Refusal> {
     if window.class_name == DIALOG_WINDOW_CLASS || window.has_dialog_frame_style {
         return Err(Refusal::DialogWindow);
@@ -212,8 +209,9 @@ fn own_exe_file_name() -> Option<&'static str> {
 }
 
 /// Gathers `hwnd`'s signals and its owning process's executable path (resolved
-/// once), then decides via [`check_eligibility`]. On success returns the
-/// executable path so callers need not resolve it again.
+/// once), then decides whether the window may be tracked, auto-applied to or
+/// stripped: [`check_window_traits`] first, then [`check_executable`]. On
+/// success returns the executable path so callers need not resolve it again.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
@@ -238,12 +236,26 @@ pub(crate) fn eligibility_for_hwnd(hwnd: HWND) -> Result<std::path::PathBuf, Ref
         has_dialog_frame_style: ex_style & WS_EX_DLGMODALFRAME != 0,
         class_name: &class_name,
     };
-    // The cheap window checks run first: resolving the executable opens the
-    // process, which is wasted on the many windows that fail them anyway.
-    check_window_traits(&window)?;
-    let exe_path = exe_path_for_window(hwnd).ok_or(Refusal::UnknownExecutable)?;
+    check_eligibility(&window, own_exe_file_name(), || exe_path_for_window(hwnd))
+}
+
+/// The decision behind [`eligibility_for_hwnd`]: [`check_window_traits`] first,
+/// then, only for a window that passes, `resolve_exe` and [`check_executable`].
+/// Returns the resolved executable path.
+///
+/// The cheap window checks run first: resolving the executable opens the
+/// process, which is wasted on the many windows that fail them anyway.
+///
+/// Pure logic -- no `HWND`/OS dependency; `resolve_exe` is the OS-facing part.
+fn check_eligibility(
+    window: &WindowTraits<'_>,
+    own_exe_file_name: Option<&str>,
+    resolve_exe: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Refusal> {
+    check_window_traits(window)?;
+    let exe_path = resolve_exe().ok_or(Refusal::UnknownExecutable)?;
     let exe_file_name = exe_path.file_name().map(|n| n.to_string_lossy());
-    check_eligibility(exe_file_name.as_deref(), own_exe_file_name(), &window)?;
+    check_executable(exe_file_name.as_deref(), own_exe_file_name)?;
     Ok(exe_path)
 }
 
@@ -251,7 +263,7 @@ pub(crate) fn eligibility_for_hwnd(hwnd: HWND) -> Result<std::path::PathBuf, Ref
 /// like a game, from weakest to strongest signal (declaration order doubles
 /// as `Ord`/`PartialOrd` ranking, lowest variant first) -- used only to sort
 /// the "Apply to Window" picker's list and/or badge an entry; unlike
-/// [`check_eligibility`]'s Layer-1 hard filters, a low (or [`Unknown`]) rank
+/// [`eligibility_for_hwnd`]'s Layer-1 hard filters, a low (or [`Unknown`]) rank
 /// never removes a window from the list. An unrecognized window (no launcher
 /// match, no graphics DLL loaded, no known engine window class) always
 /// remains pickable at [`WindowRank::Unknown`].
@@ -492,13 +504,9 @@ pub(crate) fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 /// Resolves the executable path of the process that owns `hwnd`, via
-/// `GetWindowThreadProcessId` + [`process_exe_path`]. Shared plumbing for
-/// both the borderless-hotkey path's foreground-window resolution
-/// ([`crate::win32::foreground_window_exe_path`], which is just
-/// `exe_path_for_window(GetForegroundWindow())`) and the tray's "Apply to
-/// Window" path's explicit-`hwnd` resolution -- so the PID/exe-path
-/// resolution glue lives in one place rather than being duplicated at both
-/// call sites.
+/// `GetWindowThreadProcessId` + [`process_exe_path`]. Shared by the
+/// borderless-hotkey path and the tray's "Apply to Window" path, so the
+/// PID/exe-path resolution glue lives in one place.
 ///
 /// Returns `None` if `GetWindowThreadProcessId` can't resolve a PID for
 /// `hwnd`, or if [`process_exe_path`] itself fails (see its own doc comment)
@@ -667,7 +675,7 @@ pub(crate) fn window_ex_style(hwnd: HWND) -> u32 {
 /// invisible helper windows) down to one representative per application.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs; the decision that consumes this value ([`check_eligibility`]) is
+/// docs; the decision that consumes this value ([`check_window_traits`]) is
 /// unit tested in isolation.
 pub(crate) fn is_root_owner_or_last_active_popup(hwnd: HWND) -> bool {
     // Safety: `hwnd` is a live handle; `GetAncestor`/`GetLastActivePopup`
@@ -687,7 +695,7 @@ pub(crate) fn is_root_owner_or_last_active_popup(hwnd: HWND) -> bool {
 /// assumed on query failure.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs; the decision that consumes this value ([`check_eligibility`]) is
+/// docs; the decision that consumes this value ([`check_window_traits`]) is
 /// unit tested in isolation.
 pub(crate) fn is_window_cloaked(hwnd: HWND) -> bool {
     let mut is_cloaked: i32 = 0;
@@ -708,6 +716,19 @@ pub(crate) fn is_window_cloaked(hwnd: HWND) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the production decision with an executable of the given file name
+    /// (`None` = unresolvable).
+    fn eligibility(
+        exe_file_name: Option<&str>,
+        own_exe_file_name: Option<&str>,
+        window: &WindowTraits<'_>,
+    ) -> Result<(), Refusal> {
+        check_eligibility(window, own_exe_file_name, || {
+            exe_file_name.map(|name| std::path::Path::new("C:\\games").join(name))
+        })
+        .map(|_| ())
+    }
 
     #[test]
     fn is_canonical_window_accepts_a_visible_window() {
@@ -877,15 +898,15 @@ mod tests {
     }
 
     #[test]
-    fn check_eligibility_accepts_a_normal_top_level_game_window() {
+    fn eligibility_accepts_a_normal_top_level_game_window() {
         assert_eq!(
-            check_eligibility(Some("game.exe"), Some("gameframe.exe"), &game_window()),
+            eligibility(Some("game.exe"), Some("gameframe.exe"), &game_window()),
             Ok(())
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_every_denylisted_exe_case_insensitively() {
+    fn eligibility_refuses_every_denylisted_exe_case_insensitively() {
         for denied in SYSTEM_PROCESS_DENYLIST {
             for name in [
                 denied.to_string(),
@@ -893,7 +914,7 @@ mod tests {
                 denied.to_lowercase(),
             ] {
                 assert_eq!(
-                    check_eligibility(Some(&name), None, &game_window()),
+                    eligibility(Some(&name), None, &game_window()),
                     Err(Refusal::SystemProcess(name.clone())),
                     "{name}"
                 );
@@ -902,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn check_eligibility_denylist_covers_the_shell_and_core_system_processes() {
+    fn eligibility_denylist_covers_the_shell_and_core_system_processes() {
         for required in [
             "explorer.exe",
             "ShellExperienceHost.exe",
@@ -918,66 +939,66 @@ mod tests {
             "sihost.exe",
         ] {
             assert!(
-                check_eligibility(Some(required), None, &game_window()).is_err(),
+                eligibility(Some(required), None, &game_window()).is_err(),
                 "{required}"
             );
         }
     }
 
     #[test]
-    fn check_eligibility_refuses_gameframes_own_exe_case_insensitively() {
+    fn eligibility_refuses_gameframes_own_exe_case_insensitively() {
         assert_eq!(
-            check_eligibility(Some("GAMEFRAME.EXE"), Some("gameframe.exe"), &game_window()),
+            eligibility(Some("GAMEFRAME.EXE"), Some("gameframe.exe"), &game_window()),
             Err(Refusal::OwnExecutable)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_a_window_with_an_unknown_exe() {
+    fn eligibility_refuses_a_window_with_an_unknown_exe() {
         assert_eq!(
-            check_eligibility(None, None, &game_window()),
+            eligibility(None, None, &game_window()),
             Err(Refusal::UnknownExecutable)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_an_owned_window() {
+    fn eligibility_refuses_an_owned_window() {
         let window = WindowTraits {
             is_owned: true,
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("game.exe"), None, &window),
+            eligibility(Some("game.exe"), None, &window),
             Err(Refusal::OwnedWindow)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_a_tool_window() {
+    fn eligibility_refuses_a_tool_window() {
         let window = WindowTraits {
             has_tool_window_style: true,
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("game.exe"), None, &window),
+            eligibility(Some("game.exe"), None, &window),
             Err(Refusal::NotMainWindow)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_a_dialog_class_window() {
+    fn eligibility_refuses_a_dialog_class_window() {
         let window = WindowTraits {
             class_name: "#32770",
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("game.exe"), None, &window),
+            eligibility(Some("game.exe"), None, &window),
             Err(Refusal::DialogWindow)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_a_dialog_frame_window_even_when_owned_with_app_window_style() {
+    fn eligibility_refuses_a_dialog_frame_window_even_when_owned_with_app_window_style() {
         let window = WindowTraits {
             is_owned: true,
             has_app_window_style: true,
@@ -985,13 +1006,13 @@ mod tests {
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("game.exe"), None, &window),
+            eligibility(Some("game.exe"), None, &window),
             Err(Refusal::DialogWindow)
         );
     }
 
     #[test]
-    fn check_eligibility_refuses_a_hidden_or_cloaked_window() {
+    fn eligibility_refuses_a_hidden_or_cloaked_window() {
         for window in [
             WindowTraits {
                 is_visible: false,
@@ -1003,43 +1024,43 @@ mod tests {
             },
         ] {
             assert_eq!(
-                check_eligibility(Some("game.exe"), None, &window),
+                eligibility(Some("game.exe"), None, &window),
                 Err(Refusal::NotMainWindow)
             );
         }
     }
 
     #[test]
-    fn check_eligibility_accepts_an_owned_non_dialog_window_with_app_window_style() {
+    fn eligibility_accepts_an_owned_non_dialog_window_with_app_window_style() {
         let window = WindowTraits {
             is_owned: true,
             has_app_window_style: true,
             ..game_window()
         };
-        assert_eq!(check_eligibility(Some("game.exe"), None, &window), Ok(()));
+        assert_eq!(eligibility(Some("game.exe"), None, &window), Ok(()));
     }
 
     #[test]
-    fn check_eligibility_refuses_a_non_representative_popup() {
+    fn eligibility_refuses_a_non_representative_popup() {
         let window = WindowTraits {
             is_root_owner_or_last_active_popup: false,
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("game.exe"), None, &window),
+            eligibility(Some("game.exe"), None, &window),
             Err(Refusal::NotMainWindow)
         );
     }
 
     #[test]
-    fn check_eligibility_reports_a_system_process_before_a_dialog() {
+    fn eligibility_reports_a_dialog_before_a_system_process() {
         let window = WindowTraits {
             class_name: "#32770",
             ..game_window()
         };
         assert_eq!(
-            check_eligibility(Some("explorer.exe"), None, &window),
-            Err(Refusal::SystemProcess("explorer.exe".to_owned()))
+            eligibility(Some("explorer.exe"), None, &window),
+            Err(Refusal::DialogWindow)
         );
     }
 }

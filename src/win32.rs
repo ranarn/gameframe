@@ -596,8 +596,6 @@ const DRIFT_REAPPLY_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriftDecision {
     Reapply,
-    /// The window is minimized: its off-screen position is not drift.
-    SkipMinimized,
     SkipNotDrifted,
     /// Another attempt on this window happened less than
     /// [`DRIFT_REAPPLY_MIN_INTERVAL`] ago; the event should be re-checked once
@@ -610,13 +608,10 @@ pub(crate) enum DriftDecision {
 /// Pure decision for one drift event. `since_last_attempt` is the time since
 /// this window's previous re-apply attempt, `None` if it has had none.
 fn decide_drift_reapply(
-    minimized: bool,
     drifted: bool,
     since_last_attempt: Option<std::time::Duration>,
 ) -> DriftDecision {
-    if minimized {
-        DriftDecision::SkipMinimized
-    } else if !drifted {
+    if !drifted {
         DriftDecision::SkipNotDrifted
     } else if let Some(since) = since_last_attempt.filter(|d| *d < DRIFT_REAPPLY_MIN_INTERVAL) {
         DriftDecision::SkipRateLimited {
@@ -646,14 +641,13 @@ impl DriftAttempts {
         &self,
         window: isize,
         now: std::time::Instant,
-        minimized: bool,
         drifted: bool,
     ) -> DriftDecision {
         let since = self
             .last
             .get(&window)
             .map(|t| now.saturating_duration_since(*t));
-        decide_drift_reapply(minimized, drifted, since)
+        decide_drift_reapply(drifted, since)
     }
 
     fn record(&mut self, window: isize, now: std::time::Instant) {
@@ -671,11 +665,11 @@ pub(crate) fn is_window_minimized(hwnd: HWND) -> bool {
 }
 
 /// Decides whether a drift event on `hwnd` should re-apply the Zone.
-pub(crate) fn decide_drift_for_window(hwnd: HWND, minimized: bool, drifted: bool) -> DriftDecision {
+pub(crate) fn decide_drift_for_window(hwnd: HWND, drifted: bool) -> DriftDecision {
     DRIFT_ATTEMPTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .decide(hwnd as isize, std::time::Instant::now(), minimized, drifted)
+        .decide(hwnd as isize, std::time::Instant::now(), drifted)
 }
 
 /// Records now as the time of `hwnd`'s latest drift re-apply attempt.
@@ -739,9 +733,10 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 /// guard: a minimized window's `GetWindowRect` reports its off-screen
 /// minimized position (roughly `(-32000, -32000)`), not a real, restorable
 /// region, so applying a target region to it would move/resize it based on
-/// that bogus rect. The picker filter ([`crate::window_filter::check_eligibility`])
-/// only checks `IsWindowVisible` (which stays `TRUE` for minimized windows),
-/// so a minimized window can legitimately reach this function via the
+/// that bogus rect. The eligibility filter
+/// ([`crate::window_filter::eligibility_for_hwnd`]) has no minimized check
+/// (`IsWindowVisible` stays `TRUE` for minimized windows), so a minimized
+/// window can legitimately reach this function via the
 /// tray-menu path -- this guard is what keeps that path's OS-mutation
 /// behavior identical to the hotkey path's, not just sharing the three-call
 /// mutation sequence.
@@ -831,11 +826,9 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
 
 /// Resolves the current foreground window's `HWND`, via `GetForegroundWindow()`.
 ///
-/// Returns `None` if there is no foreground window. Shared by
-/// [`foreground_window_exe_path`] (exe-path resolution for the tracked-game
-/// lookup) and, by
-/// [`crate::app::handle_toggle_borderless`] directly, which needs the raw
-/// `HWND` itself (not just its exe path) to look up and act on that window.
+/// Returns `None` if there is no foreground window. Used directly by
+/// [`crate::app::handle_toggle_borderless`], which needs the raw `HWND` to
+/// look up and act on that window.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
@@ -845,32 +838,6 @@ pub fn foreground_window() -> Option<HWND> {
     // call uses it.
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_null() { None } else { Some(hwnd) }
-}
-
-/// Resolves the current foreground window's owning process's executable
-/// path, via [`foreground_window`] + [`window_filter::exe_path_for_window`].
-///
-/// Lets a caller (namely [`crate::app::handle_toggle_borderless`]) decide
-/// whether the foreground window belongs to a tracked game *before*
-/// deciding whether to proceed at all.
-///
-/// Returns `None` if there is no foreground window, or if the exe path
-/// can't be resolved (see [`window_filter::exe_path_for_window`]) -- both
-/// treated identically by callers as "no tracked-game lookup possible for
-/// this press".
-///
-/// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs.
-///
-/// Currently has no internal caller: [`crate::app::handle_toggle_borderless`]
-/// resolves [`foreground_window`] once and passes that same `HWND` into
-/// [`window_filter::exe_path_for_window`] directly, to avoid a second,
-/// redundant `GetForegroundWindow()` call. Kept as a small standalone
-/// convenience wrapper for any caller that only needs the exe path and
-/// doesn't care about the `HWND` itself.
-#[allow(dead_code)]
-pub fn foreground_window_exe_path() -> Option<std::path::PathBuf> {
-    window_filter::exe_path_for_window(foreground_window()?)
 }
 
 /// Hides the real taskbar completely via `ShowWindow(Shell_TrayWnd,
@@ -1336,10 +1303,9 @@ pub fn set_taskbar_hide_absolute_armed(
 /// This exists because a hide-vs-show decision made from a remembered flag
 /// that only the hotkey ever wrote would go stale: the taskbar can also be
 /// hidden by an entirely different path (a tracked game's launch-detection
-/// auto-hide,
-/// [`set_taskbar_hide_absolute_armed`], which re-applies on every foreground
-/// switch back to the game, not just the initial launch). That path never
-/// touches the hotkey's own memory, so the two could disagree about whether
+/// auto-hide, [`set_taskbar_hide_absolute_armed`], which re-applies on every
+/// foreground switch back to the game, not just the initial launch). That path
+/// never touches the hotkey's own memory, so the two could disagree about whether
 /// the taskbar was hidden, making the hotkey's next press act on a stale
 /// premise (hiding an already-hidden taskbar is a no-op; the *following*
 /// press then does the opposite of what was expected). Grounding the
@@ -1645,8 +1611,8 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i3
 /// Reads a window's title via `GetWindowTextLengthW`/`GetWindowTextW`,
 /// returning an empty string if the window has no title (or either call
 /// fails) rather than propagating an error -- an untitled window is simply
-/// filtered out by [`crate::window_filter::is_listable_title`], not treated as a hard failure of
-/// the whole enumeration.
+/// filtered out by [`crate::window_filter::is_listable_title`], not treated
+/// as a hard failure of the whole enumeration.
 pub(crate) fn window_text(hwnd: HWND) -> String {
     // Safety: `hwnd` is a live handle; `GetWindowTextLengthW` performs no
     // writes.
@@ -1897,7 +1863,8 @@ fn resolve_hwnd_for_pid(pid: u32) -> Option<HWND> {
 /// Returns `None` if no running process matches `exe_path` (the game isn't
 /// currently running -- callers must silently skip it: its setting still
 /// saves normally and applies on its next launch/hotkey/tray-apply) or if one
-/// does but it has no listable top-level window (e.g. still starting up with no window shown yet).
+/// does but it has no listable top-level window (e.g. still starting up with
+/// no window shown yet).
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
@@ -2053,21 +2020,11 @@ mod tests {
     }
 
     #[test]
-    fn drift_decision_skips_a_minimized_window() {
-        let attempts = DriftAttempts::default();
-
-        assert_eq!(
-            attempts.decide(1, std::time::Instant::now(), true, true),
-            DriftDecision::SkipMinimized
-        );
-    }
-
-    #[test]
     fn drift_decision_skips_a_window_that_has_not_drifted() {
         let attempts = DriftAttempts::default();
 
         assert_eq!(
-            attempts.decide(1, std::time::Instant::now(), false, false),
+            attempts.decide(1, std::time::Instant::now(), false),
             DriftDecision::SkipNotDrifted
         );
     }
@@ -2078,16 +2035,16 @@ mod tests {
         let t0 = std::time::Instant::now();
         let step = std::time::Duration::from_millis;
 
-        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
         attempts.record(1, t0);
         assert_eq!(
-            attempts.decide(1, t0 + step(400), false, true),
+            attempts.decide(1, t0 + step(400), true),
             DriftDecision::SkipRateLimited {
                 retry_in: step(600)
             }
         );
         assert_eq!(
-            attempts.decide(1, t0 + step(1000), false, true),
+            attempts.decide(1, t0 + step(1000), true),
             DriftDecision::Reapply
         );
     }
@@ -2100,10 +2057,10 @@ mod tests {
         attempts.record(1, t0);
 
         assert!(matches!(
-            attempts.decide(1, t0, false, true),
+            attempts.decide(1, t0, true),
             DriftDecision::SkipRateLimited { .. }
         ));
-        assert_eq!(attempts.decide(2, t0, false, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(2, t0, true), DriftDecision::Reapply);
     }
 
     #[test]
@@ -2111,8 +2068,8 @@ mod tests {
         let attempts = DriftAttempts::default();
         let t0 = std::time::Instant::now();
 
-        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
-        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
     }
 
     #[test]
@@ -2727,9 +2684,9 @@ mod tests {
     /// must not reappear when the mouse hovers near the bottom of the screen
     /// while hidden -- not scriptable without OS-level screen/window-state
     /// inspection, but the underlying `ShowWindow` state change *is*
-    /// directly observable via `IsWindowVisible`). Ignored by default (not part of the automated
-    /// suite, same OS-facing convention as the rest of this module) --
-    /// run explicitly with `cargo test --lib win32::tests::hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility -- --ignored`
+    /// directly observable via `IsWindowVisible`). Ignored by default (not part
+    /// of the automated suite, same OS-facing convention as the rest of this
+    /// module) -- run explicitly with `cargo test --lib win32::tests::hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility -- --ignored`
     /// on a real desktop session. Mutates the real Shell_TrayWnd on this
     /// machine for the duration of the test, restoring it in every case
     /// (including a failed assertion, via a drop guard) so a test failure

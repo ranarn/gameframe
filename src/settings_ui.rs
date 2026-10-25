@@ -280,8 +280,8 @@ impl SettingsState {
     /// needed because `keyboard_hook::keyboard_hook_proc` swallows the
     /// physical Ctrl+Escape combination before it can ever arrive as a
     /// normal `egui::Event::Key` for [`Self::handle_key_event`] to observe.
-    /// A no-op when `ctrl_escape_suppressed` is `false`, or when nothing is currently
-    /// capturing.
+    /// A no-op when `ctrl_escape_suppressed` is `false`, or when nothing is
+    /// currently capturing.
     ///
     /// Deliberately reuses [`Self::handle_key_event`]'s existing, already-
     /// tested Ctrl+Escape formatting/duplicate-check logic rather than
@@ -806,9 +806,10 @@ fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<H
 ///
 /// Deliberately NOT `HotKey::Display`, whose `into_string()` round-trips to
 /// a different, lowercase, spelled-out format (`"control+alt+keyb"`) that
-/// doesn't match what `profile_store`/`register_each` already expect. Returns `None` if `key` is
-/// itself a physical modifier key (a modifier-only press never completes a
-/// capture) or has no known name in GameFrame's hotkey vocabulary.
+/// doesn't match what `profile_store`/`register_each` already expect.
+/// Returns `None` if `key` is itself a physical modifier key (a
+/// modifier-only press never completes a capture) or has no known name in
+/// GameFrame's hotkey vocabulary.
 ///
 /// Note: egui's `Modifiers` has no Windows/Super-key flag on this platform
 /// (`mac_cmd` is Mac-only, `command` mirrors `ctrl` on Windows) -- so a

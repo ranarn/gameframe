@@ -757,8 +757,8 @@ mod tests {
         assert_eq!(second, migrated);
     }
 
-    /// Builds config TOML (legacy preset shape or Zone shape) with one tracked game per
-    /// entry of `flags`, each carrying that per-game taskbar flag.
+    /// Builds config TOML (legacy preset shape or Zone shape) with one tracked
+    /// game per entry of `flags`, each carrying that per-game taskbar flag.
     fn config_with_game_flags(legacy: bool, flags: &[bool]) -> String {
         let mut s = String::new();
         if legacy {
@@ -1044,7 +1044,7 @@ mod tests {
         write_config_file(&config_dir, "not { toml");
 
         assert_eq!(load(&config_dir).unwrap(), migrated);
-        assert!(backup_files(&config_dir) == ["config.toml.pre-zone.bak"]);
+        assert_eq!(backup_files(&config_dir), ["config.toml.pre-zone.bak"]);
     }
 
     #[test]

@@ -508,8 +508,8 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// process should exit (see [`win32::relaunch_elevated`]); `false` in every
 /// other case (success, or a non-elevation failure that was just logged).
 ///
-/// Loads the config on every press (via [`profile_store::load`], which serves
-/// its in-memory copy and is refreshed by every save) so a Zone/game
+/// Reads the current config on every press (via [`profile_store::load`],
+/// which serves its in-memory copy, refreshed by every save) so a Zone/game
 /// added/edited via Settings since the last press is picked up immediately.
 /// The hotkey binding itself is re-registered separately, right after the
 /// Settings window closes -- see the `ShowSettings` branch in
@@ -610,7 +610,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
         )
     {
         log!(
-            "borderless toggle: failed to set taskbar auto-hide for {}: {e}",
+            "borderless toggle: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
         );
     }
@@ -621,18 +621,18 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
 /// Reacts to a click on one of the "Apply to Window" submenu's
 /// dynamically-listed windows ([`tray_ui::decode_window_item_id`]): resolves
 /// `target_hwnd`'s owning process's executable path, looks it up (or adds it,
-/// with auto-apply on, taskbar-auto-hide on) in the tracked-games list via
+/// with auto-apply on) in the tracked-games list via
 /// [`profile_store::upsert_tracked_game`], persists that list update
 /// immediately (even if a later step below fails), then applies the
 /// Zone's borderless+reposition treatment to `target_hwnd` --
 /// which may not be the foreground window at all, that's the whole point of
 /// this tray-menu path -- via [`win32::apply_borderless_to_window`], and,
-/// only once that border-apply succeeds, sets the tracked game's
-/// taskbar-auto-hide value absolutely. A
+/// only once that border-apply succeeds, sets the taskbar absolutely from the
+/// global `hide_taskbar_on_apply` and `taskbar_hide_mode`. A
 /// border-apply failure (e.g. the target window is minimized) returns early
 /// without touching the taskbar at all -- mirroring
 /// [`handle_toggle_borderless`]'s equivalent gating -- since forcing the
-/// taskbar into auto-hide for a window that was never actually stripped
+/// taskbar away for a window that was never actually stripped
 /// would contradict the whole point of coupling the two.
 ///
 /// A one-shot action, not a toggle: selecting the same window again simply
@@ -640,7 +640,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
 /// pre-strip state is remembered (see [`win32::apply_borderless_to_window`]),
 /// so the borderless hotkey can restore it.
 ///
-/// Loads the config on every click, for the same reason
+/// Reads the current config on every click, for the same reason
 /// [`handle_toggle_borderless`] does.
 ///
 /// Unlike [`handle_toggle_borderless`], a failure here (including an
@@ -719,7 +719,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         config.taskbar_hide_mode,
     ) {
         log!(
-            "apply to window: failed to set taskbar auto-hide for {}: {e}",
+            "apply to window: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
         );
     }
@@ -743,9 +743,8 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// to reach an actual apply here at all (see [`resolve_auto_apply`]'s doc
 /// comment), so there is no upsert/save step.
 ///
-/// Loads the config on every foreground-change event, matching
-/// [`handle_toggle_borderless`]/[`handle_apply_to_window`]'s own "load on
-/// every trigger" convention.
+/// Reads the current config on every foreground-change event, matching
+/// [`handle_toggle_borderless`]/[`handle_apply_to_window`].
 ///
 /// OS-facing (resolves a real `HWND`'s owning process and applies real
 /// window/taskbar mutations) -- not exercised by this crate's automated
@@ -825,7 +824,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         config.taskbar_hide_mode,
     ) {
         log!(
-            "launch detection: failed to set taskbar auto-hide for {}: {e}",
+            "launch detection: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
         );
     }
@@ -849,6 +848,7 @@ pub(crate) fn handle_applied_window_drift(
     config_dir: &Path,
     hwnd: HWND,
 ) -> Option<std::time::Duration> {
+    // A minimized window's rect is its off-screen minimized position, not drift.
     if win32::auto_apply_suppressed(hwnd) || win32::is_window_minimized(hwnd) {
         return None;
     }
@@ -857,11 +857,14 @@ pub(crate) fn handle_applied_window_drift(
     let (tracked_game, zone) = resolve_auto_apply(&config, &exe_path)?;
     let target_region = resolve_region(&zone, &primary_monitor_geometry()).ok()?;
     let drifted = matches!(win32::window_has_drifted(hwnd, target_region), Ok(true));
-    match win32::decide_drift_for_window(hwnd, false, drifted) {
+    match win32::decide_drift_for_window(hwnd, drifted) {
         win32::DriftDecision::Reapply => {}
         win32::DriftDecision::SkipRateLimited { retry_in } => return Some(retry_in),
-        win32::DriftDecision::SkipMinimized | win32::DriftDecision::SkipNotDrifted => return None,
+        win32::DriftDecision::SkipNotDrifted => return None,
     }
+    // Recorded before the eligibility check so a refused window is rate
+    // limited (and logged) like any other attempt.
+    win32::record_drift_attempt(hwnd);
     if let Err(refusal) = window_filter::eligibility_for_hwnd(hwnd) {
         log!(
             "drift re-apply: refusing the window of {}: {refusal}",
@@ -869,7 +872,6 @@ pub(crate) fn handle_applied_window_drift(
         );
         return None;
     }
-    win32::record_drift_attempt(hwnd);
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
         log!(
             "drift re-apply: failed for {}: {e}",
