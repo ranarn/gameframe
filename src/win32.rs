@@ -646,7 +646,7 @@ pub fn foreground_window_exe_path() -> Option<std::path::PathBuf> {
 pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Marker first (issue #68): a kill right after the hide is then covered.
-    taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
+    let _ = taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
     // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
     unsafe {
@@ -665,7 +665,7 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
 /// module docs.
 pub fn show_taskbar() -> Result<(), Win32Error> {
     show_taskbar_window()?;
-    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
+    taskbar_recovery::mark_restored();
     Ok(())
 }
 
@@ -712,7 +712,7 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
             let current_flags = read_appbar_flags(hwnd);
             let current = state_from_flags(current_flags);
             let restore = plan_taskbar_hide(mode, current);
-            taskbar_recovery::mark_hidden(restore);
+            let _ = taskbar_recovery::mark_hidden(restore);
             write_appbar_state(hwnd, current_flags, TaskbarAutohideState::AutoHidden);
             Ok(restore)
         }
@@ -729,7 +729,7 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
         TaskbarHideRestore::FullyHidden => show_taskbar(),
         TaskbarHideRestore::HoverReveal(state) => {
             set_appbar_state(state)?;
-            taskbar_recovery::mark_restored(remembered);
+            taskbar_recovery::mark_restored();
             Ok(())
         }
     }
@@ -995,15 +995,23 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
         }
         TaskbarHideMode::HoverReveal => {
             let target = taskbar_autohide_state_from_bool(hide);
-            if hide {
+            let undo = if hide {
                 // Marker first (issue #68), recording the state to go back to.
                 let hwnd = find_taskbar_window()?;
                 let prior = state_from_flags(read_appbar_flags(hwnd));
-                taskbar_recovery::mark_hidden(TaskbarHideRestore::HoverReveal(prior));
+                taskbar_recovery::mark_hidden(TaskbarHideRestore::HoverReveal(prior))
+            } else {
+                None
+            };
+            if let Err(e) = set_appbar_state(target) {
+                // The hide never happened: don't claim it did.
+                if let Some(undo) = undo {
+                    taskbar_recovery::undo_hide(undo);
+                }
+                return Err(e);
             }
-            set_appbar_state(target)?;
             if !hide {
-                taskbar_recovery::mark_restored(TaskbarHideRestore::HoverReveal(target));
+                taskbar_recovery::mark_restored();
             }
             Ok(())
         }

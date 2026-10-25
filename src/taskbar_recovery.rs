@@ -19,7 +19,7 @@
 
 use crate::win32::{self, TaskbarAutohideState, TaskbarHideRestore};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 pub const MARKER_FILE: &str = "taskbar-hidden.marker";
 
@@ -103,11 +103,56 @@ pub fn decide_recovery(marker: MarkerState, observed: ObservedTaskbar) -> Recove
     }
 }
 
-/// True if restoring to `restore` leaves the taskbar hidden anyway (a
-/// `HoverReveal` whose prior state was already auto-hide), in which case the
-/// marker must stay: something else may still be relying on the hide.
-fn restore_keeps_taskbar_hidden(restore: TaskbarHideRestore) -> bool {
-    restore == TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AutoHidden)
+/// What GameFrame currently believes it has hidden: the in-memory half of the
+/// bookkeeping. Pure state transitions only, no IO, so it is cheap to hold
+/// behind a mutex and easy to test.
+#[derive(Debug, Default)]
+struct HideRecord {
+    hidden: Option<TaskbarHideRestore>,
+}
+
+impl HideRecord {
+    /// Records a hide. Returns the record as it was before if this changed it
+    /// (the caller must then persist the new record), `None` if unchanged.
+    ///
+    /// While a hide is recorded a later one keeps the original, which holds
+    /// the true prior state (a nested `HoverReveal` reads `AutoHidden` as its
+    /// "prior" only because the first hide already set it). The exception is
+    /// `FullyHidden` over a `HoverReveal`: recovery must then show the
+    /// taskbar window, which a `HoverReveal` record would not do.
+    fn hide(&mut self, restore: TaskbarHideRestore) -> Option<Option<TaskbarHideRestore>> {
+        let previous = self.hidden;
+        let next = match (previous, restore) {
+            (None, _) => restore,
+            (Some(TaskbarHideRestore::HoverReveal(_)), TaskbarHideRestore::FullyHidden) => restore,
+            (Some(existing), _) => existing,
+        };
+        if previous == Some(next) {
+            return None;
+        }
+        self.hidden = Some(next);
+        Some(previous)
+    }
+
+    /// Forgets the hide. Any restore returns the taskbar to a state GameFrame
+    /// is no longer responsible for, even a restore to the user's own
+    /// auto-hide.
+    fn restore(&mut self) {
+        self.hidden = None;
+    }
+}
+
+/// What the panic hook should restore. `in_memory` is `None` when the lock on
+/// the in-memory record could not be taken (held by the panicking thread or
+/// another one); the marker file in `dir` is then the source of truth.
+fn panic_restore_target(in_memory: Option<Option<TaskbarHideRestore>>, dir: Option<&Path>) -> Option<TaskbarHideRestore> {
+    match in_memory {
+        Some(known) => known,
+        None => match dir.map(read_marker_file) {
+            Some(MarkerState::Technique(r)) => Some(r),
+            _ => None,
+        },
+    }
 }
 
 fn marker_path(dir: &Path) -> PathBuf {
@@ -134,61 +179,82 @@ fn clear_marker_file(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Process-wide marker bookkeeping: where the file lives and what GameFrame
-/// currently believes it has hidden (for the panic hook and tray Exit).
-struct Tracker {
-    dir: Option<PathBuf>,
-    hidden: Option<TaskbarHideRestore>,
+/// Process-wide state. The record is only ever locked for in-memory
+/// transitions (never across file IO), so the panic hook's `try_lock` fails
+/// only in a tiny window. The marker directory sits outside that lock so the
+/// hook can always reach the marker file when it does fail.
+static RECORD: Mutex<HideRecord> = Mutex::new(HideRecord { hidden: None });
+static MARKER_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Serializes marker file writes and removals so they land in the order the
+/// in-memory transitions happened. The panic hook never takes it.
+static FILE_IO: Mutex<()> = Mutex::new(());
+
+fn record() -> std::sync::MutexGuard<'static, HideRecord> {
+    RECORD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-static TRACKER: Mutex<Tracker> = Mutex::new(Tracker { dir: None, hidden: None });
+fn persist(restore: Option<TaskbarHideRestore>) {
+    let Some(dir) = MARKER_DIR.get() else { return };
+    let _io = FILE_IO.lock().unwrap_or_else(|e| e.into_inner());
+    match restore {
+        Some(r) => {
+            if let Err(e) = write_marker_file(dir, r) {
+                log!("could not write the taskbar marker: {e}");
+            }
+        }
+        None => {
+            if let Err(e) = clear_marker_file(dir) {
+                log!("could not remove the taskbar marker: {e}");
+            }
+        }
+    }
+}
 
 /// Sets the directory the marker file lives in. Until this is called nothing
 /// is written to disk (in-memory tracking still works).
 pub fn init(dir: &Path) {
-    TRACKER.lock().unwrap_or_else(|e| e.into_inner()).dir = Some(dir.to_path_buf());
+    let _ = MARKER_DIR.set(dir.to_path_buf());
 }
+
+/// Undo handle for a [`mark_hidden`] call whose OS hide then failed.
+#[must_use]
+pub struct HideUndo(Option<TaskbarHideRestore>);
 
 /// Records that GameFrame is about to hide the taskbar using `restore`'s
 /// technique. Call this *before* the OS hide so a kill in between is covered.
-/// The first hide wins: while a hide is already recorded, a later one (e.g.
-/// the zone editor over an armed session) keeps the original record, which
-/// holds the true prior state. A write failure is logged, never propagated.
-pub fn mark_hidden(restore: TaskbarHideRestore) {
-    let mut tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
-    if tracker.hidden.is_some() {
-        return;
-    }
-    tracker.hidden = Some(restore);
-    if let Some(dir) = &tracker.dir
-        && let Err(e) = write_marker_file(dir, restore)
-    {
-        log!("could not write the taskbar marker: {e}");
-    }
+/// See [`HideRecord::hide`] for how nested hides combine. A write failure is
+/// logged, never propagated. Returns `Some` if the record changed; if the OS
+/// hide then fails, pass it to [`undo_hide`].
+pub fn mark_hidden(restore: TaskbarHideRestore) -> Option<HideUndo> {
+    let (changed, now) = {
+        let mut rec = record();
+        let changed = rec.hide(restore);
+        (changed, rec.hidden)
+    };
+    let previous = changed?;
+    persist(now);
+    Some(HideUndo(previous))
 }
 
-/// Records that GameFrame restored the taskbar to `restore`'s state, clearing
-/// the marker -- unless that restore leaves the taskbar hidden anyway.
-pub fn mark_restored(restore: TaskbarHideRestore) {
-    if restore_keeps_taskbar_hidden(restore) {
-        return;
-    }
-    clear_tracked();
+/// Rolls back a [`mark_hidden`] whose OS hide failed, so GameFrame does not
+/// believe it hid a taskbar it did not.
+pub fn undo_hide(undo: HideUndo) {
+    let HideUndo(previous) = undo;
+    record().hidden = previous;
+    persist(previous);
 }
 
-fn clear_tracked() {
-    let mut tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
-    tracker.hidden = None;
-    if let Some(dir) = &tracker.dir
-        && let Err(e) = clear_marker_file(dir)
-    {
-        log!("could not remove the taskbar marker: {e}");
-    }
+/// Records that GameFrame restored the taskbar, clearing the record and the
+/// marker. (A restore to the user's own auto-hide state clears it too: the
+/// taskbar is then back in a state GameFrame is not responsible for.)
+pub fn mark_restored() {
+    record().restore();
+    persist(None);
 }
 
 /// What GameFrame currently believes it has hidden, if anything.
 pub fn currently_hidden() -> Option<TaskbarHideRestore> {
-    TRACKER.lock().unwrap_or_else(|e| e.into_inner()).hidden
+    record().hidden
 }
 
 /// Graceful-exit safety net: if the taskbar is still hidden by GameFrame
@@ -200,7 +266,7 @@ pub fn restore_on_exit() {
         log!("failed to restore taskbar on exit: {e}");
     }
     // Whatever happened above, a graceful exit leaves no marker.
-    clear_tracked();
+    mark_restored();
 }
 
 /// Startup recovery: reads the marker, compares it with the real taskbar,
@@ -211,23 +277,30 @@ pub fn recover_on_startup(dir: &Path) {
     if marker == MarkerState::None {
         return;
     }
-    let action = match win32::observe_taskbar() {
-        Ok((visible, autohide)) => decide_recovery(marker, ObservedTaskbar { visible, autohide }),
-        // No taskbar window (e.g. Explorer is not up): nothing to repair.
-        Err(_) => RecoveryAction::Nothing,
+    let result = match win32::observe_taskbar() {
+        Ok((visible, autohide)) => {
+            let action = decide_recovery(marker, ObservedTaskbar { visible, autohide });
+            log!("taskbar recovery: marker {marker:?} -> {action:?}");
+            match action {
+                RecoveryAction::Nothing => Ok(()),
+                RecoveryAction::ShowTaskbar => win32::show_taskbar(),
+                RecoveryAction::SetAppbarState(state) => {
+                    win32::restore_taskbar(TaskbarHideRestore::HoverReveal(state))
+                }
+            }
+        }
+        Err(e) => Err(e),
     };
-    log!("taskbar recovery: marker {marker:?} -> {action:?}");
-    let result = match action {
-        RecoveryAction::Nothing => Ok(()),
-        RecoveryAction::ShowTaskbar => win32::show_taskbar(),
-        RecoveryAction::SetAppbarState(state) => win32::restore_taskbar(TaskbarHideRestore::HoverReveal(state)),
-    };
-    if let Err(e) = result {
-        log!("taskbar recovery failed: {e}");
-    }
-    clear_tracked();
-    if let Err(e) = clear_marker_file(dir) {
-        log!("could not remove the taskbar marker: {e}");
+    // The marker is the only record of a stranded hide: keep it if the
+    // taskbar could not be observed or repaired, so the next start retries.
+    match result {
+        Ok(()) => {
+            mark_restored();
+            if let Err(e) = clear_marker_file(dir) {
+                log!("could not remove the taskbar marker: {e}");
+            }
+        }
+        Err(e) => log!("taskbar recovery failed, keeping the marker: {e}"),
     }
 }
 
@@ -235,9 +308,10 @@ pub fn recover_on_startup(dir: &Path) {
 /// (the release build aborts after the hook, so no destructor would), then
 /// defers to the previously installed hook.
 ///
-/// Safe from any thread and non-panicking: it only `try_lock`s the tracker (a
-/// panic while the lock is held falls back to the on-disk marker), and the
-/// restore is plain Win32 calls whose errors are ignored.
+/// Safe from any thread and non-panicking: it only `try_lock`s the record (if
+/// that fails, e.g. the panicking thread holds it, the on-disk marker in the
+/// lock-free `MARKER_DIR` is read instead), it never takes the file-IO lock,
+/// and the restore is plain Win32 calls whose errors are ignored.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -248,23 +322,16 @@ pub fn install_panic_hook() {
 }
 
 fn restore_for_panic() {
-    let (restore, dir) = match TRACKER.try_lock() {
-        Ok(tracker) => (tracker.hidden, tracker.dir.clone()),
-        Err(std::sync::TryLockError::Poisoned(p)) => {
-            let tracker = p.into_inner();
-            (tracker.hidden, tracker.dir.clone())
-        }
-        // Held by the panicking thread itself: use the marker file instead.
-        Err(std::sync::TryLockError::WouldBlock) => (None, None),
+    let in_memory = match RECORD.try_lock() {
+        Ok(rec) => Some(rec.hidden),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().hidden),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     };
-    let restore = restore.or_else(|| match dir.as_deref().map(read_marker_file) {
-        Some(MarkerState::Technique(r)) => Some(r),
-        _ => None,
-    });
-    if let Some(restore) = restore {
+    let dir = MARKER_DIR.get().map(PathBuf::as_path);
+    if let Some(restore) = panic_restore_target(in_memory, dir) {
         let _ = win32::restore_taskbar_raw(restore);
         if let Some(dir) = dir {
-            let _ = clear_marker_file(&dir);
+            let _ = clear_marker_file(dir);
         }
     }
 }
@@ -365,9 +432,57 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_to_auto_hide_keeps_the_marker_but_others_clear_it() {
-        assert!(restore_keeps_taskbar_hidden(HOVER_FROM_AUTO));
-        assert!(!restore_keeps_taskbar_hidden(HOVER_FROM_VISIBLE));
-        assert!(!restore_keeps_taskbar_hidden(FULLY));
+    fn a_restore_clears_the_record_even_when_it_returns_to_the_users_auto_hide() {
+        let mut rec = HideRecord::default();
+        rec.hide(HOVER_FROM_AUTO);
+        rec.restore();
+        assert_eq!(rec.hidden, None);
+        // A later hide with a different technique is then recorded afresh.
+        rec.hide(FULLY);
+        assert_eq!(rec.hidden, Some(FULLY));
+    }
+
+    #[test]
+    fn the_first_hide_wins_over_a_nested_hover_reveal() {
+        let mut rec = HideRecord::default();
+        assert_eq!(rec.hide(HOVER_FROM_VISIBLE), Some(None));
+        // A nested hover-reveal sees AutoHidden as its "prior"; ignore it.
+        assert_eq!(rec.hide(HOVER_FROM_AUTO), None);
+        assert_eq!(rec.hidden, Some(HOVER_FROM_VISIBLE));
+        assert_eq!(rec.hide(FULLY), Some(Some(HOVER_FROM_VISIBLE)));
+    }
+
+    #[test]
+    fn fully_hidden_replaces_a_hover_reveal_record_but_not_the_reverse() {
+        let mut rec = HideRecord::default();
+        rec.hide(HOVER_FROM_VISIBLE);
+        rec.hide(FULLY);
+        assert_eq!(rec.hidden, Some(FULLY));
+        assert_eq!(rec.hide(HOVER_FROM_VISIBLE), None);
+        assert_eq!(rec.hidden, Some(FULLY));
+    }
+
+    #[test]
+    fn the_panic_hook_falls_back_to_the_marker_file_when_the_lock_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_marker_file(tmp.path(), FULLY).unwrap();
+        assert_eq!(panic_restore_target(None, Some(tmp.path())), Some(FULLY));
+    }
+
+    #[test]
+    fn the_panic_hook_prefers_the_in_memory_record_and_ignores_an_unrelated_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_marker_file(tmp.path(), FULLY).unwrap();
+        assert_eq!(panic_restore_target(Some(Some(HOVER_FROM_VISIBLE)), Some(tmp.path())), Some(HOVER_FROM_VISIBLE));
+        assert_eq!(panic_restore_target(Some(None), Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn the_panic_hook_has_nothing_to_restore_without_a_readable_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(panic_restore_target(None, Some(tmp.path())), None);
+        assert_eq!(panic_restore_target(None, None), None);
+        std::fs::write(marker_path(tmp.path()), "???").unwrap();
+        assert_eq!(panic_restore_target(None, Some(tmp.path())), None);
     }
 }
