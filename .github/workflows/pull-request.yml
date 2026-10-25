@@ -61,6 +61,30 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  # Generates the third-party notices (as the installer build does) so a license
+  # cargo-about can't resolve fails the PR, not main. Install step is shared with build.yml.
+  third-party-notices:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main saves the cache; PR runs restore it without evicting main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-cargo-about
+      - name: Generate notices
+        shell: pwsh
+        run: |
+          # Same flags as installer/build.ps1.
+          cargo about generate --locked --fail --threshold 0.9 -o "$env:RUNNER_TEMP/notices.txt" installer/third-party-notices.hbs
+          if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed ($LASTEXITCODE)" }
+          if ((Get-Item "$env:RUNNER_TEMP/notices.txt").Length -eq 0) { throw 'empty notices file' }
+
   # Blocks a PR that adds a dependency with a known vulnerability.
   dependency-review:
     runs-on: ubuntu-latest
