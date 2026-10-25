@@ -77,11 +77,17 @@ jobs:
           VERSION: ${{ steps.next.outputs.version }}
           ALLOW_MAJOR: ${{ inputs.allow-major }}
         run: |
-          prev_tag=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
           prev=${prev_tag#v}
           prev=${prev:-0.0.0}
           prev_major=${prev%%.*}
           next_major=${VERSION%%.*}
+          # Fail closed: a non-numeric major would make the comparison below
+          # error out inside `if` and silently fall through to "allowed".
+          if ! [[ "$prev_major" =~ ^[0-9]+$ && "$next_major" =~ ^[0-9]+$ ]]; then
+            echo "::error::Cannot compare versions: previous '$prev' (tag '$prev_tag'), next '$VERSION'. Both must start with a numeric major."
+            exit 1
+          fi
           if [ "$next_major" -gt "$prev_major" ] && [ "$prev_major" -lt 1 ]; then
             if [ "$ALLOW_MAJOR" = "true" ]; then
               echo "Major guard: $prev -> $VERSION is a major bump, allowed by allow-major"
@@ -91,7 +97,7 @@ jobs:
               exit 1
             fi
           else
-            echo "Major guard: $prev -> $VERSION is not a major bump from below 1.0, allowed"
+            echo "Major guard: $prev -> $VERSION, allowed (no major bump from below 1.0)"
           fi
 
   build:
