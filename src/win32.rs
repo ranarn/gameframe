@@ -205,12 +205,10 @@ fn apply_autohide_state(current_flags: u32, state: TaskbarAutohideState) -> u32 
 /// Reasons a live Win32 window-manipulation call can fail.
 #[derive(Debug)]
 pub enum Win32Error {
-    /// `GetForegroundWindow` returned a null handle (no foreground window).
-    NoForegroundWindow,
     /// The window is minimized (`IsIconic`), so its bounding rectangle would
     /// be its off-screen minimized position (roughly `(-32000, -32000)`)
     /// rather than a real, restorable region. Returned by both
-    /// [`toggle_borderless_on_foreground_window`] (for the foreground window)
+    /// [`toggle_borderless_on_window`] (for the foreground window)
     /// and [`apply_borderless_to_window`] (for an arbitrary tray-picked
     /// window, which is very likely not the foreground window).
     WindowMinimized,
@@ -264,7 +262,6 @@ impl Win32Error {
 impl std::fmt::Display for Win32Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Win32Error::NoForegroundWindow => write!(f, "no foreground window to manipulate"),
             Win32Error::WindowMinimized => write!(f, "window is minimized"),
             Win32Error::Os(e) => write!(f, "Win32 window manipulation failed: {e}"),
             Win32Error::Hresult(hr) => write!(
@@ -282,7 +279,6 @@ impl std::fmt::Display for Win32Error {
 impl std::error::Error for Win32Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Win32Error::NoForegroundWindow => None,
             Win32Error::WindowMinimized => None,
             Win32Error::Os(e) => Some(e),
             Win32Error::Hresult(_) => None,
@@ -457,7 +453,122 @@ pub fn window_drifted(current_region: Region, current_style: u32, target: Region
     current_region != target || strip_border_style(current_style) != current_style
 }
 
+/// The pre-strip [`RestoreState`] of every window GameFrame has stripped,
+/// keyed by window handle, plus the windows the user restored by hand. Pure
+/// data -- no OS calls -- so the per-window toggle decision
+/// ([`toggle_with_store`]) is unit testable.
+#[derive(Debug, Default)]
+struct RestoreStore {
+    states: std::collections::BTreeMap<isize, RestoreState>,
+    /// Windows the user restored with the hotkey: auto-apply and drift
+    /// re-apply leave them alone until the window is destroyed or the user
+    /// strips it again.
+    opted_out: std::collections::BTreeSet<isize>,
+}
+
+impl RestoreStore {
+    const fn new() -> Self {
+        Self {
+            states: std::collections::BTreeMap::new(),
+            opted_out: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn get(&self, window: isize) -> Option<RestoreState> {
+        self.states.get(&window).copied()
+    }
+
+    /// Records `state` unless the window already has one: the first state
+    /// recorded is the window's original bordered look and must survive any
+    /// later re-apply.
+    ///
+    /// A state whose style has no border to strip is not recorded: a window
+    /// that is already borderless the first time GameFrame sees it has no
+    /// truer original to go back to, and the hotkey must not claim a restore
+    /// it cannot do.
+    fn record_if_absent(&mut self, window: isize, state: RestoreState) {
+        if strip_border_style(state.style) == state.style {
+            return;
+        }
+        self.states.entry(window).or_insert(state);
+    }
+
+    /// Drops everything remembered about `window` (it was destroyed).
+    fn forget(&mut self, window: isize) {
+        self.states.remove(&window);
+        self.opted_out.remove(&window);
+    }
+}
+
+static RESTORE_STATES: std::sync::Mutex<RestoreStore> = std::sync::Mutex::new(RestoreStore::new());
+
+fn lock_store(store: &std::sync::Mutex<RestoreStore>) -> std::sync::MutexGuard<'_, RestoreStore> {
+    store.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether `hwnd` has a remembered pre-strip state, i.e. the next borderless
+/// hotkey press on it restores rather than strips.
+pub fn has_restore_state(hwnd: HWND) -> bool {
+    lock_store(&RESTORE_STATES).get(hwnd as isize).is_some()
+}
+
+/// Decides and performs one borderless-toggle press for `window`.
+///
+/// No remembered state: the pre-strip state is committed *before* `mutate`
+/// runs, so a partial failure still leaves the original recoverable. A
+/// remembered state: `mutate` restores it, and the entry is removed only if
+/// that fully succeeded. Other windows' entries never influence the press.
+///
+/// `store` is locked only around each read/write, never while `mutate` runs.
+fn toggle_with_store<E>(
+    store: &std::sync::Mutex<RestoreStore>,
+    window: isize,
+    live_style: u32,
+    live_region: Region,
+    target_region: Region,
+    mutate: impl FnOnce(ToggleAction) -> Result<(), E>,
+) -> Result<(), E> {
+    let remembered = lock_store(store).get(window);
+    let (action, next_state) = plan_toggle(remembered, live_style, live_region, target_region);
+    match action {
+        ToggleAction::MakeBorderless { .. } => {
+            {
+                let mut guard = lock_store(store);
+                guard.opted_out.remove(&window);
+                if let Some(state) = next_state {
+                    guard.record_if_absent(window, state);
+                }
+            }
+            mutate(action)
+        }
+        ToggleAction::Restore(_) => {
+            mutate(action)?;
+            let mut guard = lock_store(store);
+            guard.states.remove(&window);
+            guard.opted_out.insert(window);
+            Ok(())
+        }
+    }
+}
+
 static APPLIED_WINDOWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the user restored `hwnd` with the borderless hotkey, so auto-apply
+/// and drift re-apply must leave it alone until it is destroyed or stripped
+/// again.
+pub fn auto_apply_suppressed(hwnd: HWND) -> bool {
+    lock_store(&RESTORE_STATES)
+        .opted_out
+        .contains(&(hwnd as isize))
+}
+
+/// Lifts the suppression set by a hotkey restore: the user explicitly asked
+/// for `hwnd` to be placed again (tray picker).
+pub fn allow_auto_apply(hwnd: HWND) {
+    lock_store(&RESTORE_STATES)
+        .opted_out
+        .remove(&(hwnd as isize));
+}
 
 /// Remembers `hwnd` as one GameFrame applied the Zone to, so the
 /// location-change watcher can cheaply (one mutex lock + scan) ignore every
@@ -477,8 +588,15 @@ pub fn is_applied_window(hwnd: HWND) -> bool {
         .contains(&(hwnd as isize))
 }
 
-/// Forgets `hwnd` (called when it is destroyed).
+/// Forgets `hwnd` (called when it is destroyed) along with its remembered
+/// restore state.
 pub fn forget_applied_window(hwnd: HWND) {
+    unmark_applied_window(hwnd);
+    lock_store(&RESTORE_STATES).forget(hwnd as isize);
+}
+
+/// Stops the drift watcher treating `hwnd` as GameFrame-placed.
+fn unmark_applied_window(hwnd: HWND) {
     APPLIED_WINDOWS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -497,7 +615,7 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 
 /// Strips a window's border and moves/resizes it to `target_region`: the
 /// shared "make borderless" mutation shared by
-/// [`toggle_borderless_on_foreground_window`] (acting on
+/// [`toggle_borderless_on_window`] (acting on
 /// `GetForegroundWindow()`'s result) and the tray menu's "Apply to Window"
 /// picker (acting on an explicit window the user chose, which may not be the
 /// foreground window at all -- see [`crate::app`]'s dispatch of a decoded
@@ -506,13 +624,14 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 /// callers only need a target `HWND` and region -- neither caller needs to
 /// separately read/strip the style first.
 ///
-/// Unlike [`toggle_borderless_on_foreground_window`], this performs a
-/// one-shot strip with no toggle/restore-state tracking: callers that need a
-/// remembered "undo" (the hotkey path) layer that on top themselves via
-/// [`plan_toggle`]/[`RestoreState`]; callers that don't (the tray-menu path)
-/// simply call this directly.
+/// Once the style change succeeds, records the window's pre-strip
+/// style/region as its [`RestoreState`] unless it already has one, so the
+/// borderless hotkey can later restore a window placed by any path (tray
+/// picker, auto-apply, drift re-apply) to its original look. A window that
+/// was already borderless has no border to restore and gets no entry (see
+/// [`RestoreStore::record_if_absent`]).
 ///
-/// Mirrors [`toggle_borderless_on_foreground_window`]'s own minimized-window
+/// Mirrors [`toggle_borderless_on_window`]'s own minimized-window
 /// guard: a minimized window's `GetWindowRect` reports its off-screen
 /// minimized position (roughly `(-32000, -32000)`), not a real, restorable
 /// region, so applying a target region to it would move/resize it based on
@@ -534,37 +653,34 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     }
 
     let live_style = get_window_style(hwnd)?;
+    let live_region = get_window_region(hwnd)?;
     let new_style = strip_border_style(live_style);
     set_window_style(hwnd, new_style)?;
+    // Recorded once the first mutation succeeded, so a window GameFrame could
+    // not change (e.g. an elevated game) never gets a restore entry; the
+    // remaining calls below can still fail with the original already safe.
+    lock_store(&RESTORE_STATES).record_if_absent(
+        hwnd as isize,
+        RestoreState {
+            style: live_style,
+            region: live_region,
+        },
+    );
     set_window_region(hwnd, target_region)?;
     disable_rounded_corners(hwnd)?;
     Ok(())
 }
 
-/// Performs the borderless-toggle hotkey's full effect on the current
-/// foreground window: strips its border and moves it to `target_region` (if
-/// nothing is remembered), or restores it to exactly the style/region
-/// remembered from the last strip (if something is).
+/// Performs the borderless-toggle hotkey's full effect on `hwnd` (the
+/// foreground window): strips its border and moves it to `target_region` (if
+/// it has no remembered state), or restores it to exactly the style/region
+/// remembered from its first strip (if it has). The remembered state is kept
+/// per window, so other windows never affect the press; see
+/// [`toggle_with_store`].
 ///
-/// `state` is read to decide which of those two happens (via [`plan_toggle`])
-/// and updated in place to reflect the new remembered state -- callers keep
-/// one `state` per hotkey press cycle across calls (see
-/// [`crate::app::run_event_loop`]).
-///
-/// OS-facing: acts on the real foreground window. Not exercised by this
-/// crate's automated tests -- see module docs.
-pub fn toggle_borderless_on_foreground_window(
-    state: &mut Option<RestoreState>,
-    target_region: Region,
-) -> Result<(), Win32Error> {
-    // Safety: `GetForegroundWindow` takes no arguments and performs no
-    // writes; its result is null-checked immediately below before any other
-    // call uses it.
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() {
-        return Err(Win32Error::NoForegroundWindow);
-    }
-
+/// OS-facing: acts on the real window. Not exercised by this crate's
+/// automated tests -- see module docs.
+pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<(), Win32Error> {
     // A minimized window's `GetWindowRect` reports its off-screen minimized
     // position (roughly `(-32000, -32000)`), not a real, restorable region
     // -- bail out before that gets read/remembered/applied as if it were
@@ -578,61 +694,45 @@ pub fn toggle_borderless_on_foreground_window(
     let live_style = get_window_style(hwnd)?;
     let live_region = get_window_region(hwnd)?;
 
-    let (action, next_state) = plan_toggle(*state, live_style, live_region, target_region);
-
-    match action {
-        ToggleAction::MakeBorderless { region, .. } => {
-            // Commit the new remembered state *before* attempting the
-            // OS-mutating calls below. `next_state` here is `Some(restore)`
-            // derived purely from `live_style`/`live_region`, already safely
-            // read above via `GetWindowLongPtrW`/`GetWindowRect`, so
-            // committing it early is safe -- and it matters: if a later call
-            // in this sequence fails (e.g. the style is stripped but the
-            // region move then fails), the original restore state must not
-            // be lost. Committing early means the next press still restores
-            // the window correctly instead of deriving a wrong "restore"
-            // state from an already-partially-mutated window.
-            //
-            // The actual mutation is delegated to
-            // [`apply_borderless_to_window`] (shared with the tray-menu
-            // path) rather than repeating its three-call sequence here; it
-            // re-reads `hwnd`'s style itself, which is safe since nothing
-            // has mutated it between the `live_style` read above and here --
-            // the resulting stripped style is identical to plan_toggle's own
-            // `new_style` (ignored above via `..`).
-            *state = next_state;
-            apply_borderless_to_window(hwnd, region)?;
-        }
-        ToggleAction::Restore(restore) => {
-            // Do NOT commit `next_state` (always `None` here) until all three
-            // restore calls below have actually succeeded. Unlike the
-            // `MakeBorderless` arm, `restore` already holds the window's true
-            // original style/region -- clearing `*state` to `None` early
-            // would, if one of these calls fails partway through (e.g. the
-            // target window closed/crashed between presses), permanently
-            // discard the only copy of that original state before it was
-            // ever successfully applied, leaving no way to retry or recover
-            // it.
-            set_window_style(hwnd, restore.style)?;
-            set_window_region(hwnd, restore.region)?;
-            reset_corner_preference(hwnd)?;
-            *state = next_state;
-        }
-    }
-
-    Ok(())
+    toggle_with_store(
+        &RESTORE_STATES,
+        hwnd as isize,
+        live_style,
+        live_region,
+        target_region,
+        |action| match action {
+            // The mutation is delegated to [`apply_borderless_to_window`]
+            // (shared with the tray-menu and auto-apply paths). The
+            // pre-strip state was already committed by
+            // [`toggle_with_store`], so a partial failure here still leaves
+            // the original restorable.
+            ToggleAction::MakeBorderless { region, .. } => apply_borderless_to_window(hwnd, region),
+            // The entry is only removed once all three restore calls
+            // succeeded; a failure partway keeps the only copy of the
+            // original state so a retry can recover it.
+            ToggleAction::Restore(restore) => {
+                set_window_style(hwnd, restore.style)?;
+                set_window_region(hwnd, restore.region)?;
+                reset_corner_preference(hwnd)?;
+                // A restored window is no longer GameFrame-placed: stop the
+                // drift watcher from re-stripping it. [`toggle_with_store`]
+                // also marks it as restored by the user, which keeps
+                // auto-apply (including its re-apply on every foreground
+                // event) away from it until it is destroyed or stripped again.
+                unmark_applied_window(hwnd);
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Resolves the current foreground window's `HWND`, via `GetForegroundWindow()`.
 ///
 /// Returns `None` if there is no foreground window. Shared by
 /// [`foreground_window_exe_path`] (exe-path resolution for the tracked-game
-/// lookup) and, per the issue #31 HIGH review fix, by
-/// [`crate::app::handle_toggle_borderless`] directly -- it needs the raw
-/// `HWND` itself (not just its exe path) to remember *which* window a strip
-/// was applied to, so a later restore press can be refused if a different
-/// window is now focused (see `crate::app`'s `stripped_hwnd`/
-/// `should_allow_restore`).
+/// lookup) and, by
+/// [`crate::app::handle_toggle_borderless`] directly, which needs the raw
+/// `HWND` itself (not just its exe path) to look up and act on that window.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
@@ -649,16 +749,7 @@ pub fn foreground_window() -> Option<HWND> {
 ///
 /// Lets a caller (namely [`crate::app::handle_toggle_borderless`]) decide
 /// whether the foreground window belongs to a tracked game *before*
-/// deciding whether to proceed at all -- [`toggle_borderless_on_foreground_window`]
-/// resolves `GetForegroundWindow()` internally and never surfaces the
-/// resolved `HWND` to its caller, so this calls [`foreground_window`]
-/// separately rather than sharing a single resolved `HWND` across both; the
-/// two calls are expected to resolve to the same window in practice
-/// (nothing user-driven runs between them), but even if focus somehow
-/// changed between the two calls, the worst case is a stale tracked-game
-/// lookup for this one hotkey press -- not a crash or a wrong window being
-/// mutated, since the actual mutation still resolves its own `HWND`
-/// independently.
+/// deciding whether to proceed at all.
 ///
 /// Returns `None` if there is no foreground window, or if the exe path
 /// can't be resolved (see [`window_filter::exe_path_for_window`]) -- both
@@ -1180,7 +1271,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
 /// function's doc comment for why): currently visible hides via
 /// [`set_taskbar_hide_absolute`]; currently hidden shows via the same.
 ///
-/// Fully independent of [`toggle_borderless_on_foreground_window`]'s
+/// Fully independent of [`toggle_borderless_on_window`]'s
 /// `RestoreState`, and of [`set_taskbar_hide_absolute_armed`]'s
 /// `ARMED_TASKBAR_RESTORE` bookkeeping -- this reads only the taskbar's real
 /// OS-level visibility, never any tracked-game config or armed-window state,
@@ -1818,6 +1909,10 @@ pub(crate) fn live_reapply_running_window(
         return LiveApplyOutcome::Failed(e);
     }
 
+    // An explicit placement, like the tray picker: lift any hotkey-restore
+    // opt-out so auto-apply and drift re-apply cover the window again.
+    allow_auto_apply(hwnd);
+
     if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode) {
         log!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
     }
@@ -2009,6 +2104,193 @@ mod tests {
             })
         );
         assert_eq!(state_after_second, None);
+    }
+
+    const BORDERED: u32 = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU;
+    const ORIGINAL: Region = Region {
+        x: 10,
+        y: 20,
+        width: 800,
+        height: 600,
+    };
+    const TARGET: Region = Region {
+        x: 0,
+        y: 0,
+        width: 960,
+        height: 1080,
+    };
+
+    fn press(
+        store: &std::sync::Mutex<RestoreStore>,
+        window: isize,
+        mutate_result: Result<(), ()>,
+    ) -> Vec<ToggleAction> {
+        let mut seen = Vec::new();
+        let _ = toggle_with_store(store, window, BORDERED, ORIGINAL, TARGET, |action| {
+            seen.push(action);
+            mutate_result
+        });
+        seen
+    }
+
+    #[test]
+    fn toggle_with_store_strips_a_window_it_has_no_state_for_and_remembers_it() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+
+        let actions = press(&store, 1, Ok(()));
+
+        assert!(matches!(actions[..], [ToggleAction::MakeBorderless { .. }]));
+        assert_eq!(
+            lock_store(&store).get(1),
+            Some(RestoreState {
+                style: BORDERED,
+                region: ORIGINAL
+            })
+        );
+    }
+
+    #[test]
+    fn toggle_with_store_restores_a_stripped_window_and_forgets_it() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+
+        let actions = press(&store, 1, Ok(()));
+
+        assert_eq!(
+            actions,
+            vec![ToggleAction::Restore(RestoreState {
+                style: BORDERED,
+                region: ORIGINAL
+            })]
+        );
+        assert_eq!(lock_store(&store).get(1), None);
+    }
+
+    #[test]
+    fn toggle_with_store_keeps_the_entry_when_a_restore_fails() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+
+        press(&store, 1, Err(()));
+
+        assert!(lock_store(&store).get(1).is_some());
+    }
+
+    #[test]
+    fn toggle_with_store_keeps_the_entry_when_a_strip_fails_partway() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+
+        press(&store, 1, Err(()));
+
+        assert!(lock_store(&store).get(1).is_some());
+    }
+
+    #[test]
+    fn toggle_with_store_treats_windows_independently() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+
+        let actions = press(&store, 2, Ok(()));
+
+        assert!(matches!(actions[..], [ToggleAction::MakeBorderless { .. }]));
+        assert!(lock_store(&store).get(1).is_some());
+        assert!(lock_store(&store).get(2).is_some());
+    }
+
+    #[test]
+    fn toggle_with_store_strips_again_after_the_entry_is_forgotten() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+        lock_store(&store).forget(1);
+
+        let actions = press(&store, 1, Ok(()));
+
+        assert!(matches!(actions[..], [ToggleAction::MakeBorderless { .. }]));
+    }
+
+    #[test]
+    fn record_if_absent_does_not_overwrite_the_original_state() {
+        let mut store = RestoreStore::new();
+        let original = RestoreState {
+            style: BORDERED,
+            region: ORIGINAL,
+        };
+        store.record_if_absent(1, original);
+
+        store.record_if_absent(
+            1,
+            RestoreState {
+                style: BORDERED | WS_MINIMIZEBOX,
+                region: TARGET,
+            },
+        );
+
+        assert_eq!(store.get(1), Some(original));
+    }
+
+    #[test]
+    fn record_if_absent_ignores_a_window_that_is_already_borderless() {
+        let mut store = RestoreStore::new();
+
+        store.record_if_absent(
+            1,
+            RestoreState {
+                style: strip_border_style(BORDERED),
+                region: ORIGINAL,
+            },
+        );
+
+        assert_eq!(store.get(1), None);
+    }
+
+    #[test]
+    fn toggle_with_store_does_not_claim_a_restore_for_an_already_borderless_window() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        let borderless = strip_border_style(BORDERED);
+
+        let _ = toggle_with_store(
+            &store,
+            1,
+            borderless,
+            ORIGINAL,
+            TARGET,
+            |_| Ok::<(), ()>(()),
+        );
+
+        assert_eq!(lock_store(&store).get(1), None);
+    }
+
+    #[test]
+    fn a_hotkey_restore_suppresses_auto_apply_until_the_window_is_stripped_again() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+
+        press(&store, 1, Ok(()));
+        assert!(lock_store(&store).opted_out.contains(&1));
+
+        press(&store, 1, Ok(()));
+        assert!(!lock_store(&store).opted_out.contains(&1));
+    }
+
+    #[test]
+    fn a_failed_restore_does_not_suppress_auto_apply() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+
+        press(&store, 1, Err(()));
+
+        assert!(!lock_store(&store).opted_out.contains(&1));
+    }
+
+    #[test]
+    fn forgetting_a_window_clears_its_suppression() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        press(&store, 1, Ok(()));
+        press(&store, 1, Ok(()));
+
+        lock_store(&store).forget(1);
+
+        assert!(!lock_store(&store).opted_out.contains(&1));
     }
 
     #[test]
@@ -2631,20 +2913,12 @@ mod tests {
     }
 
     #[test]
-    fn win32_error_no_foreground_window_is_not_access_denied() {
-        assert!(!Win32Error::NoForegroundWindow.is_access_denied());
-    }
-
-    #[test]
     fn win32_error_implements_display_and_std_error() {
         fn assert_is_std_error<E: std::error::Error>(_: &E) {}
 
-        let no_fg = Win32Error::NoForegroundWindow;
         let os_err = Win32Error::Os(std::io::Error::from_raw_os_error(5));
 
-        assert_is_std_error(&no_fg);
         assert_is_std_error(&os_err);
-        assert_eq!(no_fg.to_string(), "no foreground window to manipulate");
         assert!(
             os_err
                 .to_string()

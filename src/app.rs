@@ -8,11 +8,11 @@
 //! hotkey to toggling the taskbar hidden/visible (mode-aware as of issue
 //! #42 -- see [`crate::profile_store::TaskbarHideMode`]) via
 //! [`crate::win32`]. The two hotkey mechanics are fully independent: the
-//! borderless toggle keeps its own `toggle_state` below, while the taskbar
-//! toggle ([`win32::toggle_taskbar_hide`]) keeps none at all, instead
-//! reading the taskbar's real OS-level state on every press -- either can
-//! be pressed without the other having been used first. A click on one of the
-//! "Apply to Window" submenu's dynamically-listed windows (recognized via
+//! borderless toggle keeps its restore state per window in [`win32`], while
+//! the taskbar toggle ([`win32::toggle_taskbar_hide`]) keeps none at all,
+//! instead reading the taskbar's real OS-level state on every press --
+//! either can be pressed without the other having been used first. A click
+//! on one of the "Apply to Window" submenu's dynamically-listed windows (recognized via
 //! [`tray_ui::decode_window_item_id`], distinct from the three fixed
 //! top-level menu items) resolves that window's owning process against the
 //! tracked-games list (adding it, with this issue's new-tracked-game
@@ -20,8 +20,8 @@
 //! [`crate::profile_store::upsert_tracked_game`]) and applies its assigned
 //! Zone's borderless+reposition treatment to that specific window via
 //! [`win32::apply_borderless_to_window`] -- a one-shot action with no
-//! remembered restore state, unlike the hotkey path's `toggle_state` (see
-//! [`handle_apply_to_window`]).
+//! toggle/undo of its own (see [`handle_apply_to_window`]); the borderless
+//! hotkey can still restore the window it placed.
 //!
 //! A third trigger requires no user action at all: [`crate::launch_watcher`]
 //! registers a `SetWinEventHook` on the same message loop and, on every
@@ -55,7 +55,7 @@ use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
-use crate::win32::{self, RestoreState};
+use crate::win32;
 use crate::window_filter;
 use crate::zone_overlay;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
@@ -223,18 +223,6 @@ fn run_event_loop(
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
 ) {
-    // Remembers the foreground window's pre-toggle style/region across
-    // presses of the borderless hotkey -- `None` means the window (if any)
-    // is currently in its normal bordered state; `Some` means the last
-    // press stripped it and this is what a second press should restore.
-    let mut toggle_state: Option<RestoreState> = None;
-
-    // Remembers which window `toggle_state` was stripped from, in lockstep
-    // with `toggle_state` itself -- lets `handle_toggle_borderless` refuse a
-    // restore press if a *different* window now has focus (see
-    // `should_allow_restore`; HIGH review finding, issue #31 iteration 3).
-    let mut stripped_hwnd: Option<HWND> = None;
-
     // A Quit received during the first-run zone prompt (before this pump
     // existed) must not wait for the next message.
     if instance_channel::quit_pending() {
@@ -386,7 +374,7 @@ fn run_event_loop(
             let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
             match action {
                 Some(HotkeyAction::ToggleBorderless) => {
-                    if handle_toggle_borderless(config_dir, &mut toggle_state, &mut stripped_hwnd) {
+                    if handle_toggle_borderless(config_dir) {
                         // GameFrame relaunched itself elevated to complete a
                         // manipulation that failed for lack of permissions;
                         // this (unelevated) instance's job is done.
@@ -465,11 +453,11 @@ pub(crate) fn resolve_auto_apply(
 
 /// Decides whether [`handle_toggle_borderless`]'s tracked-game gate should
 /// block this hotkey press outright, given whether the press is a pending
-/// *restore* (`is_restoring`, i.e. `toggle_state.is_some()` -- see
-/// [`win32::plan_toggle`], which derives the same strip-vs-restore decision
-/// from that same remembered state) and whether the foreground window's
-/// process currently resolves to a tracked game with a Zone set
-/// (`tracked`, i.e. `resolve_tracked_apply(..).is_some()`).
+/// *restore* (`is_restoring`, i.e. the foreground window has a remembered
+/// [`win32::RestoreState`] -- see [`win32::plan_toggle`], which derives the
+/// same strip-vs-restore decision from that same state) and whether the
+/// foreground window's process currently resolves to a tracked game with a
+/// Zone set (`tracked`, i.e. `resolve_tracked_apply(..).is_some()`).
 ///
 /// Only the strip direction is gated on tracked-game membership: an
 /// untracked foreground window blocks an initial strip, but never blocks a
@@ -478,56 +466,25 @@ pub(crate) fn resolve_auto_apply(
 /// finding on issue #31) -- gating both directions uniformly would
 /// permanently orphan a currently-stripped window in its borderless state
 /// for the rest of the running session if its tracked game were removed via
-/// Settings (or the Zone cleared) in between
-/// the strip press and the restore press, since nothing else in the app can
-/// restore it once the remembered `RestoreState` game is no longer
-/// resolvable. `plan_toggle`'s `Restore` arm doesn't need a resolved
+/// Settings (or the Zone cleared) in between the strip press and the restore
+/// press, since nothing else in the app can restore it once the remembered
+/// `RestoreState` game is no longer resolvable. `plan_toggle`'s `Restore` arm doesn't need a resolved
 /// Zone/region at all, so there is no correctness reason to require one
 /// here.
 ///
-/// This function alone is *not* sufficient to greenlight a restore, though:
-/// per the HIGH review finding on issue #31 iteration 3, a restore must
-/// additionally only proceed against the *same* window that was originally
-/// stripped -- see the separate, HWND-identity-based [`should_allow_restore`],
-/// which [`handle_toggle_borderless`] also consults before calling
-/// [`win32::toggle_borderless_on_foreground_window`] on the restore path.
+/// Remembered restore state is per window, so a restore always applies to
+/// the very window it was recorded for (the foreground window itself).
 ///
 /// Pure -- no OS call -- so it's unit testable in complete isolation.
 fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
     !is_restoring && !tracked
 }
 
-/// Decides whether a pending restore (`stripped`, the `HWND` that was
-/// stripped by the last successful strip press, remembered alongside
-/// `toggle_state`) may be applied to the window that currently has focus
-/// (`current`, from [`win32::foreground_window`]).
-///
-/// Restoring blindly applies the previously-stripped window's saved
-/// style/region to *whatever* `GetForegroundWindow()` currently returns --
-/// if the user alt-tabbed away to a different window (Chrome, Explorer,
-/// another tracked game) in between the strip and restore presses, applying
-/// the restore there would corrupt that unrelated window's position/style
-/// while permanently orphaning the original window in its stripped state
-/// (fixes the HIGH review finding on issue #31 iteration 3, introduced by
-/// [`should_block_untracked_toggle`]'s iteration-2 fix unconditionally
-/// allowing every pending restore through regardless of which window is now
-/// focused).
-///
-/// Only returns `true` when both `current` and `stripped` are `Some` and
-/// equal -- a `None` foreground window, no remembered stripped window, or a
-/// mismatch between the two all refuse the restore.
-///
-/// Pure -- no OS call, just an `HWND` comparison -- so it's unit testable in
-/// complete isolation.
-fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
-    current.is_some() && current == stripped
-}
-
 /// Reacts to a press of the borderless-toggle hotkey: resolves the
 /// foreground window's owning process against the tracked-games list (see
 /// [`resolve_tracked_apply`]) and, if it's tracked (or a restore is already
 /// pending for *this same window* -- see below), applies (or reverts) the
-/// border-strip via [`win32::toggle_borderless_on_foreground_window`], then,
+/// border-strip via [`win32::toggle_borderless_on_window`], then,
 /// on a successful strip only, sets the tracked game's taskbar-auto-hide
 /// value absolutely.
 ///
@@ -539,16 +496,11 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// happens to be the one now in the foreground -- see that function's doc
 /// comment for the full reasoning.
 ///
-/// A pending restore is additionally gated on window identity via
-/// [`should_allow_restore`]: `stripped_hwnd` remembers which window
-/// `toggle_state` was stripped from, and a restore press only proceeds if
-/// the current foreground window (`fg_hwnd`) is that same window. If the
-/// user alt-tabbed to a different window in between the strip and restore
-/// presses, this press is refused outright -- logged, `toggle_state`/
-/// `stripped_hwnd` left untouched -- rather than applying the original
-/// game's saved style/region to whatever window now happens to have focus
-/// (HIGH review finding, issue #31 iteration 3). The user can still complete
-/// the correct restore later by refocusing the originally-stripped window.
+/// Restore state is remembered per window ([`win32::has_restore_state`]), so
+/// the press acts on the foreground window alone: a window with state is
+/// restored, any other is stripped (if tracked). Windows placed by the tray
+/// picker, auto-apply or drift re-apply have state too, so the hotkey restores
+/// them as well.
 ///
 /// Taskbar auto-hide is set only on the strip direction, not on restore:
 /// using the same fixed global boolean on both directions would leave the
@@ -568,11 +520,7 @@ fn should_allow_restore(current: Option<HWND>, stripped: Option<HWND>) -> bool {
 /// Settings window closes -- see the `ShowSettings` branch in
 /// [`run_event_loop`] -- so a changed binding also takes effect without a
 /// restart.
-fn handle_toggle_borderless(
-    config_dir: &Path,
-    toggle_state: &mut Option<RestoreState>,
-    stripped_hwnd: &mut Option<HWND>,
-) -> bool {
+fn handle_toggle_borderless(config_dir: &Path) -> bool {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
@@ -581,31 +529,18 @@ fn handle_toggle_borderless(
         }
     };
 
-    // Whether this press is about to restore (a `RestoreState` is already
-    // remembered from a prior strip) or strip (nothing remembered yet) --
-    // see `should_block_untracked_toggle`'s doc comment for why only the
-    // strip direction is gated on tracked-game membership below.
-    let is_restoring = toggle_state.is_some();
-
-    // Resolved once and reused both for the tracked-game lookup below and
-    // for the restore-direction identity check (`should_allow_restore`) --
-    // see `win32::foreground_window`'s doc comment for why this replaces a
-    // second, separate `GetForegroundWindow()` call.
-    let fg_hwnd = win32::foreground_window();
-
-    if is_restoring && !should_allow_restore(fg_hwnd, *stripped_hwnd) {
-        log!(
-            "borderless toggle: a pending restore exists for a different window; ignoring press until that window is focused again"
-        );
-        // Deliberately do NOT clear `toggle_state`/`stripped_hwnd` here --
-        // the user can still complete the correct restore later by
-        // refocusing the originally-stripped window (HIGH review finding,
-        // issue #31 iteration 3).
+    let Some(fg_hwnd) = win32::foreground_window() else {
+        log!("borderless toggle: no foreground window; ignoring");
         return false;
-    }
+    };
 
-    let tracked = fg_hwnd
-        .and_then(window_filter::exe_path_for_window)
+    // Whether this press is about to restore (the window has a remembered
+    // `RestoreState`) or strip (it has none) -- see
+    // `should_block_untracked_toggle`'s doc comment for why only the strip
+    // direction is gated on tracked-game membership below.
+    let is_restoring = win32::has_restore_state(fg_hwnd);
+
+    let tracked = window_filter::exe_path_for_window(fg_hwnd)
         .and_then(|exe_path| resolve_tracked_apply(&config, &exe_path));
 
     if should_block_untracked_toggle(is_restoring, tracked.is_some()) {
@@ -642,25 +577,7 @@ fn handle_toggle_borderless(
         },
     };
 
-    // Commit `stripped_hwnd` for the strip direction *before* attempting the
-    // OS-mutating call below, mirroring `win32.rs`'s own "commit early"
-    // pattern for `toggle_state` in its `MakeBorderless` arm (see that arm's
-    // doc comment: "Commit the new remembered state *before* attempting the
-    // OS-mutating calls below"). Without this, a partial failure inside
-    // `toggle_borderless_on_foreground_window` would leave `toggle_state`
-    // committed (as designed, by that function itself) but `stripped_hwnd`
-    // unchanged -- a desync where `is_restoring` reads `true` on the next
-    // press but `should_allow_restore` refuses it forever, since
-    // `stripped_hwnd` never got recorded (HIGH review finding, issue #31
-    // iteration 4). The restore direction is not committed early: a failed
-    // restore should still leave `stripped_hwnd` in place so a retry can
-    // succeed, mirroring `win32.rs`'s own `Restore` arm, which only clears
-    // `toggle_state` after all three restore calls succeed.
-    if !is_restoring {
-        *stripped_hwnd = fg_hwnd;
-    }
-
-    if let Err(e) = win32::toggle_borderless_on_foreground_window(toggle_state, target_region) {
+    if let Err(e) = win32::toggle_borderless_on_window(fg_hwnd, target_region) {
         if e.is_access_denied() {
             log!("borderless toggle failed (access denied); requesting elevation");
             match win32::relaunch_elevated() {
@@ -671,14 +588,6 @@ fn handle_toggle_borderless(
             log!("borderless toggle failed: {e}");
         }
         return false;
-    }
-
-    // Mirror `toggle_state`'s own transition for `stripped_hwnd` on success:
-    // the strip direction was already committed above (before the call); a
-    // successful restore (only reachable here when `should_allow_restore`
-    // already confirmed `fg_hwnd == *stripped_hwnd`) clears it now.
-    if is_restoring {
-        *stripped_hwnd = None;
     }
 
     // Only set taskbar auto-hide on the strip direction -- setting it again
@@ -692,12 +601,11 @@ fn handle_toggle_borderless(
     // Uses `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
     // later automatically restores the taskbar with no hotkey press
-    // required. `fg_hwnd` is guaranteed `Some` here: `tracked` was only
-    // resolved (in the strip direction) from `fg_hwnd` itself above.
+    // required.
     if !is_restoring
-        && let (Some((tracked_game, _)), Some(hwnd)) = (&tracked, fg_hwnd)
+        && let Some((tracked_game, _)) = &tracked
         && let Err(e) = win32::set_taskbar_hide_absolute_armed(
-            hwnd,
+            fg_hwnd,
             config.hide_taskbar_on_apply,
             config.taskbar_hide_mode,
         )
@@ -728,10 +636,10 @@ fn handle_toggle_borderless(
 /// taskbar into auto-hide for a window that was never actually stripped
 /// would contradict the whole point of coupling the two.
 ///
-/// A one-shot action, not a toggle: there is no remembered restore state for
-/// this path (see this module's doc comment for the scope decision), so
-/// selecting the same window again simply re-applies the same treatment
-/// rather than undoing it.
+/// A one-shot action, not a toggle: selecting the same window again simply
+/// re-applies the same treatment rather than undoing it. The window's
+/// pre-strip state is remembered (see [`win32::apply_borderless_to_window`]),
+/// so the borderless hotkey can restore it.
 ///
 /// Reloads the config from disk on every click, for the same reason
 /// [`handle_toggle_borderless`] does.
@@ -796,6 +704,9 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         return;
     }
     win32::remember_applied_window(target_hwnd);
+    // Picking the window from the tray is an explicit request, which
+    // overrides an earlier hotkey restore of it.
+    win32::allow_auto_apply(target_hwnd);
 
     // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
     // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
@@ -840,6 +751,11 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// [`resolve_auto_apply`] above is the pure decision this function
 /// delegates to, and is what's actually unit tested.
 pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
+    // The user restored this window with the hotkey: leave it alone.
+    if win32::auto_apply_suppressed(hwnd) {
+        return;
+    }
+
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
@@ -914,6 +830,9 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 ///
 /// OS-facing; the drift decision is [`win32::window_drifted`], unit tested.
 pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
+    if win32::auto_apply_suppressed(hwnd) {
+        return;
+    }
     let Some(exe_path) = window_filter::exe_path_for_window(hwnd) else {
         return;
     };
@@ -1081,34 +1000,6 @@ mod tests {
     #[test]
     fn should_block_untracked_toggle_allows_a_tracked_restore() {
         assert!(!should_block_untracked_toggle(true, true));
-    }
-
-    #[test]
-    fn should_allow_restore_when_the_foreground_window_matches_the_stripped_window() {
-        let hwnd = 1usize as HWND;
-        assert!(should_allow_restore(Some(hwnd), Some(hwnd)));
-    }
-
-    #[test]
-    fn should_allow_restore_refuses_when_a_different_window_is_now_focused() {
-        // Alt-tab from a stripped game to any other window (issue #31,
-        // iteration-3 HIGH fix) must never let the pending restore apply to
-        // the newly-focused window.
-        let stripped = 1usize as HWND;
-        let other = 2usize as HWND;
-        assert!(!should_allow_restore(Some(other), Some(stripped)));
-    }
-
-    #[test]
-    fn should_allow_restore_refuses_when_there_is_no_foreground_window() {
-        let stripped = 1usize as HWND;
-        assert!(!should_allow_restore(None, Some(stripped)));
-    }
-
-    #[test]
-    fn should_allow_restore_refuses_when_nothing_was_ever_stripped() {
-        let hwnd = 1usize as HWND;
-        assert!(!should_allow_restore(Some(hwnd), None));
     }
 
     fn config_with_zone_and_game(zone: Option<Zone>, auto_apply: bool) -> (Config, PathBuf) {
