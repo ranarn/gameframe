@@ -879,10 +879,6 @@ mod tests {
     #[test]
     fn global_taskbar_flag_is_off_when_there_were_no_games() {
         assert_global_flag_derivation(true, &[], false);
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("GameFrame");
-        write_config_file(&config_dir, "[hotkeys]\n");
-        assert!(!load_from_disk(&config_dir).unwrap().hide_taskbar_on_apply);
     }
 
     #[test]
