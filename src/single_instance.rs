@@ -62,7 +62,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    args.into_iter().skip(1).any(|a| a.as_ref() == ELEVATED_RELAUNCH_FLAG)
+    args.into_iter()
+        .skip(1)
+        .any(|a| a.as_ref() == ELEVATED_RELAUNCH_FLAG)
 }
 
 /// Returns `true` if this process is the only running GameFrame, `false` if
@@ -92,7 +94,10 @@ pub fn acquire(wait: Option<Duration>) -> bool {
 /// One attempt. On success the handle is intentionally kept open for the
 /// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
 fn try_acquire(mutex_name: &str) -> bool {
-    let name: Vec<u16> = mutex_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = mutex_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
     // call; null security attributes are valid. GetLastError is read
     // immediately after, before any other API call can overwrite it.
@@ -121,7 +126,10 @@ mod tests {
     #[test]
     fn owning_the_mutex_proceeds_regardless_of_wait() {
         assert_eq!(decide(true, Duration::ZERO, None), Decision::Proceed);
-        assert_eq!(decide(true, Duration::from_secs(9), WAIT), Decision::Proceed);
+        assert_eq!(
+            decide(true, Duration::from_secs(9), WAIT),
+            Decision::Proceed
+        );
     }
 
     #[test]
@@ -132,9 +140,18 @@ mod tests {
     #[test]
     fn elevated_relaunch_retries_until_timeout() {
         assert_eq!(decide(false, Duration::ZERO, WAIT), Decision::Retry);
-        assert_eq!(decide(false, Duration::from_millis(4999), WAIT), Decision::Retry);
-        assert_eq!(decide(false, Duration::from_secs(5), WAIT), Decision::GiveUp);
-        assert_eq!(decide(false, Duration::from_secs(6), WAIT), Decision::GiveUp);
+        assert_eq!(
+            decide(false, Duration::from_millis(4999), WAIT),
+            Decision::Retry
+        );
+        assert_eq!(
+            decide(false, Duration::from_secs(5), WAIT),
+            Decision::GiveUp
+        );
+        assert_eq!(
+            decide(false, Duration::from_secs(6), WAIT),
+            Decision::GiveUp
+        );
     }
 
     #[test]
@@ -149,7 +166,10 @@ mod tests {
 
     #[test]
     fn flag_is_detected_after_program_name_only() {
-        assert!(is_elevated_relaunch(["gameframe.exe", "--elevated-relaunch"]));
+        assert!(is_elevated_relaunch([
+            "gameframe.exe",
+            "--elevated-relaunch"
+        ]));
         assert!(!is_elevated_relaunch(["gameframe.exe"]));
         assert!(!is_elevated_relaunch(["--elevated-relaunch"]));
         assert!(!is_elevated_relaunch(["gameframe.exe", "--other"]));

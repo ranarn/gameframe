@@ -21,7 +21,11 @@ fn main() {
 
     std::fs::create_dir_all("assets").expect("failed to create assets/");
     std::fs::write("assets/icon.ico", &ico).expect("failed to write assets/icon.ico");
-    println!("wrote assets/icon.ico ({} frames, {} bytes)", frames.len(), ico.len());
+    println!(
+        "wrote assets/icon.ico ({} frames, {} bytes)",
+        frames.len(),
+        ico.len()
+    );
 }
 
 fn render_png(size: u32) -> Vec<u8> {

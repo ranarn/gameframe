@@ -54,7 +54,9 @@ pub enum ZoneOverlayError {
 impl std::fmt::Display for ZoneOverlayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ZoneOverlayError::Taskbar(e) => write!(f, "failed to force taskbar auto-hide for zone editing: {e}"),
+            ZoneOverlayError::Taskbar(e) => {
+                write!(f, "failed to force taskbar auto-hide for zone editing: {e}")
+            }
             ZoneOverlayError::Window(e) => write!(f, "failed to open the zone editor overlay: {e}"),
         }
     }
@@ -88,7 +90,10 @@ pub fn run_zone_editor_overlay(
     mode: TaskbarHideMode,
 ) -> Result<Option<Zone>, ZoneOverlayError> {
     let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
-    let monitor = Monitor { width: monitor_geometry.width, height: monitor_geometry.height };
+    let monitor = Monitor {
+        width: monitor_geometry.width,
+        height: monitor_geometry.height,
+    };
 
     let remembered_taskbar_state = win32::hide_taskbar(mode).map_err(ZoneOverlayError::Taskbar)?;
 
@@ -113,7 +118,12 @@ pub fn run_zone_editor_overlay(
     let run_result = eframe::run_native(
         "GameFrame zone editor",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(OverlayApp { state, outcome: outcome_for_app }))),
+        Box::new(move |_cc| {
+            Ok(Box::new(OverlayApp {
+                state,
+                outcome: outcome_for_app,
+            }))
+        }),
     );
 
     run_result.map_err(ZoneOverlayError::Window)?;
@@ -160,8 +170,11 @@ fn native_options(monitor: &MonitorGeometry) -> eframe::NativeOptions {
     // `IDCompositionVisual` (DirectComposition) instead of the raw HWND.
     let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
-    wgpu_setup.instance_descriptor.backend_options.dx12.presentation_system =
-        eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    wgpu_setup
+        .instance_descriptor
+        .backend_options
+        .dx12
+        .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
 
     eframe::NativeOptions {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
@@ -199,7 +212,10 @@ impl eframe::App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw_dim_and_zone(ui);
         self.handle_draw_interaction(ui);
-        if matches!(self.state.editor, EditorState::Placed { .. } | EditorState::Resizing { .. }) {
+        if matches!(
+            self.state.editor,
+            EditorState::Placed { .. } | EditorState::Resizing { .. }
+        ) {
             self.handle_resize_interaction(ui);
         }
 
@@ -230,7 +246,11 @@ impl OverlayApp {
         };
 
         if let Some(rect) = live_rect {
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30));
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+            );
             painter.rect_stroke(
                 rect,
                 0.0,
@@ -239,11 +259,17 @@ impl OverlayApp {
             );
         }
 
-        if let EditorState::Placed { zone } | EditorState::Resizing { live: zone, .. } = &self.state.editor {
+        if let EditorState::Placed { zone } | EditorState::Resizing { live: zone, .. } =
+            &self.state.editor
+        {
             for handle in Handle::ALL {
                 let center = handle_center(zone, handle);
                 let color = egui::Color32::from_rgb(80, 200, 255);
-                painter.rect_filled(egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0)), 2.0, color);
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0)),
+                    2.0,
+                    color,
+                );
             }
         }
     }
@@ -251,12 +277,24 @@ impl OverlayApp {
     /// Whole-screen drag capture for the initial corner-to-corner draw
     /// (`Empty`/`Dragging` states only).
     fn handle_draw_interaction(&mut self, ui: &egui::Ui) {
-        if !matches!(self.state.editor, EditorState::Empty | EditorState::Dragging { .. }) {
+        if !matches!(
+            self.state.editor,
+            EditorState::Empty | EditorState::Dragging { .. }
+        ) {
             return;
         }
-        let response = ui.interact(ui.max_rect(), ui.scope_id().with("draw-area"), egui::Sense::click_and_drag());
-        let Some(pos) = response.interact_pointer_pos() else { return };
-        let point = Point { x: pos.x as i32, y: pos.y as i32 };
+        let response = ui.interact(
+            ui.max_rect(),
+            ui.scope_id().with("draw-area"),
+            egui::Sense::click_and_drag(),
+        );
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let point = Point {
+            x: pos.x as i32,
+            y: pos.y as i32,
+        };
 
         if response.drag_started() {
             self.state.apply(Action::Start(point));
@@ -279,9 +317,18 @@ impl OverlayApp {
         for handle in Handle::ALL {
             let center = handle_center(&zone, handle);
             let rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
-            let response = ui.interact(rect, ui.scope_id().with(("handle", format!("{handle:?}"))), egui::Sense::drag());
-            let Some(pos) = response.interact_pointer_pos() else { continue };
-            let point = Point { x: pos.x as i32, y: pos.y as i32 };
+            let response = ui.interact(
+                rect,
+                ui.scope_id().with(("handle", format!("{handle:?}"))),
+                egui::Sense::drag(),
+            );
+            let Some(pos) = response.interact_pointer_pos() else {
+                continue;
+            };
+            let point = Point {
+                x: pos.x as i32,
+                y: pos.y as i32,
+            };
 
             if response.drag_started() {
                 self.state.apply(Action::Grab(handle));
@@ -316,15 +363,17 @@ impl OverlayApp {
                             let save_button =
                                 control_button("Save", egui::Color32::from_rgb(34, 160, 60));
                             if ui.add_enabled(can_save, save_button).clicked()
-                                && let Some(outcome) = self.state.apply(Action::Save) {
-                                    *self.outcome.borrow_mut() = Some(outcome);
-                                }
+                                && let Some(outcome) = self.state.apply(Action::Save)
+                            {
+                                *self.outcome.borrow_mut() = Some(outcome);
+                            }
                             let cancel_button =
                                 control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
                             if ui.add(cancel_button).clicked()
-                                && let Some(outcome) = self.state.apply(Action::Cancel) {
-                                    *self.outcome.borrow_mut() = Some(outcome);
-                                }
+                                && let Some(outcome) = self.state.apply(Action::Cancel)
+                            {
+                                *self.outcome.borrow_mut() = Some(outcome);
+                            }
                         });
                         ui.vertical_centered(|ui| {
                             ui.label(
@@ -341,13 +390,20 @@ impl OverlayApp {
 /// Builds a Save/Cancel control button with the enlarged size and
 /// color-coded fill used by the zone editor's control panel (issue #39).
 fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).size(22.0).color(egui::Color32::WHITE))
-        .fill(fill)
-        .min_size(egui::vec2(140.0, 56.0))
+    egui::Button::new(
+        egui::RichText::new(text)
+            .size(22.0)
+            .color(egui::Color32::WHITE),
+    )
+    .fill(fill)
+    .min_size(egui::vec2(140.0, 56.0))
 }
 
 fn rect_from_points(a: Point, b: Point) -> egui::Rect {
-    egui::Rect::from_two_pos(egui::pos2(a.x as f32, a.y as f32), egui::pos2(b.x as f32, b.y as f32))
+    egui::Rect::from_two_pos(
+        egui::pos2(a.x as f32, a.y as f32),
+        egui::pos2(b.x as f32, b.y as f32),
+    )
 }
 
 fn rect_from_zone(zone: &Zone) -> egui::Rect {
@@ -358,7 +414,12 @@ fn rect_from_zone(zone: &Zone) -> egui::Rect {
 }
 
 fn handle_center(zone: &Zone, handle: Handle) -> egui::Pos2 {
-    let (x, y, w, h) = (zone.x as f32, zone.y as f32, zone.width as f32, zone.height as f32);
+    let (x, y, w, h) = (
+        zone.x as f32,
+        zone.y as f32,
+        zone.width as f32,
+        zone.height as f32,
+    );
     match handle {
         Handle::N => egui::pos2(x + w / 2.0, y),
         Handle::S => egui::pos2(x + w / 2.0, y + h),

@@ -69,7 +69,12 @@ impl std::error::Error for RegionCalcError {}
 /// - a region that starts on-monitor but extends past its edge is clamped to
 ///   fit within the monitor rather than rejected
 pub fn resolve_region(zone: &Zone, monitor: &MonitorGeometry) -> Result<Region, RegionCalcError> {
-    let Zone { x, y, width, height } = *zone;
+    let Zone {
+        x,
+        y,
+        width,
+        height,
+    } = *zone;
     if width <= 0 || height <= 0 {
         return Err(RegionCalcError::InvalidDimensions);
     }
@@ -86,7 +91,12 @@ pub fn resolve_region(zone: &Zone, monitor: &MonitorGeometry) -> Result<Region, 
     let clamped_width = width.min(monitor_right - x);
     let clamped_height = height.min(monitor_bottom - y);
 
-    Ok(Region { x, y, width: clamped_width, height: clamped_height })
+    Ok(Region {
+        x,
+        y,
+        width: clamped_width,
+        height: clamped_height,
+    })
 }
 
 #[cfg(test)]
@@ -95,18 +105,46 @@ mod tests {
 
     #[test]
     fn zone_valid_region_passes_through_unchanged() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 100, y: 50, width: 800, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
 
         let region = resolve_region(&zone, &monitor).unwrap();
 
-        assert_eq!(region, Region { x: 100, y: 50, width: 800, height: 600 });
+        assert_eq!(
+            region,
+            Region {
+                x: 100,
+                y: 50,
+                width: 800,
+                height: 600
+            }
+        );
     }
 
     #[test]
     fn zone_zero_width_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 0, y: 0, width: 0, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 600,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -115,8 +153,18 @@ mod tests {
 
     #[test]
     fn zone_negative_position_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: -10, y: 0, width: 800, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: -10,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -125,8 +173,18 @@ mod tests {
 
     #[test]
     fn zone_negative_width_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 0, y: 0, width: -800, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: -800,
+            height: 600,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -135,8 +193,18 @@ mod tests {
 
     #[test]
     fn zone_negative_height_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 0, y: 0, width: 800, height: -600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: -600,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -145,20 +213,48 @@ mod tests {
 
     #[test]
     fn zone_origin_exactly_at_monitor_left_edge_is_accepted() {
-        let monitor = MonitorGeometry { x: 100, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 100, y: 0, width: 800, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 100,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 100,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
 
         let region = resolve_region(&zone, &monitor).unwrap();
 
-        assert_eq!(region, Region { x: 100, y: 0, width: 800, height: 600 });
+        assert_eq!(
+            region,
+            Region {
+                x: 100,
+                y: 0,
+                width: 800,
+                height: 600
+            }
+        );
     }
 
     #[test]
     fn zone_origin_exactly_at_monitor_right_edge_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
         // monitor_right = 0 + 1920 = 1920; an origin exactly at monitor_right is
         // off-monitor entirely (the interval is right-exclusive).
-        let zone = Zone { x: 1920, y: 0, width: 100, height: 100 };
+        let zone = Zone {
+            x: 1920,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -167,20 +263,48 @@ mod tests {
 
     #[test]
     fn zone_origin_exactly_at_monitor_top_edge_is_accepted() {
-        let monitor = MonitorGeometry { x: 0, y: 100, width: 1920, height: 1080 };
-        let zone = Zone { x: 0, y: 100, width: 800, height: 600 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 100,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 0,
+            y: 100,
+            width: 800,
+            height: 600,
+        };
 
         let region = resolve_region(&zone, &monitor).unwrap();
 
-        assert_eq!(region, Region { x: 0, y: 100, width: 800, height: 600 });
+        assert_eq!(
+            region,
+            Region {
+                x: 0,
+                y: 100,
+                width: 800,
+                height: 600
+            }
+        );
     }
 
     #[test]
     fn zone_origin_exactly_at_monitor_bottom_edge_is_rejected() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
         // monitor_bottom = 0 + 1080 = 1080; an origin exactly at monitor_bottom is
         // off-monitor entirely (the interval is right-exclusive).
-        let zone = Zone { x: 0, y: 1080, width: 100, height: 100 };
+        let zone = Zone {
+            x: 0,
+            y: 1080,
+            width: 100,
+            height: 100,
+        };
 
         let result = resolve_region(&zone, &monitor);
 
@@ -189,24 +313,60 @@ mod tests {
 
     #[test]
     fn zone_region_overflowing_monitor_is_clamped_to_fit() {
-        let monitor = MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 };
-        let zone = Zone { x: 1000, y: 900, width: 5000, height: 5000 };
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let zone = Zone {
+            x: 1000,
+            y: 900,
+            width: 5000,
+            height: 5000,
+        };
 
         let region = resolve_region(&zone, &monitor).unwrap();
 
-        assert_eq!(region, Region { x: 1000, y: 900, width: 920, height: 180 });
+        assert_eq!(
+            region,
+            Region {
+                x: 1000,
+                y: 900,
+                width: 920,
+                height: 180
+            }
+        );
     }
 
     #[test]
     fn monitor_bounds_computation_does_not_panic_on_near_i32_max_geometry() {
         // monitor.x + monitor.width would overflow i32 with plain addition;
         // resolve_region must not panic when computing monitor bounds.
-        let monitor = MonitorGeometry { x: i32::MAX - 10, y: i32::MAX - 10, width: 1000, height: 1000 };
-        let zone = Zone { x: i32::MAX - 10, y: i32::MAX - 10, width: 5, height: 5 };
+        let monitor = MonitorGeometry {
+            x: i32::MAX - 10,
+            y: i32::MAX - 10,
+            width: 1000,
+            height: 1000,
+        };
+        let zone = Zone {
+            x: i32::MAX - 10,
+            y: i32::MAX - 10,
+            width: 5,
+            height: 5,
+        };
 
         let region = resolve_region(&zone, &monitor).unwrap();
 
-        assert_eq!(region, Region { x: i32::MAX - 10, y: i32::MAX - 10, width: 5, height: 5 });
+        assert_eq!(
+            region,
+            Region {
+                x: i32::MAX - 10,
+                y: i32::MAX - 10,
+                width: 5,
+                height: 5
+            }
+        );
     }
 
     #[test]
@@ -218,17 +378,41 @@ mod tests {
 
         assert_is_std_error(&invalid_dimensions);
         assert_is_std_error(&out_of_bounds);
-        assert_eq!(invalid_dimensions.to_string(), "region width or height was zero or negative");
-        assert_eq!(out_of_bounds.to_string(), "region origin lies outside the monitor's bounds");
+        assert_eq!(
+            invalid_dimensions.to_string(),
+            "region width or height was zero or negative"
+        );
+        assert_eq!(
+            out_of_bounds.to_string(),
+            "region origin lies outside the monitor's bounds"
+        );
     }
 
     #[test]
     fn zone_resolves_relative_to_a_monitor_with_a_negative_origin() {
-        let secondary_1440p_left_of_primary = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
-        let zone = Zone { x: -2000, y: 100, width: 500, height: 400 };
+        let secondary_1440p_left_of_primary = MonitorGeometry {
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let zone = Zone {
+            x: -2000,
+            y: 100,
+            width: 500,
+            height: 400,
+        };
 
         let region = resolve_region(&zone, &secondary_1440p_left_of_primary).unwrap();
 
-        assert_eq!(region, Region { x: -2000, y: 100, width: 500, height: 400 });
+        assert_eq!(
+            region,
+            Region {
+                x: -2000,
+                y: 100,
+                width: 500,
+                height: 400
+            }
+        );
     }
 }
