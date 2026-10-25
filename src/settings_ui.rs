@@ -16,13 +16,14 @@
 //!   particular can only be confirmed by manual/usertest verification on a
 //!   real desktop session.
 
-use crate::cursor_style::{self, CursorShape};
-use crate::profile_store::{
-    self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame, Zone,
-};
-use crate::region_calc::{resolve_region, MonitorGeometry, Region};
 use crate::autostart::{self, AutostartError};
+use crate::cursor_style::{self, CursorShape};
 use crate::keyboard_hook;
+use crate::profile_store::{
+    self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame,
+    Zone,
+};
+use crate::region_calc::{MonitorGeometry, Region, resolve_region};
 use crate::win32;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -117,8 +118,16 @@ impl SettingsState {
         Self {
             zone: config.zone,
             toggle_borderless: config.hotkeys.toggle_borderless.clone().unwrap_or_default(),
-            toggle_taskbar_autohide: config.hotkeys.toggle_taskbar_autohide.clone().unwrap_or_default(),
-            toggle_game_cursor: config.hotkeys.toggle_game_cursor.clone().unwrap_or_default(),
+            toggle_taskbar_autohide: config
+                .hotkeys
+                .toggle_taskbar_autohide
+                .clone()
+                .unwrap_or_default(),
+            toggle_game_cursor: config
+                .hotkeys
+                .toggle_game_cursor
+                .clone()
+                .unwrap_or_default(),
             cursor: config.cursor.clone(),
             capturing: None,
             unsupported_key_pressed: false,
@@ -200,13 +209,17 @@ impl SettingsState {
 
         let already_bound = [
             (HotkeyField::ToggleBorderless, &self.toggle_borderless),
-            (HotkeyField::ToggleTaskbarAutohide, &self.toggle_taskbar_autohide),
+            (
+                HotkeyField::ToggleTaskbarAutohide,
+                &self.toggle_taskbar_autohide,
+            ),
             (HotkeyField::ToggleGameCursor, &self.toggle_game_cursor),
         ]
         .into_iter()
         .any(|(other, binding)| other != field && !binding.is_empty() && *binding == combo);
         if already_bound {
-            self.duplicate_hotkey_error = Some(format!("{combo} is already bound to another hotkey"));
+            self.duplicate_hotkey_error =
+                Some(format!("{combo} is already bound to another hotkey"));
             return;
         }
 
@@ -236,9 +249,18 @@ impl SettingsState {
     /// (see [`crate::keyboard_hook::take_suppressed_ctrl_escape`]) so this
     /// stays pure and unit-testable without a real OS-level hook; only the
     /// polling call itself is OS-facing.
-    pub fn complete_capture_with_ctrl_escape_if_suppressed(&mut self, ctrl_escape_suppressed: bool) {
+    pub fn complete_capture_with_ctrl_escape_if_suppressed(
+        &mut self,
+        ctrl_escape_suppressed: bool,
+    ) {
         if ctrl_escape_suppressed {
-            self.handle_key_event(egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE }, egui::Key::Escape);
+            self.handle_key_event(
+                egui::Modifiers {
+                    ctrl: true,
+                    ..egui::Modifiers::NONE
+                },
+                egui::Key::Escape,
+            );
         }
     }
 
@@ -371,7 +393,10 @@ fn config_with_zone(mut config: Config, zone: Option<Zone>) -> Config {
 /// Returns the config as saved, so callers act on the on-disk taskbar settings
 /// (`hide_taskbar_on_apply`, `taskbar_hide_mode`) rather than on unsaved
 /// Settings state.
-pub(crate) fn persist_zone(config_dir: &Path, zone: Option<Zone>) -> Result<Config, SettingsUiError> {
+pub(crate) fn persist_zone(
+    config_dir: &Path,
+    zone: Option<Zone>,
+) -> Result<Config, SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let updated = config_with_zone(config, zone);
     profile_store::save(config_dir, &updated).map_err(SettingsUiError::Config)?;
@@ -410,7 +435,10 @@ fn live_reapply_tracked_game(
     let region = match resolve_region(zone, monitor) {
         Ok(region) => region,
         Err(e) => {
-            log!("live re-apply: failed to resolve the Zone for {}: {e}", game.display_name);
+            log!(
+                "live re-apply: failed to resolve the Zone for {}: {e}",
+                game.display_name
+            );
             return Some(live_apply_failure_message(&game.display_name));
         }
     };
@@ -727,7 +755,10 @@ fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<H
         return None;
     }
     let code = key_to_code(key)?;
-    Some(HotKey::new(Some(modifiers_to_hotkey_modifiers(modifiers)), code))
+    Some(HotKey::new(
+        Some(modifiers_to_hotkey_modifiers(modifiers)),
+        code,
+    ))
 }
 
 /// Converts a captured key-down event (the held `modifiers` plus the
@@ -790,7 +821,12 @@ pub fn primary_monitor_geometry() -> MonitorGeometry {
     // pointers or lifetimes are involved.
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    MonitorGeometry { x: 0, y: 0, width, height }
+    MonitorGeometry {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
 }
 
 /// Reasons opening the Settings window or persisting its result can fail.
@@ -897,7 +933,8 @@ pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).
                 if start_with_windows != started_with_windows {
-                    autostart::set_enabled(start_with_windows).map_err(SettingsUiError::Autostart)?;
+                    autostart::set_enabled(start_with_windows)
+                        .map_err(SettingsUiError::Autostart)?;
                 }
                 return Ok(());
             }
@@ -979,7 +1016,10 @@ fn run_settings_frame(
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_TITLE)
             .with_inner_size(settings_window_size(&monitor))
-            .with_position(centered_window_position(&monitor, settings_window_size(&monitor)))
+            .with_position(centered_window_position(
+                &monitor,
+                settings_window_size(&monitor),
+            ))
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -1013,7 +1053,11 @@ fn run_settings_frame(
 /// Settings window's title-bar/taskbar icon.
 fn window_icon() -> egui::IconData {
     const SIZE: u32 = 256;
-    egui::IconData { rgba: gameframe::icon::mark_rgba(SIZE), width: SIZE, height: SIZE }
+    egui::IconData {
+        rgba: gameframe::icon::mark_rgba(SIZE),
+        width: SIZE,
+        height: SIZE,
+    }
 }
 
 /// The live egui app backing the Settings window. Torn down entirely when
@@ -1095,14 +1139,23 @@ impl SettingsApp {
 
         if is_capturing {
             if self.state.unsupported_key_pressed {
-                ui.colored_label(egui::Color32::RED, "That key isn't supported -- try another.");
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "That key isn't supported -- try another.",
+                );
             }
             if let Some(error) = &self.state.duplicate_hotkey_error {
                 ui.colored_label(egui::Color32::RED, error);
             }
 
             for event in ui.ctx().input(|i| i.events.clone()) {
-                if let egui::Event::Key { physical_key: Some(key), pressed: true, repeat: false, modifiers, .. } = event
+                if let egui::Event::Key {
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
                 {
                     self.state.handle_key_event(modifiers, key);
                 }
@@ -1120,7 +1173,9 @@ impl SettingsApp {
     /// `Vec` out from under `iter_mut`'s in-progress borrow.
     fn games_section(&mut self, ui: &mut egui::Ui) {
         if self.state.tracked_games.is_empty() {
-            ui.label("No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.");
+            ui.label(
+                "No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.",
+            );
             return;
         }
 
@@ -1333,7 +1388,8 @@ impl SettingsApp {
             "Shake the mouse to make the cursor pulse",
         );
         ui.checkbox(&mut c.hide_when_cursor_hidden, "Hide when the game hides its cursor")
-            .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");    }
+            .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
+    }
 
     /// Renders the "Zone, hotkeys & taskbar" tab.
     fn general_section(&mut self, ui: &mut egui::Ui) {
@@ -1342,7 +1398,11 @@ impl SettingsApp {
         ui.separator();
         ui.heading("Global hotkeys");
         self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
-        self.hotkey_row(ui, "Toggle taskbar autohide:", HotkeyField::ToggleTaskbarAutohide);
+        self.hotkey_row(
+            ui,
+            "Toggle taskbar autohide:",
+            HotkeyField::ToggleTaskbarAutohide,
+        );
         self.hotkey_row(ui, "Toggle game cursor:", HotkeyField::ToggleGameCursor);
         // Re-sync immediately after the hotkey rows: a "Set hotkey" click
         // just above sets `state.capturing = Some(..)` within this same
@@ -1386,7 +1446,8 @@ impl SettingsApp {
         let view = zone_view(self.state.zone.as_ref(), &self.monitor);
 
         ui.horizontal(|ui| {
-            let (outline_rect, _response) = ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
+            let (outline_rect, _response) =
+                ui.allocate_exact_size(THUMBNAIL_SIZE, egui::Sense::hover());
             let painter = ui.painter();
             painter.rect_stroke(
                 outline_rect,
@@ -1397,8 +1458,12 @@ impl SettingsApp {
             match &view {
                 ZoneView::Resolved(region) => {
                     let highlight_rect = egui::Rect::from_min_size(
-                        outline_rect.min + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
-                        egui::vec2(region.width * THUMBNAIL_SIZE.x, region.height * THUMBNAIL_SIZE.y),
+                        outline_rect.min
+                            + egui::vec2(region.x * THUMBNAIL_SIZE.x, region.y * THUMBNAIL_SIZE.y),
+                        egui::vec2(
+                            region.width * THUMBNAIL_SIZE.x,
+                            region.height * THUMBNAIL_SIZE.y,
+                        ),
                     );
                     painter.rect_filled(highlight_rect, 0.0, fill_color);
                 }
@@ -1419,7 +1484,10 @@ impl SettingsApp {
             ui.vertical(|ui| {
                 match &self.state.zone {
                     Some(zone) => {
-                        ui.monospace(format!("({}, {}, {}x{})", zone.x, zone.y, zone.width, zone.height));
+                        ui.monospace(format!(
+                            "({}, {}, {}x{})",
+                            zone.x, zone.y, zone.width, zone.height
+                        ));
                     }
                     None => {
                         ui.label("No zone set");
@@ -1430,10 +1498,16 @@ impl SettingsApp {
                         .on_hover_text("The zone doesn't fit the current monitor. Edit it to fix.");
                 }
                 ui.horizontal(|ui| {
-                    let label = if self.state.zone.is_some() { "Edit zone" } else { "Draw zone" };
+                    let label = if self.state.zone.is_some() {
+                        "Edit zone"
+                    } else {
+                        "Draw zone"
+                    };
                     if ui.button(label).clicked() {
-                        *self.exit.borrow_mut() =
-                            Some(SettingsExit::EditZone(self.state.clone(), self.pending_status_messages.clone()));
+                        *self.exit.borrow_mut() = Some(SettingsExit::EditZone(
+                            self.state.clone(),
+                            self.pending_status_messages.clone(),
+                        ));
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if self.state.zone.is_some() && ui.button("Clear").clicked() {
@@ -1443,7 +1517,8 @@ impl SettingsApp {
                             Ok(_) => self.state.clear_zone(),
                             Err(e) => {
                                 log!("failed to clear the zone: {e}");
-                                self.pending_status_messages = vec![format!("couldn't clear the zone: {e}")];
+                                self.pending_status_messages =
+                                    vec![format!("couldn't clear the zone: {e}")];
                             }
                         }
                     }
@@ -1490,7 +1565,9 @@ impl SettingsApp {
                 // would need a separate "already tried and failed" flag to
                 // avoid, not required by this issue's acceptance criteria.
             }
-            self.state.complete_capture_with_ctrl_escape_if_suppressed(keyboard_hook::take_suppressed_ctrl_escape());
+            self.state.complete_capture_with_ctrl_escape_if_suppressed(
+                keyboard_hook::take_suppressed_ctrl_escape(),
+            );
         } else {
             self.keyboard_hook = None;
         }
@@ -1506,7 +1583,10 @@ impl eframe::App for SettingsApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(self.state.to_config(), self.state.start_with_windows));
+                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(
+                        self.state.to_config(),
+                        self.state.start_with_windows,
+                    ));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {
@@ -1532,15 +1612,21 @@ impl eframe::App for SettingsApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.state.tab, SettingsTab::Games, "Games");
                 ui.selectable_value(&mut self.state.tab, SettingsTab::Cursor, "Cursor");
-                ui.selectable_value(&mut self.state.tab, SettingsTab::General, "Zone, hotkeys & taskbar");
+                ui.selectable_value(
+                    &mut self.state.tab,
+                    SettingsTab::General,
+                    "Zone, hotkeys & taskbar",
+                );
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.state.tab {
-                SettingsTab::Games => self.games_section(ui),
-                SettingsTab::Cursor => self.cursor_section(ui),
-                SettingsTab::General => self.general_section(ui),
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.state.tab {
+                    SettingsTab::Games => self.games_section(ui),
+                    SettingsTab::Cursor => self.cursor_section(ui),
+                    SettingsTab::General => self.general_section(ui),
+                });
         });
     }
 }
@@ -1561,9 +1647,22 @@ mod tests {
 
     #[test]
     fn config_with_zone_replaces_only_the_zone_of_the_on_disk_config() {
-        let mut on_disk = Config { zone: Some(Zone { x: 1, y: 2, width: 3, height: 4 }), ..Config::default() };
+        let mut on_disk = Config {
+            zone: Some(Zone {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            }),
+            ..Config::default()
+        };
         on_disk.hotkeys.toggle_borderless = Some("Ctrl+B".to_string());
-        let new_zone = Zone { x: 100, y: 50, width: 800, height: 600 };
+        let new_zone = Zone {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
 
         let updated = config_with_zone(on_disk.clone(), Some(new_zone));
 
@@ -1586,7 +1685,12 @@ mod tests {
             ..Config::default()
         };
         profile_store::save(dir, &config).unwrap();
-        let zone = Zone { x: 10, y: 20, width: 300, height: 200 };
+        let zone = Zone {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
 
         let saved = persist_zone(dir, Some(zone)).unwrap();
 
@@ -1616,8 +1720,13 @@ mod tests {
     }
 
     #[test]
-    fn format_captured_hotkey_with_modifiers_and_a_letter_key_uses_gameframes_stored_string_convention() {
-        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+    fn format_captured_hotkey_with_modifiers_and_a_letter_key_uses_gameframes_stored_string_convention()
+     {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
 
         let formatted = format_captured_hotkey(modifiers, egui::Key::B);
 
@@ -1626,7 +1735,10 @@ mod tests {
 
     #[test]
     fn format_captured_hotkey_rejects_a_modifier_only_press_as_an_incomplete_capture() {
-        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
 
         let formatted = format_captured_hotkey(modifiers, egui::Key::ControlLeft);
 
@@ -1647,16 +1759,29 @@ mod tests {
 
     #[test]
     fn build_captured_hotkey_constructs_a_hotkey_directly_from_modifiers_and_physical_key() {
-        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
 
         let hotkey = build_captured_hotkey(modifiers, egui::Key::B);
 
-        assert_eq!(hotkey, Some(HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyB)));
+        assert_eq!(
+            hotkey,
+            Some(HotKey::new(
+                Some(Modifiers::CONTROL | Modifiers::ALT),
+                Code::KeyB
+            ))
+        );
     }
 
     #[test]
     fn build_captured_hotkey_returns_none_for_a_physical_modifier_only_press() {
-        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
 
         let hotkey = build_captured_hotkey(modifiers, egui::Key::ControlLeft);
 
@@ -1678,17 +1803,28 @@ mod tests {
         // successfully construct a `global_hotkey::hotkey::HotKey` -- issue #29's
         // acceptance criterion -- and the two must describe the same chord (same
         // modifiers, same physical key), not merely both succeed independently.
-        let modifiers = egui::Modifiers { ctrl: true, shift: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
 
         let combo = format_captured_hotkey(modifiers, egui::Key::Q);
         let hotkey = build_captured_hotkey(modifiers, egui::Key::Q);
 
         assert_eq!(combo, Some("Ctrl+Shift+Q".to_string()));
-        assert_eq!(hotkey, Some(HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyQ)));
+        assert_eq!(
+            hotkey,
+            Some(HotKey::new(
+                Some(Modifiers::CONTROL | Modifiers::SHIFT),
+                Code::KeyQ
+            ))
+        );
     }
 
     #[test]
-    fn key_display_name_excludes_enter_and_space_because_they_are_unbindable_via_the_capture_button() {
+    fn key_display_name_excludes_enter_and_space_because_they_are_unbindable_via_the_capture_button()
+     {
         // Enter/Space are consumed as a click on the focused "Set hotkey"/"Cancel"
         // button before the raw `Event::Key` ever reaches `handle_key_event`, so
         // they can never actually complete a capture -- see the doc comment on
@@ -1698,7 +1834,12 @@ mod tests {
     }
 
     fn test_monitor() -> MonitorGeometry {
-        MonitorGeometry { x: 0, y: 0, width: 1920, height: 1080 }
+        MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }
     }
 
     #[test]
@@ -1716,7 +1857,12 @@ mod tests {
     #[test]
     fn from_config_of_a_saved_config_shows_the_saved_hotkeys_and_zone() {
         let config = Config {
-            zone: Some(Zone { x: 10, y: 10, width: 200, height: 100 }),
+            zone: Some(Zone {
+                x: 10,
+                y: 10,
+                width: 200,
+                height: 100,
+            }),
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
@@ -1725,17 +1871,33 @@ mod tests {
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
             hide_taskbar_on_apply: true,
-            cursor: CursorSettings { enabled: true, size: 72, ..CursorSettings::default() },
+            cursor: CursorSettings {
+                enabled: true,
+                size: 72,
+                ..CursorSettings::default()
+            },
         };
 
         let state = SettingsState::from_config(&config);
 
-        assert_eq!(state.zone, Some(Zone { x: 10, y: 10, width: 200, height: 100 }));
+        assert_eq!(
+            state.zone,
+            Some(Zone {
+                x: 10,
+                y: 10,
+                width: 200,
+                height: 100
+            })
+        );
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
         assert_eq!(state.toggle_taskbar_autohide, "Ctrl+Alt+T");
         assert_eq!(state.toggle_game_cursor, "Ctrl+Alt+M");
         assert_eq!(state.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
-        assert_eq!(state.to_config(), config, "game cursor settings round-trip through Settings");
+        assert_eq!(
+            state.to_config(),
+            config,
+            "game cursor settings round-trip through Settings"
+        );
     }
 
     #[test]
@@ -1744,10 +1906,20 @@ mod tests {
         state.toggle_game_cursor = "Ctrl+Alt+M".to_string();
         state.start_capture(HotkeyField::ToggleBorderless);
 
-        state.handle_key_event(egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }, egui::Key::M);
+        state.handle_key_event(
+            egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Key::M,
+        );
 
         assert_eq!(state.toggle_borderless, "");
-        assert_eq!(state.duplicate_hotkey_error, Some("Ctrl+Alt+M is already bound to another hotkey".to_string()));
+        assert_eq!(
+            state.duplicate_hotkey_error,
+            Some("Ctrl+Alt+M is already bound to another hotkey".to_string())
+        );
     }
 
     #[test]
@@ -1755,9 +1927,19 @@ mod tests {
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleGameCursor);
 
-        state.handle_key_event(egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }, egui::Key::M);
+        state.handle_key_event(
+            egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Key::M,
+        );
         assert_eq!(state.toggle_game_cursor, "Ctrl+Alt+M");
-        assert_eq!(state.to_config().hotkeys.toggle_game_cursor, Some("Ctrl+Alt+M".to_string()));
+        assert_eq!(
+            state.to_config().hotkeys.toggle_game_cursor,
+            Some("Ctrl+Alt+M".to_string())
+        );
 
         state.clear_hotkey(HotkeyField::ToggleGameCursor);
         assert_eq!(state.to_config().hotkeys.toggle_game_cursor, None);
@@ -1781,8 +1963,14 @@ mod tests {
 
         let config = state.to_config();
 
-        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
-        assert_eq!(config.hotkeys.toggle_taskbar_autohide, Some("Ctrl+Alt+D".to_string()));
+        assert_eq!(
+            config.hotkeys.toggle_borderless,
+            Some("Ctrl+Alt+B".to_string())
+        );
+        assert_eq!(
+            config.hotkeys.toggle_taskbar_autohide,
+            Some("Ctrl+Alt+D".to_string())
+        );
     }
 
     #[test]
@@ -1843,39 +2031,96 @@ mod tests {
 
     #[test]
     fn zone_round_trips_through_from_config_and_to_config() {
-        let zone = Zone { x: 1, y: 2, width: 3, height: 4 };
-        let config = Config { zone: Some(zone), ..Config::default() };
+        let zone = Zone {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        let config = Config {
+            zone: Some(zone),
+            ..Config::default()
+        };
 
         let round_tripped = SettingsState::from_config(&config).to_config();
 
         assert_eq!(round_tripped.zone, Some(zone));
-        assert_eq!(SettingsState::from_config(&Config::default()).to_config().zone, None);
+        assert_eq!(
+            SettingsState::from_config(&Config::default())
+                .to_config()
+                .zone,
+            None
+        );
     }
 
     #[test]
     fn set_zone_sets_the_zone_returned_by_the_zone_editor_overlay() {
         let mut state = SettingsState::from_config(&Config::default());
 
-        state.set_zone(Zone { x: 100, y: 50, width: 800, height: 600 });
+        state.set_zone(Zone {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        });
 
-        assert_eq!(state.zone, Some(Zone { x: 100, y: 50, width: 800, height: 600 }));
-        assert_eq!(state.to_config().zone, Some(Zone { x: 100, y: 50, width: 800, height: 600 }));
+        assert_eq!(
+            state.zone,
+            Some(Zone {
+                x: 100,
+                y: 50,
+                width: 800,
+                height: 600
+            })
+        );
+        assert_eq!(
+            state.to_config().zone,
+            Some(Zone {
+                x: 100,
+                y: 50,
+                width: 800,
+                height: 600
+            })
+        );
     }
 
     #[test]
     fn set_zone_replaces_any_previously_set_zone_rather_than_appending() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.zone = Some(Zone { x: 0, y: 0, width: 100, height: 100 });
+        state.zone = Some(Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        });
 
-        state.set_zone(Zone { x: 200, y: 200, width: 300, height: 300 });
+        state.set_zone(Zone {
+            x: 200,
+            y: 200,
+            width: 300,
+            height: 300,
+        });
 
-        assert_eq!(state.zone, Some(Zone { x: 200, y: 200, width: 300, height: 300 }));
+        assert_eq!(
+            state.zone,
+            Some(Zone {
+                x: 200,
+                y: 200,
+                width: 300,
+                height: 300
+            })
+        );
     }
 
     #[test]
     fn clear_zone_removes_the_zone() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.zone = Some(Zone { x: 1, y: 2, width: 3, height: 4 });
+        state.zone = Some(Zone {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        });
 
         state.clear_zone();
 
@@ -1887,7 +2132,11 @@ mod tests {
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleBorderless);
 
-        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
         state.handle_key_event(modifiers, egui::Key::B);
 
         assert_eq!(state.toggle_borderless, "Ctrl+Alt+B");
@@ -1919,7 +2168,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_capture_with_ctrl_escape_if_suppressed_records_the_combo_when_the_hook_swallowed_it() {
+    fn complete_capture_with_ctrl_escape_if_suppressed_records_the_combo_when_the_hook_swallowed_it()
+     {
         // Mirrors `keyboard_hook::keyboard_hook_proc`'s CRITICAL fix: the hook
         // swallows the physical Ctrl+Escape press before it can ever arrive as
         // an `egui::Event::Key`, so this is the only path that can complete
@@ -1934,7 +2184,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_the_hook_did_not_swallow_anything() {
+    fn complete_capture_with_ctrl_escape_if_suppressed_is_a_no_op_when_the_hook_did_not_swallow_anything()
+     {
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleBorderless);
 
@@ -1959,7 +2210,10 @@ mod tests {
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleBorderless);
 
-        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
         state.handle_key_event(modifiers, egui::Key::Escape);
 
         assert_eq!(state.toggle_borderless, "Ctrl+Escape");
@@ -1971,7 +2225,10 @@ mod tests {
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleBorderless);
 
-        let modifiers = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
         state.handle_key_event(modifiers, egui::Key::ControlLeft);
 
         assert_eq!(state.toggle_borderless, "");
@@ -2046,7 +2303,11 @@ mod tests {
         state.toggle_taskbar_autohide = "Ctrl+Alt+B".to_string();
         state.start_capture(HotkeyField::ToggleBorderless);
 
-        let modifiers = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
         state.handle_key_event(modifiers, egui::Key::B);
 
         assert_eq!(state.toggle_borderless, "");
@@ -2060,7 +2321,11 @@ mod tests {
         state.toggle_taskbar_autohide = "Ctrl+Alt+B".to_string();
         state.start_capture(HotkeyField::ToggleBorderless);
         state.handle_key_event(
-            egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE },
+            egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
             egui::Key::B,
         );
         assert!(state.duplicate_hotkey_error.is_some());
@@ -2098,21 +2363,52 @@ mod tests {
     #[test]
     fn normalize_region_expresses_a_region_as_proportions_of_the_monitor() {
         let monitor = test_monitor();
-        let region = Region { x: 960, y: 0, width: 960, height: 1080 };
+        let region = Region {
+            x: 960,
+            y: 0,
+            width: 960,
+            height: 1080,
+        };
 
         let normalized = normalize_region(&region, &monitor);
 
-        assert_eq!(normalized, NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 });
+        assert_eq!(
+            normalized,
+            NormalizedRegion {
+                x: 0.5,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0
+            }
+        );
     }
 
     #[test]
     fn normalize_region_accounts_for_a_monitor_with_a_non_zero_origin() {
-        let monitor = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
-        let region = Region { x: -1280, y: 0, width: 1280, height: 1440 };
+        let monitor = MonitorGeometry {
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let region = Region {
+            x: -1280,
+            y: 0,
+            width: 1280,
+            height: 1440,
+        };
 
         let normalized = normalize_region(&region, &monitor);
 
-        assert_eq!(normalized, NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 });
+        assert_eq!(
+            normalized,
+            NormalizedRegion {
+                x: 0.5,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0
+            }
+        );
     }
 
     #[test]
@@ -2126,7 +2422,12 @@ mod tests {
 
     #[test]
     fn centered_window_position_accounts_for_a_monitor_with_a_non_zero_origin() {
-        let monitor = MonitorGeometry { x: -2560, y: 0, width: 2560, height: 1440 };
+        let monitor = MonitorGeometry {
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
 
         let position = centered_window_position(&monitor, [440.0, 560.0]);
 
@@ -2140,22 +2441,43 @@ mod tests {
 
     #[test]
     fn zone_view_normalizes_a_zone_that_fits_the_monitor() {
-        let zone = Zone { x: 960, y: 0, width: 960, height: 1080 };
+        let zone = Zone {
+            x: 960,
+            y: 0,
+            width: 960,
+            height: 1080,
+        };
 
         let view = zone_view(Some(&zone), &test_monitor());
 
-        assert_eq!(view, ZoneView::Resolved(NormalizedRegion { x: 0.5, y: 0.0, width: 0.5, height: 1.0 }));
+        assert_eq!(
+            view,
+            ZoneView::Resolved(NormalizedRegion {
+                x: 0.5,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0
+            })
+        );
     }
 
     #[test]
     fn zone_view_surfaces_a_reason_for_a_zone_that_does_not_fit_the_monitor() {
         // Simulates a Zone persisted while GameFrame ran on a different
         // (e.g. 4K) monitor: its origin lies outside `test_monitor`'s bounds.
-        let zone = Zone { x: 5000, y: 5000, width: 200, height: 100 };
+        let zone = Zone {
+            x: 5000,
+            y: 5000,
+            width: 200,
+            height: 100,
+        };
 
         let view = zone_view(Some(&zone), &test_monitor());
 
-        assert!(matches!(view, ZoneView::Unresolvable(ref reason) if !reason.is_empty()), "got {view:?}");
+        assert!(
+            matches!(view, ZoneView::Unresolvable(ref reason) if !reason.is_empty()),
+            "got {view:?}"
+        );
     }
 
     #[test]
@@ -2170,7 +2492,12 @@ mod tests {
 
         // User edits and saves.
         state.toggle_borderless = "Ctrl+Alt+B".to_string();
-        state.set_zone(Zone { x: 10, y: 10, width: 300, height: 200 });
+        state.set_zone(Zone {
+            x: 10,
+            y: 10,
+            width: 300,
+            height: 200,
+        });
         let to_persist = state.to_config();
         profile_store::save(&config_dir, &to_persist).unwrap();
 
@@ -2179,6 +2506,14 @@ mod tests {
         let reopened_state = SettingsState::from_config(&reloaded_config);
 
         assert_eq!(reopened_state.toggle_borderless, "Ctrl+Alt+B");
-        assert_eq!(reopened_state.zone, Some(Zone { x: 10, y: 10, width: 300, height: 200 }));
+        assert_eq!(
+            reopened_state.zone,
+            Some(Zone {
+                x: 10,
+                y: 10,
+                width: 300,
+                height: 200
+            })
+        );
     }
 }

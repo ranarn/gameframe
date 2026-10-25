@@ -195,9 +195,11 @@ impl Tray {
         ))
         .map_err(TrayUiError::Menu)?;
 
-        let apply_to_window_menu = Submenu::with_id(ids.apply_to_window.clone(), "Apply to Window", true);
+        let apply_to_window_menu =
+            Submenu::with_id(ids.apply_to_window.clone(), "Apply to Window", true);
         rebuild_apply_to_window_items(&apply_to_window_menu);
-        menu.append(&apply_to_window_menu).map_err(TrayUiError::Menu)?;
+        menu.append(&apply_to_window_menu)
+            .map_err(TrayUiError::Menu)?;
 
         let start_with_windows_item = CheckMenuItem::with_id(
             ids.start_with_windows.clone(),
@@ -206,7 +208,8 @@ impl Tray {
             crate::autostart::is_enabled(),
             None,
         );
-        menu.append(&start_with_windows_item).map_err(TrayUiError::Menu)?;
+        menu.append(&start_with_windows_item)
+            .map_err(TrayUiError::Menu)?;
 
         menu.append(&MenuItem::with_id(ids.exit.clone(), "Exit", true, None))
             .map_err(TrayUiError::Menu)?;
@@ -220,7 +223,12 @@ impl Tray {
             .build()
             .map_err(TrayUiError::Tray)?;
 
-        Ok(Self { _icon: tray_icon, ids, apply_to_window_menu, start_with_windows_item })
+        Ok(Self {
+            _icon: tray_icon,
+            ids,
+            apply_to_window_menu,
+            start_with_windows_item,
+        })
     }
 
     /// The id -> action mapping for this tray's three fixed top-level menu
@@ -281,7 +289,8 @@ impl Tray {
     /// the menu shows (in case Settings, the installer or Task Manager
     /// changed it in the meantime).
     pub fn sync_start_with_windows_check(&self) {
-        self.start_with_windows_item.set_checked(crate::autostart::is_enabled());
+        self.start_with_windows_item
+            .set_checked(crate::autostart::is_enabled());
     }
 }
 
@@ -294,7 +303,12 @@ fn rebuild_apply_to_window_items(submenu: &Submenu) {
     while submenu.remove_at(0).is_some() {}
 
     for (hwnd, title) in crate::win32::list_visible_windows() {
-        let item = MenuItem::with_id(encode_window_item_id(hwnd), escape_menu_ampersand(&title), true, None);
+        let item = MenuItem::with_id(
+            encode_window_item_id(hwnd),
+            escape_menu_ampersand(&title),
+            true,
+            None,
+        );
         // A single item failing to append (e.g. a transient allocation
         // failure) shouldn't abort populating the rest of the list.
         let _ = submenu.append(&item);
@@ -329,7 +343,10 @@ mod tests {
     fn action_for_maps_the_exit_id_to_the_exit_action() {
         let ids = TrayMenuIds::new();
 
-        assert_eq!(ids.action_for(&MenuId::new(EXIT_ID)), Some(TrayAction::Exit));
+        assert_eq!(
+            ids.action_for(&MenuId::new(EXIT_ID)),
+            Some(TrayAction::Exit)
+        );
     }
 
     #[test]
@@ -380,20 +397,28 @@ mod tests {
 
     #[test]
     fn decode_window_item_id_rejects_an_id_missing_the_window_item_prefix() {
-        assert_eq!(decode_window_item_id(&MenuId::new("not-a-window-item")), None);
+        assert_eq!(
+            decode_window_item_id(&MenuId::new("not-a-window-item")),
+            None
+        );
     }
 
     #[test]
     fn decode_window_item_id_rejects_a_prefixed_id_with_a_non_numeric_suffix() {
         assert_eq!(
-            decode_window_item_id(&MenuId::new(format!("{APPLY_TO_WINDOW_ITEM_ID_PREFIX}not-a-number"))),
+            decode_window_item_id(&MenuId::new(format!(
+                "{APPLY_TO_WINDOW_ITEM_ID_PREFIX}not-a-number"
+            ))),
             None
         );
     }
 
     #[test]
     fn decode_window_item_id_rejects_one_of_the_three_fixed_top_level_menu_ids() {
-        assert_eq!(decode_window_item_id(&MenuId::new(APPLY_TO_WINDOW_ID)), None);
+        assert_eq!(
+            decode_window_item_id(&MenuId::new(APPLY_TO_WINDOW_ID)),
+            None
+        );
         assert_eq!(decode_window_item_id(&MenuId::new(EXIT_ID)), None);
         assert_eq!(decode_window_item_id(&MenuId::new(SHOW_SETTINGS_ID)), None);
     }
@@ -410,6 +435,9 @@ mod tests {
 
     #[test]
     fn escape_menu_ampersand_doubles_every_ampersand_in_a_title_with_multiple() {
-        assert_eq!(escape_menu_ampersand("Tom & Jerry & Friends"), "Tom && Jerry && Friends");
+        assert_eq!(
+            escape_menu_ampersand("Tom & Jerry & Friends"),
+            "Tom && Jerry && Friends"
+        );
     }
 }

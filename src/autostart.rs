@@ -24,18 +24,24 @@ use windows_sys::Win32::System::Registry::{
 /// removes the same name, so the two must stay in sync.
 const VALUE_NAME: &str = "GameFrame";
 const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_APPROVED_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const STARTUP_APPROVED_SUBKEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
 #[derive(Debug)]
 pub enum AutostartError {
     CurrentExe(std::io::Error),
-    Registry { operation: &'static str, code: WIN32_ERROR },
+    Registry {
+        operation: &'static str,
+        code: WIN32_ERROR,
+    },
 }
 
 impl std::fmt::Display for AutostartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AutostartError::CurrentExe(e) => write!(f, "could not resolve GameFrame's executable path: {e}"),
+            AutostartError::CurrentExe(e) => {
+                write!(f, "could not resolve GameFrame's executable path: {e}")
+            }
             AutostartError::Registry { operation, code } => {
                 write!(f, "registry {operation} failed with Win32 error {code}")
             }
@@ -131,15 +137,26 @@ fn enable_at(location: &RegistryLocation, exe: &Path) -> Result<(), AutostartErr
         )
     };
     if code != ERROR_SUCCESS {
-        return Err(AutostartError::Registry { operation: "write", code });
+        return Err(AutostartError::Registry {
+            operation: "write",
+            code,
+        });
     }
     // Clear a Task Manager "Disabled" override so the entry actually runs.
-    delete_value(location.root, location.startup_approved_subkey, location.value_name)
+    delete_value(
+        location.root,
+        location.startup_approved_subkey,
+        location.value_name,
+    )
 }
 
 fn disable_at(location: &RegistryLocation) -> Result<(), AutostartError> {
     delete_value(location.root, location.run_subkey, location.value_name)?;
-    delete_value(location.root, location.startup_approved_subkey, location.value_name)
+    delete_value(
+        location.root,
+        location.startup_approved_subkey,
+        location.value_name,
+    )
 }
 
 /// Deletes one value; a value (or key) that doesn't exist counts as success.
@@ -149,7 +166,10 @@ fn delete_value(root: HKEY, subkey: &str, value_name: &str) -> Result<(), Autost
     let code = unsafe { RegDeleteKeyValueW(root, subkey.as_ptr(), value.as_ptr()) };
     match code {
         ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
-        code => Err(AutostartError::Registry { operation: "delete", code }),
+        code => Err(AutostartError::Registry {
+            operation: "delete",
+            code,
+        }),
     }
 }
 
@@ -174,7 +194,11 @@ mod tests {
     impl ScratchKey {
         fn new(name: &str) -> Self {
             let root_key = format!(r"Software\GameFrameTest-{}-{name}", std::process::id());
-            Self { run: format!(r"{root_key}\Run"), approved: format!(r"{root_key}\Approved"), root_key }
+            Self {
+                run: format!(r"{root_key}\Run"),
+                approved: format!(r"{root_key}\Approved"),
+                root_key,
+            }
         }
 
         fn location(&self) -> RegistryLocation<'_> {
@@ -204,7 +228,9 @@ mod tests {
             };
             (code == ERROR_SUCCESS).then(|| {
                 let len = size as usize / size_of::<u16>();
-                String::from_utf16_lossy(&buf[..len]).trim_end_matches('\0').to_owned()
+                String::from_utf16_lossy(&buf[..len])
+                    .trim_end_matches('\0')
+                    .to_owned()
             })
         }
 
@@ -255,9 +281,14 @@ mod tests {
 
     #[test]
     fn run_command_quotes_a_path_containing_spaces() {
-        let command = run_command(Path::new(r"C:\Users\First Last\AppData\Local\Programs\GameFrame\gameframe.exe"));
+        let command = run_command(Path::new(
+            r"C:\Users\First Last\AppData\Local\Programs\GameFrame\gameframe.exe",
+        ));
 
-        assert_eq!(command, r#""C:\Users\First Last\AppData\Local\Programs\GameFrame\gameframe.exe""#);
+        assert_eq!(
+            command,
+            r#""C:\Users\First Last\AppData\Local\Programs\GameFrame\gameframe.exe""#
+        );
     }
 
     #[test]
@@ -275,7 +306,10 @@ mod tests {
         enable_at(&scratch.location(), exe).unwrap();
 
         assert!(is_enabled_at(&scratch.location()));
-        assert_eq!(scratch.read_run_value().as_deref(), Some(r#""C:\Program Files\GameFrame\gameframe.exe""#));
+        assert_eq!(
+            scratch.read_run_value().as_deref(),
+            Some(r#""C:\Program Files\GameFrame\gameframe.exe""#)
+        );
     }
 
     #[test]

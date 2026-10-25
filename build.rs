@@ -13,6 +13,11 @@ fn main() {
     resource.set("ProductName", "GameFrame");
     resource.set("FileDescription", "GameFrame");
     resource.set("CompanyName", "Jonas Ranerfors");
-    resource.set("LegalCopyright", "Copyright (C) 2026 Jonas Ranerfors. Licensed under GPL-3.0-or-later.");
-    resource.compile().expect("failed to embed the Windows app icon resource (assets/icon.ico)");
+    resource.set(
+        "LegalCopyright",
+        "Copyright (C) 2026 Jonas Ranerfors. Licensed under GPL-3.0-or-later.",
+    );
+    resource
+        .compile()
+        .expect("failed to embed the Windows app icon resource (assets/icon.ico)");
 }

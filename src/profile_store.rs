@@ -59,7 +59,12 @@ impl TrackedGame {
     /// Builds a freshly-added tracked game with the specified defaults:
     /// auto-apply on, game cursor on.
     pub fn new_default(exe_path: PathBuf, display_name: String) -> Self {
-        TrackedGame { exe_path, display_name, auto_apply: true, game_cursor: true }
+        TrackedGame {
+            exe_path,
+            display_name,
+            auto_apply: true,
+            game_cursor: true,
+        }
     }
 }
 
@@ -81,7 +86,11 @@ impl TrackedGame {
 /// a live process, which returns a consistent casing run-to-run, so two
 /// differently-cased paths for the *same* game are not expected in
 /// practice.
-pub fn upsert_tracked_game(games: &mut Vec<TrackedGame>, exe_path: PathBuf, display_name: String) -> usize {
+pub fn upsert_tracked_game(
+    games: &mut Vec<TrackedGame>,
+    exe_path: PathBuf,
+    display_name: String,
+) -> usize {
     if let Some(pos) = games.iter().position(|g| g.exe_path == exe_path) {
         return pos;
     }
@@ -485,7 +494,12 @@ mod tests {
     #[test]
     fn should_not_prompt_for_zone_when_a_zone_is_set() {
         let config = Config {
-            zone: Some(Zone { x: 0, y: 0, width: 800, height: 600 }),
+            zone: Some(Zone {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }),
             ..Config::default()
         };
         assert!(!should_prompt_for_zone(&config));
@@ -502,7 +516,11 @@ mod tests {
             config,
             Config {
                 zone: None,
-                hotkeys: HotkeyBindings { toggle_borderless: None, toggle_taskbar_autohide: None, toggle_game_cursor: None },
+                hotkeys: HotkeyBindings {
+                    toggle_borderless: None,
+                    toggle_taskbar_autohide: None,
+                    toggle_game_cursor: None
+                },
                 tracked_games: Vec::new(),
                 taskbar_hide_mode: TaskbarHideMode::FullyHidden,
                 hide_taskbar_on_apply: true,
@@ -517,7 +535,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
         let written = Config {
-            zone: Some(Zone { x: 1, y: 2, width: 300, height: 400 }),
+            zone: Some(Zone {
+                x: 1,
+                y: 2,
+                width: 300,
+                height: 400,
+            }),
             hotkeys: HotkeyBindings {
                 toggle_borderless: Some("Ctrl+Alt+B".to_string()),
                 toggle_taskbar_autohide: Some("Ctrl+Alt+T".to_string()),
@@ -531,7 +554,11 @@ mod tests {
             }],
             taskbar_hide_mode: TaskbarHideMode::HoverReveal,
             hide_taskbar_on_apply: false,
-            cursor: CursorSettings { enabled: true, size: 80, ..CursorSettings::default() },
+            cursor: CursorSettings {
+                enabled: true,
+                size: 80,
+                ..CursorSettings::default()
+            },
         };
         save(&config_dir, &written).unwrap();
 
@@ -595,9 +622,23 @@ mod tests {
 
         let config = load(&config_dir).unwrap();
 
-        assert_eq!(config.zone, Some(Zone { x: 10, y: 20, width: 200, height: 100 }));
-        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
-        assert_eq!(config.hotkeys.toggle_taskbar_autohide, Some("Ctrl+Alt+T".to_string()));
+        assert_eq!(
+            config.zone,
+            Some(Zone {
+                x: 10,
+                y: 20,
+                width: 200,
+                height: 100
+            })
+        );
+        assert_eq!(
+            config.hotkeys.toggle_borderless,
+            Some("Ctrl+Alt+B".to_string())
+        );
+        assert_eq!(
+            config.hotkeys.toggle_taskbar_autohide,
+            Some("Ctrl+Alt+T".to_string())
+        );
         assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::HoverReveal);
         assert_eq!(
             config.tracked_games,
@@ -644,7 +685,10 @@ mod tests {
         let config = load(&config_dir).unwrap();
 
         assert_eq!(config.zone, None);
-        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
+        assert_eq!(
+            config.hotkeys.toggle_borderless,
+            Some("Ctrl+Alt+B".to_string())
+        );
         assert_eq!(config.hotkeys.toggle_taskbar_autohide, None);
         assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
         assert_eq!(config.tracked_games.len(), 1);
@@ -660,9 +704,18 @@ mod tests {
         let migrated = load(&config_dir).unwrap();
 
         let on_disk = std::fs::read_to_string(config_dir.join(CONFIG_FILE_NAME)).unwrap();
-        assert!(!on_disk.contains("presets"), "the legacy [presets] table must be gone: {on_disk}");
-        assert!(!on_disk.contains("preset ="), "tracked games must no longer carry a preset: {on_disk}");
-        assert!(on_disk.contains("[zone]"), "the zone must be written: {on_disk}");
+        assert!(
+            !on_disk.contains("presets"),
+            "the legacy [presets] table must be gone: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("preset ="),
+            "tracked games must no longer carry a preset: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("[zone]"),
+            "the zone must be written: {on_disk}"
+        );
         let second = load(&config_dir).unwrap();
         assert_eq!(second, migrated);
     }
@@ -888,7 +941,10 @@ mod tests {
         assert_eq!(config.zone, None);
         assert_eq!(config.tracked_games, Vec::new());
         assert_eq!(config.taskbar_hide_mode, TaskbarHideMode::FullyHidden);
-        assert_eq!(config.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
+        assert_eq!(
+            config.hotkeys.toggle_borderless,
+            Some("Ctrl+Alt+B".to_string())
+        );
     }
 
     #[test]
@@ -902,7 +958,10 @@ mod tests {
         save(&config_dir, &config).unwrap();
 
         let reloaded = load(&config_dir).unwrap();
-        assert_eq!(reloaded.hotkeys.toggle_borderless, Some("Ctrl+Alt+B".to_string()));
+        assert_eq!(
+            reloaded.hotkeys.toggle_borderless,
+            Some("Ctrl+Alt+B".to_string())
+        );
     }
 
     #[test]
@@ -922,7 +981,8 @@ mod tests {
 
     #[test]
     fn tracked_game_new_default_has_auto_apply_on() {
-        let game = TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        let game =
+            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
 
         assert_eq!(game.exe_path, PathBuf::from("C:\\Games\\thing.exe"));
         assert_eq!(game.display_name, "Thing");
@@ -933,7 +993,11 @@ mod tests {
     fn upsert_tracked_game_appends_a_new_default_entry_when_no_existing_match() {
         let mut games: Vec<TrackedGame> = Vec::new();
 
-        let index = upsert_tracked_game(&mut games, PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+        let index = upsert_tracked_game(
+            &mut games,
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+        );
 
         assert_eq!(index, 0);
         assert_eq!(games.len(), 1);
@@ -943,8 +1007,10 @@ mod tests {
 
     #[test]
     fn upsert_tracked_game_reuses_the_existing_entry_for_a_matching_executable_path() {
-        let mut games =
-            vec![TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string())];
+        let mut games = vec![TrackedGame::new_default(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+        )];
         games[0].auto_apply = false;
 
         let index = upsert_tracked_game(
@@ -954,7 +1020,11 @@ mod tests {
         );
 
         assert_eq!(index, 0);
-        assert_eq!(games.len(), 1, "picking an already-tracked game again must not create a duplicate entry");
+        assert_eq!(
+            games.len(),
+            1,
+            "picking an already-tracked game again must not create a duplicate entry"
+        );
         // Display name is captured only at add-time.
         assert_eq!(games[0].display_name, "Thing");
         // Existing settings are preserved untouched, not reset to defaults.
@@ -970,7 +1040,10 @@ mod tests {
 
     #[test]
     fn find_tracked_game_returns_the_matching_entry() {
-        let games = vec![TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string())];
+        let games = vec![TrackedGame::new_default(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+        )];
 
         let found = find_tracked_game(&games, std::path::Path::new("C:\\Games\\thing.exe"));
 
@@ -998,7 +1071,14 @@ mod tests {
         assert_is_std_error(&io_err);
         assert_is_std_error(&serialize_err);
 
-        assert_eq!(io_err.to_string(), "config I/O error: config file not found");
-        assert!(serialize_err.to_string().starts_with("failed to serialize config: "));
+        assert_eq!(
+            io_err.to_string(),
+            "config I/O error: config file not found"
+        );
+        assert!(
+            serialize_err
+                .to_string()
+                .starts_with("failed to serialize config: ")
+        );
     }
 }

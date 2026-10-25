@@ -41,8 +41,16 @@ pub enum Handle {
 }
 
 impl Handle {
-    pub const ALL: [Handle; 8] =
-        [Handle::N, Handle::S, Handle::E, Handle::W, Handle::Ne, Handle::Nw, Handle::Se, Handle::Sw];
+    pub const ALL: [Handle; 8] = [
+        Handle::N,
+        Handle::S,
+        Handle::E,
+        Handle::W,
+        Handle::Ne,
+        Handle::Nw,
+        Handle::Se,
+        Handle::Sw,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +64,11 @@ pub enum EditorState {
     Placed { zone: Zone },
     /// A specific handle is being dragged; `original` is kept so `Cancel`
     /// can discard back to it without needing a separate undo stack.
-    Resizing { original: Zone, handle: Handle, live: Zone },
+    Resizing {
+        original: Zone,
+        handle: Handle,
+        live: Zone,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +126,10 @@ impl AppState {
             Action::Start(p) => {
                 match self.editor {
                     EditorState::Empty => {
-                        self.editor = EditorState::Dragging { anchor: p, current: p };
+                        self.editor = EditorState::Dragging {
+                            anchor: p,
+                            current: p,
+                        };
                         self.last_message = "drawing from corner".to_string();
                     }
                     _ => self.reject("`start` is only legal from Empty"),
@@ -127,7 +142,11 @@ impl AppState {
                         *current = p;
                         self.last_message = "live preview updated".to_string();
                     }
-                    EditorState::Resizing { original, handle, live } => {
+                    EditorState::Resizing {
+                        original,
+                        handle,
+                        live,
+                    } => {
                         *live = apply_handle_drag(*original, *handle, p, self.monitor);
                         self.last_message = "live resize updated".to_string();
                     }
@@ -153,7 +172,11 @@ impl AppState {
             Action::Grab(handle) => {
                 match &self.editor {
                     EditorState::Placed { zone } => {
-                        self.editor = EditorState::Resizing { original: *zone, handle, live: *zone };
+                        self.editor = EditorState::Resizing {
+                            original: *zone,
+                            handle,
+                            live: *zone,
+                        };
                         self.last_message = format!("resizing via {handle:?}");
                     }
                     _ => self.reject("`grab` needs a placed zone"),
@@ -196,7 +219,11 @@ const EDGE_SNAP_PX: i32 = 20;
 
 /// Snaps `value` to `edge` when within [`EDGE_SNAP_PX`] of it.
 fn snap_to_edge(value: i32, edge: i32) -> i32 {
-    if (value - edge).abs() <= EDGE_SNAP_PX { edge } else { value }
+    if (value - edge).abs() <= EDGE_SNAP_PX {
+        edge
+    } else {
+        value
+    }
 }
 
 /// Normalizes a two-corner drag into a positive-area zone, clamped to the
@@ -206,9 +233,20 @@ fn snap_to_edge(value: i32, edge: i32) -> i32 {
 fn normalize(anchor: Point, current: Point, monitor: Monitor) -> Zone {
     let x0 = snap_to_edge(anchor.x.min(current.x).clamp(0, monitor.width), 0);
     let y0 = snap_to_edge(anchor.y.min(current.y).clamp(0, monitor.height), 0);
-    let x1 = snap_to_edge(anchor.x.max(current.x).clamp(0, monitor.width), monitor.width);
-    let y1 = snap_to_edge(anchor.y.max(current.y).clamp(0, monitor.height), monitor.height);
-    Zone { x: x0, y: y0, width: (x1 - x0).max(1), height: (y1 - y0).max(1) }
+    let x1 = snap_to_edge(
+        anchor.x.max(current.x).clamp(0, monitor.width),
+        monitor.width,
+    );
+    let y1 = snap_to_edge(
+        anchor.y.max(current.y).clamp(0, monitor.height),
+        monitor.height,
+    );
+    Zone {
+        x: x0,
+        y: y0,
+        width: (x1 - x0).max(1),
+        height: (y1 - y0).max(1),
+    }
 }
 
 /// Applies a live pointer position to a single handle drag: only the
@@ -239,7 +277,12 @@ fn apply_handle_drag(original: Zone, handle: Handle, pointer: Point, monitor: Mo
         bottom = snap_to_edge(pointer.y.clamp(top + 1, monitor.height), monitor.height);
     }
 
-    Zone { x: left, y: top, width: right - left, height: bottom - top }
+    Zone {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
 }
 
 #[cfg(test)]
@@ -247,7 +290,10 @@ mod tests {
     use super::*;
 
     fn monitor() -> Monitor {
-        Monitor { width: 1920, height: 1080 }
+        Monitor {
+            width: 1920,
+            height: 1080,
+        }
     }
 
     fn placed(zone: Zone) -> AppState {
@@ -268,7 +314,12 @@ mod tests {
 
     #[test]
     fn new_with_zone_starts_placed_with_the_given_zone() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let state = AppState::new_with_zone(monitor(), zone);
         assert_eq!(state.editor, EditorState::Placed { zone });
     }
@@ -280,13 +331,21 @@ mod tests {
         assert_eq!(outcome, None);
         assert_eq!(
             state.editor,
-            EditorState::Dragging { anchor: Point { x: 10, y: 20 }, current: Point { x: 10, y: 20 } }
+            EditorState::Dragging {
+                anchor: Point { x: 10, y: 20 },
+                current: Point { x: 10, y: 20 }
+            }
         );
     }
 
     #[test]
     fn start_is_illegal_outside_empty_and_leaves_state_unchanged() {
-        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let mut state = placed(zone);
         let before = state.editor.clone();
 
@@ -305,7 +364,10 @@ mod tests {
 
         assert_eq!(
             state.editor,
-            EditorState::Dragging { anchor: Point { x: 10, y: 10 }, current: Point { x: 200, y: 150 } }
+            EditorState::Dragging {
+                anchor: Point { x: 10, y: 10 },
+                current: Point { x: 200, y: 150 }
+            }
         );
     }
 
@@ -329,14 +391,22 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: Zone { x: 100, y: 50, width: 200, height: 200 }
+                zone: Zone {
+                    x: 100,
+                    y: 50,
+                    width: 200,
+                    height: 200
+                }
             }
         );
     }
 
     #[test]
     fn commit_clamps_a_drag_that_overshoots_the_monitor_bounds() {
-        let mut state = AppState::new(Monitor { width: 800, height: 600 });
+        let mut state = AppState::new(Monitor {
+            width: 800,
+            height: 600,
+        });
         state.apply(Action::Start(Point { x: -50, y: -50 }));
         state.apply(Action::Drag(Point { x: 5000, y: 5000 }));
 
@@ -345,7 +415,12 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: Zone { x: 0, y: 0, width: 800, height: 600 }
+                zone: Zone {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600
+                }
             }
         );
     }
@@ -361,7 +436,12 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: Zone { x: 0, y: 0, width: 1920, height: 1080 }
+                zone: Zone {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
             }
         );
     }
@@ -377,7 +457,12 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: Zone { x: 21, y: 21, width: 1878, height: 1038 }
+                zone: Zone {
+                    x: 21,
+                    y: 21,
+                    width: 1878,
+                    height: 1038
+                }
             }
         );
     }
@@ -400,7 +485,12 @@ mod tests {
 
     #[test]
     fn drag_while_resizing_moves_only_the_grabbed_handles_edges() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
@@ -413,14 +503,24 @@ mod tests {
                 handle: Handle::E,
                 // Only the right edge (E) should move; y-axis pointer motion
                 // is ignored since E doesn't touch top/bottom.
-                live: Zone { x: 100, y: 100, width: 700, height: 300 }
+                live: Zone {
+                    x: 100,
+                    y: 100,
+                    width: 700,
+                    height: 300
+                }
             }
         );
     }
 
     #[test]
     fn resize_snaps_the_west_handle_within_threshold_to_the_left_edge() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::W));
 
@@ -431,14 +531,24 @@ mod tests {
             EditorState::Resizing {
                 original: zone,
                 handle: Handle::W,
-                live: Zone { x: 0, y: 100, width: 500, height: 300 }
+                live: Zone {
+                    x: 0,
+                    y: 100,
+                    width: 500,
+                    height: 300
+                }
             }
         );
     }
 
     #[test]
     fn resize_snaps_the_east_handle_within_threshold_to_the_right_edge() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
@@ -449,14 +559,24 @@ mod tests {
             EditorState::Resizing {
                 original: zone,
                 handle: Handle::E,
-                live: Zone { x: 100, y: 100, width: 1820, height: 300 }
+                live: Zone {
+                    x: 100,
+                    y: 100,
+                    width: 1820,
+                    height: 300
+                }
             }
         );
     }
 
     #[test]
     fn resize_does_not_snap_the_grabbed_handle_just_outside_the_edge_threshold() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
@@ -467,14 +587,24 @@ mod tests {
             EditorState::Resizing {
                 original: zone,
                 handle: Handle::E,
-                live: Zone { x: 100, y: 100, width: 1799, height: 300 }
+                live: Zone {
+                    x: 100,
+                    y: 100,
+                    width: 1799,
+                    height: 300
+                }
             }
         );
     }
 
     #[test]
     fn commit_from_resizing_moves_back_to_placed_with_the_live_zone() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
         state.apply(Action::Drag(Point { x: 800, y: 100 }));
@@ -485,14 +615,24 @@ mod tests {
         assert_eq!(
             state.editor,
             EditorState::Placed {
-                zone: Zone { x: 100, y: 100, width: 700, height: 300 }
+                zone: Zone {
+                    x: 100,
+                    y: 100,
+                    width: 700,
+                    height: 300
+                }
             }
         );
     }
 
     #[test]
     fn save_from_placed_returns_the_saved_zone() {
-        let zone = Zone { x: 10, y: 20, width: 300, height: 400 };
+        let zone = Zone {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 400,
+        };
         let mut state = placed(zone);
 
         let outcome = state.apply(Action::Save);
@@ -520,7 +660,12 @@ mod tests {
 
     #[test]
     fn save_is_illegal_from_resizing() {
-        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
 
@@ -544,14 +689,24 @@ mod tests {
 
     #[test]
     fn cancel_is_legal_from_placed() {
-        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let mut state = placed(zone);
         assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
     }
 
     #[test]
     fn cancel_is_legal_from_resizing() {
-        let zone = Zone { x: 0, y: 0, width: 100, height: 100 };
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
         assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
@@ -559,7 +714,12 @@ mod tests {
 
     #[test]
     fn grabbing_any_of_the_eight_handles_on_a_placed_zone_transitions_to_resizing() {
-        let zone = Zone { x: 100, y: 100, width: 400, height: 300 };
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         for handle in Handle::ALL {
             let mut state = placed(zone);
 
@@ -568,7 +728,11 @@ mod tests {
             assert_eq!(outcome, None);
             assert_eq!(
                 state.editor,
-                EditorState::Resizing { original: zone, handle, live: zone },
+                EditorState::Resizing {
+                    original: zone,
+                    handle,
+                    live: zone
+                },
                 "{handle:?} should start a resize"
             );
         }
