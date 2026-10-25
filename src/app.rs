@@ -917,7 +917,7 @@ fn open_settings(config_dir: &Path) -> Result<(), settings_ui::SettingsUiError> 
 /// under. Falls back to a `GameFrame` directory relative to the current
 /// working directory in the (in-practice-never-on-real-Windows) case where
 /// the `APPDATA` environment variable isn't set, rather than panicking.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     match std::env::var("APPDATA") {
         Ok(appdata) => PathBuf::from(appdata).join("GameFrame"),
         Err(_) => PathBuf::from("GameFrame"),

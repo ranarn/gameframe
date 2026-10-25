@@ -73,7 +73,7 @@ where
 pub fn acquire(wait: Option<Duration>) -> bool {
     let start = Instant::now();
     loop {
-        let owned = try_acquire();
+        let owned = try_acquire(MUTEX_NAME);
         match decide(owned, start.elapsed(), wait) {
             Decision::Proceed => return true,
             Decision::Retry => std::thread::sleep(POLL_INTERVAL),
@@ -91,8 +91,8 @@ pub fn acquire(wait: Option<Duration>) -> bool {
 
 /// One attempt. On success the handle is intentionally kept open for the
 /// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
-fn try_acquire() -> bool {
-    let name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+fn try_acquire(mutex_name: &str) -> bool {
+    let name: Vec<u16> = mutex_name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
     // call; null security attributes are valid. GetLastError is read
     // immediately after, before any other API call can overwrite it.
@@ -135,6 +135,16 @@ mod tests {
         assert_eq!(decide(false, Duration::from_millis(4999), WAIT), Decision::Retry);
         assert_eq!(decide(false, Duration::from_secs(5), WAIT), Decision::GiveUp);
         assert_eq!(decide(false, Duration::from_secs(6), WAIT), Decision::GiveUp);
+    }
+
+    #[test]
+    fn a_held_mutex_makes_further_attempts_fail() {
+        // Own name, so a running GameFrame can't interfere.
+        let name = format!("Local\\GameFrame-test-{}", std::process::id());
+        assert!(try_acquire(&name));
+        for _ in 0..3 {
+            assert!(!try_acquire(&name));
+        }
     }
 
     #[test]
