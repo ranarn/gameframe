@@ -55,6 +55,7 @@ use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
+use crate::updater::{CheckOutcome, FlagGuard, SpawnError};
 use crate::win32;
 use crate::window_filter;
 use crate::zone_overlay;
@@ -64,14 +65,17 @@ use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
-    MSG, MessageBoxW, TranslateMessage,
+    DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+    MB_SETFOREGROUND, MB_YESNO, MSG, MessageBoxW, TranslateMessage,
 };
 
 pub fn run() -> Result<(), TrayUiError> {
     let config_dir = config_dir();
     crate::logging::init(&config_dir);
     log!("GameFrame {} started", env!("CARGO_PKG_VERSION"));
+
+    // The installer of an update cannot delete its own download.
+    crate::update_install::clean_stale_downloads();
 
     // Undo a taskbar hide a crashed or killed run left behind,
     // before anything in this run can hide it, then guard against panics.
@@ -883,51 +887,95 @@ pub(crate) fn handle_applied_window_drift(
     None
 }
 
-/// Whether the tray's update-check result box is open.
+/// Whether one of the tray's update message boxes is open.
 static UPDATE_RESULT_BOX_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Clears [`UPDATE_RESULT_BOX_OPEN`] on drop, so a panic while the box is
-/// shown releases it too.
-struct ResultBoxOpen;
-
-impl Drop for ResultBoxOpen {
-    fn drop(&mut self) {
-        UPDATE_RESULT_BOX_OPEN.store(false, std::sync::atomic::Ordering::Release);
+/// Shows a message box titled "GameFrame" and returns the button pressed.
+/// Blocks, so call it from a worker thread.
+fn show_message_box(text: &str, style: u32) -> i32 {
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let text = wide(text);
+    let title = wide("GameFrame");
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            style | MB_SETFOREGROUND,
+        )
     }
 }
 
 /// Runs an update check on a worker thread (the event loop never waits on the
-/// network) and shows the result in a message box from that thread. Ignored
-/// while an earlier check is still fetching or its result box is still open.
+/// network) and shows the result in a message box from that thread; an
+/// available update is offered for installation. Ignored while a message box
+/// of an earlier check is still open; while a Settings-started check is still
+/// fetching, a box says so.
 fn check_for_updates_from_tray() {
-    use std::sync::atomic::Ordering;
-    if UPDATE_RESULT_BOX_OPEN.swap(true, Ordering::AcqRel) {
+    let Some(box_open) = FlagGuard::acquire(&UPDATE_RESULT_BOX_OPEN) else {
         log!("update check: the previous result is still shown");
         return;
-    }
-    let box_open = ResultBoxOpen;
+    };
     let started = crate::updater::spawn_check(move |result| {
         let _box_open = box_open;
-        let icon = if result.is_ok() {
-            MB_ICONINFORMATION
-        } else {
-            MB_ICONWARNING
-        };
-        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-        let text = wide(&crate::updater::result_message(&result));
-        let title = wide("GameFrame");
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                text.as_ptr(),
-                title.as_ptr(),
-                MB_OK | icon | MB_SETFOREGROUND,
+        match result {
+            Ok(CheckOutcome::UpdateAvailable(info)) => offer_install(info),
+            result => {
+                let icon = if result.is_ok() {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
+                show_message_box(&crate::updater::result_message(&result), MB_OK | icon);
+            }
+        }
+    });
+    let why_not = match started {
+        Ok(()) => return,
+        Err(SpawnError::Busy) => "An update check is already running. Try again in a moment.",
+        Err(SpawnError::ThreadFailed) => "Couldn't start the update check.",
+    };
+    // The flag went down with the dropped closure; take it again for the box
+    // that tells the user why nothing was checked.
+    if let Some(box_open) = FlagGuard::acquire(&UPDATE_RESULT_BOX_OPEN) {
+        std::thread::spawn(move || {
+            let _box_open = box_open;
+            show_message_box(why_not, MB_OK | MB_ICONINFORMATION);
+        });
+    }
+}
+
+/// Shows `text` in a warning box and waits for it to be dismissed.
+pub(crate) fn show_warning_box(text: &str) {
+    show_message_box(text, MB_OK | MB_ICONWARNING);
+}
+
+/// Asks whether to install the available update `info` and, on yes, installs
+/// it on a worker thread: GameFrame then quits and the installer starts it
+/// again. Blocks on the question, so call it from a worker thread.
+fn offer_install(info: crate::updater::UpdateInfo) {
+    let question = format!(
+        "{}\n\nInstall it now? GameFrame will close and start again.",
+        CheckOutcome::UpdateAvailable(info.clone()).message()
+    );
+    if show_message_box(&question, MB_YESNO | MB_ICONINFORMATION) != IDYES {
+        return;
+    }
+    let started = crate::update_install::spawn_install(info, |result| {
+        if let Err(e) = result {
+            show_message_box(
+                &crate::update_install::install_error_message(&e),
+                MB_OK | MB_ICONWARNING,
             );
         }
     });
-    if !started {
-        log!("update check: one is already running");
+    if let Err(why) = started {
+        let text = match why {
+            SpawnError::Busy => "An update is already being installed.",
+            SpawnError::ThreadFailed => "Couldn't start the update install.",
+        };
+        show_message_box(text, MB_OK | MB_ICONINFORMATION);
     }
 }
 

@@ -25,7 +25,7 @@ use crate::profile_store::{
     Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
-use crate::updater::{CheckOutcome, UpdateError};
+use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -1082,6 +1082,7 @@ fn run_settings_frame(
                 keyboard_hook: None,
                 cursor_previews: None,
                 update_check: UpdateCheck::Idle,
+                update_install: UpdateInstall::Idle,
             }))
         }),
     )
@@ -1144,6 +1145,8 @@ struct SettingsApp {
     cursor_previews: Option<CursorPreviews>,
     /// The "Check for updates now" button's state; dropped with the window.
     update_check: UpdateCheck,
+    /// The "Install update" button's state, once a check found an update.
+    update_install: UpdateInstall,
 }
 
 /// Progress of the Settings window's update check.
@@ -1154,6 +1157,22 @@ enum UpdateCheck {
     Done(Result<CheckOutcome, UpdateError>),
     /// Not started: another check (the tray's) was already running.
     Busy,
+    /// The worker ended without sending a result.
+    Lost,
+}
+
+/// Progress of installing the update an `UpdateCheck` found.
+enum UpdateInstall {
+    Idle,
+    /// Running on a worker thread, which sends the result here.
+    Running(std::sync::mpsc::Receiver<Result<(), UpdateError>>),
+    /// The installer was started; it asks GameFrame to quit.
+    Started,
+    Failed(UpdateError),
+    /// Not started: another install was already running.
+    Busy,
+    /// Not started: the worker thread could not be created.
+    NotStarted,
     /// The worker ended without sending a result.
     Lost,
 }
@@ -1516,9 +1535,14 @@ impl SettingsApp {
         }
 
         ui.horizontal(|ui| {
-            let running = matches!(self.update_check, UpdateCheck::Running(_));
+            // A new check while an install runs would drop the install's result.
+            let installing = matches!(
+                self.update_install,
+                UpdateInstall::Running(_) | UpdateInstall::Started
+            );
+            let enabled = !installing && !matches!(self.update_check, UpdateCheck::Running(_));
             if ui
-                .add_enabled(!running, egui::Button::new("Check for updates now"))
+                .add_enabled(enabled, egui::Button::new("Check for updates now"))
                 .clicked()
             {
                 let (sender, receiver) = std::sync::mpsc::channel();
@@ -1527,11 +1551,12 @@ impl SettingsApp {
                     let _ = sender.send(result);
                     ctx.request_repaint();
                 });
-                self.update_check = if started {
-                    UpdateCheck::Running(receiver)
-                } else {
-                    UpdateCheck::Busy
+                self.update_check = match started {
+                    Ok(()) => UpdateCheck::Running(receiver),
+                    Err(SpawnError::Busy) => UpdateCheck::Busy,
+                    Err(SpawnError::ThreadFailed) => UpdateCheck::Lost,
                 };
+                self.update_install = UpdateInstall::Idle;
             }
             match &self.update_check {
                 UpdateCheck::Idle => {}
@@ -1558,6 +1583,82 @@ impl SettingsApp {
                 }
             }
         });
+
+        if let UpdateCheck::Done(Ok(CheckOutcome::UpdateAvailable(info))) = &self.update_check {
+            let info = info.clone();
+            ui.horizontal(|ui| self.update_install_row(ui, info));
+        }
+    }
+
+    /// Renders the "Install update" button and its status line. The install
+    /// runs on a worker thread that wakes the UI when it has a result; on
+    /// success the installer quits GameFrame (closing this window) and starts
+    /// it again.
+    fn update_install_row(&mut self, ui: &mut egui::Ui, info: UpdateInfo) {
+        if let UpdateInstall::Running(receiver) = &self.update_install {
+            match receiver.try_recv() {
+                Ok(Ok(())) => self.update_install = UpdateInstall::Started,
+                Ok(Err(e)) => self.update_install = UpdateInstall::Failed(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_install = UpdateInstall::Lost;
+                }
+            }
+        }
+
+        let busy = matches!(
+            self.update_install,
+            UpdateInstall::Running(_) | UpdateInstall::Started
+        );
+        let label = format!("Install v{}", info.version);
+        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let ctx = ui.ctx().clone();
+            let started = crate::update_install::spawn_install(info, move |result| {
+                // With the window gone nobody reads the channel; a failure is
+                // then shown in a box so it is never only in the log.
+                if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
+                    crate::app::show_warning_box(&crate::update_install::install_error_message(&e));
+                }
+                ctx.request_repaint();
+            });
+            self.update_install = match started {
+                Ok(()) => UpdateInstall::Running(receiver),
+                Err(SpawnError::Busy) => UpdateInstall::Busy,
+                Err(SpawnError::ThreadFailed) => UpdateInstall::NotStarted,
+            };
+        }
+        match &self.update_install {
+            UpdateInstall::Idle => {}
+            UpdateInstall::Running(_) => {
+                ui.spinner();
+                ui.label("Downloading the update...");
+            }
+            UpdateInstall::Started => {
+                ui.label("Installing; GameFrame restarts in a moment.");
+            }
+            UpdateInstall::Failed(e) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    crate::update_install::install_error_message(e),
+                );
+            }
+            UpdateInstall::Busy => {
+                ui.label("An update is already being installed.");
+            }
+            UpdateInstall::NotStarted => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "Couldn't start the update install.",
+                );
+            }
+            UpdateInstall::Lost => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "Installing the update failed: it ended unexpectedly",
+                );
+            }
+        }
     }
 
     /// Renders the Zone section: a monitor-outline thumbnail with the Zone

@@ -19,6 +19,7 @@ mod settings_ui;
 mod single_instance;
 mod taskbar_recovery;
 mod tray_ui;
+mod update_install;
 mod updater;
 mod win32;
 mod window_filter;

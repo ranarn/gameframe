@@ -1,17 +1,20 @@
 //! Update check: asks GitHub's "latest release" endpoint whether a release
-//! newer than the running build exists.
+//! newer than the running build exists, and which installer and SHA-256 digest
+//! belong to it. Installing it is [`crate::update_install`].
 //!
 //! The decision logic is pure: [`check`] takes the running version and a
-//! fetch closure, and [`parse_release`], [`Version`] and [`select_asset`] work
-//! on plain strings, so all of it is unit tested without a network. The
-//! network part is [`fetch_latest_release`] (a blocking WinHTTP request, see
-//! [`crate::http`]) and [`spawn_check`], which runs the whole check on a
-//! worker thread so no UI thread ever waits on it.
+//! fetch closure, and [`parse_release`], [`Version`], [`select_asset`] and
+//! [`verify_sha256`] work on plain strings and readers, so all of it is unit
+//! tested without a network. The network part is [`fetch_latest_release`] (a
+//! blocking WinHTTP request, see [`crate::http`]) and [`spawn_check`], which
+//! runs the whole check on a worker thread so no UI thread ever waits on it.
 //!
 //! A development build (version `0.0.0`) never fetches anything.
 
 use crate::http::HttpError;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The GitHub API host and the path of the latest non-draft, non-pre-release.
@@ -25,9 +28,8 @@ const INSTALLER_PREFIX: &str = "GameFrame-Setup-";
 const INSTALLER_SUFFIX: &str = ".exe";
 const DIGEST_PREFIX: &str = "sha256:";
 
-/// Hosts an installer may be downloaded from: release assets are served from
-/// `github.com` and redirected to `objects.githubusercontent.com`.
-const DOWNLOAD_HOSTS: [&str; 2] = ["github.com", "objects.githubusercontent.com"];
+/// The host of an asset's `browser_download_url`.
+pub(crate) const ASSET_HOST: &str = "github.com";
 
 /// A plain `x.y.z` version, compared numerically component by component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,15 +84,19 @@ pub(crate) enum UpdateError {
     /// The installer asset's download URL is not an HTTPS URL on a GitHub
     /// download host.
     UntrustedDownloadUrl(String),
+    /// The downloaded file is not the one the release's digest describes.
+    DigestMismatch,
+    /// Downloading or storing the installer failed.
+    Download(String),
+    /// The verified installer could not be started.
+    LaunchInstaller(String),
 }
 
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UpdateError::Network(e) => write!(f, "couldn't reach GitHub: {e}"),
-            // A 403 that is not a rate limit looks the same here; telling them
-            // apart needs the `X-RateLimit-Remaining` header, so an automatic
-            // check must not treat this as proof of a rate limit.
+            // A 403 that is not a rate limit shows the same message.
             UpdateError::HttpStatus(403 | 429) => {
                 write!(
                     f,
@@ -115,6 +121,12 @@ impl std::fmt::Display for UpdateError {
             UpdateError::UntrustedDownloadUrl(u) => {
                 write!(f, "the installer's download URL is not a GitHub URL: {u}")
             }
+            UpdateError::DigestMismatch => write!(
+                f,
+                "the downloaded installer does not match the release's SHA-256 digest, so it was not run"
+            ),
+            UpdateError::Download(e) => write!(f, "downloading the update failed: {e}"),
+            UpdateError::LaunchInstaller(e) => write!(f, "couldn't start the installer: {e}"),
         }
     }
 }
@@ -212,18 +224,22 @@ pub(crate) fn parse_release(json: &str) -> Result<Release, UpdateError> {
     })
 }
 
-/// Whether `url` is HTTPS on exactly one of [`DOWNLOAD_HOSTS`] (no userinfo,
-/// port or look-alike host).
+/// Whether `url` is HTTPS on exactly [`ASSET_HOST`] (no userinfo, port or
+/// look-alike host).
 fn is_trusted_download_url(url: &str) -> bool {
-    url.strip_prefix("https://")
-        .and_then(|rest| rest.split(['/', '?', '#']).next())
-        .is_some_and(|host| DOWNLOAD_HOSTS.contains(&host))
+    crate::http::split_https_url(url).is_some_and(|(host, _)| host == ASSET_HOST)
+}
+
+/// The file name of the installer of `version`.
+pub(crate) fn installer_name(version: Version) -> String {
+    format!("{INSTALLER_PREFIX}{version}{INSTALLER_SUFFIX}")
 }
 
 /// Picks the `GameFrame-Setup-<release version>.exe` asset (not its `.sha256`
-/// sibling, the notices or an installer of another version) and returns its download URL and expected SHA-256.
+/// sibling, the notices or an installer of another version) and returns its
+/// download URL and expected SHA-256.
 pub(crate) fn select_asset(release: &Release) -> Result<(String, String), UpdateError> {
-    let installer_name = format!("{INSTALLER_PREFIX}{}{INSTALLER_SUFFIX}", release.version);
+    let installer_name = installer_name(release.version);
     let asset = release
         .assets
         .iter()
@@ -283,32 +299,41 @@ fn fetch_latest_release() -> Result<Option<String>, UpdateError> {
 /// Whether a check started by [`spawn_check`] is still running.
 static CHECK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Holds [`CHECK_IN_FLIGHT`] set; clears it on drop, so a panicking worker or
-/// a failed thread spawn releases it too.
-struct InFlight;
+/// Holds a flag set; clears it on drop, so a panicking worker or a failed
+/// thread spawn releases it too.
+pub(crate) struct FlagGuard(&'static AtomicBool);
 
-impl InFlight {
-    /// `None` while another check holds the flag.
-    fn acquire() -> Option<Self> {
-        (!CHECK_IN_FLIGHT.swap(true, Ordering::AcqRel)).then_some(Self)
+impl FlagGuard {
+    /// `None` while another holder has the flag.
+    pub(crate) fn acquire(flag: &'static AtomicBool) -> Option<Self> {
+        (!flag.swap(true, Ordering::AcqRel)).then_some(Self(flag))
     }
 }
 
-impl Drop for InFlight {
+impl Drop for FlagGuard {
     fn drop(&mut self) {
-        CHECK_IN_FLIGHT.store(false, Ordering::Release);
+        self.0.store(false, Ordering::Release);
     }
+}
+
+/// Why a worker thread (check or install) was not started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnError {
+    /// An earlier one is still running.
+    Busy,
+    /// The operating system refused the thread.
+    ThreadFailed,
 }
 
 /// Runs a check for the running build on a worker thread and hands the
-/// result to `on_done` there. Logs a failure. Returns `false` (and starts
-/// nothing) while an earlier check is still fetching; the flag is released
-/// before `on_done` runs, so a slow `on_done` (a message box) blocks nothing.
+/// result to `on_done` there. Logs a failure. Starts nothing while an earlier
+/// check is still fetching; the flag is released before `on_done` runs, so a
+/// slow `on_done` (a message box) blocks nothing.
 pub(crate) fn spawn_check(
     on_done: impl FnOnce(Result<CheckOutcome, UpdateError>) + Send + 'static,
-) -> bool {
-    let Some(in_flight) = InFlight::acquire() else {
-        return false;
+) -> Result<(), SpawnError> {
+    let Some(in_flight) = FlagGuard::acquire(&CHECK_IN_FLIGHT) else {
+        return Err(SpawnError::Busy);
     };
     let spawned = std::thread::Builder::new()
         .name("update-check".into())
@@ -320,11 +345,39 @@ pub(crate) fn spawn_check(
             }
             on_done(result);
         });
-    if let Err(e) = spawned {
+    spawned.map(drop).map_err(|e| {
         log!("update check: couldn't start the worker thread: {e}");
-        return false;
+        SpawnError::ThreadFailed
+    })
+}
+
+/// Checks that the bytes `reader` yields hash to `expected` (64 hex digits,
+/// either case). Streams the data; nothing is buffered.
+pub(crate) fn verify_sha256(mut reader: impl Read, expected: &str) -> Result<(), UpdateError> {
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(UpdateError::InvalidDigest(expected.to_string()));
     }
-    true
+    let mut hasher = Sha256::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|e| UpdateError::Download(format!("reading the file failed: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(UpdateError::DigestMismatch)
+    }
 }
 
 #[cfg(test)]
@@ -712,10 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn select_asset_accepts_https_urls_on_github_download_hosts() {
+    fn select_asset_accepts_https_urls_on_the_asset_host() {
         for url in [
             "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe",
-            "https://objects.githubusercontent.com/x/GameFrame-Setup-1.2.0.exe?a=b",
+            "https://github.com/x/GameFrame-Setup-1.2.0.exe?a=b",
         ] {
             assert_eq!(select_with_url(url).unwrap().0, url);
         }
@@ -732,6 +785,7 @@ mod tests {
             "https://evil.test#@github.com/a.exe",
             "https://github.com:8443/a.exe",
             "https://notgithub.com/a.exe",
+            "https://release-assets.githubusercontent.com/a.exe",
             "",
         ] {
             assert!(
@@ -745,18 +799,90 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_flag_is_held_until_dropped_even_by_a_panic() {
-        let held = InFlight::acquire().expect("free at first");
-        assert!(InFlight::acquire().is_none());
+    fn flag_guard_holds_the_flag_until_dropped_even_by_a_panic() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let held = FlagGuard::acquire(&FLAG).expect("free at first");
+        assert!(FlagGuard::acquire(&FLAG).is_none());
         drop(held);
 
         let panicked = std::panic::catch_unwind(|| {
-            let _held = InFlight::acquire().expect("free after drop");
+            let _held = FlagGuard::acquire(&FLAG).expect("free after drop");
             panic!("worker failed");
         });
 
         assert!(panicked.is_err());
-        assert!(InFlight::acquire().is_some());
+        assert!(FlagGuard::acquire(&FLAG).is_some());
+    }
+
+    const SHA_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn verify_sha256_accepts_a_matching_digest_in_either_case() {
+        assert_eq!(verify_sha256(&b"abc"[..], SHA_ABC), Ok(()));
+        assert_eq!(
+            verify_sha256(&b"abc"[..], &SHA_ABC.to_ascii_uppercase()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn verify_sha256_hashes_the_whole_stream() {
+        let data = vec![7u8; 300_000];
+        let expected: String = Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        assert_eq!(verify_sha256(&data[..], &expected), Ok(()));
+        assert_eq!(
+            verify_sha256(&data[..data.len() - 1], &expected),
+            Err(UpdateError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_sha256_rejects_a_different_file() {
+        assert_eq!(
+            verify_sha256(&b"abd"[..], SHA_ABC),
+            Err(UpdateError::DigestMismatch)
+        );
+        assert_eq!(
+            verify_sha256(&b""[..], SHA_ABC),
+            Err(UpdateError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_sha256_rejects_a_malformed_expected_digest() {
+        for expected in [
+            "",
+            "abc",
+            &format!("sha256:{SHA_ABC}"),
+            &SHA_ABC[..63],
+            &format!("{SHA_ABC}0"),
+            &format!("{}g", &SHA_ABC[..63]),
+        ] {
+            assert_eq!(
+                verify_sha256(&b"abc"[..], expected),
+                Err(UpdateError::InvalidDigest(expected.to_string())),
+                "{expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_sha256_reports_a_failing_reader() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk gone"))
+            }
+        }
+
+        assert!(matches!(
+            verify_sha256(Failing, SHA_ABC),
+            Err(UpdateError::Download(e)) if e.contains("disk gone")
+        ));
     }
 
     #[test]

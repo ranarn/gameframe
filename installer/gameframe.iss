@@ -38,6 +38,9 @@ AppPublisher=Jonas Ranerfors
 AppPublisherURL=https://github.com/ranarn/gameframe
 AppSupportURL=https://github.com/ranarn/gameframe/issues
 AppUpdatesURL=https://github.com/ranarn/gameframe/releases
+; One setup at a time: a second silent update started before the first has quit
+; GameFrame waits for it instead of running alongside.
+SetupMutex=GameFrame-Setup-{#AppGuid}
 AppCopyright=Copyright (C) 2026 Jonas Ranerfors
 PrivilegesRequired=lowest
 DefaultDirName={autopf}\{#AppName}
@@ -90,6 +93,10 @@ Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; An update started by GameFrame itself passes /RELAUNCH (src/update_install.rs) and has no
+; wizard to tick the box above, so it starts the app here. A plain silent install
+; leaves the app stopped.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]
 var
@@ -202,6 +209,17 @@ begin
     Ord(WasInstalled), Ord(InitialStartup), Ord(WizardIsTaskSelected('startup')), Ord(StartupApplied)]));
   StopGameFrame;
   Result := '';
+end;
+
+// Whether setup was started with the bare /RELAUNCH switch.
+function RelaunchRequested: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+      Result := True;
 end;
 
 function StartupChoiceChanged: Boolean;

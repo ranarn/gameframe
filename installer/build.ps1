@@ -1,7 +1,7 @@
 # Builds the GameFrame installer: third-party notices (cargo about) + release exe -> Inno Setup -> target\installer\GameFrame-Setup-<version>.exe and GameFrame-Third-Party-Notices.txt
 #
 # Requires cargo-about (version pinned in .github/workflows/build.yml; locally:
-# cargo install cargo-about --locked --version 0.9.2) and Inno Setup 7
+# cargo install cargo-about --locked --features cli --version 0.9.2) and Inno Setup 7
 # (winget install JRSoftware.InnoSetup.7). Only Inno Setup 7 install dirs are
 # searched -- it installs side by side with 6, and an ISCC.exe on PATH could be
 # either.
@@ -20,7 +20,7 @@ if (-not $iscc) {
 
 cargo about --version | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw 'cargo-about not found -- install it: cargo install cargo-about --locked --version 0.9.2'
+    throw 'cargo-about not found -- install it: cargo install cargo-about --locked --features cli --version 0.9.2'
 }
 
 Push-Location $repo
