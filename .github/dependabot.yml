@@ -8,6 +8,13 @@ updates:
       interval: weekly
     cooldown:
       default-days: 3
+    # Renders as `fix(deps): ...`: release-pilot counts only `fix` towards a
+    # release. Dependabot's `prefix-development` and the groups'
+    # `dependency-type` are not supported for cargo, so dev dependencies get
+    # the same prefix.
+    commit-message:
+      prefix: fix
+      include: scope
     groups:
       cargo:
         patterns: ["*"]
