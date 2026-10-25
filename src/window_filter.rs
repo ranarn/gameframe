@@ -1,8 +1,8 @@
 //! The tray menu's "Apply to Window" picker's two-layer game-window
 //! filtering/ranking:
 //!
-//! - Layer 1 ([`check_eligibility`]) hard-filters system-process, dialog, cloaked, owned and tool windows
-//!   out of the list entirely.
+//! - Layer 1 ([`check_eligibility`]) hard-filters system-process, dialog,
+//!   cloaked, owned and tool windows out of the list entirely.
 //! - Layer 2 ([`rank_window`]) only ever reorders the remaining list by how
 //!   confidently a window looks like a game (launcher install match, then
 //!   loaded graphics module, then engine window class) -- it never hides a
@@ -460,9 +460,9 @@ fn window_class_name(hwnd: HWND) -> String {
 /// docs; the decision that consumes this value ([`matches_known_install`]) is
 /// unit tested in isolation.
 ///
-/// `pub(crate)` (rather than private) since issue #33's PID<->HWND
-/// resolution (`crate::win32::find_pid_by_exe_path`) also calls this
-/// directly, to confirm a toolhelp snapshot's cheap file-name pre-filter
+/// `pub(crate)` (rather than private) since the PID<->HWND resolution
+/// (`crate::win32::find_pid_by_exe_path`) also calls this directly, to
+/// confirm a toolhelp snapshot's cheap file-name pre-filter
 /// match with a full-path comparison before accepting a PID.
 pub(crate) fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
     // Safety: `pid` is a plain integer; `OpenProcess` takes no pointers.

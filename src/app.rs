@@ -5,17 +5,17 @@
 //! window ([`crate::settings_ui`]), a press of the bound borderless hotkey
 //! ([`crate::hotkeys`]) to stripping/restoring the foreground window's
 //! border via [`crate::win32`], and a press of the bound taskbar-autohide
-//! hotkey to toggling the taskbar hidden/visible (mode-aware as of issue
-//! #42 -- see [`crate::profile_store::TaskbarHideMode`]) via
-//! [`crate::win32`]. The two hotkey mechanics are fully independent: the
+//! hotkey to toggling the taskbar hidden/visible (mode-aware -- see
+//! [`crate::profile_store::TaskbarHideMode`]) via [`crate::win32`]. The
+//! borderless and taskbar hotkey mechanics are fully independent: the
 //! borderless toggle keeps its restore state per window in [`win32`], while
 //! the taskbar toggle ([`win32::toggle_taskbar_hide`]) keeps none at all,
 //! instead reading the taskbar's real OS-level state on every press --
 //! either can be pressed without the other having been used first. A click
-//! on one of the "Apply to Window" submenu's dynamically-listed windows (recognized via
-//! [`tray_ui::decode_window_item_id`], distinct from the three fixed
-//! top-level menu items) resolves that window's owning process against the
-//! tracked-games list (adding it, with this issue's new-tracked-game
+//! on one of the "Apply to Window" submenu's dynamically-listed windows
+//! (recognized via [`tray_ui::decode_window_item_id`], distinct from the
+//! four fixed top-level menu items) resolves that window's owning process
+//! against the tracked-games list (adding it, with the new-tracked-game
 //! defaults, if not already tracked -- see
 //! [`crate::profile_store::upsert_tracked_game`]) and applies its assigned
 //! Zone's borderless+reposition treatment to that specific window via
@@ -30,9 +30,9 @@
 //! foreground window, but only if that game's `auto_apply` flag is on (see
 //! [`resolve_auto_apply`]).
 //!
-//! Issue #43 adds automatic taskbar restore, with no hotkey press required:
+//! The taskbar is also restored automatically, with no hotkey press required:
 //! every apply-path call site above that hides the taskbar for a specific
-//! window now arms [`win32::set_taskbar_hide_absolute_armed`]'s remembered
+//! window arms [`win32::set_taskbar_hide_absolute_armed`]'s remembered
 //! restore for that window (see `win32::ARMED_TASKBAR_RESTORE`'s doc
 //! comment). [`crate::launch_watcher`] registers a second `SetWinEventHook`
 //! scoped to `EVENT_OBJECT_DESTROY` and restores the taskbar automatically
@@ -72,7 +72,7 @@ pub fn run() -> Result<(), TrayUiError> {
     crate::logging::init(&config_dir);
     log!("GameFrame {} started", env!("CARGO_PKG_VERSION"));
 
-    // Issue #68: undo a taskbar hide a crashed or killed run left behind,
+    // Undo a taskbar hide a crashed or killed run left behind,
     // before anything in this run can hide it, then guard against panics.
     crate::taskbar_recovery::init(&config_dir);
     crate::taskbar_recovery::recover_on_startup(&config_dir);
@@ -80,7 +80,7 @@ pub fn run() -> Result<(), TrayUiError> {
 
     let tray = Tray::new()?;
 
-    // Lets a second launch ask this instance to open Settings (issue #70).
+    // Lets a second launch ask this instance to open Settings.
     // Created on this thread so this thread's pumps dispatch its messages.
     let instance_channel = instance_channel::Receiver::create();
 
@@ -94,7 +94,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // happen on this thread, before that loop starts.
     let launch_watcher_hook = launch_watcher::register(&config_dir);
 
-    // Issue #43: a second, separate hook scoped to exactly
+    // A second, separate hook scoped to exactly
     // `EVENT_OBJECT_DESTROY`, rather than widening the foreground-change
     // hook's event range -- see `crate::launch_watcher`'s module docs for
     // why. Registered on this same thread for the same reason as
@@ -111,12 +111,11 @@ pub fn run() -> Result<(), TrayUiError> {
 
     run_event_loop(&tray, hotkeys, hotkey_reports, &config_dir, &cursor_overlay);
 
-    // Stops the game cursor thread, which also restores swapped system
-    // cursors (see `crate::cursor_overlay`).
+    // Stops the game cursor thread (see `crate::cursor_overlay`).
     drop(cursor_overlay);
     drop(instance_channel);
 
-    // Issue #43: if a Zone-apply's taskbar hide is still armed when the
+    // If a Zone-apply's taskbar hide is still armed when the
     // user quits via the tray "Exit" item, restore it now -- before `tray`
     // is dropped below (which just removes the tray icon; it has no bearing
     // on the taskbar) and before the process actually exits, so the desktop
@@ -288,21 +287,20 @@ fn run_event_loop(
         // that particular menu display, but it does mean the very next
         // open is guaranteed current.
         //
-        // This replaces an earlier unconditional "refresh before every
-        // dispatched message" approach. The primary, certain reason: `tray-icon`
-        // sets a 15ms `WM_TIMER` while the mouse hovers over the icon, which
-        // would otherwise have driven a full `EnumWindows` + per-window
-        // `GetWindowTextW` + submenu rebuild (real Win32 syscalls) up to ~66
-        // times/second just from the cursor resting nearby -- needlessly
-        // expensive on this process's one and only message loop. A secondary,
-        // less certain consideration: per the documented `GetWindowTextW`
-        // contract, a same-process target window causes a `WM_GETTEXT` to be
-        // sent via `SendMessage` and can block if that window is stuck,
-        // whereas a cross-process target (the common case when enumerating
-        // the whole desktop) is documented to read the cached caption text
-        // directly instead, specifically so callers don't hang on an
-        // unresponsive foreign process -- so the practical hang risk here is
-        // narrower than "any hung window on the desktop" (more like "one of
+        // Refreshing before every dispatched message would be wrong. The
+        // primary, certain reason: `tray-icon` sets a 15ms `WM_TIMER` while the
+        // mouse hovers over the icon, which would drive a full `EnumWindows` +
+        // per-window `GetWindowTextW` + submenu rebuild (real Win32 syscalls)
+        // up to ~66 times/second just from the cursor resting nearby --
+        // needlessly expensive on this process's one and only message loop. A
+        // secondary, less certain consideration: per the documented
+        // `GetWindowTextW` contract, a same-process target window causes a
+        // `WM_GETTEXT` to be sent via `SendMessage` and can block if that
+        // window is stuck, whereas a cross-process target (the common case
+        // when enumerating the whole desktop) is documented to read the cached
+        // caption text directly instead, specifically so callers don't hang on
+        // an unresponsive foreign process -- so the practical hang risk here
+        // is narrower than "any hung window on the desktop" (more like "one of
         // GameFrame's own windows getting stuck"), but still worth avoiding
         // at no extra cost. No crate-native "menu about to show" event exists
         // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
@@ -427,11 +425,11 @@ fn no_apply_reason(config: &profile_store::Config) -> &'static str {
 }
 
 /// Like [`resolve_tracked_apply`], but additionally requires the tracked
-/// game's `auto_apply` flag to be on -- the extra gate this issue's
-/// launch-detection trigger (`crate::launch_watcher`) applies that the
-/// hotkey/tray "manual" apply paths deliberately do not (per issue #31's
-/// design: `auto_apply` only governs whether a launch is auto-applied
-/// without a hotkey press, not whether a manual hotkey/tray press works).
+/// game's `auto_apply` flag to be on -- the extra gate the launch-detection
+/// trigger (`crate::launch_watcher`) applies that the hotkey/tray "manual"
+/// apply paths deliberately do not (`auto_apply` only governs whether a
+/// launch is auto-applied without a hotkey press, not whether a manual
+/// hotkey/tray press works).
 ///
 /// Returns `None` for exactly the same two cases [`resolve_tracked_apply`]
 /// does (no match; no Zone set), plus a third: matched, Zone set, but
@@ -462,15 +460,14 @@ pub(crate) fn resolve_auto_apply(
 /// Only the strip direction is gated on tracked-game membership: an
 /// untracked foreground window blocks an initial strip, but never blocks a
 /// pending restore purely because the *current* foreground window is
-/// untracked. This is a deliberate judgment call (see the MEDIUM review
-/// finding on issue #31) -- gating both directions uniformly would
+/// untracked. This is deliberate -- gating both directions uniformly would
 /// permanently orphan a currently-stripped window in its borderless state
 /// for the rest of the running session if its tracked game were removed via
 /// Settings (or the Zone cleared) in between the strip press and the restore
 /// press, since nothing else in the app can restore it once the remembered
-/// `RestoreState` game is no longer resolvable. `plan_toggle`'s `Restore` arm doesn't need a resolved
-/// Zone/region at all, so there is no correctness reason to require one
-/// here.
+/// `RestoreState` game is no longer resolvable. `plan_toggle`'s `Restore`
+/// arm doesn't need a resolved Zone/region at all, so there is no
+/// correctness reason to require one here.
 ///
 /// Remembered restore state is per window, so a restore always applies to
 /// the very window it was recorded for (the foreground window itself).
@@ -505,17 +502,15 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// Taskbar auto-hide is set only on the strip direction, not on restore:
 /// using the same fixed global boolean on both directions would leave the
 /// taskbar auto-hidden after a full strip+restore cycle instead of it coming
-/// back, for the common `hide_taskbar_on_apply: true` default (MEDIUM review
-/// finding, issue #31 iteration 3).
+/// back, for the common `hide_taskbar_on_apply: true` default.
 ///
 /// Returns `true` if GameFrame just relaunched itself elevated and this
 /// process should exit (see [`win32::relaunch_elevated`]); `false` in every
 /// other case (success, or a non-elevation failure that was just logged).
 ///
-/// Reloads the config from disk on every press (rather than caching it
-/// across the whole run) so a Zone/game added/edited via Settings
-/// since the last press is picked up immediately -- the trade-off is a
-/// small, infrequent disk read on a user-initiated action, which is cheap.
+/// Loads the config on every press (via [`profile_store::load`], which serves
+/// its in-memory copy and is refreshed by every save) so a Zone/game
+/// added/edited via Settings since the last press is picked up immediately.
 /// The hotkey binding itself is re-registered separately, right after the
 /// Settings window closes -- see the `ShowSettings` branch in
 /// [`run_event_loop`] -- so a changed binding also takes effect without a
@@ -599,15 +594,13 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
     // Only set taskbar auto-hide on the strip direction -- setting it again
     // on restore (using the same fixed global boolean) would leave the
     // taskbar auto-hidden after the user exits borderless/game mode instead
-    // of it coming back, for the common `hide_taskbar_on_apply: true` default
-    // (MEDIUM review finding, issue #31 iteration 3). Coupling taskbar hide
-    // to the Zone apply is about the strip/apply action, not the
-    // restore/undo action.
+    // of it coming back, for the common `hide_taskbar_on_apply: true` default.
+    // Coupling taskbar hide to the Zone apply is about the strip/apply
+    // action, not the restore/undo action.
     //
     // Uses `set_taskbar_hide_absolute_armed` rather than the plain
-    // `set_taskbar_hide_absolute` (issue #43) so that closing `fg_hwnd`
-    // later automatically restores the taskbar with no hotkey press
-    // required.
+    // `set_taskbar_hide_absolute` so that closing `fg_hwnd` later
+    // automatically restores the taskbar with no hotkey press required.
     if !is_restoring
         && let Some((tracked_game, _)) = &tracked
         && let Err(e) = win32::set_taskbar_hide_absolute_armed(
@@ -647,13 +640,13 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
 /// pre-strip state is remembered (see [`win32::apply_borderless_to_window`]),
 /// so the borderless hotkey can restore it.
 ///
-/// Reloads the config from disk on every click, for the same reason
+/// Loads the config on every click, for the same reason
 /// [`handle_toggle_borderless`] does.
 ///
 /// Unlike [`handle_toggle_borderless`], a failure here (including an
 /// access-denied failure) is only logged, not retried via
-/// [`win32::relaunch_elevated`] -- reactive elevation for this path is out
-/// of scope for this slice.
+/// [`win32::relaunch_elevated`] -- reactive elevation is scoped to the
+/// hotkey path.
 fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     let mut config = match profile_store::load(config_dir) {
         Ok(config) => config,
@@ -717,7 +710,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     // overrides an earlier hotkey restore of it.
     win32::allow_auto_apply(target_hwnd);
 
-    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
     // automatically restores the taskbar with no hotkey press required.
     if let Err(e) = win32::set_taskbar_hide_absolute_armed(
@@ -739,8 +732,8 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// `hwnd` via [`win32::apply_borderless_to_window`], then, only once that
 /// succeeds, sets the global hide-taskbar-on-apply value absolutely --
 /// exactly mirroring [`handle_apply_to_window`]'s one-shot apply shape
-/// (including its border-apply-must-succeed-first gate on the taskbar step,
-/// per issue #31's HIGH review fix) and [`win32::apply_borderless_to_window`]
+/// (including its border-apply-must-succeed-first gate on the taskbar step)
+/// and [`win32::apply_borderless_to_window`]
 /// itself, rather than the hotkey path's toggle/restore mechanism -- a
 /// launch-detected apply has no "undo" concept, since there's nothing to
 /// restore from (the game just started).
@@ -750,13 +743,13 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
 /// to reach an actual apply here at all (see [`resolve_auto_apply`]'s doc
 /// comment), so there is no upsert/save step.
 ///
-/// Reloads the config from disk on every foreground-change event, matching
-/// [`handle_toggle_borderless`]/[`handle_apply_to_window`]'s own "reload
-/// from disk on every trigger" convention.
+/// Loads the config on every foreground-change event, matching
+/// [`handle_toggle_borderless`]/[`handle_apply_to_window`]'s own "load on
+/// every trigger" convention.
 ///
 /// OS-facing (resolves a real `HWND`'s owning process and applies real
 /// window/taskbar mutations) -- not exercised by this crate's automated
-/// tests, per this crate's established convention (manual usertest only).
+/// tests, per this crate's convention for OS-facing code.
 /// [`resolve_auto_apply`] above is the pure decision this function
 /// delegates to, and is what's actually unit tested.
 pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
@@ -823,7 +816,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     // or restyles itself (e.g. after an in-game settings change).
     win32::remember_applied_window(hwnd);
 
-    // `set_taskbar_hide_absolute_armed` (issue #43) rather than the plain
+    // `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
     // automatically restores the taskbar with no hotkey press required.
     if let Err(e) = win32::set_taskbar_hide_absolute_armed(
@@ -885,6 +878,7 @@ pub(crate) fn handle_applied_window_drift(
     }
     None
 }
+
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips the
 /// taskbar's *actual* hidden/visible state via [`win32::toggle_taskbar_hide`],
 /// which grounds its decision in the taskbar's real OS-level state rather
@@ -898,10 +892,9 @@ pub(crate) fn handle_applied_window_drift(
 /// on the taskbar doesn't require it), so there's no relaunch-elevated path
 /// here.
 ///
-/// Reloads the config from disk on every press, matching
-/// [`handle_toggle_borderless`]'s own "reload from disk on every trigger"
-/// convention -- so a mode change made via Settings since the last press is
-/// picked up immediately.
+/// Reads the current (cached) config on every press, as
+/// [`handle_toggle_borderless`] does, so a mode change made via Settings
+/// since the last press is picked up immediately.
 fn handle_toggle_taskbar_autohide(config_dir: &Path) {
     let mode = match profile_store::load(config_dir) {
         Ok(config) => config.taskbar_hide_mode,
@@ -948,10 +941,11 @@ fn show_settings(
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
 ) {
-    // Synchronous/modal-style for this MVP: opening Settings blocks this
-    // thread until the Settings window closes, at which point the egui/wgpu
-    // context it used is fully dropped and we resume pumping tray messages
-    // right where we left off.
+    // Synchronous/modal-style: opening Settings blocks this thread until the
+    // Settings window closes, at which point the egui/wgpu context it used is
+    // fully dropped and we resume pumping tray messages right where we left
+    // off.
+    //
     // The outcome of the last registration is handed to Settings instead of
     // re-checking: while it is open this instance's own registrations hold
     // the combos, so a fresh probe would report GameFrame's own bindings as
@@ -967,8 +961,7 @@ fn show_settings(
     // registering again (its `Drop` destroys the manager's hidden window,
     // which releases its hotkeys): a plain `hotkeys = register_hotkeys(..)`
     // evaluates the right side first, so every unchanged key failed with
-    // "already registered" and all hotkeys went dead after any Settings visit
-    // (#52).
+    // "already registered" and all hotkeys went dead after any Settings visit.
     drop(hotkeys.take());
     (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
     cursor_overlay.reload(config_dir);
@@ -1022,7 +1015,7 @@ mod tests {
         // prior strip) must always be allowed to complete, even if the game
         // is no longer tracked (e.g. removed via Settings mid-session) --
         // otherwise the window is permanently orphaned in its stripped
-        // state for the rest of the run (MEDIUM review finding, issue #31).
+        // state for the rest of the run.
         assert!(!should_block_untracked_toggle(true, false));
     }
 
@@ -1135,7 +1128,7 @@ mod tests {
     /// Regression coverage for the bug where a hotkey bound via Settings
     /// didn't take effect until a full app restart: `run_event_loop`'s
     /// `ShowSettings` branch reacts to Settings closing by calling
-    /// [`register_hotkeys`] again, which reloads the config from disk and
+    /// [`register_hotkeys`] again, which loads the saved config and
     /// resolves it into fresh bindings. This test exercises exactly that
     /// reload-and-resolve chain -- load, simulate a Settings save that
     /// changes a binding, reload -- and asserts the new binding is picked

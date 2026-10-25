@@ -1,5 +1,5 @@
 //! Lazily-instantiated egui Settings window: draw/edit the single optional
-//! Zone, and assign GameFrame's two global hotkey bindings, persisted via
+//! Zone, and assign GameFrame's three global hotkey bindings, persisted via
 //! [`crate::profile_store`].
 //!
 //! Split in two:
@@ -36,7 +36,8 @@ use std::rc::Rc;
 pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
 
 /// The editable state backing the Settings window: the single optional
-/// [`Zone`] and the two hotkey binding strings (empty = unbound).
+/// [`Zone`], the three hotkey binding strings (empty = unbound) and the other
+/// Settings fields.
 ///
 /// Plain data, no egui/OS dependency -- fully unit testable.
 ///
@@ -74,13 +75,12 @@ pub struct SettingsState {
     /// entries are added.
     pub tracked_games: Vec<TrackedGame>,
     /// Which technique GameFrame uses to hide the taskbar whenever any call
-    /// site hides it (issue #42) -- `FullyHidden` (new default, no
-    /// hover-reveal) or `HoverReveal` (today's pre-#42 native
-    /// `SHAppBarMessage` behavior, opt-in). Set via a radio choice next to
-    /// the global hotkeys in the Settings window.
+    /// site hides it -- `FullyHidden` (the default, no hover-reveal) or
+    /// `HoverReveal` (the native `SHAppBarMessage` behavior, opt-in). Set via
+    /// a radio choice in the Settings window.
     pub taskbar_hide_mode: TaskbarHideMode,
     /// Whether applying the Zone also hides the taskbar -- the global
-    /// "Hide taskbar when the Zone is applied" checkbox (issue #49).
+    /// "Hide taskbar when the Zone is applied" checkbox.
     pub hide_taskbar_on_apply: bool,
     /// The "Start with Windows" checkbox. Not part of [`Config`] -- the
     /// registry is its source of truth (see [`crate::autostart`]) -- so
@@ -106,7 +106,7 @@ pub enum SettingsTab {
     General,
 }
 
-/// Which of GameFrame's two hotkey fields a press-to-bind capture applies
+/// Which of GameFrame's three hotkey fields a press-to-bind capture applies
 /// to. See [`SettingsState::capturing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)] // mirrors `hotkeys::HotkeyAction`
@@ -279,9 +279,8 @@ impl SettingsState {
     /// when `ctrl_escape_suppressed` is `true` -- the direct-completion path
     /// needed because `keyboard_hook::keyboard_hook_proc` swallows the
     /// physical Ctrl+Escape combination before it can ever arrive as a
-    /// normal `egui::Event::Key` for [`Self::handle_key_event`] to observe
-    /// (issue #40's CRITICAL review finding). A no-op when
-    /// `ctrl_escape_suppressed` is `false`, or when nothing is currently
+    /// normal `egui::Event::Key` for [`Self::handle_key_event`] to observe.
+    /// A no-op when `ctrl_escape_suppressed` is `false`, or when nothing is currently
     /// capturing.
     ///
     /// Deliberately reuses [`Self::handle_key_event`]'s existing, already-
@@ -403,7 +402,7 @@ pub fn zone_view(zone: Option<&Zone>, monitor: &MonitorGeometry) -> ZoneView {
 }
 
 /// The non-blocking status-line message shown for a tracked game whose live
-/// re-apply attempt (issue #33) failed -- e.g. the window couldn't be
+/// re-apply attempt failed -- e.g. the window couldn't be
 /// repositioned because of an access-denied error. The Zone itself was already
 /// saved (the overlay persists it on Save); the message just explains that
 /// the game will pick it up the next time it is applied (launch, hotkey or
@@ -444,7 +443,7 @@ pub(crate) fn persist_zone(
     Ok(updated)
 }
 
-/// Attempts issue #33's live re-apply for a single tracked game, via
+/// Attempts the live re-apply for a single tracked game, via
 /// [`win32::resolve_running_window`] + [`win32::live_reapply_running_window`].
 /// Returns `Some(message)` only when an attempt was actually made and failed
 /// (the game was running, but repositioning it hit an OS-level error) -- a
@@ -470,7 +469,7 @@ fn live_reapply_tracked_game(
     // Not-running must always short-circuit before region resolution is even
     // attempted: a saved Zone that no longer fits the current monitor would
     // otherwise surface a spurious failure message for a game that was
-    // never actually running (issue #33's iteration-3 review fix).
+    // never actually running.
     let hwnd = win32::resolve_running_window(&game.exe_path)?;
 
     let region = match resolve_region(zone, monitor) {
@@ -650,7 +649,7 @@ fn key_display_name(key: egui::Key) -> Option<&'static str> {
         // `Escape` is bindable as a main key ONLY when combined with a held
         // modifier (e.g. `Ctrl+Escape`) -- a bare, unmodified Escape press is
         // intercepted earlier by `handle_key_event`'s cancel-capture check
-        // (see issue #40) and never reaches this function at all.
+        // and never reaches this function at all.
         Key::Escape => "Escape",
         // Anything else (keys with no token in GameFrame's stored string
         // vocabulary) is not representable -- leave the capture listening
@@ -780,12 +779,11 @@ fn modifiers_to_hotkey_modifiers(modifiers: egui::Modifiers) -> Modifiers {
 
 /// Constructs a `global_hotkey::hotkey::HotKey` directly from a captured
 /// chord (held `modifiers` plus the physical, non-modifier `key` that
-/// completed it) -- satisfying issue #29's acceptance criterion that the
-/// captured chord construct a `HotKey` via `HotKey::new(mods, code)` rather
-/// than solely through a later `FromStr` round-trip of the persisted string
-/// (that round-trip still happens separately, in `hotkeys::register_each`,
-/// on every app startup -- unavoidable since the persisted config is a plain
-/// string, not a living `HotKey`).
+/// completed it) via `HotKey::new(mods, code)`, rather than solely through a
+/// later `FromStr` round-trip of the persisted string (that round-trip still
+/// happens separately, in `hotkeys::register_each`, on every app startup --
+/// unavoidable since the persisted config is a plain string, not a living
+/// `HotKey`).
 ///
 /// Returns `None` if `key` is itself a physical modifier key, or has no
 /// `Code` counterpart in GameFrame's supported vocabulary ([`key_to_code`])
@@ -817,7 +815,7 @@ fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<H
 /// captured combo can only carry Ctrl/Alt/Shift, matching every binding
 /// GameFrame has ever stored to date.
 fn format_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<String> {
-    // Validate via a directly-constructed `HotKey` first (issue #29) -- a chord
+    // Validate via a directly-constructed `HotKey` first -- a chord
     // that can't build one (unrepresentable physical key) must not produce a
     // stored string either. The modifier substrings below are then read back off
     // that same constructed `HotKey`'s `mods`, not recomputed independently from
@@ -851,9 +849,9 @@ fn non_empty(value: &str) -> Option<String> {
 /// Queries the primary monitor's geometry via a minimal Win32 call.
 ///
 /// OS-facing -- not exercised by this crate's automated tests, for the same
-/// reason as [`crate::tray_ui::Tray::new`]. MVP scope targets the
-/// primary/foreground monitor only (see `region_calc` module docs); no
-/// monitor-enumeration module exists.
+/// reason as [`crate::tray_ui::Tray::new`]. Only the primary monitor is
+/// supported (see `region_calc` module docs); there is no monitor-enumeration
+/// module.
 pub fn primary_monitor_geometry() -> MonitorGeometry {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -902,9 +900,8 @@ impl std::error::Error for SettingsUiError {
 /// [`Config`] to persist), a Cancel/close-without-saving, or a request to
 /// open the zone-editor overlay for the Zone (carrying the current
 /// in-progress [`SettingsState`], plus this session's current pending
-/// live-re-apply status messages -- issue #33's
-/// [`SettingsApp::pending_status_messages`] -- so neither is lost while the
-/// overlay is open).
+/// live-re-apply status messages ([`SettingsApp::pending_status_messages`])
+/// so neither is lost while the overlay is open).
 ///
 /// [`run_settings_window`] loops on this: `EditZone` re-opens the
 /// Settings window (with the overlay's result, and the carried-forward
@@ -916,8 +913,8 @@ enum SettingsExit {
     Saved(Config, bool),
     Cancelled,
     /// Carries the in-progress [`SettingsState`] plus this session's current
-    /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`],
-    /// issue #33) -- so a message surfaced by a Zone commit made
+    /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`])
+    /// -- so a message surfaced by a Zone commit made
     /// just before "Edit zone" was clicked isn't lost when this
     /// session's `SettingsApp` is torn down; [`run_settings_window`] carries
     /// it forward as the next session's initial status messages.
@@ -945,12 +942,12 @@ enum SettingsExit {
 /// close-then-reopen sequencing already used for "Show Settings" itself
 /// from the tray's message loop (see `app::run_event_loop`).
 ///
-/// Also threads issue #33's non-blocking live-re-apply status messages
-/// across that same close-then-reopen boundary: `status_messages` starts
-/// empty, is replaced wholesale by whatever [`SettingsExit::EditZone`]
-/// carried out of the just-closed session (either its untouched
-/// carried-forward messages, or a fresh set if the overlay's save fired
-/// trigger 3's cascade), and is handed to the next [`run_settings_frame`]
+/// Also threads the non-blocking live-re-apply status messages across that
+/// same close-then-reopen boundary: `status_messages` starts empty, is
+/// replaced wholesale by whatever [`SettingsExit::EditZone`] carried out of
+/// the just-closed session (either its untouched carried-forward messages,
+/// or a fresh set if the overlay's save triggered a live re-apply), and is
+/// handed to the next [`run_settings_frame`]
 /// call as its `initial_status_messages` -- so a status line surfaced right
 /// before "Edit zone" was clicked survives the round trip through
 /// the overlay instead of vanishing with the torn-down `SettingsApp`.
@@ -986,10 +983,10 @@ pub fn run_settings_window(
             SettingsExit::Cancelled => return Ok(()),
             SettingsExit::EditZone(mut latest_state, latest_status_messages) => {
                 // Carried forward as-is unless the overlay actually commits a
-                // new zone below (trigger 3 only fires on an accepted save,
-                // per this issue's "commit only" rule) -- cancelling/failing
-                // to open the overlay is not itself a commit, so whatever
-                // status messages were already showing must survive it.
+                // new zone below (a live re-apply only fires on an accepted
+                // save) -- cancelling/failing to open the overlay is not
+                // itself a commit, so whatever status messages were already
+                // showing must survive it.
                 status_messages = latest_status_messages;
                 match zone_overlay::run_zone_editor_overlay(
                     latest_state.zone,
@@ -1038,7 +1035,7 @@ pub fn run_settings_window(
 /// whole function).
 ///
 /// `initial_status_messages` seeds the new [`SettingsApp`]'s
-/// [`SettingsApp::pending_status_messages`] (issue #33) -- carried over from
+/// [`SettingsApp::pending_status_messages`] -- carried over from
 /// the previous session's [`SettingsExit::EditZone`], or empty on the
 /// very first call from [`run_settings_window`]. Any close other than an
 /// explicit Save, Cancel, or "Draw zone"/"Edit zone" click -- concretely, the
@@ -1109,7 +1106,7 @@ fn window_icon() -> egui::IconData {
 /// The live egui app backing the Settings window. Torn down entirely when
 /// [`run_settings_window`] returns -- nothing here outlives that call.
 ///
-/// Also owns issue #33's transient live-re-apply status messages
+/// Also owns the transient live-re-apply status messages
 /// ([`pending_status_messages`](SettingsApp::pending_status_messages)),
 /// which -- unlike `state` -- deliberately don't survive a
 /// [`SettingsExit::EditZone`] round trip unchanged: they're carried
@@ -1124,17 +1121,17 @@ struct SettingsApp {
     monitor: MonitorGeometry,
     exit: Rc<RefCell<Option<SettingsExit>>>,
     /// Zero or more non-blocking status messages from the most recent
-    /// commit-triggered live re-apply attempt (issue #33) -- e.g.
+    /// commit-triggered live re-apply attempt -- e.g.
     /// [`live_apply_failure_message`] for a tracked game whose window
     /// couldn't be repositioned. Purely transient UI feedback: not part of
     /// [`SettingsState`] (never round-trips through `to_config`/persist),
     /// and replaced wholesale -- not accumulated -- on each new
-    /// commit-triggered attempt, per this issue's acceptance criteria.
+    /// commit-triggered attempt.
     pending_status_messages: Vec<String>,
     /// `Some(guard)` while `state.capturing` is `Some` (kept in sync each
     /// frame by [`Self::sync_keyboard_hook`]) -- suppresses the physical
     /// Ctrl+Escape combination so Windows doesn't steal it for the Start
-    /// menu while a hotkey capture is listening (issue #40). `None`
+    /// menu while a hotkey capture is listening. `None`
     /// otherwise; dropping it (either via that sync, or via `SettingsApp`
     /// itself being torn down when the Settings window closes) uninstalls
     /// the hook, per [`keyboard_hook::KeyboardHookGuard`]'s RAII contract.
@@ -1459,7 +1456,7 @@ impl SettingsApp {
         // the *old* `None` state. Without this second call the hook wouldn't
         // install until the following frame, leaving a one-frame window
         // where physical Ctrl+Escape still reaches Windows' Start-menu
-        // shortcut (issue #40 MEDIUM review finding).
+        // shortcut.
         self.sync_keyboard_hook();
 
         ui.separator();
@@ -1517,7 +1514,8 @@ impl SettingsApp {
                     painter.rect_filled(highlight_rect, 0.0, fill_color);
                 }
                 ZoneView::Unresolvable(_) => {
-                    // Visible placeholder instead of silently drawing nothing.
+                    // Cross out the thumbnail in red so an unresolvable Zone
+                    // is visible rather than silently drawing nothing.
                     painter.line_segment(
                         [outline_rect.left_top(), outline_rect.right_bottom()],
                         egui::Stroke::new(1.5, egui::Color32::RED),
@@ -1583,10 +1581,10 @@ impl SettingsApp {
     /// [`eframe::App::ui`] -- both once at the very top of the frame, and
     /// again immediately after [`Self::hotkey_row`] runs (see the call site's
     /// comment for why: closes the one-frame install gap between a "Set
-    /// hotkey" click and the hook actually going live, an issue #40 review
-    /// finding). A no-op most calls, since it only ever acts when presence
-    /// (`Option::is_some`) disagrees with `capturing`, not on every call a
-    /// capture happens to still be active.
+    /// hotkey" click and the hook actually going live). A no-op most calls,
+    /// since it only ever acts when presence (`Option::is_some`) disagrees
+    /// with `capturing`, not on every call a capture happens to still be
+    /// active.
     ///
     /// While a capture is active, also polls
     /// [`keyboard_hook::take_suppressed_ctrl_escape`] and completes the
@@ -1594,7 +1592,7 @@ impl SettingsApp {
     /// Ctrl+Escape press -- see
     /// [`SettingsState::complete_capture_with_ctrl_escape_if_suppressed`]'s
     /// doc comment for why that combo can never arrive as a normal
-    /// `egui::Event::Key` (issue #40's CRITICAL review finding).
+    /// `egui::Event::Key`.
     ///
     /// Doesn't need to separately cover the Settings window closing while
     /// still capturing -- that path is instead covered by `keyboard_hook`
@@ -1606,13 +1604,12 @@ impl SettingsApp {
         if self.state.capturing.is_some() {
             if self.keyboard_hook.is_none() {
                 self.keyboard_hook = keyboard_hook::KeyboardHookGuard::install();
-                // Known, intentional tradeoff (issue #40, not fixed -- out of
-                // scope): if `install()` returns `None` (e.g. some
-                // restricted/sandboxed environment), this branch retries
-                // every call for the rest of the capture session, since
-                // `self.keyboard_hook` stays `None`. Harmless but wasteful;
-                // would need a separate "already tried and failed" flag to
-                // avoid, not required by this issue's acceptance criteria.
+                // Known, intentional tradeoff: if `install()` returns `None`
+                // (e.g. some restricted/sandboxed environment), this branch
+                // retries every call for the rest of the capture session,
+                // since `self.keyboard_hook` stays `None`. Harmless but
+                // wasteful; avoiding it would need a separate "already tried
+                // and failed" flag.
             }
             self.state.complete_capture_with_ctrl_escape_if_suppressed(
                 keyboard_hook::take_suppressed_ctrl_escape(),
@@ -1656,7 +1653,7 @@ impl eframe::App for SettingsApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Issue #33's non-blocking status line(s): zero or more messages
+            // Non-blocking status line(s): zero or more messages
             // from the most recent commit-triggered live re-apply attempt.
             // Rendered above the tabs so they're visible whichever tab is
             // open.
@@ -1857,10 +1854,10 @@ mod tests {
 
     #[test]
     fn format_captured_hotkey_only_completes_a_capture_that_also_constructs_a_valid_hotkey() {
-        // Every key GameFrame's capture button can actually complete with must also
-        // successfully construct a `global_hotkey::hotkey::HotKey` -- issue #29's
-        // acceptance criterion -- and the two must describe the same chord (same
-        // modifiers, same physical key), not merely both succeed independently.
+        // Every key GameFrame's capture button can actually complete with must
+        // also successfully construct a `global_hotkey::hotkey::HotKey`, and
+        // the two must describe the same chord (same modifiers, same physical
+        // key), not merely both succeed independently.
         let modifiers = egui::Modifiers {
             ctrl: true,
             shift: true,
@@ -2228,10 +2225,10 @@ mod tests {
     #[test]
     fn complete_capture_with_ctrl_escape_if_suppressed_records_the_combo_when_the_hook_swallowed_it()
      {
-        // Mirrors `keyboard_hook::keyboard_hook_proc`'s CRITICAL fix: the hook
-        // swallows the physical Ctrl+Escape press before it can ever arrive as
-        // an `egui::Event::Key`, so this is the only path that can complete
-        // the capture for that specific combo.
+        // `keyboard_hook::keyboard_hook_proc` swallows the physical
+        // Ctrl+Escape press before it can ever arrive as an
+        // `egui::Event::Key`, so this is the only path that can complete the
+        // capture for that specific combo.
         let mut state = SettingsState::from_config(&Config::default());
         state.start_capture(HotkeyField::ToggleBorderless);
 
@@ -2559,7 +2556,7 @@ mod tests {
         let to_persist = state.to_config();
         profile_store::save(&config_dir, &to_persist).unwrap();
 
-        // "Reopen" Settings: reload from disk and rebuild the view-model.
+        // "Reopen" Settings: load the saved config and rebuild the view-model.
         let reloaded_config = profile_store::load(&config_dir).unwrap();
         let reopened_state = SettingsState::from_config(&reloaded_config);
 

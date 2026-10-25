@@ -73,7 +73,7 @@ where
 
 /// Whether the process arguments (program name first) are a request to quit
 /// the running instance (`gameframe.exe --quit`): the process sends `Quit` and
-/// exits without taking the instance. Used by hand and by the updater (#83).
+/// exits without taking the instance. Used by hand and by the updater.
 pub fn is_quit_request<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,

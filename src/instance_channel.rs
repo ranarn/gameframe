@@ -1,5 +1,4 @@
-//! Command channel from a second `gameframe.exe` to the running instance
-//! (issue #70).
+//! Command channel from a second `gameframe.exe` to the running instance.
 //!
 //! The running instance owns a hidden **message-only window**; a second launch
 //! finds it by class name and posts one registered window message

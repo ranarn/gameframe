@@ -17,8 +17,10 @@
 //! to it only through [`CursorOverlay`]'s shared state.
 //!
 //! The thread is per-monitor-DPI-aware (`SetThreadDpiAwarenessContext`), so
-//! cursor positions and the window are in physical pixels on every monitor
-//! regardless of the rest of the process's awareness.
+//! cursor positions and the window are in physical pixels on every monitor.
+//! The application manifest already declares Per-Monitor V2 for the whole
+//! process, so the call is redundant; it is kept so the thread stays correct
+//! even if the manifest changes.
 //!
 //! Like YoloMouse, the game cursor exists only in and over the game: it is
 //! shown while the window *under the cursor* (`WindowFromPoint`, which skips

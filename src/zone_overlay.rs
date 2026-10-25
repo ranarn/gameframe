@@ -15,7 +15,7 @@
 //!
 //! Drives [`crate::zone_editor::AppState`] from real pointer input, and
 //! hides the taskbar for the duration of the editing session via
-//! [`crate::win32::hide_taskbar`] (mode-aware as of issue #42 -- see
+//! [`crate::win32::hide_taskbar`] (mode-aware -- see
 //! [`crate::profile_store::TaskbarHideMode`]), restoring exactly the
 //! previous state via [`crate::win32::restore_taskbar`] once the session
 //! ends -- Save, Cancel, or the window being closed any other way (an RAII
@@ -279,8 +279,7 @@ impl eframe::App for OverlayApp {
 impl OverlayApp {
     /// Dims the whole desktop, then draws the current/live zone as a
     /// brighter cutout with an outline, plus one small colored square per
-    /// resize handle. Deliberately unpolished: visual polish (dim/handle
-    /// styling, hover cursors) is out of scope per issue #28.
+    /// resize handle. Deliberately plain: no hover cursors or other styling.
     fn draw_dim_and_zone(&self, ui: &egui::Ui) {
         let painter = ui.painter();
         let screen = ui.max_rect();
@@ -386,17 +385,17 @@ impl OverlayApp {
         }
     }
 
-    /// The overlay's own modal Save/Cancel controls (issue #28: "fully
-    /// modal for its editing session with its own Save/Cancel controls").
+    /// The overlay's own Save/Cancel controls; the overlay is fully modal for
+    /// its editing session.
     fn control_panel(&mut self, ctx: &egui::Context) {
         // "Save" is disabled outside `Placed` rather than silently rejected,
         // since there's no separate settings window backdrop to surface a
         // rejection message against here.
         let can_save = matches!(self.state.editor, EditorState::Placed { .. });
 
-        // issue #39: buttons enlarged/color-coded and moved further down
-        // from the top edge, and the hint label enlarged/centered, so the
-        // controls are impossible to miss against the darkened overlay.
+        // Large, color-coded buttons placed well below the top edge, with an
+        // enlarged centered hint label, so the controls are impossible to
+        // miss against the darkened overlay.
         egui::Area::new(egui::Id::unique("zone-editor-controls"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0))
             .show(ctx, |ui| {
@@ -434,7 +433,7 @@ impl OverlayApp {
 }
 
 /// Builds a Save/Cancel control button with the enlarged size and
-/// color-coded fill used by the zone editor's control panel (issue #39).
+/// color-coded fill used by the zone editor's control panel.
 fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     egui::Button::new(
         egui::RichText::new(text)

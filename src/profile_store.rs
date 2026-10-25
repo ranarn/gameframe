@@ -21,8 +21,8 @@ pub type HotkeyBinding = Option<String>;
 pub struct HotkeyBindings {
     pub toggle_borderless: HotkeyBinding,
     pub toggle_taskbar_autohide: HotkeyBinding,
-    /// Turns the game cursor on/off (see [`crate::cursor_style`]). Absent in
-    /// configs written before it existed, hence the default.
+    /// Turns the game cursor on/off (see [`crate::cursor_style`]). Optional in
+    /// the file, so configs without it still load.
     #[serde(default)]
     pub toggle_game_cursor: HotkeyBinding,
 }
@@ -110,17 +110,16 @@ pub fn find_tracked_game<'a>(games: &'a [TrackedGame], exe_path: &Path) -> Optio
     games.iter().find(|g| g.exe_path == exe_path)
 }
 
-/// Which technique GameFrame uses to hide the taskbar (issue #42) -- applies
+/// Which technique GameFrame uses to hide the taskbar -- applies
 /// wherever a call site hides the taskbar (the borderless-toggle strip
 /// direction, the tray "Apply to Window"/launch-detection apply paths, the
 /// manual taskbar-autohide-toggle hotkey, and the zone-editor overlay's
 /// force-on session), via `win32::plan_taskbar_hide`/`win32::hide_taskbar`.
 ///
-/// `#[default]` is `FullyHidden` -- this issue's new default -- so
-/// `#[serde(default)]` on [`Config::taskbar_hide_mode`] resolves a config
-/// file written before this field existed to `FullyHidden` rather than
-/// erroring, mirroring [`Config::tracked_games`]'s own backward-compat
-/// pattern.
+/// `#[default]` is `FullyHidden`, so `#[serde(default)]` on
+/// [`Config::taskbar_hide_mode`] resolves a config file without this field to
+/// `FullyHidden` rather than erroring, mirroring [`Config::tracked_games`]'s
+/// own backward-compat pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TaskbarHideMode {
     /// The taskbar is hidden via `ShowWindow(Shell_TrayWnd, SW_HIDE)` and
@@ -128,13 +127,13 @@ pub enum TaskbarHideMode {
     #[default]
     FullyHidden,
     /// The taskbar is hidden via the native `SHAppBarMessage`/`ABS_AUTOHIDE`
-    /// mechanism -- today's pre-#42 behavior, preserved unchanged: hovering
-    /// the mouse near the screen edge reveals it.
+    /// mechanism: hovering the mouse near the screen edge reveals it.
     HoverReveal,
 }
 
-/// GameFrame's persisted config: the optional Zone, the two global hotkey
-/// bindings, and the per-game tracked-games list.
+/// GameFrame's persisted config: the optional Zone, the three global hotkey
+/// bindings, the tracked-games list, the taskbar settings and the game cursor
+/// settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     /// The single optional Zone. `None` until the user draws one.
@@ -161,7 +160,7 @@ fn default_hide_taskbar_on_apply() -> bool {
 }
 
 impl Default for Config {
-    /// The starter config written on first run: no Zone, both hotkeys
+    /// The starter config written on first run: no Zone, all hotkeys
     /// unbound, no tracked games yet, and the taskbar hidden fully (no
     /// hover-reveal) once the Zone is applied.
     fn default() -> Self {
@@ -236,11 +235,11 @@ struct LegacyPresets {
     custom: Option<Zone>,
 }
 
-/// Key of the per-game taskbar flag that issue #49 folded into the global
-/// [`Config::hide_taskbar_on_apply`].
+/// Key of the legacy per-game taskbar flag, which is folded into the global
+/// [`Config::hide_taskbar_on_apply`] when an old config is loaded.
 const PER_GAME_TASKBAR_KEY: &str = "taskbar_autohide";
 
-/// Folds per-game `taskbar_autohide` flags (present in preset-era and #48-era
+/// Folds per-game `taskbar_autohide` flags (present in older
 /// configs) into the global `hide_taskbar_on_apply` key: true if any game had
 /// it on, false if every game had it off. The no-games case does reach this
 /// fold but changes nothing (the value then comes from
@@ -298,7 +297,7 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
 /// Order: a config already in the Zone shape loads as-is; a legacy
 /// (preset-era, has a `[presets]` table) config is converted via
 /// [`convert_legacy_config`] and the new shape is written back immediately; a
-/// #48-era config still carrying per-game `taskbar_autohide` flags has them
+/// config still carrying per-game `taskbar_autohide` flags has them
 /// folded into the global setting ([`fold_per_game_taskbar_flags`]) and is
 /// written back too; anything else (corrupt TOML, unrecognised shape) is
 /// replaced with a freshly written default config rather than returned as an
@@ -374,7 +373,7 @@ fn load_from_disk(config_dir: &Path) -> Result<Config, ProfileStoreError> {
         };
     }
 
-    // A #48-era config still carries per-game taskbar flags: fold them into
+    // An older config may still carry per-game taskbar flags: fold them into
     // the global setting and write the new shape back.
     let mut table = table;
     let folded = fold_per_game_taskbar_flags(&mut table);
@@ -758,7 +757,7 @@ mod tests {
         assert_eq!(second, migrated);
     }
 
-    /// Builds config TOML (legacy or #48 shape) with one tracked game per
+    /// Builds config TOML (legacy preset shape or Zone shape) with one tracked game per
     /// entry of `flags`, each carrying that per-game taskbar flag.
     fn config_with_game_flags(legacy: bool, flags: &[bool]) -> String {
         let mut s = String::new();
@@ -938,7 +937,7 @@ mod tests {
 
     #[test]
     fn load_of_an_unconvertible_old_shape_config_resets_to_defaults() {
-        // The pre-#26 shape (`presets` as an array of tagged variants) is
+        // An old shape (`presets` as an array of tagged variants) is
         // not convertible -- it is discarded and replaced with defaults.
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
