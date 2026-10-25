@@ -131,6 +131,18 @@ pub enum TaskbarHideMode {
     HoverReveal,
 }
 
+/// How GameFrame reacts when its startup update check finds a newer release.
+/// Serialized as `"auto"` / `"ask"`; a config without the field means `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateMode {
+    /// Install the update right away, silently.
+    #[default]
+    Auto,
+    /// Add an "Update to vX.Y.Z" tray item and install when it is chosen.
+    Ask,
+}
+
 /// GameFrame's persisted config: the optional Zone, the three global hotkey
 /// bindings, the tracked-games list, the taskbar settings and the game cursor
 /// settings.
@@ -153,6 +165,9 @@ pub struct Config {
     /// The game cursor's settings (config table `[cursor]`).
     #[serde(default)]
     pub cursor: CursorSettings,
+    /// What the startup update check does with an available update.
+    #[serde(default)]
+    pub update_mode: UpdateMode,
 }
 
 fn default_hide_taskbar_on_apply() -> bool {
@@ -171,6 +186,7 @@ impl Default for Config {
             taskbar_hide_mode: TaskbarHideMode::default(),
             hide_taskbar_on_apply: true,
             cursor: CursorSettings::default(),
+            update_mode: UpdateMode::default(),
         }
     }
 }
@@ -288,6 +304,7 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
         taskbar_hide_mode: legacy.taskbar_hide_mode,
         hide_taskbar_on_apply: legacy.hide_taskbar_on_apply,
         cursor: CursorSettings::default(),
+        update_mode: UpdateMode::default(),
     })
 }
 
@@ -562,6 +579,7 @@ mod tests {
                 taskbar_hide_mode: TaskbarHideMode::FullyHidden,
                 hide_taskbar_on_apply: true,
                 cursor: CursorSettings::default(),
+                update_mode: UpdateMode::Auto,
             }
         );
         assert!(config_dir.join(CONFIG_FILE_NAME).exists());
@@ -596,12 +614,52 @@ mod tests {
                 size: 80,
                 ..CursorSettings::default()
             },
+            update_mode: UpdateMode::Ask,
         };
         save(&config_dir, &written).unwrap();
 
         let loaded = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(loaded, written);
+    }
+
+    #[test]
+    fn update_mode_defaults_to_auto_when_the_config_has_no_such_field() {
+        let config: Config = toml::from_str("hide_taskbar_on_apply = true").unwrap();
+
+        assert_eq!(config.update_mode, UpdateMode::Auto);
+    }
+
+    #[test]
+    fn update_mode_round_trips_both_values_through_the_config_file() {
+        for mode in [UpdateMode::Auto, UpdateMode::Ask] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("GameFrame");
+            let written = Config {
+                update_mode: mode,
+                ..Config::default()
+            };
+            save(&config_dir, &written).unwrap();
+
+            let loaded = load_from_disk(&config_dir).unwrap();
+
+            assert_eq!(loaded.update_mode, mode);
+        }
+    }
+
+    #[test]
+    fn update_mode_is_written_as_auto_or_ask() {
+        for (mode, literal) in [
+            (UpdateMode::Auto, "update_mode = \"auto\""),
+            (UpdateMode::Ask, "update_mode = \"ask\""),
+        ] {
+            let config = Config {
+                update_mode: mode,
+                ..Config::default()
+            };
+
+            assert!(toml::to_string(&config).unwrap().contains(literal));
+        }
     }
 
     #[test]

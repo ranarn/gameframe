@@ -1,7 +1,9 @@
 //! Owns the system tray icon and its five top-level context menu items
 //! ("Show Settings", "Apply to Window", "Start with Windows", "Check for
-//! Updates Now", "Exit"), plus the id -> action mapping that lets `app`'s
-//! event loop recognize a click on "Exit" and start the clean-shutdown path.
+//! Updates Now", "Exit"), plus an "Update to vX.Y.Z" item while an update is
+//! offered (ask mode, see [`Tray::show_update_item`]), and the id -> action
+//! mapping that lets `app`'s event loop recognize a click on "Exit" and start
+//! the clean-shutdown path.
 //!
 //! "Apply to Window" is itself a live [`Submenu`] of currently-visible
 //! top-level windows (see [`Tray::refresh_apply_to_window_menu`] for the
@@ -41,13 +43,19 @@ pub enum TrayAction {
     ShowSettings,
     ToggleStartWithWindows,
     CheckForUpdates,
+    /// The dynamic "Update to vX.Y.Z" item ([`Tray::show_update_item`]).
+    InstallUpdate,
     Exit,
 }
+
+/// The tray icon's hover text when no update is downloading.
+pub const DEFAULT_TOOLTIP: &str = "GameFrame";
 
 const SHOW_SETTINGS_ID: &str = "gameframe-show-settings";
 const APPLY_TO_WINDOW_ID: &str = "gameframe-apply-to-window";
 const START_WITH_WINDOWS_ID: &str = "gameframe-start-with-windows";
 const CHECK_FOR_UPDATES_ID: &str = "gameframe-check-for-updates";
+const INSTALL_UPDATE_ID: &str = "gameframe-install-update";
 const EXIT_ID: &str = "gameframe-exit";
 
 /// Prefix for the dynamically-generated "Apply to Window" submenu items'
@@ -91,6 +99,7 @@ pub struct TrayMenuIds {
     apply_to_window: MenuId,
     start_with_windows: MenuId,
     check_for_updates: MenuId,
+    install_update: MenuId,
     exit: MenuId,
 }
 
@@ -101,6 +110,7 @@ impl TrayMenuIds {
             apply_to_window: MenuId::new(APPLY_TO_WINDOW_ID),
             start_with_windows: MenuId::new(START_WITH_WINDOWS_ID),
             check_for_updates: MenuId::new(CHECK_FOR_UPDATES_ID),
+            install_update: MenuId::new(INSTALL_UPDATE_ID),
             exit: MenuId::new(EXIT_ID),
         }
     }
@@ -120,6 +130,8 @@ impl TrayMenuIds {
             Some(TrayAction::ToggleStartWithWindows)
         } else if *id == self.check_for_updates {
             Some(TrayAction::CheckForUpdates)
+        } else if *id == self.install_update {
+            Some(TrayAction::InstallUpdate)
         } else if *id == self.exit {
             Some(TrayAction::Exit)
         } else {
@@ -173,7 +185,10 @@ impl std::error::Error for TrayUiError {
 /// after "Exit" is selected is the entire clean-shutdown path for the
 /// icon itself.
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    menu: Menu,
+    /// The Update to vX.Y.Z item while an update is offered.
+    update_item: std::cell::RefCell<Option<MenuItem>>,
     ids: TrayMenuIds,
     apply_to_window_menu: Submenu,
     start_with_windows_item: CheckMenuItem,
@@ -231,14 +246,16 @@ impl Tray {
         let icon = app_tray_icon().map_err(TrayUiError::Icon)?;
 
         let tray_icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(menu.clone()))
             .with_icon(icon)
-            .with_tooltip("GameFrame")
+            .with_tooltip(DEFAULT_TOOLTIP)
             .build()
             .map_err(TrayUiError::Tray)?;
 
         Ok(Self {
-            _icon: tray_icon,
+            icon: tray_icon,
+            menu,
+            update_item: std::cell::RefCell::new(None),
             ids,
             apply_to_window_menu,
             start_with_windows_item,
@@ -291,6 +308,47 @@ impl Tray {
     /// Not exercised by this crate's automated tests -- see module docs.
     pub fn refresh_apply_to_window_menu(&self) {
         rebuild_apply_to_window_items(&self.apply_to_window_menu);
+    }
+
+    /// Adds (or relabels) the Update to v<version> item above Check for
+    /// Updates Now. A failure is logged; the menu stays as it was.
+    ///
+    /// OS-facing; not exercised by the automated tests (see module docs).
+    pub fn show_update_item(&self, version: &str) {
+        let label = format!("Update to v{version}");
+        let mut slot = self.update_item.borrow_mut();
+        if let Some(item) = slot.as_ref() {
+            item.set_text(label);
+            return;
+        }
+        let item = MenuItem::with_id(self.ids.install_update.clone(), label, true, None);
+        // Just above Check for Updates Now, wherever that sits.
+        let position = self
+            .menu
+            .items()
+            .iter()
+            .position(|i| *i.id() == self.ids.check_for_updates)
+            .unwrap_or(0);
+        match self.menu.insert(&item, position) {
+            Ok(()) => *slot = Some(item),
+            Err(e) => log!("couldn't add the update item to the tray menu: {e}"),
+        }
+    }
+
+    /// Removes the Update to ... item, if shown.
+    pub fn hide_update_item(&self) {
+        if let Some(item) = self.update_item.borrow_mut().take()
+            && let Err(e) = self.menu.remove(&item)
+        {
+            log!("couldn't remove the update item from the tray menu: {e}");
+        }
+    }
+
+    /// Sets the tray icon's hover text.
+    pub fn set_tooltip(&self, text: &str) {
+        if let Err(e) = self.icon.set_tooltip(Some(text)) {
+            log!("couldn't set the tray tooltip: {e}");
+        }
     }
 
     /// Re-reads the registry ([`crate::autostart::is_enabled`], the single
@@ -377,6 +435,16 @@ mod tests {
         assert_eq!(
             ids.action_for(&MenuId::new(CHECK_FOR_UPDATES_ID)),
             Some(TrayAction::CheckForUpdates)
+        );
+    }
+
+    #[test]
+    fn action_for_maps_the_install_update_id_to_the_install_update_action() {
+        let ids = TrayMenuIds::new();
+
+        assert_eq!(
+            ids.action_for(&MenuId::new(INSTALL_UPDATE_ID)),
+            Some(TrayAction::InstallUpdate)
         );
     }
 

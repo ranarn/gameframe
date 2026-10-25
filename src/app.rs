@@ -55,7 +55,11 @@ use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
 use crate::settings_ui::{self, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
-use crate::updater::{CheckOutcome, FlagGuard, SpawnError};
+use crate::update_ui::{
+    Failure, UpdateEvent, UpdateEvents, handle_update_event, schedule_startup_update_check,
+    start_install,
+};
+use crate::updater::{CheckOutcome, FlagGuard, SpawnError, UpdateInfo};
 use crate::win32;
 use crate::window_filter;
 use crate::zone_overlay;
@@ -114,7 +118,19 @@ pub fn run() -> Result<(), TrayUiError> {
     // mouse while this thread is blocked in Settings or the zone editor.
     let cursor_overlay = CursorOverlay::start(&config_dir);
 
-    run_event_loop(&tray, hotkeys, hotkey_reports, &config_dir, &cursor_overlay);
+    // Shortly after startup, off this thread; the result comes back through
+    // `updates` (see `UpdateEvents`).
+    let updates = UpdateEvents::new();
+    schedule_startup_update_check(updates.notifier());
+
+    run_event_loop(
+        &tray,
+        hotkeys,
+        hotkey_reports,
+        &config_dir,
+        &cursor_overlay,
+        &updates,
+    );
 
     // Stops the game cursor thread (see `crate::cursor_overlay`).
     drop(cursor_overlay);
@@ -226,7 +242,11 @@ fn run_event_loop(
     mut hotkey_reports: Vec<BindingReport>,
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
+    updates: &UpdateEvents,
 ) {
+    // The update the tray item "Update to vX.Y.Z" offers (ask mode).
+    let mut offered_update: Option<UpdateInfo> = None;
+
     // A Quit received during the first-run zone prompt (before this pump
     // existed) must not wait for the next message.
     if instance_channel::quit_pending() {
@@ -243,6 +263,12 @@ fn run_event_loop(
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // Results of the startup update check and of installs started from
+        // the tray (posted by worker threads, which wake this pump).
+        while let Some(event) = updates.try_recv() {
+            handle_update_event(event, tray, config_dir, &mut offered_update);
         }
 
         // Commands from a second launch (see crate::instance_channel); the
@@ -359,6 +385,11 @@ fn run_event_loop(
                     tray.sync_start_with_windows_check();
                 }
                 Some(TrayAction::CheckForUpdates) => check_for_updates_from_tray(),
+                Some(TrayAction::InstallUpdate) => {
+                    if let Some(info) = offered_update.clone() {
+                        start_install(info, Failure::Report);
+                    }
+                }
                 None => {}
             }
         }
@@ -893,7 +924,7 @@ static UPDATE_RESULT_BOX_OPEN: std::sync::atomic::AtomicBool =
 
 /// Shows a message box titled "GameFrame" and returns the button pressed.
 /// Blocks, so call it from a worker thread.
-fn show_message_box(text: &str, style: u32) -> i32 {
+pub(crate) fn show_message_box(text: &str, style: u32) -> i32 {
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let text = wide(text);
     let title = wide("GameFrame");
@@ -922,6 +953,9 @@ fn check_for_updates_from_tray() {
         match result {
             Ok(CheckOutcome::UpdateAvailable(info)) => offer_install(info),
             result => {
+                if matches!(result, Ok(CheckOutcome::UpToDate)) {
+                    crate::update_ui::notify(UpdateEvent::UpToDate);
+                }
                 let icon = if result.is_ok() {
                     MB_ICONINFORMATION
                 } else {
@@ -962,21 +996,7 @@ fn offer_install(info: crate::updater::UpdateInfo) {
     if show_message_box(&question, MB_YESNO | MB_ICONINFORMATION) != IDYES {
         return;
     }
-    let started = crate::update_install::spawn_install(info, |result| {
-        if let Err(e) = result {
-            show_message_box(
-                &crate::update_install::install_error_message(&e),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
-    });
-    if let Err(why) = started {
-        let text = match why {
-            SpawnError::Busy => "An update is already being installed.",
-            SpawnError::ThreadFailed => "Couldn't start the update install.",
-        };
-        show_message_box(text, MB_OK | MB_ICONINFORMATION);
-    }
+    start_install(info, Failure::Report);
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips the

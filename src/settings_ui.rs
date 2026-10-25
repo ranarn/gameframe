@@ -22,7 +22,7 @@ use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::keyboard_hook;
 use crate::profile_store::{
     self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame,
-    Zone,
+    UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
@@ -88,6 +88,9 @@ pub struct SettingsState {
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
     /// fills it from the registry; Save writes it back only if it changed.
     pub start_with_windows: bool,
+    /// What the startup update check does with an available update (the
+    /// radio choice under Updates).
+    pub update_mode: UpdateMode,
     /// The open tab. UI-only (never persisted), but kept here rather than on
     /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
     pub tab: SettingsTab,
@@ -152,6 +155,7 @@ impl SettingsState {
             taskbar_hide_mode: config.taskbar_hide_mode,
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
+            update_mode: config.update_mode,
             tab: SettingsTab::default(),
             hotkey_failures: Vec::new(),
         }
@@ -196,6 +200,7 @@ impl SettingsState {
             taskbar_hide_mode: self.taskbar_hide_mode,
             hide_taskbar_on_apply: self.hide_taskbar_on_apply,
             cursor: self.cursor.clone(),
+            update_mode: self.update_mode,
         }
     }
 
@@ -1518,6 +1523,16 @@ impl SettingsApp {
 
         ui.separator();
         ui.heading("Updates");
+        ui.radio_value(
+            &mut self.state.update_mode,
+            UpdateMode::Auto,
+            "Install updates automatically at startup",
+        );
+        ui.radio_value(
+            &mut self.state.update_mode,
+            UpdateMode::Ask,
+            "Ask me (adds a tray item when an update is available)",
+        );
         self.update_check_row(ui);
     }
 
@@ -1548,6 +1563,9 @@ impl SettingsApp {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let ctx = ui.ctx().clone();
                 let started = crate::updater::spawn_check(move |result| {
+                    if matches!(result, Ok(CheckOutcome::UpToDate)) {
+                        crate::update_ui::notify(crate::update_ui::UpdateEvent::UpToDate);
+                    }
                     let _ = sender.send(result);
                     ctx.request_repaint();
                 });
@@ -1614,7 +1632,7 @@ impl SettingsApp {
         if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
             let (sender, receiver) = std::sync::mpsc::channel();
             let ctx = ui.ctx().clone();
-            let started = crate::update_install::spawn_install(info, move |result| {
+            let started = crate::update_ui::spawn_install(info, move |result| {
                 // With the window gone nobody reads the channel; a failure is
                 // then shown in a box so it is never only in the log.
                 if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
@@ -2111,6 +2129,7 @@ mod tests {
                 size: 72,
                 ..CursorSettings::default()
             },
+            update_mode: UpdateMode::Auto,
         };
 
         let state = SettingsState::from_config(&config);
@@ -2178,6 +2197,21 @@ mod tests {
 
         state.clear_hotkey(HotkeyField::ToggleGameCursor);
         assert_eq!(state.to_config().hotkeys.toggle_game_cursor, None);
+    }
+
+    #[test]
+    fn update_mode_round_trips_through_the_settings_state() {
+        for mode in [UpdateMode::Auto, UpdateMode::Ask] {
+            let config = Config {
+                update_mode: mode,
+                ..Config::default()
+            };
+
+            let state = SettingsState::from_config(&config);
+
+            assert_eq!(state.update_mode, mode);
+            assert_eq!(state.to_config().update_mode, mode);
+        }
     }
 
     #[test]

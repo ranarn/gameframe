@@ -24,9 +24,13 @@ applications' windows, hides the taskbar, installs a low-level keyboard hook onl
 while you are binding a hotkey, and never injects into game processes or reads
 their memory. To rank windows in the Apply to Window picker it queries a
 process's executable path and loaded-module list through standard Windows APIs.
-The only network traffic is an update check you start yourself (tray "Check for
-Updates Now" or Settings), plus the download that follows if you accept an
-update. Both use HTTPS through Windows' own WinHTTP, so the system certificate
+The only network traffic is the update check and the download that follows it.
+GameFrame checks about 20 seconds after it starts (and again when you choose
+"Check for Updates Now" in the tray or Settings). With the default setting
+("Install updates automatically at startup") it then installs an available
+update without asking; with "Ask me" it adds a tray item and installs only when
+you choose it. A failed startup check is only logged. The check and the
+download use HTTPS through Windows' own WinHTTP, so the system certificate
 store and proxy settings apply:
 
 - The check is a GET of `api.github.com/repos/ranarn/gameframe/releases/latest`.
@@ -41,11 +45,10 @@ store and proxy settings apply:
   silently and detached from a temp folder, which the next start deletes.
 - The installer asks the running instance to quit by posting a `Quit` command to
   the instance's hidden message-only window; `gameframe.exe --quit` sends the
-  same command from a second launch. `Quit` travels
-  on a separate registered window message that is not let through UIPI, so a
-  lower-integrity process cannot quit the instance, and a normal-integrity launch
-  cannot quit an elevated one (the installer then falls back to `taskkill` after
-  a timeout). Opening Settings uses a message that is let through, since that is
-  harmless.
+  same command from a second launch. `Quit` travels on a separate registered
+  window message that is not let through UIPI, so a lower-integrity process
+  cannot quit the instance, and a normal-integrity launch cannot quit an
+  elevated one (the installer then falls back to `taskkill` after a timeout).
+  Opening Settings uses a message that is let through, since that is harmless.
 
 Reports about any of these or the installer are in scope.

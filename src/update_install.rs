@@ -140,13 +140,17 @@ fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
     })
 }
 
-/// Installs the update `info` on a worker thread: download, verify, start the
-/// installer. `on_done` gets the result there, after the flag is released. On
-/// success the installer asks this instance to quit and starts it again; if
-/// the installer then fails, this instance keeps running. Starts nothing while
-/// an earlier install is still running.
+/// Installs the update `info` on a worker thread: `on_start` runs there first,
+/// then download, verify, start the installer, then `on_done` gets the result.
+/// After a failure the in-flight flag is already released when `on_done` runs.
+/// After a success `on_done` runs with it still held, and it is released only
+/// when `on_done` returns, so `on_done` can wait for the installer to quit this
+/// instance (which then starts it again) without a second install starting
+/// meanwhile. If the installer fails, this instance keeps running. Starts
+/// nothing while an earlier install is still running.
 pub(crate) fn spawn_install(
     info: UpdateInfo,
+    on_start: impl FnOnce() + Send + 'static,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), SpawnError> {
     let Some(in_flight) = FlagGuard::acquire(&INSTALL_IN_FLIGHT) else {
@@ -155,12 +159,18 @@ pub(crate) fn spawn_install(
     std::thread::Builder::new()
         .name("update-install".into())
         .spawn(move || {
-            let result = install(&info);
-            if let Err(e) = &result {
-                log!("update install failed: {e}");
+            on_start();
+            match install(&info) {
+                Ok(()) => {
+                    on_done(Ok(()));
+                    drop(in_flight);
+                }
+                Err(e) => {
+                    log!("update install failed: {e}");
+                    drop(in_flight);
+                    on_done(Err(e));
+                }
             }
-            drop(in_flight);
-            on_done(result);
         })
         .map(drop)
         .map_err(|e| {

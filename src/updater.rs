@@ -12,6 +12,7 @@
 //! A development build (version `0.0.0`) never fetches anything.
 
 use crate::http::HttpError;
+use crate::profile_store::UpdateMode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -96,11 +97,12 @@ impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UpdateError::Network(e) => write!(f, "couldn't reach GitHub: {e}"),
-            // A 403 that is not a rate limit shows the same message.
-            UpdateError::HttpStatus(403 | 429) => {
+            // A 403 is not proof of a rate limit, so the message only says so
+            // as a possibility.
+            UpdateError::HttpStatus(status @ (403 | 429)) => {
                 write!(
                     f,
-                    "GitHub refused the request (rate limit?), try again later"
+                    "GitHub refused the request (HTTP {status}, possibly a rate limit), try again later"
                 )
             }
             UpdateError::HttpStatus(status) => {
@@ -282,6 +284,34 @@ pub(crate) fn check(
         download_url,
         sha256,
     }))
+}
+
+/// What the startup check does with its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupAction {
+    /// Nothing to install or offer. A failed check ends up here too: it is
+    /// only logged (by [`spawn_check`]), never shown, and not retried.
+    Nothing,
+    /// Install this update now, without asking.
+    InstallNow(UpdateInfo),
+    /// Offer this update as a tray item.
+    OfferInTray(UpdateInfo),
+}
+
+/// Decides what to do with the result of the startup check under `mode`.
+pub(crate) fn startup_action(
+    mode: UpdateMode,
+    result: Result<CheckOutcome, UpdateError>,
+) -> StartupAction {
+    match (result, mode) {
+        (Ok(CheckOutcome::UpdateAvailable(info)), UpdateMode::Auto) => {
+            StartupAction::InstallNow(info)
+        }
+        (Ok(CheckOutcome::UpdateAvailable(info)), UpdateMode::Ask) => {
+            StartupAction::OfferInTray(info)
+        }
+        _ => StartupAction::Nothing,
+    }
 }
 
 /// Fetches the latest-release JSON from GitHub; `None` when no release has been
@@ -627,11 +657,9 @@ mod tests {
             let message = UpdateError::HttpStatus(status).to_string();
             assert!(!message.contains("reach"), "{message}");
         }
-        assert!(
-            UpdateError::HttpStatus(403)
-                .to_string()
-                .contains("rate limit")
-        );
+        let forbidden = UpdateError::HttpStatus(403).to_string();
+        assert!(forbidden.contains("possibly a rate limit"), "{forbidden}");
+        assert!(forbidden.contains("403"), "{forbidden}");
         assert!(UpdateError::HttpStatus(500).to_string().contains("500"));
     }
 
@@ -883,6 +911,54 @@ mod tests {
             verify_sha256(Failing, SHA_ABC),
             Err(UpdateError::Download(e)) if e.contains("disk gone")
         ));
+    }
+
+    fn available() -> CheckOutcome {
+        CheckOutcome::UpdateAvailable(UpdateInfo {
+            version: Version(1, 2, 0),
+            download_url: "https://github.com/a.exe".into(),
+            sha256: SHA_A.into(),
+        })
+    }
+
+    #[test]
+    fn startup_action_installs_an_available_update_in_auto_mode() {
+        let CheckOutcome::UpdateAvailable(info) = available() else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            startup_action(UpdateMode::Auto, Ok(available())),
+            StartupAction::InstallNow(info)
+        );
+    }
+
+    #[test]
+    fn startup_action_offers_an_available_update_in_ask_mode() {
+        let CheckOutcome::UpdateAvailable(info) = available() else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            startup_action(UpdateMode::Ask, Ok(available())),
+            StartupAction::OfferInTray(info)
+        );
+    }
+
+    #[test]
+    fn startup_action_does_nothing_without_an_update_or_on_an_error() {
+        for mode in [UpdateMode::Auto, UpdateMode::Ask] {
+            for result in [
+                Ok(CheckOutcome::UpToDate),
+                Ok(CheckOutcome::DevelopmentBuild),
+                Ok(CheckOutcome::NoReleasePublished),
+                Err(UpdateError::Network("offline".into())),
+                Err(UpdateError::HttpStatus(403)),
+                Err(UpdateError::Malformed("x".into())),
+            ] {
+                assert_eq!(startup_action(mode, result), StartupAction::Nothing);
+            }
+        }
     }
 
     #[test]
