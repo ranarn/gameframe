@@ -25,17 +25,14 @@
 //! window.
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
-    TH32CS_SNAPMODULE32,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
 };
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-};
+use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GA_ROOTOWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup, GetWindowLongPtrW,
-    GetWindowThreadProcessId,
+    GA_ROOTOWNER, GetAncestor, GetClassNameW, GetLastActivePopup, GetWindowLongPtrW, GetWindowThreadProcessId,
+    GWL_EXSTYLE,
 };
 
 /// Decides whether a window is worth offering in the tray menu's "Apply to
@@ -151,11 +148,7 @@ pub enum WindowRank {
 /// the OS-facing signal gathering ([`matches_known_install`] callers,
 /// [`has_known_graphics_module`] callers, [`is_known_engine_window_class`]
 /// callers).
-pub(crate) fn rank_window(
-    is_launcher_match: bool,
-    has_graphics_module: bool,
-    has_known_engine_window_class: bool,
-) -> WindowRank {
+pub(crate) fn rank_window(is_launcher_match: bool, has_graphics_module: bool, has_known_engine_window_class: bool) -> WindowRank {
     if is_launcher_match {
         WindowRank::LauncherMatch
     } else if has_graphics_module {
@@ -170,8 +163,7 @@ pub(crate) fn rank_window(
 /// The Layer-2 window-class heuristic list: a small, explicitly-known set of
 /// game-engine window classes, used only as the weakest tie-breaker signal in
 /// [`rank_window`] -- never as an exclusion.
-const KNOWN_ENGINE_WINDOW_CLASSES: &[&str] =
-    &["UnrealWindow", "Direct3DWindowClass", "YYGameMakerYY"];
+const KNOWN_ENGINE_WINDOW_CLASSES: &[&str] = &["UnrealWindow", "Direct3DWindowClass", "YYGameMakerYY"];
 
 /// Prefixes for engine window classes that vary per-app (SDL/GLFW embed the
 /// hosting app's own name after a fixed prefix), checked in addition to
@@ -184,22 +176,13 @@ const KNOWN_ENGINE_WINDOW_CLASS_PREFIXES: &[&str] = &["SDL_app", "GLFW"];
 /// `GetClassNameW` call that supplies `class_name`.
 fn is_known_engine_window_class(class_name: &str) -> bool {
     KNOWN_ENGINE_WINDOW_CLASSES.contains(&class_name)
-        || KNOWN_ENGINE_WINDOW_CLASS_PREFIXES
-            .iter()
-            .any(|prefix| class_name.starts_with(prefix))
+        || KNOWN_ENGINE_WINDOW_CLASS_PREFIXES.iter().any(|prefix| class_name.starts_with(prefix))
 }
 
 /// The Layer-2 loaded-graphics-module list: DLLs whose presence in a
 /// process's already-loaded module list is a medium-confidence "this process
 /// talks to a graphics API" signal for [`rank_window`] -- never an exclusion.
-const KNOWN_GRAPHICS_MODULES: &[&str] = &[
-    "d3d9.dll",
-    "d3d11.dll",
-    "dxgi.dll",
-    "d3d12.dll",
-    "opengl32.dll",
-    "vulkan-1.dll",
-];
+const KNOWN_GRAPHICS_MODULES: &[&str] = &["d3d9.dll", "d3d11.dll", "dxgi.dll", "d3d12.dll", "opengl32.dll", "vulkan-1.dll"];
 
 /// Whether any of `loaded_module_names` (a process's already-loaded module
 /// list, as gathered via `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE |
@@ -208,11 +191,9 @@ const KNOWN_GRAPHICS_MODULES: &[&str] = &[
 /// string matching -- no OS dependency -- so it's unit testable in isolation
 /// from the real toolhelp snapshot that supplies `loaded_module_names`.
 fn has_known_graphics_module(loaded_module_names: &[String]) -> bool {
-    loaded_module_names.iter().any(|loaded| {
-        KNOWN_GRAPHICS_MODULES
-            .iter()
-            .any(|known| loaded.eq_ignore_ascii_case(known))
-    })
+    loaded_module_names
+        .iter()
+        .any(|loaded| KNOWN_GRAPHICS_MODULES.iter().any(|known| loaded.eq_ignore_ascii_case(known)))
 }
 
 /// Whether `exe_path` (a window's owning process's executable path, as
@@ -226,13 +207,8 @@ fn has_known_graphics_module(loaded_module_names: &[String]) -> bool {
 /// Pure path matching -- no OS/filesystem dependency -- so it's unit testable
 /// in isolation from the real `steamlocate`/`QueryFullProcessImageNameW`
 /// calls that supply `exe_path`/`known_install_dirs`.
-fn matches_known_install(
-    exe_path: &std::path::Path,
-    known_install_dirs: &[std::path::PathBuf],
-) -> bool {
-    known_install_dirs
-        .iter()
-        .any(|install_dir| exe_path.starts_with(install_dir))
+fn matches_known_install(exe_path: &std::path::Path, known_install_dirs: &[std::path::PathBuf]) -> bool {
+    known_install_dirs.iter().any(|install_dir| exe_path.starts_with(install_dir))
 }
 
 /// The two Layer-2 signals that are genuinely process-level -- an executable
@@ -266,10 +242,7 @@ pub(crate) struct ProcessRankSignals {
 /// OS-facing glue -- not exercised by this crate's automated tests -- see
 /// module docs; [`rank_window`] itself (the decision logic) is unit tested in
 /// isolation.
-pub(crate) fn rank_window_for_hwnd(
-    hwnd: HWND,
-    cache: &mut std::collections::HashMap<u32, ProcessRankSignals>,
-) -> WindowRank {
+pub(crate) fn rank_window_for_hwnd(hwnd: HWND, cache: &mut std::collections::HashMap<u32, ProcessRankSignals>) -> WindowRank {
     let mut pid: u32 = 0;
     // Safety: `hwnd` is a live handle; `&mut pid` is a valid out-pointer for
     // `GetWindowThreadProcessId`'s documented contract.
@@ -282,19 +255,12 @@ pub(crate) fn rank_window_for_hwnd(
             .map(|exe_path| matches_known_install(&exe_path, &known_steam_install_dirs()))
             .unwrap_or(false);
         let has_graphics_module = has_known_graphics_module(&loaded_module_names(pid));
-        ProcessRankSignals {
-            is_launcher_match,
-            has_graphics_module,
-        }
+        ProcessRankSignals { is_launcher_match, has_graphics_module }
     });
 
     let has_known_engine_class = is_known_engine_window_class(&window_class_name(hwnd));
 
-    rank_window(
-        process_signals.is_launcher_match,
-        process_signals.has_graphics_module,
-        has_known_engine_class,
-    )
+    rank_window(process_signals.is_launcher_match, process_signals.has_graphics_module, has_known_engine_class)
 }
 
 /// Reads a window's class name via `GetClassNameW`, returning an empty
@@ -353,9 +319,7 @@ pub(crate) fn process_exe_path(pid: u32) -> Option<std::path::PathBuf> {
     if ok == 0 {
         return None;
     }
-    Some(std::path::PathBuf::from(String::from_utf16_lossy(
-        &buffer[..size as usize],
-    )))
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize])))
 }
 
 /// Resolves the executable path of the process that owns `hwnd`, via
@@ -407,8 +371,7 @@ pub(crate) fn exe_path_for_window(hwnd: HWND) -> Option<std::path::PathBuf> {
 fn loaded_module_names(pid: u32) -> Vec<String> {
     // Safety: `pid` is a plain integer; `CreateToolhelp32Snapshot` takes no
     // pointers.
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Vec::new();
     }
@@ -422,11 +385,7 @@ fn loaded_module_names(pid: u32) -> Vec<String> {
     // `Module32FirstW`/`Module32NextW`'s documented contract.
     let mut has_entry = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
     while has_entry {
-        let len = entry
-            .szModule
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(entry.szModule.len());
+        let len = entry.szModule.iter().position(|&c| c == 0).unwrap_or(entry.szModule.len());
         names.push(String::from_utf16_lossy(&entry.szModule[..len]));
         // Safety: same as above.
         has_entry = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
@@ -447,8 +406,7 @@ type SteamInstallDirsSnapshot = (std::time::Instant, Vec<std::path::PathBuf>);
 /// (see [`known_steam_install_dirs`]) rather than on every
 /// `crate::win32::list_visible_windows` call.
 fn steam_install_dirs_cache() -> &'static std::sync::Mutex<Option<SteamInstallDirsSnapshot>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<SteamInstallDirsSnapshot>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<SteamInstallDirsSnapshot>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -469,14 +427,11 @@ const STEAM_INSTALL_DIRS_CACHE_TTL: std::time::Duration = std::time::Duration::f
 /// isolation.
 fn known_steam_install_dirs() -> Vec<std::path::PathBuf> {
     let cache = steam_install_dirs_cache();
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((cached_at, dirs)) = guard.as_ref()
-        && cached_at.elapsed() < STEAM_INSTALL_DIRS_CACHE_TTL
-    {
-        return dirs.clone();
-    }
+        && cached_at.elapsed() < STEAM_INSTALL_DIRS_CACHE_TTL {
+            return dirs.clone();
+        }
 
     let dirs = scan_steam_install_dirs();
     *guard = Some((std::time::Instant::now(), dirs.clone()));
@@ -578,16 +533,12 @@ mod tests {
 
     #[test]
     fn is_listable_window_accepts_a_visible_window_with_a_non_empty_title() {
-        assert!(is_listable_window(
-            "Notepad", true, false, true, false, false
-        ));
+        assert!(is_listable_window("Notepad", true, false, true, false, false));
     }
 
     #[test]
     fn is_listable_window_rejects_an_invisible_window() {
-        assert!(!is_listable_window(
-            "Notepad", false, false, true, false, false
-        ));
+        assert!(!is_listable_window("Notepad", false, false, true, false, false));
     }
 
     #[test]
@@ -602,30 +553,22 @@ mod tests {
 
     #[test]
     fn is_listable_window_rejects_a_cloaked_window_even_with_a_visible_non_blank_title() {
-        assert!(!is_listable_window(
-            "Notepad", true, true, true, false, false
-        ));
+        assert!(!is_listable_window("Notepad", true, true, true, false, false));
     }
 
     #[test]
     fn is_listable_window_rejects_an_owned_window_that_is_not_its_owners_last_active_popup() {
-        assert!(!is_listable_window(
-            "Helper", true, false, false, false, false
-        ));
+        assert!(!is_listable_window("Helper", true, false, false, false, false));
     }
 
     #[test]
     fn is_listable_window_accepts_a_non_root_owner_window_when_app_window_style_is_set() {
-        assert!(is_listable_window(
-            "Overlay", true, false, false, false, true
-        ));
+        assert!(is_listable_window("Overlay", true, false, false, false, true));
     }
 
     #[test]
     fn is_listable_window_rejects_a_tool_window() {
-        assert!(!is_listable_window(
-            "Toolbar", true, false, true, true, false
-        ));
+        assert!(!is_listable_window("Toolbar", true, false, true, true, false));
     }
 
     #[test]
@@ -634,15 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn is_listable_window_app_window_style_overrides_both_a_non_root_owner_and_a_tool_window_together()
-     {
+    fn is_listable_window_app_window_style_overrides_both_a_non_root_owner_and_a_tool_window_together() {
         // The strongest form of the documented WS_EX_APPWINDOW override:
         // forces inclusion even when BOTH other Layer-1 rejections
         // (non-representative owner-chain window AND tool-window style)
         // would otherwise apply simultaneously.
-        assert!(is_listable_window(
-            "Overlay", true, false, false, true, true
-        ));
+        assert!(is_listable_window("Overlay", true, false, false, true, true));
     }
 
     #[test]
@@ -657,18 +597,12 @@ mod tests {
 
     #[test]
     fn rank_window_with_a_loaded_graphics_module_ranks_below_a_launcher_match() {
-        assert_eq!(
-            rank_window(false, true, false),
-            WindowRank::GraphicsModuleLoaded
-        );
+        assert_eq!(rank_window(false, true, false), WindowRank::GraphicsModuleLoaded);
     }
 
     #[test]
     fn rank_window_with_a_known_engine_window_class_ranks_below_a_graphics_module() {
-        assert_eq!(
-            rank_window(false, false, true),
-            WindowRank::EngineWindowClass
-        );
+        assert_eq!(rank_window(false, false, true), WindowRank::EngineWindowClass);
     }
 
     #[test]
@@ -678,10 +612,7 @@ mod tests {
 
     #[test]
     fn rank_window_prioritizes_graphics_module_over_engine_window_class() {
-        assert_eq!(
-            rank_window(false, true, true),
-            WindowRank::GraphicsModuleLoaded
-        );
+        assert_eq!(rank_window(false, true, true), WindowRank::GraphicsModuleLoaded);
     }
 
     #[test]
@@ -714,28 +645,20 @@ mod tests {
 
     #[test]
     fn has_known_graphics_module_is_false_when_no_known_module_is_loaded() {
-        assert!(!has_known_graphics_module(&[
-            "kernel32.dll".to_string(),
-            "user32.dll".to_string()
-        ]));
+        assert!(!has_known_graphics_module(&["kernel32.dll".to_string(), "user32.dll".to_string()]));
     }
 
     #[test]
     fn matches_known_install_accepts_an_exe_inside_a_known_install_dir() {
-        let install_dir = std::path::PathBuf::from(
-            r"C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper",
-        );
+        let install_dir = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper");
         let exe_path = install_dir.join("GraveyardKeeper.exe");
         assert!(matches_known_install(&exe_path, &[install_dir]));
     }
 
     #[test]
     fn matches_known_install_rejects_an_exe_outside_every_known_install_dir() {
-        let install_dir = std::path::PathBuf::from(
-            r"C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper",
-        );
-        let exe_path =
-            std::path::PathBuf::from(r"C:\Users\Player\Downloads\SomeIndieGame\game.exe");
+        let install_dir = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper");
+        let exe_path = std::path::PathBuf::from(r"C:\Users\Player\Downloads\SomeIndieGame\game.exe");
         assert!(!matches_known_install(&exe_path, &[install_dir]));
     }
 }

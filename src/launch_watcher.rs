@@ -102,8 +102,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
 };
 
 /// The config directory the callback reloads the config from on every
@@ -165,6 +164,7 @@ pub fn unregister(hook: HWINEVENTHOOK) {
         UnhookWinEvent(hook);
     }
 }
+
 
 /// Registers the `EVENT_OBJECT_DESTROY` WinEvent hook on the calling
 /// thread -- issue #43's auto-restore-on-close watcher. Must be called

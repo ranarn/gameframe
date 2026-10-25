@@ -305,7 +305,9 @@ mod tests {
 
     #[test]
     fn commands_round_trip_through_the_wire_encoding() {
-        for command in [Command::OpenSettings] {
+        // Extend with every new variant.
+        const ALL: &[Command] = &[Command::OpenSettings];
+        for &command in ALL {
             assert_eq!(Command::from_wparam(command.to_wparam()), Some(command));
         }
     }

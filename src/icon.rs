@@ -43,14 +43,7 @@ pub fn mark_rgba(size: u32) -> Vec<u8> {
 
 /// Counts how many of the `SUPERSAMPLE * SUPERSAMPLE` sub-pixel samples of
 /// pixel `(px, py)` fall inside a bracket, for edge anti-aliasing.
-fn supersampled_coverage(
-    px: u32,
-    py: u32,
-    hi: f32,
-    margin: f32,
-    arm_len: f32,
-    thickness: f32,
-) -> u32 {
+fn supersampled_coverage(px: u32, py: u32, hi: f32, margin: f32, arm_len: f32, thickness: f32) -> u32 {
     let mut covered = 0;
     for sy in 0..SUPERSAMPLE {
         for sx in 0..SUPERSAMPLE {
@@ -65,9 +58,7 @@ fn supersampled_coverage(
 }
 
 fn lerp_gradient(t: f32) -> [u8; 3] {
-    std::array::from_fn(|i| {
-        (GRADIENT_START[i] + (GRADIENT_END[i] - GRADIENT_START[i]) * t).round() as u8
-    })
+    std::array::from_fn(|i| (GRADIENT_START[i] + (GRADIENT_END[i] - GRADIENT_START[i]) * t).round() as u8)
 }
 
 /// True if `(x, y)`, in the supersampled `hi`-sized canvas, falls inside one
@@ -82,21 +73,13 @@ fn in_bracket(x: f32, y: f32, hi: f32, margin: f32, arm_len: f32, thickness: f32
         (margin, far, 1.0, -1.0),
         (far, far, -1.0, -1.0),
     ];
-    corners
-        .iter()
-        .any(|&corner| in_arm_pair(x, y, corner, arm_len, thickness))
+    corners.iter().any(|&corner| in_arm_pair(x, y, corner, arm_len, thickness))
 }
 
 /// One corner's two arms: a horizontal band running along the corner's row
 /// and a vertical band running along its column, both `thickness` wide and
 /// `arm_len` long, extending from `(cx, cy)` toward the center by `(dx, dy)`.
-fn in_arm_pair(
-    x: f32,
-    y: f32,
-    (cx, cy, dx, dy): (f32, f32, f32, f32),
-    arm_len: f32,
-    thickness: f32,
-) -> bool {
+fn in_arm_pair(x: f32, y: f32, (cx, cy, dx, dy): (f32, f32, f32, f32), arm_len: f32, thickness: f32) -> bool {
     let in_range = |v: f32, a: f32, b: f32| v >= a.min(b) && v <= a.max(b);
 
     let horizontal = in_range(x, cx, cx + dx * arm_len) && in_range(y, cy, cy + dy * thickness);
@@ -122,17 +105,10 @@ mod tests {
 
         // Just inside the top-left margin, on the horizontal arm.
         let margin = (size as f32 * 0.14).round() as u32;
-        assert!(
-            pixel_alpha(margin + 2, margin) > 200,
-            "corner bracket pixel should be opaque"
-        );
+        assert!(pixel_alpha(margin + 2, margin) > 200, "corner bracket pixel should be opaque");
 
         // Dead center falls between all four inward-opening brackets.
-        assert_eq!(
-            pixel_alpha(size / 2, size / 2),
-            0,
-            "center should stay transparent"
-        );
+        assert_eq!(pixel_alpha(size / 2, size / 2), 0, "center should stay transparent");
     }
 
     #[test]
@@ -165,20 +141,13 @@ mod tests {
         }
 
         let (_, top_left) = nearest_top_left.expect("top-left bracket should have opaque pixels");
-        let (_, bottom_right) =
-            nearest_bottom_right.expect("bottom-right bracket should have opaque pixels");
+        let (_, bottom_right) = nearest_bottom_right.expect("bottom-right bracket should have opaque pixels");
 
         // Violet (GRADIENT_START) -> cyan (GRADIENT_END): red falls sharply,
         // green rises sharply. Blue stays high throughout (237 -> 212), so
         // it isn't a reliable discriminator between the two ends.
-        assert!(
-            top_left[0] > bottom_right[0],
-            "red should fall from top-left to bottom-right"
-        );
-        assert!(
-            top_left[1] < bottom_right[1],
-            "green should rise from top-left to bottom-right"
-        );
+        assert!(top_left[0] > bottom_right[0], "red should fall from top-left to bottom-right");
+        assert!(top_left[1] < bottom_right[1], "green should rise from top-left to bottom-right");
     }
 
     #[test]
@@ -186,15 +155,7 @@ mod tests {
         // At 16x16 the minimum-thickness clamp must still produce visible,
         // non-degenerate brackets rather than vanishing entirely.
         let rgba = mark_rgba(16);
-        let opaque_pixel_count = rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|p| p[3] > 128)
-            .count();
-        assert!(
-            opaque_pixel_count > 8,
-            "brackets should not disappear at 16x16, got {opaque_pixel_count} opaque pixels"
-        );
+        let opaque_pixel_count = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
+        assert!(opaque_pixel_count > 8, "brackets should not disappear at 16x16, got {opaque_pixel_count} opaque pixels");
     }
 }

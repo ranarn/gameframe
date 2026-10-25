@@ -45,8 +45,7 @@ use crate::taskbar_recovery;
 /// resizable sizing border, and `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX`/`WS_SYSMENU`
 /// the title-bar buttons/system menu that have no purpose once the title bar
 /// is gone.
-const BORDERLESS_STYLE_MASK: u32 =
-    WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+const BORDERLESS_STYLE_MASK: u32 = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
 
 /// Removes the border/title-bar style bits from a raw `GWL_STYLE` value,
 /// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`)
@@ -93,18 +92,9 @@ pub fn plan_toggle(
 ) -> (ToggleAction, Option<RestoreState>) {
     match remembered {
         None => {
-            let restore = RestoreState {
-                style: live_style,
-                region: live_region,
-            };
+            let restore = RestoreState { style: live_style, region: live_region };
             let new_style = strip_border_style(live_style);
-            (
-                ToggleAction::MakeBorderless {
-                    new_style,
-                    region: target_region,
-                },
-                Some(restore),
-            )
+            (ToggleAction::MakeBorderless { new_style, region: target_region }, Some(restore))
         }
         Some(restore) => (ToggleAction::Restore(restore), None),
     }
@@ -170,10 +160,7 @@ pub enum TaskbarHideRestore {
 ///   `AlwaysVisible`.
 ///
 /// Pure decision logic -- no OS call.
-pub fn plan_taskbar_hide(
-    mode: TaskbarHideMode,
-    current: TaskbarAutohideState,
-) -> TaskbarHideRestore {
+pub fn plan_taskbar_hide(mode: TaskbarHideMode, current: TaskbarAutohideState) -> TaskbarHideRestore {
     match mode {
         TaskbarHideMode::FullyHidden => TaskbarHideRestore::FullyHidden,
         TaskbarHideMode::HoverReveal => TaskbarHideRestore::HoverReveal(current),
@@ -267,14 +254,8 @@ impl std::fmt::Display for Win32Error {
             Win32Error::NoForegroundWindow => write!(f, "no foreground window to manipulate"),
             Win32Error::WindowMinimized => write!(f, "window is minimized"),
             Win32Error::Os(e) => write!(f, "Win32 window manipulation failed: {e}"),
-            Win32Error::Hresult(hr) => write!(
-                f,
-                "Win32 window manipulation failed: HRESULT {:#010x}",
-                *hr as u32
-            ),
-            Win32Error::TaskbarNotFound => {
-                write!(f, "could not find the taskbar window (Shell_TrayWnd)")
-            }
+            Win32Error::Hresult(hr) => write!(f, "Win32 window manipulation failed: HRESULT {:#010x}", *hr as u32),
+            Win32Error::TaskbarNotFound => write!(f, "could not find the taskbar window (Shell_TrayWnd)"),
         }
     }
 }
@@ -295,20 +276,19 @@ use crate::window_filter::{self, WindowRank};
 use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::UI::Shell::{
     ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOW,
-    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WindowFromPoint,
+    EnumWindows, FindWindowW, GetAncestor, GetForegroundWindow, WindowFromPoint, GA_ROOT, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_STYLE, SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNORMAL,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -327,9 +307,7 @@ fn get_window_style(hwnd: HWND) -> Result<u32, Win32Error> {
         if style == 0 {
             let last_error = windows_sys::Win32::Foundation::GetLastError();
             if last_error != 0 {
-                return Err(Win32Error::Os(std::io::Error::from_raw_os_error(
-                    last_error as i32,
-                )));
+                return Err(Win32Error::Os(std::io::Error::from_raw_os_error(last_error as i32)));
             }
         }
         style
@@ -355,9 +333,7 @@ fn set_window_style(hwnd: HWND, style: u32) -> Result<(), Win32Error> {
         if previous_style == 0 {
             let last_error = windows_sys::Win32::Foundation::GetLastError();
             if last_error != 0 {
-                return Err(Win32Error::Os(std::io::Error::from_raw_os_error(
-                    last_error as i32,
-                )));
+                return Err(Win32Error::Os(std::io::Error::from_raw_os_error(last_error as i32)));
             }
         }
     }
@@ -374,12 +350,7 @@ fn get_window_region(hwnd: HWND) -> Result<Region, Win32Error> {
     if ok == 0 {
         return Err(Win32Error::Os(std::io::Error::last_os_error()));
     }
-    Ok(Region {
-        x: rect.left,
-        y: rect.top,
-        width: rect.right - rect.left,
-        height: rect.bottom - rect.top,
-    })
+    Ok(Region { x: rect.left, y: rect.top, width: rect.right - rect.left, height: rect.bottom - rect.top })
 }
 
 /// Moves/resizes a window to `region` without changing its z-order or
@@ -395,15 +366,7 @@ fn set_window_region(hwnd: HWND, region: Region) -> Result<(), Win32Error> {
     // Safety: `hwnd` is a live handle; `SetWindowPos` takes only plain
     // integers besides it.
     let ok = unsafe {
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            region.x,
-            region.y,
-            region.width,
-            region.height,
-            FLAGS,
-        )
+        SetWindowPos(hwnd, std::ptr::null_mut(), region.x, region.y, region.width, region.height, FLAGS)
     };
     if ok == 0 {
         return Err(Win32Error::Os(std::io::Error::last_os_error()));
@@ -471,28 +434,18 @@ pub fn remember_applied_window(hwnd: HWND) {
 
 /// Whether `hwnd` was previously registered via [`remember_applied_window`].
 pub fn is_applied_window(hwnd: HWND) -> bool {
-    APPLIED_WINDOWS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&(hwnd as isize))
+    APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).contains(&(hwnd as isize))
 }
 
 /// Forgets `hwnd` (called when it is destroyed).
 pub fn forget_applied_window(hwnd: HWND) {
-    APPLIED_WINDOWS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|h| *h != hwnd as isize);
+    APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).retain(|h| *h != hwnd as isize);
 }
 
 /// Reads `hwnd`'s live bounds/style and reports [`window_drifted`] against
 /// `target`. OS-facing.
 pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error> {
-    Ok(window_drifted(
-        get_window_region(hwnd)?,
-        get_window_style(hwnd)?,
-        target,
-    ))
+    Ok(window_drifted(get_window_region(hwnd)?, get_window_style(hwnd)?, target))
 }
 
 /// Strips a window's border and moves/resizes it to `target_region`: the
@@ -641,7 +594,11 @@ pub fn foreground_window() -> Option<HWND> {
     // writes; its result is null-checked immediately below before any other
     // call uses it.
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() { None } else { Some(hwnd) }
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
 }
 
 /// Resolves the current foreground window's owning process's executable
@@ -801,6 +758,7 @@ pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Err
     Ok((visible, state_from_flags(read_appbar_flags(hwnd))))
 }
 
+
 /// Reference-counted arming state for issue #43's auto-restore-on-close
 /// feature (see [`ArmedTaskbarWindows`] for the transition logic). Tracks
 /// every window whose apply-path has hidden the taskbar and is still
@@ -848,8 +806,7 @@ pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Err
 /// or written by [`toggle_taskbar_hide`] or the zone editor's own
 /// session-scoped hide (`crate::zone_overlay`, which keeps its remembered
 /// [`TaskbarHideRestore`] locally in its own guard struct, not here).
-static ARMED_TASKBAR_RESTORE: std::sync::Mutex<Option<ArmedTaskbarWindows>> =
-    std::sync::Mutex::new(None);
+static ARMED_TASKBAR_RESTORE: std::sync::Mutex<Option<ArmedTaskbarWindows>> = std::sync::Mutex::new(None);
 
 /// Pure reference-counted arming state backing [`ARMED_TASKBAR_RESTORE`],
 /// factored out so its transitions are unit testable without touching the
@@ -904,11 +861,7 @@ impl ArmedTaskbarWindows {
     /// in [`ARMED_TASKBAR_RESTORE`]'s doc comment).
     fn leave(&mut self, hwnd_id: isize) -> Option<TaskbarHideRestore> {
         self.windows.remove(&hwnd_id);
-        if self.windows.is_empty() {
-            self.restore.take()
-        } else {
-            None
-        }
+        if self.windows.is_empty() { self.restore.take() } else { None }
     }
 
     /// Unconditionally ends the session (if any), returning the remembered
@@ -933,9 +886,7 @@ impl ArmedTaskbarWindows {
 /// this whole feature for the rest of the process's life the moment any
 /// panic anywhere happens to occur while the lock is held.
 fn with_armed_taskbar_windows<R>(f: impl FnOnce(&mut ArmedTaskbarWindows) -> R) -> R {
-    let mut guard = ARMED_TASKBAR_RESTORE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = ARMED_TASKBAR_RESTORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     f(guard.get_or_insert_with(ArmedTaskbarWindows::default))
 }
 
@@ -1105,28 +1056,18 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 ///
 /// OS-facing (delegates to [`hide_taskbar`]/[`set_taskbar_hide_absolute`]).
 /// Not exercised by this crate's automated tests -- see module docs.
-pub fn set_taskbar_hide_absolute_armed(
-    hwnd: HWND,
-    hide: bool,
-    mode: TaskbarHideMode,
-) -> Result<(), Win32Error> {
+pub fn set_taskbar_hide_absolute_armed(hwnd: HWND, hide: bool, mode: TaskbarHideMode) -> Result<(), Win32Error> {
     if hide {
         if is_taskbar_hide_session_active() {
             // Issue #52 finding 3: no OS call here, so a taskbar the hotkey
             // showed in the meantime stays visible.
-            log!(
-                "taskbar hide for {hwnd:?}: joining the active session (no OS call); {}",
-                taskbar_debug_state()
-            );
+            log!("taskbar hide for {hwnd:?}: joining the active session (no OS call); {}", taskbar_debug_state());
             join_taskbar_hide_session(hwnd);
             Ok(())
         } else {
             let restore = hide_taskbar(mode)?;
             start_taskbar_hide_session(hwnd, restore);
-            log!(
-                "taskbar hide for {hwnd:?}: started a session ({mode:?}); {}",
-                taskbar_debug_state()
-            );
+            log!("taskbar hide for {hwnd:?}: started a session ({mode:?}); {}", taskbar_debug_state());
             Ok(())
         }
     } else if is_last_armed_window(hwnd) {
@@ -1193,10 +1134,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
 pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
     // Issue #52: the hotkey sometimes does nothing after long uptime. Log
     // what it saw and what it left behind so a report comes with evidence.
-    log!(
-        "taskbar hotkey ({mode:?}): before: {}",
-        taskbar_debug_state()
-    );
+    log!("taskbar hotkey ({mode:?}): before: {}", taskbar_debug_state());
     let hidden = is_taskbar_hidden(mode)?;
     let result = set_taskbar_hide_absolute(!hidden, mode);
     log!(
@@ -1215,19 +1153,11 @@ pub fn taskbar_debug_state() -> String {
     let Ok(taskbar) = find_taskbar_window() else {
         return "Shell_TrayWnd not found".to_string();
     };
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     // Safety: plain queries on live handles with valid out-pointers.
     let (visible, on_top, foreground) = unsafe {
         GetWindowRect(taskbar, &mut rect);
-        let center = POINT {
-            x: (rect.left + rect.right) / 2,
-            y: (rect.top + rect.bottom) / 2,
-        };
+        let center = POINT { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
         let at_center = WindowFromPoint(center);
         let on_top = !at_center.is_null() && GetAncestor(at_center, GA_ROOT) == taskbar;
         (IsWindowVisible(taskbar) != 0, on_top, GetForegroundWindow())
@@ -1237,15 +1167,10 @@ pub fn taskbar_debug_state() -> String {
         "none".to_string()
     } else {
         window_filter::exe_path_for_window(foreground)
-            .map(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            })
+            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
             .unwrap_or_else(|| "?".to_string())
     };
-    let (armed, has_restore) =
-        with_armed_taskbar_windows(|s| (s.windows.len(), s.restore.is_some()));
+    let (armed, has_restore) = with_armed_taskbar_windows(|s| (s.windows.len(), s.restore.is_some()));
     format!(
         "visible={visible} appbar_flags={flags:#x} rect=({},{})-({},{}) on_top_at_center={on_top} \
          foreground={foreground:?} ({foreground_exe}) armed_windows={armed} armed_restore={has_restore}",
@@ -1368,14 +1293,7 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
     // pointer arguments (`hwnd`, `lpdirectory`) are null, which
     // `ShellExecuteW` documents as valid ("use current/none").
     let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            params.as_ptr(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), std::ptr::null(), SW_SHOWNORMAL)
     };
     // Per ShellExecuteW's documented contract, a return value greater than
     // 32 indicates success; anything else IS the failure code itself (e.g.
@@ -1386,9 +1304,7 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
     // call.
     let code = result as isize;
     if code <= 32 {
-        return Err(Win32Error::Os(std::io::Error::from_raw_os_error(
-            code as i32,
-        )));
+        return Err(Win32Error::Os(std::io::Error::from_raw_os_error(code as i32)));
     }
     Ok(())
 }
@@ -1413,20 +1329,14 @@ struct EnumWindowsState {
 }
 
 pub fn list_visible_windows() -> Vec<(HWND, String)> {
-    let mut state = EnumWindowsState {
-        windows: Vec::new(),
-        rank_cache: std::collections::HashMap::new(),
-    };
+    let mut state = EnumWindowsState { windows: Vec::new(), rank_cache: std::collections::HashMap::new() };
     // Safety: `state` outlives this call (it's a local that isn't dropped
     // until after `EnumWindows` returns); it's cast to a raw pointer solely
     // to smuggle it through `EnumWindows`'s documented `LPARAM` userdata
     // parameter, and `enum_windows_callback` below casts it back to the
     // exact same type before dereferencing it.
     unsafe {
-        EnumWindows(
-            Some(enum_windows_callback),
-            std::ptr::addr_of_mut!(state) as isize,
-        );
+        EnumWindows(Some(enum_windows_callback), std::ptr::addr_of_mut!(state) as isize);
     }
     // Layer 2: a stable sort
     // by descending `WindowRank` surfaces likely games first in the picker,
@@ -1435,11 +1345,7 @@ pub fn list_visible_windows() -> Vec<(HWND, String)> {
     // sort, so windows that tie on rank keep the relative order `EnumWindows`
     // produced them in (roughly Z-order).
     state.windows.sort_by_key(|w| std::cmp::Reverse(w.2));
-    state
-        .windows
-        .into_iter()
-        .map(|(hwnd, title, _rank)| (hwnd, title))
-        .collect()
+    state.windows.into_iter().map(|(hwnd, title, _rank)| (hwnd, title)).collect()
 }
 
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i32 {
@@ -1615,18 +1521,12 @@ unsafe extern "system" fn enum_windows_for_pid_callback(hwnd: HWND, lparam: isiz
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
 fn windows_for_pid(target_pid: u32) -> Vec<HWND> {
-    let mut state = PidWindowsState {
-        target_pid,
-        windows: Vec::new(),
-    };
+    let mut state = PidWindowsState { target_pid, windows: Vec::new() };
     // Safety: `state` outlives this call; see `list_visible_windows`'s
     // identical `EnumWindows` safety comment for why casting it through a
     // raw pointer here is sound.
     unsafe {
-        EnumWindows(
-            Some(enum_windows_for_pid_callback),
-            std::ptr::addr_of_mut!(state) as isize,
-        );
+        EnumWindows(Some(enum_windows_for_pid_callback), std::ptr::addr_of_mut!(state) as isize);
     }
     state.windows
 }
@@ -1672,11 +1572,7 @@ fn find_pid_by_exe_path(exe_path: &Path) -> Option<u32> {
     let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
     let mut found_pid = None;
     while has_entry {
-        let len = entry
-            .szExeFile
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(entry.szExeFile.len());
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
         let file_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
 
         if exe_file_name_matches(&file_name, exe_path)
@@ -1704,9 +1600,7 @@ fn find_pid_by_exe_path(exe_path: &Path) -> Option<u32> {
 /// simply never wins on size, it can still win via the foreground-match or
 /// first-found rules.
 fn window_area(hwnd: HWND) -> i64 {
-    get_window_region(hwnd)
-        .map(|r| r.width as i64 * r.height as i64)
-        .unwrap_or(0)
+    get_window_region(hwnd).map(|r| r.width as i64 * r.height as i64).unwrap_or(0)
 }
 
 /// Picks a single top-level window to treat as "the" window for `pid`,
@@ -1718,10 +1612,8 @@ fn window_area(hwnd: HWND) -> i64 {
 /// docs; [`choose_candidate_window`] above is the pure decision this
 /// delegates to, and is what's actually unit tested.
 fn resolve_hwnd_for_pid(pid: u32) -> Option<HWND> {
-    let candidates: Vec<(HWND, i64)> = windows_for_pid(pid)
-        .into_iter()
-        .map(|hwnd| (hwnd, window_area(hwnd)))
-        .collect();
+    let candidates: Vec<(HWND, i64)> =
+        windows_for_pid(pid).into_iter().map(|hwnd| (hwnd, window_area(hwnd))).collect();
     choose_candidate_window(&candidates, foreground_window())
 }
 
@@ -1846,42 +1738,22 @@ mod tests {
     // 0x14000000 -> 0x14CF0000) and GameFrame never re-applied.
     #[test]
     fn window_drifted_detects_the_last_epoch_settings_change() {
-        let target = Region {
-            x: 1660,
-            y: 0,
-            width: 3460,
-            height: 1440,
-        };
-        let drifted = Region {
-            x: 632,
-            y: 0,
-            width: 3856,
-            height: 1479,
-        };
+        let target = Region { x: 1660, y: 0, width: 3460, height: 1440 };
+        let drifted = Region { x: 632, y: 0, width: 3856, height: 1479 };
 
         assert!(window_drifted(drifted, 0x14CF0000, target));
     }
 
     #[test]
     fn window_drifted_detects_a_restored_caption_even_when_bounds_match() {
-        let target = Region {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-        };
+        let target = Region { x: 0, y: 0, width: 100, height: 100 };
 
         assert!(window_drifted(target, 0x14CF0000, target));
     }
 
     #[test]
     fn window_drifted_is_false_for_the_state_gameframe_itself_applied() {
-        let target = Region {
-            x: 1660,
-            y: 0,
-            width: 3460,
-            height: 1440,
-        };
+        let target = Region { x: 1660, y: 0, width: 3460, height: 1440 };
 
         assert!(!window_drifted(target, 0x14000000, target));
     }
@@ -1908,61 +1780,31 @@ mod tests {
     #[test]
     fn plan_toggle_with_nothing_remembered_strips_the_border_and_remembers_the_live_state() {
         let live_style = WS_CAPTION | WS_THICKFRAME;
-        let live_region = Region {
-            x: 10,
-            y: 20,
-            width: 800,
-            height: 600,
-        };
-        let target_region = Region {
-            x: 0,
-            y: 0,
-            width: 960,
-            height: 1080,
-        };
+        let live_region = Region { x: 10, y: 20, width: 800, height: 600 };
+        let target_region = Region { x: 0, y: 0, width: 960, height: 1080 };
 
         let (action, next_state) = plan_toggle(None, live_style, live_region, target_region);
 
         assert_eq!(
             action,
-            ToggleAction::MakeBorderless {
-                new_style: strip_border_style(live_style),
-                region: target_region
-            }
+            ToggleAction::MakeBorderless { new_style: strip_border_style(live_style), region: target_region }
         );
-        assert_eq!(
-            next_state,
-            Some(RestoreState {
-                style: live_style,
-                region: live_region
-            })
-        );
+        assert_eq!(next_state, Some(RestoreState { style: live_style, region: live_region }));
     }
 
     #[test]
     fn plan_toggle_with_a_remembered_state_restores_it_and_forgets_it() {
         let remembered = RestoreState {
             style: WS_CAPTION | WS_THICKFRAME,
-            region: Region {
-                x: 10,
-                y: 20,
-                width: 800,
-                height: 600,
-            },
+            region: Region { x: 10, y: 20, width: 800, height: 600 },
         };
         // Live style/region reflect the currently-borderless window; they're
         // irrelevant to this branch since we're restoring the remembered
         // state, not the live one.
         let live_style = strip_border_style(remembered.style);
-        let target_region = Region {
-            x: 0,
-            y: 0,
-            width: 960,
-            height: 1080,
-        };
+        let target_region = Region { x: 0, y: 0, width: 960, height: 1080 };
 
-        let (action, next_state) =
-            plan_toggle(Some(remembered), live_style, target_region, target_region);
+        let (action, next_state) = plan_toggle(Some(remembered), live_style, target_region, target_region);
 
         assert_eq!(action, ToggleAction::Restore(remembered));
         assert_eq!(next_state, None);
@@ -1971,42 +1813,21 @@ mod tests {
     #[test]
     fn pressing_the_hotkey_twice_round_trips_back_to_the_original_style_and_region() {
         let original_style = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU;
-        let original_region = Region {
-            x: 10,
-            y: 20,
-            width: 800,
-            height: 600,
-        };
-        let target_region = Region {
-            x: 0,
-            y: 0,
-            width: 960,
-            height: 1080,
-        };
+        let original_region = Region { x: 10, y: 20, width: 800, height: 600 };
+        let target_region = Region { x: 0, y: 0, width: 960, height: 1080 };
 
         let (first_action, state_after_first) =
             plan_toggle(None, original_style, original_region, target_region);
-        let ToggleAction::MakeBorderless {
-            new_style: stripped_style,
-            ..
-        } = first_action
-        else {
+        let ToggleAction::MakeBorderless { new_style: stripped_style, .. } = first_action else {
             panic!("expected MakeBorderless on the first press");
         };
 
-        let (second_action, state_after_second) = plan_toggle(
-            state_after_first,
-            stripped_style,
-            target_region,
-            target_region,
-        );
+        let (second_action, state_after_second) =
+            plan_toggle(state_after_first, stripped_style, target_region, target_region);
 
         assert_eq!(
             second_action,
-            ToggleAction::Restore(RestoreState {
-                style: original_style,
-                region: original_region
-            })
+            ToggleAction::Restore(RestoreState { style: original_style, region: original_region })
         );
         assert_eq!(state_after_second, None);
     }
@@ -2028,8 +1849,7 @@ mod tests {
         let foreground = 1usize as HWND;
         let larger = 2usize as HWND;
 
-        let chosen =
-            choose_candidate_window(&[(foreground, 10), (larger, 10_000)], Some(foreground));
+        let chosen = choose_candidate_window(&[(foreground, 10), (larger, 10_000)], Some(foreground));
 
         assert_eq!(chosen, Some(foreground));
     }
@@ -2093,18 +1913,12 @@ mod tests {
     fn taskbar_autohide_state_default_is_always_visible() {
         // Fresh install / first press starts from "always visible" -- the
         // taskbar's normal, un-toggled state.
-        assert_eq!(
-            TaskbarAutohideState::default(),
-            TaskbarAutohideState::AlwaysVisible
-        );
+        assert_eq!(TaskbarAutohideState::default(), TaskbarAutohideState::AlwaysVisible);
     }
 
     #[test]
     fn apply_autohide_state_sets_the_autohide_bit_when_no_bits_are_currently_set() {
-        assert_eq!(
-            apply_autohide_state(0, TaskbarAutohideState::AutoHidden),
-            ABS_AUTOHIDE
-        );
+        assert_eq!(apply_autohide_state(0, TaskbarAutohideState::AutoHidden), ABS_AUTOHIDE);
     }
 
     #[test]
@@ -2131,8 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_autohide_state_restoring_always_visible_does_not_add_an_always_on_top_bit_that_was_not_already_set()
-     {
+    fn apply_autohide_state_restoring_always_visible_does_not_add_an_always_on_top_bit_that_was_not_already_set() {
         let current_flags = ABS_AUTOHIDE;
 
         let new_flags = apply_autohide_state(current_flags, TaskbarAutohideState::AlwaysVisible);
@@ -2141,20 +1954,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_taskbar_hide_in_fully_hidden_mode_always_remembers_fully_hidden_regardless_of_current_appbar_state()
-     {
+    fn plan_taskbar_hide_in_fully_hidden_mode_always_remembers_fully_hidden_regardless_of_current_appbar_state() {
         assert_eq!(
-            plan_taskbar_hide(
-                TaskbarHideMode::FullyHidden,
-                TaskbarAutohideState::AlwaysVisible
-            ),
+            plan_taskbar_hide(TaskbarHideMode::FullyHidden, TaskbarAutohideState::AlwaysVisible),
             TaskbarHideRestore::FullyHidden
         );
         assert_eq!(
-            plan_taskbar_hide(
-                TaskbarHideMode::FullyHidden,
-                TaskbarAutohideState::AutoHidden
-            ),
+            plan_taskbar_hide(TaskbarHideMode::FullyHidden, TaskbarAutohideState::AutoHidden),
             TaskbarHideRestore::FullyHidden
         );
     }
@@ -2162,36 +1968,25 @@ mod tests {
     #[test]
     fn plan_taskbar_hide_in_hover_reveal_mode_remembers_whatever_appbar_state_was_current() {
         assert_eq!(
-            plan_taskbar_hide(
-                TaskbarHideMode::HoverReveal,
-                TaskbarAutohideState::AlwaysVisible
-            ),
+            plan_taskbar_hide(TaskbarHideMode::HoverReveal, TaskbarAutohideState::AlwaysVisible),
             TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AlwaysVisible)
         );
         assert_eq!(
-            plan_taskbar_hide(
-                TaskbarHideMode::HoverReveal,
-                TaskbarAutohideState::AutoHidden
-            ),
+            plan_taskbar_hide(TaskbarHideMode::HoverReveal, TaskbarAutohideState::AutoHidden),
             TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AutoHidden)
         );
     }
 
     #[test]
     fn taskbar_autohide_state_from_bool_true_maps_to_auto_hidden() {
-        assert_eq!(
-            taskbar_autohide_state_from_bool(true),
-            TaskbarAutohideState::AutoHidden
-        );
+        assert_eq!(taskbar_autohide_state_from_bool(true), TaskbarAutohideState::AutoHidden);
     }
 
     #[test]
     fn taskbar_autohide_state_from_bool_false_maps_to_always_visible() {
-        assert_eq!(
-            taskbar_autohide_state_from_bool(false),
-            TaskbarAutohideState::AlwaysVisible
-        );
+        assert_eq!(taskbar_autohide_state_from_bool(false), TaskbarAutohideState::AlwaysVisible);
     }
+
 
     /// Issue #43's reference-counted armed-window state (pure -- no OS
     /// call, no shared static touched, unlike `take_armed_taskbar_restore_for_window`
@@ -2225,16 +2020,12 @@ mod tests {
 
         let restore_after_a_closes = state.leave(window_a);
 
-        assert_eq!(
-            restore_after_a_closes, None,
-            "window B still wants the taskbar hidden"
-        );
+        assert_eq!(restore_after_a_closes, None, "window B still wants the taskbar hidden");
         assert!(state.is_active());
     }
 
     #[test]
-    fn armed_taskbar_windows_restores_the_original_pre_first_hide_value_once_the_last_window_closes()
-     {
+    fn armed_taskbar_windows_restores_the_original_pre_first_hide_value_once_the_last_window_closes() {
         let mut state = ArmedTaskbarWindows::default();
         let window_a = 1isize;
         let window_b = 2isize;
@@ -2263,8 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_taskbar_windows_leave_of_an_unarmed_window_returns_none_and_leaves_the_session_untouched()
-     {
+    fn armed_taskbar_windows_leave_of_an_unarmed_window_returns_none_and_leaves_the_session_untouched() {
         let mut state = ArmedTaskbarWindows::default();
         state.start(1, TaskbarHideRestore::FullyHidden);
 
@@ -2289,8 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_taskbar_windows_take_all_clears_the_whole_session_and_returns_the_restore_value_regardless_of_how_many_windows_were_armed()
-     {
+    fn armed_taskbar_windows_take_all_clears_the_whole_session_and_returns_the_restore_value_regardless_of_how_many_windows_were_armed() {
         let mut state = ArmedTaskbarWindows::default();
         state.start(1, TaskbarHideRestore::FullyHidden);
         state.join(2);
@@ -2323,8 +2112,7 @@ mod tests {
     /// never leaves the real taskbar hidden.
     #[test]
     #[ignore = "OS-facing: mutates the real taskbar window; run manually with --ignored"]
-    fn hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility()
-     {
+    fn hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility() {
         struct RestoreOnDrop;
         impl Drop for RestoreOnDrop {
             fn drop(&mut self) {
@@ -2333,24 +2121,17 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
 
-        hide_taskbar_completely()
-            .expect("hide_taskbar_completely should succeed on a real desktop session");
+        hide_taskbar_completely().expect("hide_taskbar_completely should succeed on a real desktop session");
         let visible_while_hidden = unsafe { IsWindowVisible(hwnd) };
-        assert_eq!(
-            visible_while_hidden, 0,
-            "Shell_TrayWnd should be invisible after hide_taskbar_completely"
-        );
+        assert_eq!(visible_while_hidden, 0, "Shell_TrayWnd should be invisible after hide_taskbar_completely");
 
         show_taskbar().expect("show_taskbar should succeed on a real desktop session");
         let visible_after_show = unsafe { IsWindowVisible(hwnd) };
-        assert_ne!(
-            visible_after_show, 0,
-            "Shell_TrayWnd should be visible again after show_taskbar"
-        );
+        assert_ne!(visible_after_show, 0, "Shell_TrayWnd should be visible again after show_taskbar");
     }
+
 
     /// Manual, real-OS verification for issue #43's auto-restore-on-close
     /// feature: exercises the exact same two calls
@@ -2372,8 +2153,7 @@ mod tests {
     /// never leaves the real taskbar hidden.
     #[test]
     #[ignore = "OS-facing: mutates the real taskbar window; run manually with --ignored"]
-    fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_restores_the_real_taskbar_on_a_simulated_window_close()
-     {
+    fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_restores_the_real_taskbar_on_a_simulated_window_close() {
         struct RestoreOnDrop;
         impl Drop for RestoreOnDrop {
             fn drop(&mut self) {
@@ -2382,8 +2162,7 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let taskbar_hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
         // A fabricated identity for "the game window that was hidden" --
         // never dereferenced, only compared (see doc comment above).
         let fake_game_hwnd = 0xDEAD_usize as HWND;
@@ -2391,10 +2170,7 @@ mod tests {
         set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
             .expect("hide should succeed on a real desktop session");
         let visible_while_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
-        assert_eq!(
-            visible_while_hidden, 0,
-            "Shell_TrayWnd should be invisible after arming a hide for fake_game_hwnd"
-        );
+        assert_eq!(visible_while_hidden, 0, "Shell_TrayWnd should be invisible after arming a hide for fake_game_hwnd");
 
         // Simulate `window_destroy_callback`'s own logic exactly: take the
         // armed restore for the "closed" window's HWND, then apply it.
@@ -2424,8 +2200,7 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let taskbar_hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
         let armed_hwnd = 0xDEAD_usize as HWND;
         let unrelated_hwnd = 0xBEEF_usize as HWND;
 
@@ -2445,9 +2220,8 @@ mod tests {
         // Clean up: take the real armed restore and apply it (also
         // verifies the armed state survived the unrelated take attempt
         // above untouched).
-        let restore = take_armed_taskbar_restore_for_window(armed_hwnd).expect(
-            "the original armed restore should still be armed after the unrelated take attempt",
-        );
+        let restore = take_armed_taskbar_restore_for_window(armed_hwnd)
+            .expect("the original armed restore should still be armed after the unrelated take attempt");
         restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
     }
 
@@ -2462,8 +2236,7 @@ mod tests {
     /// above).
     #[test]
     #[ignore = "OS-facing: mutates the real taskbar window; run manually with --ignored"]
-    fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_of_two_armed_windows_closes()
-     {
+    fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_of_two_armed_windows_closes() {
         struct RestoreOnDrop;
         impl Drop for RestoreOnDrop {
             fn drop(&mut self) {
@@ -2472,8 +2245,7 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let taskbar_hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
         let window_a = 0x1111_usize as HWND;
         let window_b = 0x2222_usize as HWND;
 
@@ -2482,10 +2254,7 @@ mod tests {
         set_taskbar_hide_absolute_armed(window_b, true, TaskbarHideMode::FullyHidden)
             .expect("hiding for window B (joining the already-active session) should succeed");
         let visible_while_both_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
-        assert_eq!(
-            visible_while_both_hidden, 0,
-            "Shell_TrayWnd should be invisible while both windows are armed"
-        );
+        assert_eq!(visible_while_both_hidden, 0, "Shell_TrayWnd should be invisible while both windows are armed");
 
         // Simulate window A closing: the destroy watcher's own logic.
         assert!(
@@ -2499,9 +2268,8 @@ mod tests {
         );
 
         // Now simulate window B closing -- the last armed window.
-        let restore = take_armed_taskbar_restore_for_window(window_b).expect(
-            "window B was the last armed window, so a restore value should now be returned",
-        );
+        let restore = take_armed_taskbar_restore_for_window(window_b)
+            .expect("window B was the last armed window, so a restore value should now be returned");
         restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
 
         let visible_after_b_closes = unsafe { IsWindowVisible(taskbar_hwnd) };
@@ -2511,6 +2279,7 @@ mod tests {
         );
     }
 
+
     /// Manual, real-OS verification for issue #43's tray-"Exit" auto-restore
     /// path: exercises the exact same two calls `crate::app::run` makes
     /// after `run_event_loop` returns (`take_any_armed_taskbar_restore`
@@ -2518,8 +2287,7 @@ mod tests {
     /// caveats as the tests above.
     #[test]
     #[ignore = "OS-facing: mutates the real taskbar window; run manually with --ignored"]
-    fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar_regardless_of_which_window_was_armed()
-     {
+    fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar_regardless_of_which_window_was_armed() {
         struct RestoreOnDrop;
         impl Drop for RestoreOnDrop {
             fn drop(&mut self) {
@@ -2528,22 +2296,17 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let taskbar_hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
         let fake_game_hwnd = 0xCAFE_usize as HWND;
 
         set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
             .expect("hide should succeed on a real desktop session");
         let visible_while_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
-        assert_eq!(
-            visible_while_hidden, 0,
-            "Shell_TrayWnd should be invisible after arming a hide"
-        );
+        assert_eq!(visible_while_hidden, 0, "Shell_TrayWnd should be invisible after arming a hide");
 
         // Simulate `crate::app::run`'s own tray-"Exit" logic exactly: take
         // whatever is armed, regardless of which window it was armed for.
-        let restore = take_any_armed_taskbar_restore()
-            .expect("a restore should be armed after the hide above");
+        let restore = take_any_armed_taskbar_restore().expect("a restore should be armed after the hide above");
         restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
 
         let visible_after_restore = unsafe { IsWindowVisible(taskbar_hwnd) };
@@ -2577,8 +2340,7 @@ mod tests {
         }
         let _restore = RestoreOnDrop;
 
-        let taskbar_hwnd =
-            find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
+        let taskbar_hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
         let fake_game_hwnd = 0xF00D_usize as HWND;
 
         // Simulate a tracked game's launch-detection auto-hide -- a call
@@ -2593,8 +2355,7 @@ mod tests {
 
         // The manual toggle, despite having no memory of that hide, must
         // still detect "currently hidden" from the real OS state and show it.
-        toggle_taskbar_hide(TaskbarHideMode::FullyHidden)
-            .expect("toggle should succeed on a real desktop session");
+        toggle_taskbar_hide(TaskbarHideMode::FullyHidden).expect("toggle should succeed on a real desktop session");
         assert_ne!(
             unsafe { IsWindowVisible(taskbar_hwnd) },
             0,
@@ -2603,8 +2364,7 @@ mod tests {
 
         // And the very next press must detect "currently visible" and hide
         // it again -- the old remembered-flag design would get this wrong.
-        toggle_taskbar_hide(TaskbarHideMode::FullyHidden)
-            .expect("toggle should succeed on a real desktop session");
+        toggle_taskbar_hide(TaskbarHideMode::FullyHidden).expect("toggle should succeed on a real desktop session");
         assert_eq!(
             unsafe { IsWindowVisible(taskbar_hwnd) },
             0,
@@ -2645,11 +2405,7 @@ mod tests {
         assert_is_std_error(&no_fg);
         assert_is_std_error(&os_err);
         assert_eq!(no_fg.to_string(), "no foreground window to manipulate");
-        assert!(
-            os_err
-                .to_string()
-                .starts_with("Win32 window manipulation failed: ")
-        );
+        assert!(os_err.to_string().starts_with("Win32 window manipulation failed: "));
     }
 
     #[test]
@@ -2715,9 +2471,7 @@ mod tests {
         let err = Win32Error::TaskbarNotFound;
 
         assert_is_std_error(&err);
-        assert_eq!(
-            err.to_string(),
-            "could not find the taskbar window (Shell_TrayWnd)"
-        );
+        assert_eq!(err.to_string(), "could not find the taskbar window (Shell_TrayWnd)");
     }
+
 }

@@ -58,11 +58,12 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GA_ROOT, GetAncestor, GetCursorInfo, GetCursorPos, GetIconInfo, HCURSOR, HTTRANSPARENT,
-    HWND_TOPMOST, ICONINFO, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WindowFromPoint,
+    HWND_TOPMOST, ICONINFO, MSG,
+    MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_NCHITTEST, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WindowFromPoint,
 };
 
 /// How often the window follows the cursor while shown (~250 Hz, so it keeps
@@ -252,10 +253,7 @@ fn run_overlay_thread(shared: &Shared) {
                 let root = window_under(c.x, c.y);
                 match under_cursor {
                     Some((hwnd, is_game)) if hwnd == root => is_game,
-                    _ => match (!root.is_null())
-                        .then(|| window_filter::exe_path_for_window(root))
-                        .flatten()
-                    {
+                    _ => match (!root.is_null()).then(|| window_filter::exe_path_for_window(root)).flatten() {
                         Some(exe) => {
                             let is_game = is_cursor_game(&input.games, &exe);
                             under_cursor = Some((root, is_game));
@@ -269,8 +267,7 @@ fn run_overlay_thread(shared: &Shared) {
             }
             _ => false,
         };
-        let show =
-            cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
+        let show = cursor.is_some_and(|c| cursor_style::should_show(settings, over_game, c.showing));
         if let Some(c) = cursor.filter(|c| show && c.handle != game_own_handle) {
             // The game switched cursors: read it (also for the Settings
             // preview, whatever the shape) and, for `GameOwn`, follow it.
@@ -285,9 +282,7 @@ fn run_overlay_thread(shared: &Shared) {
                 *LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(image.clone());
             }
             if game_own {
-                pointer = image
-                    .as_ref()
-                    .map(|image| cursor_style::render_game_own(settings, image));
+                pointer = image.as_ref().map(|image| cursor_style::render_game_own(settings, image));
                 pulse_base = None;
                 content = Content::Nothing;
             }
@@ -301,11 +296,7 @@ fn run_overlay_thread(shared: &Shared) {
             pulse_start = None;
             // Poll fast while enabled so the pointer appears the moment the
             // cursor crosses into the game.
-            timer.wait(if settings.enabled {
-                FRAME_INTERVAL
-            } else {
-                IDLE_INTERVAL
-            });
+            timer.wait(if settings.enabled { FRAME_INTERVAL } else { IDLE_INTERVAL });
             continue;
         };
 
@@ -451,10 +442,7 @@ static LAST_GAME_CURSOR: Mutex<Option<Bitmap>> = Mutex::new(None);
 
 /// The last cursor image read over a game, if any yet.
 pub fn last_game_cursor() -> Option<Bitmap> {
-    LAST_GAME_CURSOR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Reads the image of the cursor `handle` -- typically a game's own cursor,
@@ -477,21 +465,11 @@ fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
             let (width, height) = (mask.0, mask.1 / 2);
             let half = (width * height * 4) as usize;
             let (and, xor) = mask.2.split_at(half);
-            Some(cursor_style::cursor_image(
-                width,
-                height,
-                hot_x,
-                hot_y,
-                xor,
-                Some(and),
-            ))
+            Some(cursor_style::cursor_image(width, height, hot_x, hot_y, xor, Some(and)))
         } else {
             let (width, height, bgra) = read_bitmap_bgra(info.hbmColor)?;
-            let and = (mask.0 == width && mask.1 >= height)
-                .then(|| &mask.2[..(width * height * 4) as usize]);
-            Some(cursor_style::cursor_image(
-                width, height, hot_x, hot_y, &bgra, and,
-            ))
+            let and = (mask.0 == width && mask.1 >= height).then(|| &mask.2[..(width * height * 4) as usize]);
+            Some(cursor_style::cursor_image(width, height, hot_x, hot_y, &bgra, and))
         }
     })();
     // Safety: GetIconInfo handed us these bitmaps to delete.
@@ -531,15 +509,7 @@ fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     // `height` rows of 32-bit pixels as `header` describes.
     let rows = unsafe {
         let dc = GetDC(std::ptr::null_mut());
-        let rows = GetDIBits(
-            dc,
-            bitmap,
-            0,
-            height,
-            pixels.as_mut_ptr().cast(),
-            &mut header,
-            DIB_RGB_COLORS,
-        );
+        let rows = GetDIBits(dc, bitmap, 0, height, pixels.as_mut_ptr().cast(), &mut header, DIB_RGB_COLORS);
         ReleaseDC(std::ptr::null_mut(), dc);
         rows
     };
@@ -702,10 +672,7 @@ impl LayeredWindow {
     /// Uploads `bitmap` as the window content and places it at `pos`.
     /// Returns whether the window now shows it.
     fn present(&mut self, bitmap: &Bitmap, pos: (i32, i32)) -> bool {
-        if bitmap.width == 0
-            || bitmap.height == 0
-            || !self.ensure_surface(bitmap.width, bitmap.height)
-        {
+        if bitmap.width == 0 || bitmap.height == 0 || !self.ensure_surface(bitmap.width, bitmap.height) {
             return false;
         }
         let blend = BLENDFUNCTION {
@@ -715,10 +682,7 @@ impl LayeredWindow {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         let dst = POINT { x: pos.0, y: pos.1 };
-        let size = SIZE {
-            cx: bitmap.width as i32,
-            cy: bitmap.height as i32,
-        };
+        let size = SIZE { cx: bitmap.width as i32, cy: bitmap.height as i32 };
         let src = POINT { x: 0, y: 0 };
         // Safety: `bits` points at a `width * height * 4`-byte DIB owned by
         // `self` (just sized to `bitmap` by `ensure_surface`), the same
@@ -726,25 +690,11 @@ impl LayeredWindow {
         let ok = unsafe {
             let dib = std::slice::from_raw_parts_mut(self.bits, bitmap.pixels.len());
             // RGBA -> BGRA straight into the DIB, no intermediate buffer.
-            for (dst, src) in dib
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(bitmap.pixels.as_chunks::<4>().0)
-            {
+            for (dst, src) in dib.as_chunks_mut::<4>().0.iter_mut().zip(bitmap.pixels.as_chunks::<4>().0) {
                 *dst = [src[2], src[1], src[0], src[3]];
             }
-            UpdateLayeredWindow(
-                self.hwnd,
-                std::ptr::null_mut(),
-                &dst,
-                &size,
-                self.mem_dc,
-                &src,
-                0,
-                &blend,
-                ULW_ALPHA,
-            ) != 0
+            UpdateLayeredWindow(self.hwnd, std::ptr::null_mut(), &dst, &size, self.mem_dc, &src, 0, &blend, ULW_ALPHA)
+                != 0
         };
         if ok {
             self.pos = pos;
@@ -872,7 +822,10 @@ mod tests {
         let input = OverlayInput::from_config(&config);
 
         assert_eq!(input.games, vec![PathBuf::from("C:\\Games\\on.exe")]);
-        assert!(is_cursor_game(&input.games, Path::new("C:\\Games\\on.exe")));
+        assert!(is_cursor_game(
+            &input.games,
+            Path::new("C:\\Games\\on.exe")
+        ));
         assert!(!is_cursor_game(
             &input.games,
             Path::new("C:\\Games\\off.exe")
