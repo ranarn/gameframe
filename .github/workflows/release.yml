@@ -13,6 +13,10 @@ on:
         description: Only show the next version and changelog
         type: boolean
         default: false
+      allow-major:
+        description: Deliberately release a new major version (e.g. 1.0.0); without it a major bump below 1.0 is refused
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,6 +69,30 @@ jobs:
             exit 1
           fi
           echo "Next version: $VERSION"
+
+      # Computed here from the versions themselves, independent of how
+      # Release Pilot treats breaking changes below 1.0.
+      - name: Guard against an accidental major bump
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          ALLOW_MAJOR: ${{ inputs.allow-major }}
+        run: |
+          prev_tag=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          prev=${prev_tag#v}
+          prev=${prev:-0.0.0}
+          prev_major=${prev%%.*}
+          next_major=${VERSION%%.*}
+          if [ "$next_major" -gt "$prev_major" ] && [ "$prev_major" -lt 1 ]; then
+            if [ "$ALLOW_MAJOR" = "true" ]; then
+              echo "Major guard: $prev -> $VERSION is a major bump, allowed by allow-major"
+            else
+              echo "Major guard: $prev -> $VERSION is a major bump, refused"
+              echo "::error::Release Pilot computed $VERSION from $prev, a major bump while below 1.0. If this jump is intended, re-run the workflow with allow-major enabled."
+              exit 1
+            fi
+          else
+            echo "Major guard: $prev -> $VERSION is not a major bump from below 1.0, allowed"
+          fi
 
   build:
     needs: plan
