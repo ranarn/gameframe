@@ -23,15 +23,15 @@ use crate::profile_store::{
 use crate::region_calc::{resolve_region, MonitorGeometry, Region};
 use crate::autostart::{self, AutostartError};
 use crate::keyboard_hook;
-
-/// Title of the Settings window; `crate::instance_channel` finds the window by it.
-pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
 use crate::win32;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+
+/// Title of the Settings window; `crate::instance_channel` finds the window by it.
+pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
 
 /// The editable state backing the Settings window: the single optional
 /// [`Zone`] and the two hotkey binding strings (empty = unbound).

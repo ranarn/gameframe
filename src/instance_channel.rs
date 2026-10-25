@@ -19,6 +19,12 @@
 //! `ChangeWindowMessageFilterEx`, so a normal launch can signal an elevated
 //! instance. The sender grants the receiver the right to take the foreground
 //! (`AllowSetForegroundWindow`) so Settings can actually come to the front.
+//! Windows may refuse that grant for an elevated target (the result is
+//! ignored); Settings then still opens, but may only flash in the taskbar
+//! instead of coming to the front. Not verified against an elevated instance.
+//!
+//! If the instance could not create its window ([`Receiver::create`] returns
+//! `None`), a second launch polls for [`SEND_TIMEOUT`] (3 s), logs, and exits.
 //!
 //! Security: `MSGFLT_ALLOW` lets *any* lower-integrity process in the session
 //! post the command. That is harmless for `OpenSettings`, but revisit it
@@ -35,6 +41,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::settings_ui::SETTINGS_TITLE;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -49,7 +56,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const CLASS_NAME: &str = "GameFrame.CommandChannel-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 /// Name of the registered window message carrying a [`Command`].
 const MESSAGE_NAME: &str = "GameFrame.Command-5C28E192-0AB5-4FA5-8874-88144D010E3B";
-use crate::settings_ui::SETTINGS_TITLE;
 
 /// How long a sender keeps looking for the running instance's window: the
 /// instance takes the mutex slightly before it creates the window.
@@ -122,11 +128,12 @@ pub fn drain() -> Vec<Command> {
 /// Marks the main thread as inside the Settings window for the lifetime of the
 /// returned guard.
 #[must_use]
-pub struct SettingsGuard(());
+pub struct SettingsGuard;
 
+/// Flags Settings as open until the returned guard is dropped.
 pub fn enter_settings() -> SettingsGuard {
     SETTINGS_OPEN.store(true, Ordering::SeqCst);
-    SettingsGuard(())
+    SettingsGuard
 }
 
 impl Drop for SettingsGuard {
@@ -134,6 +141,7 @@ impl Drop for SettingsGuard {
         SETTINGS_OPEN.store(false, Ordering::SeqCst);
     }
 }
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -232,8 +240,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 command,
             ),
             Route::FocusSettings => {
+                // Settings is flagged open slightly before its window exists;
+                // queue the command rather than lose it.
                 if !focus_settings_window() {
-                    log!("instance channel: Settings is open but its window was not found");
+                    log!("instance channel: Settings window not created yet; queueing the command");
+                    enqueue(
+                        &mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()),
+                        command,
+                    );
                 }
             }
         }
