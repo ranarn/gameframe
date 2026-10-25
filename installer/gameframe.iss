@@ -38,8 +38,8 @@ AppPublisher=Jonas Ranerfors
 AppPublisherURL=https://github.com/ranarn/gameframe
 AppSupportURL=https://github.com/ranarn/gameframe/issues
 AppUpdatesURL=https://github.com/ranarn/gameframe/releases
-; One setup at a time: a second silent update started before the first has quit
-; GameFrame waits for it instead of running alongside.
+; One setup at a time: a second setup started while the first still runs reports
+; "Setup is already running" and exits (silently under /SUPPRESSMSGBOXES).
 SetupMutex=GameFrame-Setup-{#AppGuid}
 AppCopyright=Copyright (C) 2026 Jonas Ranerfors
 PrivilegesRequired=lowest
