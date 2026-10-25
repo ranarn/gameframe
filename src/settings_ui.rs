@@ -1072,7 +1072,7 @@ pub fn run_settings_window(
                             on_disk.cursor.enabled,
                         );
                     }
-                    Err(e) => eprintln!("could not re-read config to merge on Save: {e}"),
+                    Err(e) => log!("could not re-read config to merge on Save: {e}"),
                 }
                 profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
                 // Only touch the registry on an actual change, so saving

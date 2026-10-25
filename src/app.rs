@@ -343,7 +343,7 @@ struct Drained {
 /// Handles the pending update, tray-icon, tray-menu and hotkey events.
 ///
 /// Shared by [`run_event_loop`] and, through [`show_settings`], the open
-/// Settings window (`settings_open`), whose own loop blocks the main one:
+/// Settings window (the `settings` parameter), whose own loop blocks the main one:
 /// without it nothing would react until Settings closed. Stops early on an
 /// exit request, or on a Settings click while it is closed (events queued
 /// behind it stay in their channels for the next call). With Settings open,
@@ -626,8 +626,7 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// which serves its in-memory copy, refreshed by every save) so a Zone/game
 /// added/edited via Settings since the last press is picked up immediately.
 /// The hotkey binding itself is re-registered separately, right after the
-/// Settings window closes -- see the `ShowSettings` branch in
-/// [`run_event_loop`] -- so a changed binding also takes effect without a
+/// Settings window closes -- see [`show_settings`] -- so a changed binding also takes effect without a
 /// restart.
 fn handle_toggle_borderless(config_dir: &Path) -> bool {
     let config = match profile_store::load(config_dir) {
