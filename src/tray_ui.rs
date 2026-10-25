@@ -51,7 +51,7 @@ const CHECK_FOR_UPDATES_ID: &str = "gameframe-check-for-updates";
 const EXIT_ID: &str = "gameframe-exit";
 
 /// Prefix for the dynamically-generated "Apply to Window" submenu items'
-/// ids, distinguishing them from the four fixed top-level menu items above.
+/// ids, distinguishing them from the five fixed top-level menu items above.
 ///
 /// Id-encoding scheme: a window-picker item's id is this prefix followed by
 /// the target `HWND`'s numeric value (`hwnd as isize`, decimal), e.g.
@@ -70,7 +70,7 @@ fn encode_window_item_id(hwnd: HWND) -> MenuId {
 
 /// Recovers the target `HWND` encoded by [`encode_window_item_id`] from a
 /// `MenuEvent`'s id, or `None` if `id` isn't one of this shape (e.g. it's one
-/// of the four fixed top-level menu items, or garbage) -- lets `app`'s
+/// of the five fixed top-level menu items, or garbage) -- lets `app`'s
 /// dispatch loop tell "this is a window-picker click" apart from the fixed
 /// actions ([`TrayMenuIds::action_for`]) without either mechanism knowing
 /// about the other's id format.
@@ -82,7 +82,7 @@ pub fn decode_window_item_id(id: &MenuId) -> Option<HWND> {
         .map(|value| value as HWND)
 }
 
-/// The four tray menu items' ids, and the mapping back from an id to
+/// The five tray menu items' ids, and the mapping back from an id to
 /// the [`TrayAction`] it represents. Pure data -- no OS calls -- so
 /// it's testable without a live tray icon.
 #[derive(Debug, Clone)]
@@ -180,9 +180,9 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Builds and shows the real OS tray icon with its four top-level menu
+    /// Builds and shows the real OS tray icon with its five top-level menu
     /// items ("Show Settings", "Apply to Window", "Start with Windows",
-    /// "Exit"), where "Apply to Window" is itself a [`Submenu`] populated with
+    /// "Check for Updates Now", "Exit"), where "Apply to Window" is itself a [`Submenu`] populated with
     /// one item per currently-visible top-level window (see
     /// [`rebuild_apply_to_window_items`]).
     ///
@@ -245,7 +245,7 @@ impl Tray {
         })
     }
 
-    /// The id -> action mapping for this tray's four fixed top-level menu
+    /// The id -> action mapping for this tray's five fixed top-level menu
     /// items.
     pub fn ids(&self) -> &TrayMenuIds {
         &self.ids

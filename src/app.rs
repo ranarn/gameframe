@@ -14,7 +14,7 @@
 //! either can be pressed without the other having been used first. A click
 //! on one of the "Apply to Window" submenu's dynamically-listed windows
 //! (recognized via [`tray_ui::decode_window_item_id`], distinct from the
-//! four fixed top-level menu items) resolves that window's owning process
+//! five fixed top-level menu items) resolves that window's owning process
 //! against the tracked-games list (adding it, with the new-tracked-game
 //! defaults, if not already tracked -- see
 //! [`crate::profile_store::upsert_tracked_game`]) and applies its assigned

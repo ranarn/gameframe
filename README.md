@@ -43,6 +43,17 @@ Uninstall from Settings > Apps.
 Settings are stored in `%APPDATA%\GameFrame\config.toml`, and a log in
 `%APPDATA%\GameFrame\gameframe.log`.
 
+## Known limitations
+
+- The installer is not code-signed, so Windows SmartScreen may warn the first time you run it.
+  Choose **More info**, then **Run anyway**.
+- The Zone works on a single monitor only. The "fully hidden" taskbar mode does not hide the
+  taskbars of secondary monitors.
+- A game running as administrator can't be applied from the tray or by auto-apply. The
+  borderless hotkey offers to restart GameFrame elevated.
+- UWP/packaged games (windows hosted by `ApplicationFrameHost`) and windows with dialog frames are
+  refused by design.
+
 ## Building from source
 
 Requires a stable Rust toolchain targeting `x86_64-pc-windows-msvc`.
@@ -58,7 +69,7 @@ The release build is a single self-contained executable; the C runtime is static
 To build the installer, install [Inno Setup 7](https://jrsoftware.org/isinfo.php)
 (`winget install JRSoftware.InnoSetup.7`) and
 [cargo-about](https://github.com/EmbarkStudios/cargo-about)
-(`cargo install cargo-about --locked --version 0.9.2`, generates the third-party license
+(`cargo install cargo-about --locked --features cli --version 0.9.2`, generates the third-party license
 notices), then run `.\installer\build.ps1`. The result is
 `target\installer\GameFrame-Setup-<version>.exe`.
 

@@ -85,6 +85,11 @@ Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueName: "{#AppName}"; ValueType:
 ; Unchecked: remove a registration (a no-op when the value is already absent).
 Root: HKCU; Subkey: "{#RunKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: not startup
 
+[InstallDelete]
+; The same stray folders, so an upgrade cleans them up too.
+Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
+Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
+
 [UninstallDelete]
 ; Earlier versions let eframe persist window geometry under
 ; %APPDATA%\<window title>\data; remove those stray folders.

@@ -24,4 +24,28 @@ applications' windows, hides the taskbar, installs a low-level keyboard hook onl
 while you are binding a hotkey, and never injects into game processes or reads
 their memory. To rank windows in the Apply to Window picker it queries a
 process's executable path and loaded-module list through standard Windows APIs.
+The only network traffic is an update check you start yourself (tray "Check for
+Updates Now" or Settings), plus the download that follows if you accept an
+update. Both use HTTPS through Windows' own WinHTTP, so the system certificate
+store and proxy settings apply:
+
+- The check is a GET of `api.github.com/repos/ranarn/gameframe/releases/latest`.
+  A development build (version `0.0.0`) never makes it.
+- The installer's download URL must be on `github.com`. The download follows
+  redirects by hand (at most five), and every hop must be HTTPS on `github.com`
+  or `release-assets.githubusercontent.com`; any other host is refused.
+- The installer is hashed and compared with the SHA-256 digest the release API
+  reports for it. A file that does not match is deleted and never run. The
+  verified file is held open with a share mode that denies writing and deleting
+  until its process has started, so it cannot be swapped in between. It runs
+  silently and detached from a temp folder, which the next start deletes.
+- The installer asks the running instance to quit by posting a `Quit` command to
+  the instance's hidden message-only window; `gameframe.exe --quit` sends the
+  same command from a second launch. `Quit` travels
+  on a separate registered window message that is not let through UIPI, so a
+  lower-integrity process cannot quit the instance, and a normal-integrity launch
+  cannot quit an elevated one (the installer then falls back to `taskkill` after
+  a timeout). Opening Settings uses a message that is let through, since that is
+  harmless.
+
 Reports about any of these or the installer are in scope.
