@@ -18,6 +18,7 @@
 
 use crate::autostart::{self, AutostartError};
 use crate::cursor_style::{self, CursorShape};
+use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::keyboard_hook;
 use crate::profile_store::{
     self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame,
@@ -89,6 +90,10 @@ pub struct SettingsState {
     /// The open tab. UI-only (never persisted), but kept here rather than on
     /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
     pub tab: SettingsTab,
+    /// Bindings that failed to register when GameFrame last registered its
+    /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
+    /// [`Self::hotkey_failure`], which hides one once its binding was edited.
+    hotkey_failures: Vec<BindingReport>,
 }
 
 /// The Settings window's tabs.
@@ -109,6 +114,16 @@ pub enum HotkeyField {
     ToggleBorderless,
     ToggleTaskbarAutohide,
     ToggleGameCursor,
+}
+
+impl From<HotkeyAction> for HotkeyField {
+    fn from(action: HotkeyAction) -> Self {
+        match action {
+            HotkeyAction::ToggleBorderless => HotkeyField::ToggleBorderless,
+            HotkeyAction::ToggleTaskbarAutohide => HotkeyField::ToggleTaskbarAutohide,
+            HotkeyAction::ToggleGameCursor => HotkeyField::ToggleGameCursor,
+        }
+    }
 }
 
 impl SettingsState {
@@ -137,7 +152,33 @@ impl SettingsState {
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
             tab: SettingsTab::default(),
+            hotkey_failures: Vec::new(),
         }
+    }
+
+    /// Records which bindings failed to register at the last registration.
+    /// The report was made while GameFrame's own registrations held the
+    /// combos, so Settings never probes the OS itself (it would see its own
+    /// bindings as "in use").
+    pub fn set_hotkey_reports(&mut self, reports: &[BindingReport]) {
+        self.hotkey_failures = reports
+            .iter()
+            .filter(|r| matches!(r.outcome, BindingOutcome::Failed(_)))
+            .cloned()
+            .collect();
+    }
+
+    /// Why `field`'s binding failed to register, if it did and the binding is
+    /// still the one that failed. Rebinding or clearing hides it: the new
+    /// combination is only tried (and the indicator settled) on Save.
+    pub fn hotkey_failure(&self, field: HotkeyField) -> Option<&str> {
+        self.hotkey_failures
+            .iter()
+            .find(|f| HotkeyField::from(f.action) == field && f.binding == self.binding(field))
+            .and_then(|f| match &f.outcome {
+                BindingOutcome::Failed(reason) => Some(reason.as_str()),
+                BindingOutcome::Registered => None,
+            })
     }
 
     /// Builds the [`Config`] to persist. A blank (or whitespace-only) hotkey
@@ -506,13 +547,13 @@ fn is_physical_modifier_key(key: egui::Key) -> bool {
 
 /// Maps a physical, non-modifier `egui::Key` to the name token GameFrame's
 /// stored hotkey strings use for it -- the same token `global_hotkey::hotkey::HotKey`'s
-/// `FromStr` (via `resolve_bindings`) already accepts, so no changes to the
+/// `FromStr` (via `register_each`) already accepts, so no changes to the
 /// persistence/parsing layer are needed. Returns `None` for keys with no
 /// name in that vocabulary (the capture is then left listening rather than
 /// completing with an unparsable binding).
 ///
 /// `Enter` and `Space` are deliberately excluded from this vocabulary even
-/// though `global_hotkey`/`resolve_bindings` support them -- see the comment
+/// though `global_hotkey` supports them -- see the comment
 /// at their removed match arms below for why they can never actually be
 /// captured via the "Set hotkey" button.
 fn key_display_name(key: egui::Key) -> Option<&'static str> {
@@ -742,7 +783,7 @@ fn modifiers_to_hotkey_modifiers(modifiers: egui::Modifiers) -> Modifiers {
 /// completed it) -- satisfying issue #29's acceptance criterion that the
 /// captured chord construct a `HotKey` via `HotKey::new(mods, code)` rather
 /// than solely through a later `FromStr` round-trip of the persisted string
-/// (that round-trip still happens separately, in `hotkeys::resolve_bindings`,
+/// (that round-trip still happens separately, in `hotkeys::register_each`,
 /// on every app startup -- unavoidable since the persisted config is a plain
 /// string, not a living `HotKey`).
 ///
@@ -767,7 +808,7 @@ fn build_captured_hotkey(modifiers: egui::Modifiers, key: egui::Key) -> Option<H
 ///
 /// Deliberately NOT `HotKey::Display`, whose `into_string()` round-trips to
 /// a different, lowercase, spelled-out format (`"control+alt+keyb"`) that
-/// doesn't match what `profile_store`/`resolve_bindings` already expect. Returns `None` if `key` is
+/// doesn't match what `profile_store`/`register_each` already expect. Returns `None` if `key` is
 /// itself a physical modifier key (a modifier-only press never completes a
 /// capture) or has no known name in GameFrame's hotkey vocabulary.
 ///
@@ -917,9 +958,13 @@ enum SettingsExit {
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
 /// each iteration and fully drops it before the next (or before returning).
 /// Not exercised by this crate's automated tests -- see module docs.
-pub fn run_settings_window(config_dir: &Path) -> Result<(), SettingsUiError> {
+pub fn run_settings_window(
+    config_dir: &Path,
+    hotkey_reports: &[BindingReport],
+) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let mut state = SettingsState::from_config(&config);
+    state.set_hotkey_reports(hotkey_reports);
     let started_with_windows = autostart::is_enabled();
     state.start_with_windows = started_with_windows;
     let monitor = primary_monitor_geometry();
@@ -1123,6 +1168,9 @@ impl SettingsApp {
             } else {
                 let bound = self.state.binding(field);
                 ui.monospace(if bound.is_empty() { "Not bound" } else { bound });
+            }
+            if let Some(reason) = self.state.hotkey_failure(field) {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ Not working: {reason}"));
             }
 
             let set_hotkey_response = ui.button(if is_capturing { "Cancel" } else { "Set hotkey" });
@@ -2529,5 +2577,54 @@ mod tests {
                 height: 200
             })
         );
+    }
+
+    fn failed_report(action: HotkeyAction, binding: &str) -> BindingReport {
+        BindingReport {
+            action,
+            binding: binding.to_string(),
+            outcome: BindingOutcome::Failed("already in use by another program".to_string()),
+        }
+    }
+
+    #[test]
+    fn hotkey_failure_shows_the_reason_only_for_the_failed_binding() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.toggle_taskbar_autohide = "Ctrl+Alt+T".to_string();
+        state.set_hotkey_reports(&[
+            failed_report(HotkeyAction::ToggleTaskbarAutohide, "Ctrl+Alt+T"),
+            BindingReport {
+                action: HotkeyAction::ToggleBorderless,
+                binding: "Ctrl+Alt+B".to_string(),
+                outcome: BindingOutcome::Registered,
+            },
+        ]);
+
+        assert_eq!(
+            state.hotkey_failure(HotkeyField::ToggleTaskbarAutohide),
+            Some("already in use by another program")
+        );
+        assert_eq!(state.hotkey_failure(HotkeyField::ToggleBorderless), None);
+        assert_eq!(state.hotkey_failure(HotkeyField::ToggleGameCursor), None);
+    }
+
+    #[test]
+    fn hotkey_failure_clears_once_the_binding_is_changed_or_cleared() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.set_hotkey_reports(&[failed_report(HotkeyAction::ToggleBorderless, "Ctrl+Alt+B")]);
+        assert!(
+            state
+                .hotkey_failure(HotkeyField::ToggleBorderless)
+                .is_some()
+        );
+
+        state.toggle_borderless = "Ctrl+Alt+F".to_string();
+        assert_eq!(state.hotkey_failure(HotkeyField::ToggleBorderless), None);
+
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.clear_hotkey(HotkeyField::ToggleBorderless);
+        assert_eq!(state.hotkey_failure(HotkeyField::ToggleBorderless), None);
     }
 }

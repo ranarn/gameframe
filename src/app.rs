@@ -48,7 +48,7 @@
 
 use crate::autostart;
 use crate::cursor_overlay::CursorOverlay;
-use crate::hotkeys::{HotkeyAction, Hotkeys};
+use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction, Hotkeys};
 use crate::instance_channel::{self, Command};
 use crate::launch_watcher;
 use crate::profile_store;
@@ -87,7 +87,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
 
-    let hotkeys = register_hotkeys(&config_dir);
+    let (hotkeys, hotkey_reports) = register_hotkeys(&config_dir);
 
     // Registered before entering `run_event_loop`'s `GetMessageW` pump --
     // see `crate::launch_watcher`'s module docs for why registration must
@@ -109,7 +109,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // mouse while this thread is blocked in Settings or the zone editor.
     let cursor_overlay = CursorOverlay::start(&config_dir);
 
-    run_event_loop(&tray, hotkeys, &config_dir, &cursor_overlay);
+    run_event_loop(&tray, hotkeys, hotkey_reports, &config_dir, &cursor_overlay);
 
     // Stops the game cursor thread, which also restores swapped system
     // cursors (see `crate::cursor_overlay`).
@@ -173,28 +173,34 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
     }
 }
 
-/// Loads the config and registers its bound hotkeys with the OS. A failure
-/// at either step (a malformed config file, an OS registration failure --
-/// e.g. another application already holds the exact key combination) is
-/// reported to stderr rather than treated as fatal: GameFrame still starts
-/// with no hotkey wired up, matching the fresh-install "nothing bound yet"
-/// case where pressing keys is simply inert.
-fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
+/// Loads the config and registers its bound hotkeys with the OS, each on its
+/// own (see [`Hotkeys::register`]): one binding failing (e.g. another
+/// application already holds that exact combination) leaves the others
+/// working. Each failed binding is logged, and the per-binding report is
+/// returned for Settings to show (also when the hotkey manager itself can't be
+/// created: every binding is then reported failed). A malformed config file is
+/// logged and yields no hotkeys at all -- GameFrame still starts, matching the
+/// fresh-install "nothing bound yet" case.
+fn register_hotkeys(config_dir: &Path) -> (Option<Hotkeys>, Vec<BindingReport>) {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
             log!("failed to load config for hotkey registration: {e}");
-            return None;
+            return (None, Vec::new());
         }
     };
 
-    match Hotkeys::register(&config.hotkeys) {
-        Ok(hotkeys) => Some(hotkeys),
-        Err(e) => {
-            log!("failed to register global hotkeys: {e}");
-            None
+    let (hotkeys, reports) = Hotkeys::register(&config.hotkeys);
+    for report in &reports {
+        if let BindingOutcome::Failed(reason) = &report.outcome {
+            log!(
+                "failed to register hotkey {:?} for {:?}: {reason}",
+                report.binding,
+                report.action
+            );
         }
     }
+    (hotkeys, reports)
 }
 
 /// Pumps the Win32 message loop on this thread. Each dispatched message
@@ -213,6 +219,7 @@ fn register_hotkeys(config_dir: &Path) -> Option<Hotkeys> {
 fn run_event_loop(
     tray: &Tray,
     mut hotkeys: Option<Hotkeys>,
+    mut hotkey_reports: Vec<BindingReport>,
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
 ) {
@@ -256,7 +263,13 @@ fn run_event_loop(
         for command in commands {
             match command {
                 Command::OpenSettings => {
-                    show_settings(tray, &mut hotkeys, config_dir, cursor_overlay);
+                    show_settings(
+                        tray,
+                        &mut hotkeys,
+                        &mut hotkey_reports,
+                        config_dir,
+                        cursor_overlay,
+                    );
                     // A Quit that arrived while Settings was open closed it
                     // and is waiting in the queue.
                     if instance_channel::quit_pending() {
@@ -333,7 +346,13 @@ fn run_event_loop(
                     return;
                 }
                 Some(TrayAction::ShowSettings) => {
-                    show_settings(tray, &mut hotkeys, config_dir, cursor_overlay);
+                    show_settings(
+                        tray,
+                        &mut hotkeys,
+                        &mut hotkey_reports,
+                        config_dir,
+                        cursor_overlay,
+                    );
                     if instance_channel::quit_pending() {
                         return;
                     }
@@ -977,6 +996,7 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
 fn show_settings(
     tray: &Tray,
     hotkeys: &mut Option<Hotkeys>,
+    hotkey_reports: &mut Vec<BindingReport>,
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
 ) {
@@ -984,7 +1004,11 @@ fn show_settings(
     // thread until the Settings window closes, at which point the egui/wgpu
     // context it used is fully dropped and we resume pumping tray messages
     // right where we left off.
-    if let Err(e) = open_settings(config_dir) {
+    // The outcome of the last registration is handed to Settings instead of
+    // re-checking: while it is open this instance's own registrations hold
+    // the combos, so a fresh probe would report GameFrame's own bindings as
+    // "in use". Settings hides a failure once its binding has been changed.
+    if let Err(e) = open_settings(config_dir, hotkey_reports) {
         log!("failed to open Settings: {e}");
     }
 
@@ -998,7 +1022,7 @@ fn show_settings(
     // "already registered" and all hotkeys went dead after any Settings visit
     // (#52).
     drop(hotkeys.take());
-    *hotkeys = register_hotkeys(config_dir);
+    (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
     cursor_overlay.reload(config_dir);
     tray.sync_start_with_windows_check();
 }
@@ -1006,10 +1030,13 @@ fn show_settings(
 /// Opens the Settings window at `config_dir`. See
 /// [`settings_ui::run_settings_window`] for what "opens" entails (blocks
 /// until closed, persists on Save).
-fn open_settings(config_dir: &Path) -> Result<(), settings_ui::SettingsUiError> {
+fn open_settings(
+    config_dir: &Path,
+    hotkey_reports: &[BindingReport],
+) -> Result<(), settings_ui::SettingsUiError> {
     // While open, a second launch's OpenSettings focuses this window instead.
     let _modal = instance_channel::enter_settings();
-    settings_ui::run_settings_window(config_dir)
+    settings_ui::run_settings_window(config_dir, hotkey_reports)
 }
 
 /// The real `%APPDATA%\GameFrame` directory GameFrame persists its config
@@ -1026,7 +1053,7 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hotkeys::resolve_bindings;
+    use crate::hotkeys::register_each;
     use crate::profile_store::{Config, TrackedGame, Zone};
     use global_hotkey::hotkey::HotKey;
     use std::path::PathBuf;
@@ -1214,7 +1241,7 @@ mod tests {
 
         // Fresh install: nothing bound yet.
         let initial = profile_store::load(&config_dir).unwrap();
-        assert_eq!(resolve_bindings(&initial.hotkeys).unwrap(), vec![]);
+        assert!(register_each(&initial.hotkeys, |_| Ok(())).0.is_empty());
 
         // Simulates Settings persisting a newly bound hotkey on Save.
         let mut updated = initial.clone();
@@ -1224,7 +1251,7 @@ mod tests {
         // Simulates the fix: reloading after Settings closes, instead of
         // continuing to act on the config snapshot loaded at startup.
         let reloaded = profile_store::load(&config_dir).unwrap();
-        let reloaded_resolved = resolve_bindings(&reloaded.hotkeys).unwrap();
+        let (reloaded_resolved, _) = register_each(&reloaded.hotkeys, |_| Ok(()));
 
         assert_eq!(reloaded_resolved.len(), 1);
         assert_eq!(reloaded_resolved[0].action, HotkeyAction::ToggleBorderless);
