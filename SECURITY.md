@@ -2,8 +2,7 @@
 
 ## Supported versions
 
-Only the latest release receives fixes. GameFrame updates itself, so staying on
-the latest version is the expected setup.
+Only the latest release receives fixes.
 
 ## Reporting a vulnerability
 
@@ -18,8 +17,9 @@ anonymous.
 
 ## Scope
 
-GameFrame runs unelevated as a per-user tray app. It moves and restyles other
-applications' windows, hides the taskbar, installs a low-level keyboard hook only
-while you are binding a hotkey, and never injects into or reads the memory of
-game processes. Reports about any of these, the installer, or the update
-mechanism are in scope.
+GameFrame runs unelevated by default as a per-user tray app. It relaunches itself
+elevated only when a window manipulation was denied for lack of rights and you
+accept the UAC prompt. It moves and restyles other applications' windows, hides
+the taskbar, installs a low-level keyboard hook only while you are binding a
+hotkey, and never injects into or reads the memory of game processes. Reports
+about any of these or the installer are in scope.
