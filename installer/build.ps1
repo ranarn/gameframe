@@ -21,7 +21,9 @@ try {
     cargo build --release --locked
     if ($LASTEXITCODE -ne 0) { throw 'cargo build --release --locked failed' }
 
-    $version = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
+    $meta = cargo metadata --format-version 1 --no-deps
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    $version = ($meta | ConvertFrom-Json).packages |
         Where-Object name -eq 'gameframe' | Select-Object -ExpandProperty version
 
     & $iscc "/DAppVersion=$version" (Join-Path $PSScriptRoot 'gameframe.iss')

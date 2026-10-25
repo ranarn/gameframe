@@ -8,10 +8,10 @@ updates:
       interval: weekly
     cooldown:
       default-days: 3
-    # Renders as `fix(deps): ...`: release-pilot counts only `fix` towards a
-    # release. Dependabot's `prefix-development` and the groups'
+    # Renders as `fix(deps...): ...` so Dependabot updates trigger a patch
+    # release; `chore` would not. Dependabot's `prefix-development` and the groups'
     # `dependency-type` are not supported for cargo, so dev dependencies get
-    # the same prefix.
+    # the same prefix (ungrouped dev updates render as `fix(deps-dev)`).
     commit-message:
       prefix: fix
       include: scope

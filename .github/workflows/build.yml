@@ -33,7 +33,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Only main saves the cache; PR runs restore it without evicting main's.
+          # Kept uniform with the other workflows: this workflow only runs for main,
+          # so the expression is always true here.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Stamp version
@@ -47,7 +48,7 @@ jobs:
           $toml = ([regex]'(?m)^version = "[^"]*"').Replace($toml, "version = `"$env:VERSION`"", 1)
           Set-Content Cargo.toml $toml -NoNewline
           # pwsh doesn't stop on a failing native command: check every cargo call.
-          cargo update --package gameframe
+          cargo update --workspace
           if ($LASTEXITCODE -ne 0) { throw "cargo update failed ($LASTEXITCODE)" }
           $meta = cargo metadata --format-version 1 --no-deps --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed ($LASTEXITCODE)" }
