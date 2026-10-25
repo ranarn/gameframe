@@ -246,6 +246,12 @@ fn run_event_loop(
 ) {
     // The update the tray item "Update to vX.Y.Z" offers (ask mode).
     let mut offered_update: Option<UpdateInfo> = None;
+    let ctx = Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        updates,
+    };
 
     // A Quit received during the first-run zone prompt (before this pump
     // existed) must not wait for the next message.
@@ -265,12 +271,6 @@ fn run_event_loop(
             DispatchMessageW(&msg);
         }
 
-        // Results of the startup update check and of installs started from
-        // the tray (posted by worker threads, which wake this pump).
-        while let Some(event) = updates.try_recv() {
-            handle_update_event(event, tray, config_dir, &mut offered_update);
-        }
-
         // Commands from a second launch (see crate::instance_channel); the
         // channel's window is dispatched by this pump, so they are queued by now.
         let commands = instance_channel::drain();
@@ -281,13 +281,7 @@ fn run_event_loop(
         for command in commands {
             match command {
                 Command::OpenSettings => {
-                    show_settings(
-                        tray,
-                        &mut hotkeys,
-                        &mut hotkey_reports,
-                        config_dir,
-                        cursor_overlay,
-                    );
+                    show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
                     // A Quit that arrived while Settings was open closed it
                     // and is waiting in the queue.
                     if instance_channel::quit_pending() {
@@ -299,133 +293,216 @@ fn run_event_loop(
             }
         }
 
-        // Refreshes the "Apply to Window" submenu's item list only in
-        // response to an actual tray-icon mouse interaction (the mouse
-        // entering the icon, or a click on it), rather than unconditionally
-        // on every pumped message.
-        //
-        // `Enter` reliably arrives on its own dispatched `WM_MOUSEMOVE`
-        // message, strictly before the later `WM_RBUTTONUP` message that
-        // opens the context menu (a user must hover onto the tray icon
-        // before they can click it) -- so refreshing here, once per
-        // `Enter`, completes before the menu is ever shown. `Click` is
-        // included too as a defensive fallback (e.g. covers the case where
-        // this process only just started pumping messages while the cursor
-        // was already resting on the icon, so no `Enter` transition ever
-        // fires) even though, per `tray-icon`'s Windows backend, the menu is
-        // shown synchronously in the same `WM_RBUTTONUP` handler right after
-        // the `Click` event is enqueued -- refreshing on `Click` won't beat
-        // that particular menu display, but it does mean the very next
-        // open is guaranteed current.
-        //
-        // Refreshing before every dispatched message would be wrong. The
-        // primary, certain reason: `tray-icon` sets a 15ms `WM_TIMER` while the
-        // mouse hovers over the icon, which would drive a full `EnumWindows` +
-        // per-window `GetWindowTextW` + submenu rebuild (real Win32 syscalls)
-        // up to ~66 times/second just from the cursor resting nearby --
-        // needlessly expensive on this process's one and only message loop. A
-        // secondary, less certain consideration: per the documented
-        // `GetWindowTextW` contract, a same-process target window causes a
-        // `WM_GETTEXT` to be sent via `SendMessage` and can block if that
-        // window is stuck, whereas a cross-process target (the common case
-        // when enumerating the whole desktop) is documented to read the cached
-        // caption text directly instead, specifically so callers don't hang on
-        // an unresponsive foreign process -- so the practical hang risk here
-        // is narrower than "any hung window on the desktop" (more like "one of
-        // GameFrame's own windows getting stuck"), but still worth avoiding
-        // at no extra cost. No crate-native "menu about to show" event exists
-        // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
-        // comment).
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                event,
-                TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }
-            ) {
-                tray.refresh_apply_to_window_menu();
-                tray.sync_start_with_windows_check();
+        // Tray, hotkey and update events. Settings drains the same events while
+        // it is open (see `show_settings`), so nothing waits for it to close.
+        loop {
+            let drained = drain_events(&ctx, &hotkeys, &mut offered_update, SettingsMode::Closed);
+            if drained.exit {
+                return;
             }
-        }
-
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
-                handle_apply_to_window(config_dir, target_hwnd);
-                // A newly tracked game gets the game cursor right away.
-                cursor_overlay.reload(config_dir);
-                continue;
-            }
-
-            match tray.ids().action_for(event.id()) {
-                Some(TrayAction::Exit) => {
-                    // Returning here unwinds back to `run()`, which then
-                    // drops its owned `tray`, removing the OS tray icon
-                    // and destroying its hidden window -- the entire
-                    // clean-shutdown path for the tray UI.
+            if drained.show_settings {
+                show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
+                if instance_channel::quit_pending() {
                     return;
                 }
-                Some(TrayAction::ShowSettings) => {
-                    show_settings(
-                        tray,
-                        &mut hotkeys,
-                        &mut hotkey_reports,
-                        config_dir,
-                        cursor_overlay,
-                    );
-                    if instance_channel::quit_pending() {
-                        return;
-                    }
-                }
-                Some(TrayAction::ToggleStartWithWindows) => {
-                    // `muda` has already flipped the check mark, but the
-                    // registry -- not the menu -- is the source of truth:
-                    // toggle what the registry says, then re-sync the check
-                    // so a failed write doesn't leave it showing a lie.
-                    if let Err(e) = autostart::set_enabled(!autostart::is_enabled()) {
-                        log!("failed to change Start with Windows: {e}");
-                    }
-                    tray.sync_start_with_windows_check();
-                }
-                Some(TrayAction::CheckForUpdates) => check_for_updates_from_tray(),
-                Some(TrayAction::InstallUpdate) => {
-                    if let Some(info) = offered_update.clone() {
-                        start_install(info, Failure::Report);
-                    }
-                }
-                None => {}
-            }
-        }
-
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            // Only act on the key-down edge; the crate also emits a
-            // `Released` event on key-up (see `global_hotkey`'s Windows
-            // implementation), which would otherwise double-toggle.
-            if event.state() != HotKeyState::Pressed {
+                // Events queued behind the click are handled on the next pass.
                 continue;
             }
-
-            // With no hotkey bound (fresh install) `hotkeys` is `None`
-            // (nothing was registered, so no event can arrive for it
-            // anyway) or resolves to no action for `event.id()` --
-            // either way, nothing happens here and nothing panics.
-            let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
-            match action {
-                Some(HotkeyAction::ToggleBorderless) => {
-                    if handle_toggle_borderless(config_dir) {
-                        // GameFrame relaunched itself elevated to complete a
-                        // manipulation that failed for lack of permissions;
-                        // this (unelevated) instance's job is done.
-                        return;
-                    }
-                }
-                Some(HotkeyAction::ToggleTaskbarAutohide) => {
-                    handle_toggle_taskbar_autohide(config_dir);
-                }
-                Some(HotkeyAction::ToggleGameCursor) => {
-                    handle_toggle_game_cursor(config_dir, cursor_overlay);
-                }
-                None => {}
-            }
+            break;
         }
     }
+}
+
+/// The long-lived handles the event handlers share.
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    tray: &'a Tray,
+    config_dir: &'a Path,
+    cursor_overlay: &'a CursorOverlay,
+    updates: &'a UpdateEvents,
+}
+
+/// Whether Settings is open while [`drain_events`] runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsMode {
+    Closed,
+    Open,
+    /// Open and waiting for the next key to bind; hotkey presses are dropped.
+    Capturing,
+}
+
+/// What one pass of [`drain_events`] asks its caller to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drained {
+    /// Exit GameFrame (the tray's Exit item, or an elevated relaunch).
+    exit: bool,
+    /// The tray's Settings item was clicked and Settings is not open.
+    show_settings: bool,
+}
+
+/// Handles the pending update, tray-icon, tray-menu and hotkey events.
+///
+/// Shared by [`run_event_loop`] and, through [`show_settings`], the open
+/// Settings window (the `settings` parameter), whose own loop blocks the main one:
+/// without it nothing would react until Settings closed. Stops early on an
+/// exit request, or on a Settings click while it is closed (events queued
+/// behind it stay in their channels for the next call). With Settings open,
+/// that click focuses the window instead.
+fn drain_events(
+    ctx: &Shared,
+    hotkeys: &Option<Hotkeys>,
+    offered_update: &mut Option<UpdateInfo>,
+    settings: SettingsMode,
+) -> Drained {
+    let Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        updates,
+    } = *ctx;
+    let settings_open = settings != SettingsMode::Closed;
+    // Results of the startup update check and of installs started from
+    // the tray (posted by worker threads, which wake this pump).
+    while let Some(event) = updates.try_recv() {
+        handle_update_event(event, tray, config_dir, offered_update);
+    }
+
+    // Refreshes the "Apply to Window" submenu's item list only in
+    // response to an actual tray-icon mouse interaction (the mouse
+    // entering the icon, or a click on it), rather than unconditionally
+    // on every pumped message.
+    //
+    // `Enter` reliably arrives on its own dispatched `WM_MOUSEMOVE`
+    // message, strictly before the later `WM_RBUTTONUP` message that
+    // opens the context menu (a user must hover onto the tray icon
+    // before they can click it) -- so refreshing here, once per
+    // `Enter`, completes before the menu is ever shown. `Click` is
+    // included too as a defensive fallback (e.g. covers the case where
+    // this process only just started pumping messages while the cursor
+    // was already resting on the icon, so no `Enter` transition ever
+    // fires) even though, per `tray-icon`'s Windows backend, the menu is
+    // shown synchronously in the same `WM_RBUTTONUP` handler right after
+    // the `Click` event is enqueued -- refreshing on `Click` won't beat
+    // that particular menu display, but it does mean the very next
+    // open is guaranteed current.
+    //
+    // Refreshing before every dispatched message would be wrong. The
+    // primary, certain reason: `tray-icon` sets a 15ms `WM_TIMER` while the
+    // mouse hovers over the icon, which would drive a full `EnumWindows` +
+    // per-window `GetWindowTextW` + submenu rebuild (real Win32 syscalls)
+    // up to ~66 times/second just from the cursor resting nearby --
+    // needlessly expensive on this process's one and only message loop. A
+    // secondary, less certain consideration: per the documented
+    // `GetWindowTextW` contract, a same-process target window causes a
+    // `WM_GETTEXT` to be sent via `SendMessage` and can block if that
+    // window is stuck, whereas a cross-process target (the common case
+    // when enumerating the whole desktop) is documented to read the cached
+    // caption text directly instead, specifically so callers don't hang on
+    // an unresponsive foreign process -- so the practical hang risk here
+    // is narrower than "any hung window on the desktop" (more like "one of
+    // GameFrame's own windows getting stuck"), but still worth avoiding
+    // at no extra cost. No crate-native "menu about to show" event exists
+    // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
+    // comment).
+    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if matches!(
+            event,
+            TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }
+        ) {
+            tray.refresh_apply_to_window_menu();
+            tray.sync_start_with_windows_check();
+        }
+    }
+
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
+        if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
+            handle_apply_to_window(config_dir, target_hwnd);
+            // A newly tracked game gets the game cursor right away.
+            cursor_overlay.reload(config_dir);
+            continue;
+        }
+
+        match tray.ids().action_for(event.id()) {
+            Some(TrayAction::Exit) => {
+                // Returning to `run()` drops its owned `tray`, removing
+                // the OS tray icon and destroying its hidden window --
+                // the entire clean-shutdown path for the tray UI.
+                return Drained {
+                    exit: true,
+                    ..Drained::default()
+                };
+            }
+            Some(TrayAction::ShowSettings) => {
+                if settings_open {
+                    instance_channel::focus_settings_window();
+                } else {
+                    return Drained {
+                        show_settings: true,
+                        ..Drained::default()
+                    };
+                }
+            }
+            Some(TrayAction::ToggleStartWithWindows) => {
+                // `muda` has already flipped the check mark, but the
+                // registry -- not the menu -- is the source of truth:
+                // toggle what the registry says, then re-sync the check
+                // so a failed write doesn't leave it showing a lie.
+                if let Err(e) = autostart::set_enabled(!autostart::is_enabled()) {
+                    log!("failed to change Start with Windows: {e}");
+                }
+                tray.sync_start_with_windows_check();
+            }
+            Some(TrayAction::CheckForUpdates) => check_for_updates_from_tray(),
+            Some(TrayAction::InstallUpdate) => {
+                if let Some(info) = offered_update.clone() {
+                    start_install(info, Failure::Report);
+                }
+            }
+            None => {}
+        }
+    }
+
+    while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+        // Only act on the key-down edge; the crate also emits a
+        // `Released` event on key-up (see `global_hotkey`'s Windows
+        // implementation), which would otherwise double-toggle.
+        if event.state() != HotKeyState::Pressed {
+            continue;
+        }
+        // Settings is capturing a new binding: pressing a bound combo must
+        // not also run its action.
+        if settings == SettingsMode::Capturing {
+            continue;
+        }
+
+        // With no hotkey bound (fresh install) `hotkeys` is `None`
+        // (nothing was registered, so no event can arrive for it
+        // anyway) or resolves to no action for `event.id()` --
+        // either way, nothing happens here and nothing panics.
+        let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
+        match action {
+            Some(HotkeyAction::ToggleBorderless) => {
+                if handle_toggle_borderless(config_dir) {
+                    // GameFrame relaunched itself elevated to complete a
+                    // manipulation that failed for lack of permissions;
+                    // this (unelevated) instance's job is done.
+                    return Drained {
+                        exit: true,
+                        ..Drained::default()
+                    };
+                }
+            }
+            Some(HotkeyAction::ToggleTaskbarAutohide) => {
+                handle_toggle_taskbar_autohide(config_dir);
+            }
+            Some(HotkeyAction::ToggleGameCursor) => {
+                handle_toggle_game_cursor(config_dir, cursor_overlay);
+            }
+            None => {}
+        }
+    }
+
+    Drained::default()
 }
 
 /// Resolves the tracked game (if any) whose executable path is `exe_path`,
@@ -549,8 +626,7 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// which serves its in-memory copy, refreshed by every save) so a Zone/game
 /// added/edited via Settings since the last press is picked up immediately.
 /// The hotkey binding itself is re-registered separately, right after the
-/// Settings window closes -- see the `ShowSettings` branch in
-/// [`run_event_loop`] -- so a changed binding also takes effect without a
+/// Settings window closes -- see [`show_settings`] -- so a changed binding also takes effect without a
 /// restart.
 fn handle_toggle_borderless(config_dir: &Path) -> bool {
     let config = match profile_store::load(config_dir) {
@@ -1055,22 +1131,44 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
 /// Opens Settings (what the tray item and a second launch both do) and, once
 /// it closes, applies what it may have changed.
 fn show_settings(
-    tray: &Tray,
+    ctx: &Shared,
     hotkeys: &mut Option<Hotkeys>,
     hotkey_reports: &mut Vec<BindingReport>,
-    config_dir: &Path,
-    cursor_overlay: &CursorOverlay,
+    offered_update: &mut Option<UpdateInfo>,
 ) {
+    let Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        ..
+    } = *ctx;
     // Synchronous/modal-style: opening Settings blocks this thread until the
     // Settings window closes, at which point the egui/wgpu context it used is
     // fully dropped and we resume pumping tray messages right where we left
-    // off.
+    // off. Meanwhile Settings' frame loop calls back into `drain_events`, so
+    // tray, hotkey and update events are handled immediately instead of
+    // queueing until it closes.
     //
     // The outcome of the last registration is handed to Settings instead of
     // re-checking: while it is open this instance's own registrations hold
     // the combos, so a fresh probe would report GameFrame's own bindings as
     // "in use". Settings hides a failure once its binding has been changed.
-    if let Err(e) = open_settings(config_dir, hotkey_reports) {
+    let mut on_tick = {
+        let hotkeys = &*hotkeys;
+        move |capturing: bool| {
+            let mode = if capturing {
+                SettingsMode::Capturing
+            } else {
+                SettingsMode::Open
+            };
+            let drained = drain_events(ctx, hotkeys, offered_update, mode);
+            if drained.exit {
+                // Settings closes on a queued Quit and the main loop exits.
+                instance_channel::queue_quit();
+            }
+        }
+    };
+    if let Err(e) = open_settings(config_dir, hotkey_reports, &mut on_tick) {
         log!("failed to open Settings: {e}");
     }
 
@@ -1094,10 +1192,11 @@ fn show_settings(
 fn open_settings(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
+    on_tick: &mut dyn FnMut(bool),
 ) -> Result<(), settings_ui::SettingsUiError> {
     // While open, a second launch's OpenSettings focuses this window instead.
     let _modal = instance_channel::enter_settings();
-    settings_ui::run_settings_window(config_dir, hotkey_reports)
+    settings_ui::run_settings_window(config_dir, hotkey_reports, on_tick)
 }
 
 /// The real `%APPDATA%\GameFrame` directory GameFrame persists its config

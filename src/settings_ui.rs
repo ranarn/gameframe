@@ -969,6 +969,42 @@ enum SettingsExit {
     EditZone(SettingsState, Vec<String>),
 }
 
+/// The tracked-games list Save writes. Settings edits its own copy
+/// (`edited`), but the tray's "Apply to Window" can add games on disk while
+/// Settings is open (the main loop keeps running meanwhile). A game that is on
+/// disk (`on_disk`) but was not in the list Settings opened with (`opened`) was
+/// added in the meantime and is appended to `edited` so Save doesn't lose it.
+/// A game in `opened` but missing from `edited` was removed by the user in
+/// Settings and stays removed; a game already in `edited` is never duplicated.
+///
+/// Known limits: a game removed in Settings and then re-tracked through the
+/// tray while Settings is open is dropped again on Save (it is in `opened`, so
+/// it counts as removed), and per-game edits made on disk to a game already in
+/// `opened` lose to Settings' copy.
+///
+/// Pure -- compares executable paths only.
+fn merge_tracked_games(
+    opened: &[TrackedGame],
+    mut edited: Vec<TrackedGame>,
+    on_disk: &[TrackedGame],
+) -> Vec<TrackedGame> {
+    for game in on_disk {
+        let known_at_open = opened.iter().any(|g| g.exe_path == game.exe_path);
+        let in_edited = edited.iter().any(|g| g.exe_path == game.exe_path);
+        if !known_at_open && !in_edited {
+            edited.push(game.clone());
+        }
+    }
+    edited
+}
+
+/// The `cursor.enabled` value Save writes. The game-cursor hotkey persists the
+/// toggle straight to disk while Settings is open, so when the user didn't
+/// touch the setting in Settings (`edited == opened`) the on-disk value wins.
+fn merge_cursor_enabled(opened: bool, edited: bool, on_disk: bool) -> bool {
+    if edited == opened { on_disk } else { edited }
+}
+
 /// Opens the Settings window, blocking until it's closed, then returns.
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
@@ -1006,8 +1042,11 @@ enum SettingsExit {
 pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
+    on_tick: &mut dyn FnMut(bool),
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
+    let opened_games = config.tracked_games.clone();
+    let opened_cursor_enabled = config.cursor.enabled;
     let mut state = SettingsState::from_config(&config);
     state.set_hotkey_reports(hotkey_reports);
     let started_with_windows = autostart::is_enabled();
@@ -1016,8 +1055,25 @@ pub fn run_settings_window(
     let mut status_messages: Vec<String> = Vec::new();
 
     loop {
-        match run_settings_frame(config_dir, state, monitor, status_messages)? {
-            SettingsExit::Saved(config, start_with_windows) => {
+        match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
+            SettingsExit::Saved(mut config, start_with_windows) => {
+                // Keep what the tray and hotkeys changed on disk while
+                // Settings was open. A failed re-read must not abort the Save.
+                match profile_store::load(config_dir) {
+                    Ok(on_disk) => {
+                        config.tracked_games = merge_tracked_games(
+                            &opened_games,
+                            std::mem::take(&mut config.tracked_games),
+                            &on_disk.tracked_games,
+                        );
+                        config.cursor.enabled = merge_cursor_enabled(
+                            opened_cursor_enabled,
+                            config.cursor.enabled,
+                            on_disk.cursor.enabled,
+                        );
+                    }
+                    Err(e) => log!("could not re-read config to merge on Save: {e}"),
+                }
                 profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
                 // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
@@ -1095,6 +1151,7 @@ fn run_settings_frame(
     state: SettingsState,
     monitor: MonitorGeometry,
     initial_status_messages: Vec<String>,
+    on_tick: &mut dyn FnMut(bool),
 ) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
@@ -1129,6 +1186,7 @@ fn run_settings_frame(
                 cursor_previews: None,
                 update_check: UpdateCheck::Idle,
                 update_install: UpdateInstall::Idle,
+                on_tick,
             }))
         }),
     )
@@ -1163,7 +1221,11 @@ fn window_icon() -> egui::IconData {
 /// forward by [`run_settings_window`] as plain `Vec<String>` data, not as
 /// part of this struct, since this struct itself is fully torn down and
 /// reconstructed by [`run_settings_frame`] on each session.
-struct SettingsApp {
+struct SettingsApp<'a> {
+    /// Called once per frame (at least every [`QUIT_POLL`]) so the main
+    /// loop's tray, hotkey and update events keep being handled while this
+    /// window blocks that loop.
+    on_tick: &'a mut dyn FnMut(bool),
     /// Where the Zone is persisted immediately on Clear (the overlay-Save
     /// persist lives in [`run_settings_window`]).
     config_dir: std::path::PathBuf,
@@ -1231,7 +1293,7 @@ struct CursorPreviews {
     shapes: Vec<(CursorShape, egui::TextureHandle)>,
 }
 
-impl SettingsApp {
+impl SettingsApp<'_> {
     fn hotkey_row(&mut self, ui: &mut egui::Ui, label: &str, field: HotkeyField) {
         let is_capturing = self.state.capturing == Some(field);
 
@@ -1879,9 +1941,12 @@ impl SettingsApp {
     }
 }
 
-impl eframe::App for SettingsApp {
+impl eframe::App for SettingsApp<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sync_keyboard_hook();
+        // The flag tells the app to swallow hotkey presses during a capture,
+        // so pressing a bound combo to rebind it doesn't also run its action.
+        (self.on_tick)(self.state.capturing.is_some());
 
         // A Quit (installer/updater) closes Settings as Cancel does. Polled
         // here, not only via the window procedure's WM_CLOSE, so a Quit that
@@ -1950,6 +2015,63 @@ impl eframe::App for SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn game(path: &str) -> TrackedGame {
+        TrackedGame::new_default(std::path::PathBuf::from(path), path.to_string())
+    }
+
+    #[test]
+    fn merge_tracked_games_keeps_a_game_added_on_disk_while_settings_was_open() {
+        let opened = vec![game("a.exe")];
+        let edited = vec![game("a.exe")];
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+
+        let merged = merge_tracked_games(&opened, edited, &on_disk);
+
+        assert_eq!(merged, vec![game("a.exe"), game("b.exe")]);
+    }
+
+    #[test]
+    fn merge_tracked_games_keeps_a_game_the_user_removed_in_settings_removed() {
+        let opened = vec![game("a.exe"), game("b.exe")];
+        let edited = vec![game("a.exe")];
+        let on_disk = opened.clone();
+
+        let merged = merge_tracked_games(&opened, edited, &on_disk);
+
+        assert_eq!(merged, vec![game("a.exe")]);
+    }
+
+    #[test]
+    fn merge_tracked_games_keeps_the_users_edits_to_a_game_and_adds_no_duplicate() {
+        let opened = vec![game("a.exe")];
+        let mut edited_a = game("a.exe");
+        edited_a.auto_apply = !edited_a.auto_apply;
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+
+        let merged = merge_tracked_games(&opened, vec![edited_a.clone()], &on_disk);
+
+        assert_eq!(merged, vec![edited_a, game("b.exe")]);
+    }
+
+    #[test]
+    fn merge_tracked_games_does_not_duplicate_a_game_already_in_the_edited_list() {
+        let merged = merge_tracked_games(&[], vec![game("b.exe")], &[game("b.exe")]);
+
+        assert_eq!(merged, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn merge_cursor_enabled_keeps_the_on_disk_toggle_when_settings_did_not_change_it() {
+        assert!(merge_cursor_enabled(false, false, true));
+        assert!(!merge_cursor_enabled(true, true, false));
+    }
+
+    #[test]
+    fn merge_cursor_enabled_keeps_the_users_change_in_settings() {
+        assert!(merge_cursor_enabled(false, true, false));
+        assert!(!merge_cursor_enabled(true, false, true));
+    }
 
     #[test]
     fn dev_version_is_shown_as_development_build() {
