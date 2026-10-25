@@ -14,8 +14,8 @@ body:
     attributes:
       label: GameFrame version
       description: >
-        Shown in Windows Settings > Apps > GameFrame, and in the first line of
-        `%APPDATA%\GameFrame\gameframe.log`.
+        Shown in Windows Settings > Apps > GameFrame, and in the most recent
+        `GameFrame <version> started` line of `%APPDATA%\GameFrame\gameframe.log`.
     validations:
       required: true
   - type: input

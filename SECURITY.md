@@ -18,8 +18,10 @@ anonymous.
 ## Scope
 
 GameFrame runs unelevated by default as a per-user tray app. It relaunches itself
-elevated only when a window manipulation was denied for lack of rights and you
-accept the UAC prompt. It moves and restyles other applications' windows, hides
-the taskbar, installs a low-level keyboard hook only while you are binding a
-hotkey, and never injects into or reads the memory of game processes. Reports
-about any of these or the installer are in scope.
+elevated only when the borderless hotkey's window manipulation was denied for
+lack of rights and you accept the UAC prompt. It moves and restyles other
+applications' windows, hides the taskbar, installs a low-level keyboard hook only
+while you are binding a hotkey, and never injects into game processes or reads
+their memory. To rank windows in the Apply to Window picker it queries a
+process's executable path and loaded-module list through standard Windows APIs.
+Reports about any of these or the installer are in scope.
