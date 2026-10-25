@@ -36,6 +36,7 @@
 
 use crate::profile_store::TaskbarHideMode;
 use crate::region_calc::Region;
+use crate::taskbar_recovery;
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
@@ -644,6 +645,8 @@ pub fn foreground_window_exe_path() -> Option<std::path::PathBuf> {
 /// module docs.
 pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
+    // Marker first (issue #68): a kill right after the hide is then covered.
+    taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
     // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
     unsafe {
@@ -661,6 +664,14 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// module docs.
 pub fn show_taskbar() -> Result<(), Win32Error> {
+    show_taskbar_window()?;
+    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
+    Ok(())
+}
+
+/// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar`], with no marker
+/// bookkeeping (so the panic hook can use it without touching any lock).
+fn show_taskbar_window() -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
@@ -701,6 +712,7 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
             let current_flags = read_appbar_flags(hwnd);
             let current = state_from_flags(current_flags);
             let restore = plan_taskbar_hide(mode, current);
+            taskbar_recovery::mark_hidden(restore);
             write_appbar_state(hwnd, current_flags, TaskbarAutohideState::AutoHidden);
             Ok(restore)
         }
@@ -715,8 +727,31 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
 pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error> {
     match remembered {
         TaskbarHideRestore::FullyHidden => show_taskbar(),
+        TaskbarHideRestore::HoverReveal(state) => {
+            set_appbar_state(state)?;
+            taskbar_recovery::mark_restored(remembered);
+            Ok(())
+        }
+    }
+}
+
+/// [`restore_taskbar`] without any marker bookkeeping or locking -- the
+/// panic hook's variant ([`crate::taskbar_recovery::install_panic_hook`]),
+/// which must not touch a lock the panicking thread may already hold.
+pub(crate) fn restore_taskbar_raw(remembered: TaskbarHideRestore) -> Result<(), Win32Error> {
+    match remembered {
+        TaskbarHideRestore::FullyHidden => show_taskbar_window(),
         TaskbarHideRestore::HoverReveal(state) => set_appbar_state(state),
     }
+}
+
+/// Reads the taskbar as it really is: `(window visible, appbar auto-hide
+/// state)`. Used by startup recovery. OS-facing.
+pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Error> {
+    let hwnd = find_taskbar_window()?;
+    // Safety: `hwnd` is a live handle just resolved above.
+    let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    Ok((visible, state_from_flags(read_appbar_flags(hwnd))))
 }
 
 
@@ -958,7 +993,20 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
                 show_taskbar()
             }
         }
-        TaskbarHideMode::HoverReveal => set_appbar_state(taskbar_autohide_state_from_bool(hide)),
+        TaskbarHideMode::HoverReveal => {
+            let target = taskbar_autohide_state_from_bool(hide);
+            if hide {
+                // Marker first (issue #68), recording the state to go back to.
+                let hwnd = find_taskbar_window()?;
+                let prior = state_from_flags(read_appbar_flags(hwnd));
+                taskbar_recovery::mark_hidden(TaskbarHideRestore::HoverReveal(prior));
+            }
+            set_appbar_state(target)?;
+            if !hide {
+                taskbar_recovery::mark_restored(TaskbarHideRestore::HoverReveal(target));
+            }
+            Ok(())
+        }
     }
 }
 

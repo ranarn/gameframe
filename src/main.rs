@@ -15,6 +15,7 @@ mod profile_store;
 mod region_calc;
 mod settings_ui;
 mod single_instance;
+mod taskbar_recovery;
 mod tray_ui;
 mod win32;
 mod window_filter;
