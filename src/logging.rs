@@ -48,7 +48,10 @@ pub fn write(args: std::fmt::Arguments) {
 
 fn thread_name() -> String {
     let thread = std::thread::current();
-    thread.name().map(str::to_string).unwrap_or_else(|| format!("{:?}", thread.id()))
+    thread
+        .name()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", thread.id()))
 }
 
 /// Local wall-clock time, `YYYY-MM-DD hh:mm:ss.mmm`.
@@ -76,9 +79,17 @@ struct LogFile {
 impl LogFile {
     fn open(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new().create(true).append(true).open(dir.join(LOG_FILE))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(LOG_FILE))?;
         let size = file.metadata()?.len();
-        Ok(LogFile { dir: dir.to_path_buf(), max_bytes, file, size })
+        Ok(LogFile {
+            dir: dir.to_path_buf(),
+            max_bytes,
+            file,
+            size,
+        })
     }
 
     /// Appends `line`, rotating first if it would pass the cap. A failed
@@ -95,7 +106,12 @@ impl LogFile {
     fn rotate(&mut self) {
         let current = self.dir.join(LOG_FILE);
         let _ = std::fs::rename(&current, self.dir.join(OLD_LOG_FILE));
-        if let Ok(file) = OpenOptions::new().create(true).write(true).truncate(true).open(&current) {
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&current)
+        {
             self.file = file;
             self.size = 0;
         }

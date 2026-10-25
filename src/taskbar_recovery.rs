@@ -67,7 +67,9 @@ pub fn serialize_marker(restore: TaskbarHideRestore) -> String {
         TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AlwaysVisible) => {
             "hover-reveal always-visible\n".to_string()
         }
-        TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AutoHidden) => "hover-reveal auto-hidden\n".to_string(),
+        TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AutoHidden) => {
+            "hover-reveal auto-hidden\n".to_string()
+        }
     }
 }
 
@@ -75,10 +77,12 @@ pub fn serialize_marker(restore: TaskbarHideRestore) -> String {
 pub fn parse_marker(text: &str) -> Option<TaskbarHideRestore> {
     match text.trim() {
         "fully-hidden" => Some(TaskbarHideRestore::FullyHidden),
-        "hover-reveal always-visible" => {
-            Some(TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AlwaysVisible))
-        }
-        "hover-reveal auto-hidden" => Some(TaskbarHideRestore::HoverReveal(TaskbarAutohideState::AutoHidden)),
+        "hover-reveal always-visible" => Some(TaskbarHideRestore::HoverReveal(
+            TaskbarAutohideState::AlwaysVisible,
+        )),
+        "hover-reveal auto-hidden" => Some(TaskbarHideRestore::HoverReveal(
+            TaskbarAutohideState::AutoHidden,
+        )),
         _ => None,
     }
 }
@@ -100,11 +104,17 @@ pub fn decide_recovery(marker: MarkerState, observed: ObservedTaskbar) -> Recove
     match marker {
         MarkerState::None => RecoveryAction::Nothing,
         MarkerState::Technique(TaskbarHideRestore::FullyHidden) | MarkerState::Unreadable => {
-            if observed.visible { RecoveryAction::Nothing } else { RecoveryAction::ShowTaskbar }
+            if observed.visible {
+                RecoveryAction::Nothing
+            } else {
+                RecoveryAction::ShowTaskbar
+            }
         }
         MarkerState::Combined { .. } => RecoveryAction::Nothing,
         MarkerState::Technique(TaskbarHideRestore::HoverReveal(prior)) => {
-            if observed.autohide == TaskbarAutohideState::AutoHidden && prior != TaskbarAutohideState::AutoHidden {
+            if observed.autohide == TaskbarAutohideState::AutoHidden
+                && prior != TaskbarAutohideState::AutoHidden
+            {
                 RecoveryAction::SetAppbarState(prior)
             } else {
                 RecoveryAction::Nothing
@@ -128,7 +138,10 @@ struct HideRecord {
 }
 
 impl HideRecord {
-    const EMPTY: HideRecord = HideRecord { fully: false, hover: None };
+    const EMPTY: HideRecord = HideRecord {
+        fully: false,
+        hover: None,
+    };
 
     /// Records a hide. Returns the record as it was before if this changed it
     /// (the caller must then persist the new record), `None` if unchanged.
@@ -207,7 +220,10 @@ fn marker_techniques(marker: MarkerState) -> Vec<TaskbarHideRestore> {
         MarkerState::None | MarkerState::Unreadable => Vec::new(),
         MarkerState::Technique(t) => vec![t],
         MarkerState::Combined { hover_prior } => {
-            vec![TaskbarHideRestore::HoverReveal(hover_prior), TaskbarHideRestore::FullyHidden]
+            vec![
+                TaskbarHideRestore::HoverReveal(hover_prior),
+                TaskbarHideRestore::FullyHidden,
+            ]
         }
     }
 }
@@ -218,17 +234,26 @@ fn recovery_inputs(marker: MarkerState) -> Vec<MarkerState> {
     match marker {
         MarkerState::None => Vec::new(),
         MarkerState::Unreadable => vec![MarkerState::Unreadable],
-        other => marker_techniques(other).into_iter().map(MarkerState::Technique).collect(),
+        other => marker_techniques(other)
+            .into_iter()
+            .map(MarkerState::Technique)
+            .collect(),
     }
 }
 
 /// What the panic hook should restore. `in_memory` is `None` when the lock on
 /// the in-memory record could not be taken (held by the panicking thread or
 /// another one); the marker file in `dir` is then the source of truth.
-fn panic_restore_target(in_memory: Option<HideRecord>, dir: Option<&Path>) -> Vec<TaskbarHideRestore> {
+fn panic_restore_target(
+    in_memory: Option<HideRecord>,
+    dir: Option<&Path>,
+) -> Vec<TaskbarHideRestore> {
     match in_memory {
         Some(known) => known.techniques(),
-        None => dir.map(read_marker_file).map(marker_techniques).unwrap_or_default(),
+        None => dir
+            .map(read_marker_file)
+            .map(marker_techniques)
+            .unwrap_or_default(),
     }
 }
 
@@ -245,11 +270,18 @@ fn read_marker_file(dir: &Path) -> MarkerState {
     match std::fs::read_to_string(marker_path(dir)) {
         Ok(text) => match parse_record(&text) {
             None => MarkerState::Unreadable,
-            Some(HideRecord { fully: true, hover: Some(hover_prior) }) => MarkerState::Combined { hover_prior },
-            Some(HideRecord { fully: true, hover: None }) => MarkerState::Technique(TaskbarHideRestore::FullyHidden),
-            Some(HideRecord { fully: false, hover: Some(p) }) => {
-                MarkerState::Technique(TaskbarHideRestore::HoverReveal(p))
-            }
+            Some(HideRecord {
+                fully: true,
+                hover: Some(hover_prior),
+            }) => MarkerState::Combined { hover_prior },
+            Some(HideRecord {
+                fully: true,
+                hover: None,
+            }) => MarkerState::Technique(TaskbarHideRestore::FullyHidden),
+            Some(HideRecord {
+                fully: false,
+                hover: Some(p),
+            }) => MarkerState::Technique(TaskbarHideRestore::HoverReveal(p)),
             Some(_) => MarkerState::Unreadable,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => MarkerState::None,
@@ -377,7 +409,9 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
         log!("taskbar recovery: marker {input:?} -> {action:?}");
         match action {
             RecoveryAction::Nothing => {}
-            RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(TaskbarHideRestore::FullyHidden)?,
+            RecoveryAction::ShowTaskbar => {
+                win32::restore_taskbar_raw(TaskbarHideRestore::FullyHidden)?
+            }
             RecoveryAction::SetAppbarState(state) => {
                 win32::restore_taskbar_raw(TaskbarHideRestore::HoverReveal(state))?
             }
@@ -481,12 +515,18 @@ mod tests {
 
     #[test]
     fn no_marker_does_nothing_even_if_the_taskbar_is_hidden() {
-        assert_eq!(decide_recovery(MarkerState::None, observed(false, AutoHidden)), RecoveryAction::Nothing);
+        assert_eq!(
+            decide_recovery(MarkerState::None, observed(false, AutoHidden)),
+            RecoveryAction::Nothing
+        );
     }
 
     #[test]
     fn fully_hidden_marker_with_a_hidden_taskbar_shows_it() {
-        let action = decide_recovery(MarkerState::Technique(FULLY), observed(false, AlwaysVisible));
+        let action = decide_recovery(
+            MarkerState::Technique(FULLY),
+            observed(false, AlwaysVisible),
+        );
         assert_eq!(action, RecoveryAction::ShowTaskbar);
     }
 
@@ -498,19 +538,28 @@ mod tests {
 
     #[test]
     fn hover_reveal_marker_with_an_auto_hidden_taskbar_writes_back_the_prior_state() {
-        let action = decide_recovery(MarkerState::Technique(HOVER_FROM_VISIBLE), observed(true, AutoHidden));
+        let action = decide_recovery(
+            MarkerState::Technique(HOVER_FROM_VISIBLE),
+            observed(true, AutoHidden),
+        );
         assert_eq!(action, RecoveryAction::SetAppbarState(AlwaysVisible));
     }
 
     #[test]
     fn hover_reveal_marker_with_an_already_visible_taskbar_does_nothing() {
-        let action = decide_recovery(MarkerState::Technique(HOVER_FROM_VISIBLE), observed(true, AlwaysVisible));
+        let action = decide_recovery(
+            MarkerState::Technique(HOVER_FROM_VISIBLE),
+            observed(true, AlwaysVisible),
+        );
         assert_eq!(action, RecoveryAction::Nothing);
     }
 
     #[test]
     fn hover_reveal_marker_whose_prior_state_was_auto_hide_does_nothing() {
-        let action = decide_recovery(MarkerState::Technique(HOVER_FROM_AUTO), observed(true, AutoHidden));
+        let action = decide_recovery(
+            MarkerState::Technique(HOVER_FROM_AUTO),
+            observed(true, AutoHidden),
+        );
         assert_eq!(action, RecoveryAction::Nothing);
     }
 
@@ -522,8 +571,14 @@ mod tests {
 
     #[test]
     fn unreadable_marker_with_a_visible_taskbar_does_nothing() {
-        assert_eq!(decide_recovery(MarkerState::Unreadable, observed(true, AutoHidden)), RecoveryAction::Nothing);
-        assert_eq!(decide_recovery(MarkerState::Unreadable, observed(true, AlwaysVisible)), RecoveryAction::Nothing);
+        assert_eq!(
+            decide_recovery(MarkerState::Unreadable, observed(true, AutoHidden)),
+            RecoveryAction::Nothing
+        );
+        assert_eq!(
+            decide_recovery(MarkerState::Unreadable, observed(true, AlwaysVisible)),
+            RecoveryAction::Nothing
+        );
     }
 
     #[test]
@@ -558,7 +613,10 @@ mod tests {
         assert_eq!(read_marker_file(tmp.path()), MarkerState::None);
 
         write_marker_file(tmp.path(), record_of(&[HOVER_FROM_VISIBLE]));
-        assert_eq!(read_marker_file(tmp.path()), MarkerState::Technique(HOVER_FROM_VISIBLE));
+        assert_eq!(
+            read_marker_file(tmp.path()),
+            MarkerState::Technique(HOVER_FROM_VISIBLE)
+        );
 
         clear_marker_file(tmp.path()).unwrap();
         assert_eq!(read_marker_file(tmp.path()), MarkerState::None);
@@ -571,7 +629,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_marker_file(tmp.path(), record_of(&[HOVER_FROM_VISIBLE, FULLY]));
         let marker = read_marker_file(tmp.path());
-        assert_eq!(marker, MarkerState::Combined { hover_prior: AlwaysVisible });
+        assert_eq!(
+            marker,
+            MarkerState::Combined {
+                hover_prior: AlwaysVisible
+            }
+        );
         assert_eq!(marker_techniques(marker), vec![HOVER_FROM_VISIBLE, FULLY]);
     }
 

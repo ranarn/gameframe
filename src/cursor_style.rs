@@ -69,7 +69,10 @@ impl CursorShape {
 
     /// Whether `thickness` changes this shape (the filled shapes ignore it).
     pub fn uses_thickness(self) -> bool {
-        !matches!(self, CursorShape::Arrow | CursorShape::Dot | CursorShape::GameOwn)
+        !matches!(
+            self,
+            CursorShape::Arrow | CursorShape::Dot | CursorShape::GameOwn
+        )
     }
 }
 
@@ -205,7 +208,6 @@ impl Bitmap {
     pub fn alpha_at(&self, x: u32, y: u32) -> u8 {
         self.pixels[((y * self.width + x) * 4 + 3) as usize]
     }
-
 }
 
 /// The arrow outline in units of its height, tip at the origin, y down --
@@ -388,8 +390,12 @@ pub fn cursor_image(
             }
         };
         let premultiply = |c: u8| ((c as u32 * alpha as u32 + 127) / 255) as u8;
-        image.pixels[i * 4..i * 4 + 4]
-            .copy_from_slice(&[premultiply(p[2]), premultiply(p[1]), premultiply(p[0]), alpha]);
+        image.pixels[i * 4..i * 4 + 4].copy_from_slice(&[
+            premultiply(p[2]),
+            premultiply(p[1]),
+            premultiply(p[0]),
+            alpha,
+        ]);
     }
     image
 }
@@ -468,7 +474,11 @@ pub fn render_game_own(settings: &CursorSettings, image: &Bitmap) -> Bitmap {
                 if glow_strength > 0.0 {
                     let outside = (sd - border_w).max(0.0);
                     let falloff = (1.0 - outside / glow_size).clamp(0.0, 1.0);
-                    blend_over(&mut out, s.glow_color, glow_strength * falloff * falloff * opacity);
+                    blend_over(
+                        &mut out,
+                        s.glow_color,
+                        glow_strength * falloff * falloff * opacity,
+                    );
                 }
                 if border_w > 0.0 {
                     blend_over(&mut out, s.border_color, coverage(sd - border_w) * opacity);
@@ -529,7 +539,10 @@ pub fn render_preview(settings: &CursorSettings, game_cursor: Option<&Bitmap>) -
         };
         let mut out = render_game_own(settings, image);
         // The real cursor, drawn by Windows above the overlay in game.
-        let (dx, dy) = (out.hotspot_x - image.hotspot_x, out.hotspot_y - image.hotspot_y);
+        let (dx, dy) = (
+            out.hotspot_x - image.hotspot_x,
+            out.hotspot_y - image.hotspot_y,
+        );
         for y in 0..image.height {
             for x in 0..image.width {
                 let (tx, ty) = (x as i32 + dx, y as i32 + dy);
@@ -581,7 +594,12 @@ fn sample_bilinear(image: &Bitmap, x: f32, y: f32) -> [f32; 4] {
         read_pixel(image, tx as u32, ty as u32)
     };
     let (x0, y0) = (x0 as i32, y0 as i32);
-    let (a, b, c, d) = (texel(x0, y0), texel(x0 + 1, y0), texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
+    let (a, b, c, d) = (
+        texel(x0, y0),
+        texel(x0 + 1, y0),
+        texel(x0, y0 + 1),
+        texel(x0 + 1, y0 + 1),
+    );
     std::array::from_fn(|k| {
         let top = a[k] + (b[k] - a[k]) * fx;
         let bottom = c[k] + (d[k] - c[k]) * fx;
@@ -1129,7 +1147,6 @@ mod tests {
         assert!(b.pixels.iter().any(|&p| p > 0), "the ring was drawn");
     }
 
-
     #[test]
     fn pulse_contracts_onto_the_pointer_and_ends() {
         let s = settings(CursorShape::Ring);
@@ -1198,7 +1215,9 @@ mod tests {
 
     /// A solid 16x16 square cursor of `bgr` with full alpha, hotspot top-left.
     fn square_cursor(bgr: [u8; 3]) -> Bitmap {
-        let bgra: Vec<u8> = (0..256).flat_map(|_| [bgr[0], bgr[1], bgr[2], 255]).collect();
+        let bgra: Vec<u8> = (0..256)
+            .flat_map(|_| [bgr[0], bgr[1], bgr[2], 255])
+            .collect();
         cursor_image(16, 16, 0, 0, &bgra, None)
     }
 
@@ -1231,7 +1250,8 @@ mod tests {
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
         let at = |dx: i32, dy: i32| {
-            let i = (((out.hotspot_y + dy) as u32 * out.width + (out.hotspot_x + dx) as u32) * 4) as usize;
+            let i = (((out.hotspot_y + dy) as u32 * out.width + (out.hotspot_x + dx) as u32) * 4)
+                as usize;
             out.pixels[i..i + 4].to_vec()
         };
         // The red copy, 64 px wide around the hotspot.
@@ -1259,7 +1279,9 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
-        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
+        let alpha = |dx: i32, dy: i32| {
+            out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32)
+        };
         assert!(alpha(-2, 10) > 128, "left: {}", alpha(-2, 10));
         assert!(alpha(10, -2) > 128, "top: {}", alpha(10, -2));
         assert_eq!(alpha(-6, 10), 0);
@@ -1278,7 +1300,9 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([0, 0, 255]));
-        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
+        let alpha = |dx: i32, dy: i32| {
+            out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32)
+        };
         // Inside the outline: untouched, so the game's cursor isn't tinted.
         assert_eq!(alpha(8, 8), 0);
         // Just outside it, on either side: the border.
@@ -1300,7 +1324,9 @@ mod tests {
             ..CursorSettings::default()
         };
         let out = render_game_own(&s, &square_cursor([255, 255, 255]));
-        let alpha = |dx: i32, dy: i32| out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32);
+        let alpha = |dx: i32, dy: i32| {
+            out.alpha_at((out.hotspot_x + dx) as u32, (out.hotspot_y + dy) as u32)
+        };
         let near = alpha(17, 8);
         let far = alpha(23, 8);
         assert!(near > far && far > 0, "near {near}, far {far}");
@@ -1359,7 +1385,12 @@ mod tests {
         };
         let game = square_cursor([0, 0, 255]); // red, 16 px
         let preview = render_preview(&s, Some(&game));
-        let alpha = |x: i32, y: i32| preview.alpha_at((preview.hotspot_x + x) as u32, (preview.hotspot_y + y) as u32);
+        let alpha = |x: i32, y: i32| {
+            preview.alpha_at(
+                (preview.hotspot_x + x) as u32,
+                (preview.hotspot_y + y) as u32,
+            )
+        };
         // Inside the real cursor's 16 px: it, fully opaque; beyond it: the
         // half-transparent enlarged copy.
         assert_eq!(alpha(8, 8), 255);

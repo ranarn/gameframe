@@ -74,8 +74,8 @@ use windows_sys::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, SetWindowsHookExW, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 /// The `WH_KEYBOARD_LL` hook procedure: inspects every physical key-down
@@ -148,7 +148,8 @@ impl KeyboardHookGuard {
         // signature; `hmodule` is a valid handle to this process's own
         // module, and `WH_KEYBOARD_LL` with `dwthreadid == 0` is documented
         // to install a system-wide low-level keyboard hook.
-        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hmodule, 0) };
+        let hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hmodule, 0) };
         if hook.is_null() {
             None
         } else {

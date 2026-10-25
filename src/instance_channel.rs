@@ -5,18 +5,25 @@
 //! finds it by class name and posts one registered window message
 //! ([`Command`] in `wParam`). A window message is dispatched by *any* message
 //! pump on the main thread, so commands arrive even while the modal Settings
-//! window (or the zone editor) is running its own loop -- which a posted
-//! thread message would not survive.
+//! window is running its own loop -- which a posted thread message would not
+//! survive.
 //!
 //! The window procedure never runs commands itself. It either queues them for
-//! the main loop ([`drain`]) or, while the main thread is busy in a modal
-//! window ([`set_modal`]), handles what can safely be done in place (bringing
-//! the open Settings window to the front); see [`route`].
+//! the main loop ([`drain`]) or, while Settings is open ([`enter_settings`]),
+//! brings that window to the front in place; see [`route`]. Any other blocking
+//! handler (zone editor, first-run prompt) is not tracked: commands received
+//! meanwhile are queued and handled once the loop is pumping again. Queued
+//! commands are de-duplicated, so repeated launches open Settings once.
 //!
 //! Elevation: the receiver allows the message through UIPI with
 //! `ChangeWindowMessageFilterEx`, so a normal launch can signal an elevated
 //! instance. The sender grants the receiver the right to take the foreground
 //! (`AllowSetForegroundWindow`) so Settings can actually come to the front.
+//!
+//! Security: `MSGFLT_ALLOW` lets *any* lower-integrity process in the session
+//! post the command. That is harmless for `OpenSettings`, but revisit it
+//! before adding `Quit` (#71): a low-integrity process could then quit an
+//! elevated instance.
 //!
 //! Adding a command (e.g. `Quit`, issue #71): add a [`Command`] variant with
 //! its wire code in [`Command::to_wparam`]/[`Command::from_wparam`], decide
@@ -24,6 +31,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -31,17 +39,17 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    FindWindowExW, GetWindowThreadProcessId, HWND_MESSAGE, IsIconic, MSGFLT_ALLOW, PostMessageW, RegisterClassW,
-    RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, UnregisterClassW, WNDCLASSW,
+    AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, FindWindowExW, GetWindowThreadProcessId, HWND_MESSAGE, IsIconic, MSGFLT_ALLOW,
+    PostMessageW, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow,
+    ShowWindow, UnregisterClassW, WNDCLASSW,
 };
 
 /// Window class of the hidden receiver. Same GUID as the single-instance mutex.
 const CLASS_NAME: &str = "GameFrame.CommandChannel-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 /// Name of the registered window message carrying a [`Command`].
 const MESSAGE_NAME: &str = "GameFrame.Command-5C28E192-0AB5-4FA5-8874-88144D010E3B";
-/// Title of the Settings window (`settings_ui::run_settings_frame`).
-const SETTINGS_TITLE: &str = "GameFrame Settings";
+use crate::settings_ui::SETTINGS_TITLE;
 
 /// How long a sender keeps looking for the running instance's window: the
 /// instance takes the mutex slightly before it creates the window.
@@ -78,61 +86,65 @@ impl Command {
 pub enum Route {
     /// Leave it for the main loop ([`drain`]).
     Queue,
-    /// The main thread is inside Settings: bring that window to the front.
+    /// Settings is already open: bring that window to the front.
     FocusSettings,
-    /// The main thread is inside another modal window: nothing sensible to do.
-    Drop,
 }
 
-/// Pure routing decision. `modal` is whether the main thread is currently
-/// blocked in a modal window, `settings_open` whether that includes Settings.
-pub fn route(command: Command, modal: bool, settings_open: bool) -> Route {
+/// Pure routing decision. `settings_open` is whether the main thread is
+/// currently blocked inside the Settings window.
+pub fn route(command: Command, settings_open: bool) -> Route {
     match command {
-        Command::OpenSettings if !modal => Route::Queue,
         Command::OpenSettings if settings_open => Route::FocusSettings,
-        Command::OpenSettings => Route::Drop,
+        Command::OpenSettings => Route::Queue,
+    }
+}
+
+/// Adds `command` unless it is already waiting: repeated launches while the
+/// main loop is busy must not open Settings once per launch.
+fn enqueue(queue: &mut VecDeque<Command>, command: Command) {
+    if !queue.contains(&command) {
+        queue.push_back(command);
     }
 }
 
 static QUEUE: Mutex<VecDeque<Command>> = Mutex::new(VecDeque::new());
-static MODAL: AtomicBool = AtomicBool::new(false);
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Takes every command received since the last call. Call from the main loop.
 pub fn drain() -> Vec<Command> {
-    QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+    QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
 }
 
-/// Marks the main thread as inside a modal window (`settings` = the Settings
-/// window) for the lifetime of the returned guard.
+/// Marks the main thread as inside the Settings window for the lifetime of the
+/// returned guard.
 #[must_use]
-pub struct ModalGuard {
-    settings: bool,
+pub struct SettingsGuard(());
+
+pub fn enter_settings() -> SettingsGuard {
+    SETTINGS_OPEN.store(true, Ordering::SeqCst);
+    SettingsGuard(())
 }
 
-pub fn enter_modal(settings: bool) -> ModalGuard {
-    MODAL.store(true, Ordering::SeqCst);
-    SETTINGS_OPEN.store(settings, Ordering::SeqCst);
-    ModalGuard { settings }
-}
-
-impl Drop for ModalGuard {
+impl Drop for SettingsGuard {
     fn drop(&mut self) {
-        if self.settings {
-            SETTINGS_OPEN.store(false, Ordering::SeqCst);
-        }
-        MODAL.store(false, Ordering::SeqCst);
+        SETTINGS_OPEN.store(false, Ordering::SeqCst);
     }
 }
-
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn command_message() -> u32 {
-    let name = wide(MESSAGE_NAME);
-    // SAFETY: `name` is NUL-terminated and outlives the call.
-    unsafe { RegisterWindowMessageW(name.as_ptr()) }
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    *MESSAGE.get_or_init(|| {
+        let name = wide(MESSAGE_NAME);
+        // SAFETY: `name` is NUL-terminated and outlives the call.
+        unsafe { RegisterWindowMessageW(name.as_ptr()) }
+    })
 }
 
 /// The running instance's receiver. Dropping it destroys the window.
@@ -187,8 +199,16 @@ impl Receiver {
                 return None;
             }
             // Let a lower-integrity (non-elevated) sender through UIPI.
-            if ChangeWindowMessageFilterEx(hwnd, command_message(), MSGFLT_ALLOW, std::ptr::null_mut()) == 0 {
-                log!("instance channel: could not allow the command message through UIPI; an elevated instance cannot be signalled by a normal launch");
+            if ChangeWindowMessageFilterEx(
+                hwnd,
+                command_message(),
+                MSGFLT_ALLOW,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                log!(
+                    "instance channel: could not allow the command message through UIPI; an elevated instance cannot be signalled by a normal launch"
+                );
             }
             Some(Receiver { hwnd })
         }
@@ -206,16 +226,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == command_message()
         && let Some(command) = Command::from_wparam(wparam)
     {
-        let modal = MODAL.load(Ordering::SeqCst);
-        let settings_open = SETTINGS_OPEN.load(Ordering::SeqCst);
-        match route(command, modal, settings_open) {
-            Route::Queue => QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(command),
+        match route(command, SETTINGS_OPEN.load(Ordering::SeqCst)) {
+            Route::Queue => enqueue(
+                &mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()),
+                command,
+            ),
             Route::FocusSettings => {
                 if !focus_settings_window() {
                     log!("instance channel: Settings is open but its window was not found");
                 }
             }
-            Route::Drop => log!("instance channel: ignoring {command:?} while a modal window is open"),
         }
         return 0;
     }
@@ -258,7 +278,12 @@ pub fn send(command: Command) -> bool {
     loop {
         // SAFETY: plain Win32 calls; `class` outlives them.
         unsafe {
-            let hwnd = FindWindowExW(HWND_MESSAGE, std::ptr::null_mut(), class.as_ptr(), std::ptr::null());
+            let hwnd = FindWindowExW(
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                class.as_ptr(),
+                std::ptr::null(),
+            );
             if !hwnd.is_null() {
                 let mut pid = 0u32;
                 GetWindowThreadProcessId(hwnd, &mut pid);
@@ -292,17 +317,20 @@ mod tests {
     }
 
     #[test]
-    fn open_settings_is_queued_when_the_main_loop_is_free() {
-        assert_eq!(route(Command::OpenSettings, false, false), Route::Queue);
+    fn open_settings_is_queued_when_settings_is_not_open() {
+        assert_eq!(route(Command::OpenSettings, false), Route::Queue);
     }
 
     #[test]
     fn open_settings_focuses_the_window_when_settings_is_already_open() {
-        assert_eq!(route(Command::OpenSettings, true, true), Route::FocusSettings);
+        assert_eq!(route(Command::OpenSettings, true), Route::FocusSettings);
     }
 
     #[test]
-    fn open_settings_is_dropped_inside_another_modal_window() {
-        assert_eq!(route(Command::OpenSettings, true, false), Route::Drop);
+    fn repeated_commands_collapse_into_one_queued_entry() {
+        let mut queue = VecDeque::new();
+        enqueue(&mut queue, Command::OpenSettings);
+        enqueue(&mut queue, Command::OpenSettings);
+        assert_eq!(queue.len(), 1);
     }
 }
