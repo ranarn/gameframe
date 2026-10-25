@@ -1055,14 +1055,10 @@ fn run_settings_frame(
     let exit_for_app = Rc::clone(&exit);
     let config_dir = config_dir.to_path_buf();
 
-    // `.with_position(...)` here only ever takes effect on a genuine
-    // first-ever launch (no saved `WindowSettings` yet). Once eframe has
-    // persisted a position, `egui_winit::WindowSettings::initialize_viewport_builder`
-    // unconditionally calls `.with_position(...)` again with the *restored*
-    // position, so this default is always overridden on subsequent launches
-    // -- it never fights with the position/size/maximized/fullscreen
-    // restore that eframe's own persistence machinery already handles.
+    // Window geometry is not persisted, so the window opens centered on the
+    // monitor every time.
     let native_options = eframe::NativeOptions {
+        persist_window: false,
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_TITLE)
             .with_inner_size(settings_window_size(&monitor))

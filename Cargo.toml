@@ -10,7 +10,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-eframe = { version = "0.37.0", features = ["persistence"] }
+eframe = "0.37.0"
 egui = "0.37.0"
 global-hotkey = "0.9.0"
 # Default features pull in GTK (glib etc.) for Linux trays; GameFrame is Windows-only.

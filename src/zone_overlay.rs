@@ -211,6 +211,7 @@ fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOption
         .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
 
     eframe::NativeOptions {
+        persist_window: false,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()

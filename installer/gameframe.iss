@@ -82,6 +82,12 @@ Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueName: "{#AppName}"; ValueType:
 ; Unchecked: remove a registration (a no-op when the value is already absent).
 Root: HKCU; Subkey: "{#RunKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: not startup
 
+[UninstallDelete]
+; Earlier versions let eframe persist window geometry under
+; %APPDATA%\<window title>\data; remove those stray folders.
+Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
+Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
+
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
