@@ -396,7 +396,7 @@ fn find_settings_window() -> Option<HWND> {
 }
 
 /// Brings this process's Settings window to the front. `false` if not found.
-fn focus_settings_window() -> bool {
+pub fn focus_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;
     };
@@ -408,12 +408,6 @@ fn focus_settings_window() -> bool {
         SetForegroundWindow(hwnd);
     }
     true
-}
-
-/// Brings the open Settings window to the front (what the tray's Settings item
-/// does while Settings is already open). `false` if it doesn't exist yet.
-pub fn focus_settings() -> bool {
-    focus_settings_window()
 }
 
 /// Queues a `Quit` from inside this process (the tray's Exit item or an

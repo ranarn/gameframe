@@ -246,6 +246,12 @@ fn run_event_loop(
 ) {
     // The update the tray item "Update to vX.Y.Z" offers (ask mode).
     let mut offered_update: Option<UpdateInfo> = None;
+    let ctx = Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        updates,
+    };
 
     // A Quit received during the first-run zone prompt (before this pump
     // existed) must not wait for the next message.
@@ -275,15 +281,7 @@ fn run_event_loop(
         for command in commands {
             match command {
                 Command::OpenSettings => {
-                    show_settings(
-                        tray,
-                        &mut hotkeys,
-                        &mut hotkey_reports,
-                        config_dir,
-                        cursor_overlay,
-                        updates,
-                        &mut offered_update,
-                    );
+                    show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
                     // A Quit that arrived while Settings was open closed it
                     // and is waiting in the queue.
                     if instance_channel::quit_pending() {
@@ -298,28 +296,12 @@ fn run_event_loop(
         // Tray, hotkey and update events. Settings drains the same events while
         // it is open (see `show_settings`), so nothing waits for it to close.
         loop {
-            let drained = drain_events(
-                tray,
-                &hotkeys,
-                config_dir,
-                cursor_overlay,
-                updates,
-                &mut offered_update,
-                false,
-            );
+            let drained = drain_events(&ctx, &hotkeys, &mut offered_update, SettingsMode::Closed);
             if drained.exit {
                 return;
             }
             if drained.show_settings {
-                show_settings(
-                    tray,
-                    &mut hotkeys,
-                    &mut hotkey_reports,
-                    config_dir,
-                    cursor_overlay,
-                    updates,
-                    &mut offered_update,
-                );
+                show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
                 if instance_channel::quit_pending() {
                     return;
                 }
@@ -329,6 +311,24 @@ fn run_event_loop(
             break;
         }
     }
+}
+
+/// The long-lived handles the event handlers share.
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    tray: &'a Tray,
+    config_dir: &'a Path,
+    cursor_overlay: &'a CursorOverlay,
+    updates: &'a UpdateEvents,
+}
+
+/// Whether Settings is open while [`drain_events`] runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsMode {
+    Closed,
+    Open,
+    /// Open and waiting for the next key to bind; hotkey presses are dropped.
+    Capturing,
 }
 
 /// What one pass of [`drain_events`] asks its caller to do.
@@ -348,16 +348,19 @@ struct Drained {
 /// exit request, or on a Settings click while it is closed (events queued
 /// behind it stay in their channels for the next call). With Settings open,
 /// that click focuses the window instead.
-#[allow(clippy::too_many_arguments)]
 fn drain_events(
-    tray: &Tray,
+    ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
-    config_dir: &Path,
-    cursor_overlay: &CursorOverlay,
-    updates: &UpdateEvents,
     offered_update: &mut Option<UpdateInfo>,
-    settings_open: bool,
+    settings: SettingsMode,
 ) -> Drained {
+    let Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        updates,
+    } = *ctx;
+    let settings_open = settings != SettingsMode::Closed;
     // Results of the startup update check and of installs started from
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
@@ -431,7 +434,7 @@ fn drain_events(
             }
             Some(TrayAction::ShowSettings) => {
                 if settings_open {
-                    instance_channel::focus_settings();
+                    instance_channel::focus_settings_window();
                 } else {
                     return Drained {
                         show_settings: true,
@@ -464,6 +467,11 @@ fn drain_events(
         // `Released` event on key-up (see `global_hotkey`'s Windows
         // implementation), which would otherwise double-toggle.
         if event.state() != HotKeyState::Pressed {
+            continue;
+        }
+        // Settings is capturing a new binding: pressing a bound combo must
+        // not also run its action.
+        if settings == SettingsMode::Capturing {
             continue;
         }
 
@@ -1124,14 +1132,17 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
 /// Opens Settings (what the tray item and a second launch both do) and, once
 /// it closes, applies what it may have changed.
 fn show_settings(
-    tray: &Tray,
+    ctx: &Shared,
     hotkeys: &mut Option<Hotkeys>,
     hotkey_reports: &mut Vec<BindingReport>,
-    config_dir: &Path,
-    cursor_overlay: &CursorOverlay,
-    updates: &UpdateEvents,
     offered_update: &mut Option<UpdateInfo>,
 ) {
+    let Shared {
+        tray,
+        config_dir,
+        cursor_overlay,
+        ..
+    } = *ctx;
     // Synchronous/modal-style: opening Settings blocks this thread until the
     // Settings window closes, at which point the egui/wgpu context it used is
     // fully dropped and we resume pumping tray messages right where we left
@@ -1145,16 +1156,13 @@ fn show_settings(
     // "in use". Settings hides a failure once its binding has been changed.
     let mut on_tick = {
         let hotkeys = &*hotkeys;
-        move || {
-            let drained = drain_events(
-                tray,
-                hotkeys,
-                config_dir,
-                cursor_overlay,
-                updates,
-                offered_update,
-                true,
-            );
+        move |capturing: bool| {
+            let mode = if capturing {
+                SettingsMode::Capturing
+            } else {
+                SettingsMode::Open
+            };
+            let drained = drain_events(ctx, hotkeys, offered_update, mode);
             if drained.exit {
                 // Settings closes on a queued Quit and the main loop exits.
                 instance_channel::queue_quit();
@@ -1185,7 +1193,7 @@ fn show_settings(
 fn open_settings(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
-    on_tick: &mut dyn FnMut(),
+    on_tick: &mut dyn FnMut(bool),
 ) -> Result<(), settings_ui::SettingsUiError> {
     // While open, a second launch's OpenSettings focuses this window instead.
     let _modal = instance_channel::enter_settings();
