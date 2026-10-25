@@ -551,6 +551,12 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
         return false;
     }
 
+    // Restoring stays allowed for any window; only stripping is refused.
+    if !is_restoring && let Err(refusal) = window_filter::eligibility_for_hwnd(fg_hwnd) {
+        log!("borderless toggle: refusing the window: {refusal}");
+        return false;
+    }
+
     let target_region = match &tracked {
         Some((tracked_game, zone)) => {
             let monitor = primary_monitor_geometry();
@@ -657,9 +663,12 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         }
     };
 
-    let Some(exe_path) = window_filter::exe_path_for_window(target_hwnd) else {
-        log!("apply to window: could not resolve the target window's executable path");
-        return;
+    let exe_path = match window_filter::eligibility_for_hwnd(target_hwnd) {
+        Ok(exe_path) => exe_path,
+        Err(refusal) => {
+            log!("apply to window: refusing the window: {refusal}");
+            return;
+        }
     };
 
     let display_name = win32::window_text(target_hwnd);
@@ -783,6 +792,14 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         return;
     };
 
+    if let Err(refusal) = window_filter::eligibility_for_hwnd(hwnd) {
+        log!(
+            "launch detection: refusing the window of {}: {refusal}",
+            tracked_game.display_name
+        );
+        return;
+    }
+
     let monitor = primary_monitor_geometry();
     let target_region = match resolve_region(&zone, &monitor) {
         Ok(region) => region,
@@ -846,6 +863,13 @@ pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
         return;
     };
     if !matches!(win32::window_has_drifted(hwnd, target_region), Ok(true)) {
+        return;
+    }
+    if let Err(refusal) = window_filter::eligibility_for_hwnd(hwnd) {
+        log!(
+            "drift re-apply: refusing the window of {}: {refusal}",
+            tracked_game.display_name
+        );
         return;
     }
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {

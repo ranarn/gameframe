@@ -304,7 +304,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOW,
     SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WindowFromPoint,
+    ShowWindow, WindowFromPoint,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -1539,28 +1539,14 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i3
     // synchronously invoking this callback.
     let state = unsafe { &mut *(lparam as *mut EnumWindowsState) };
 
-    // Safety: `hwnd` is a live handle supplied by `EnumWindows` itself;
-    // `IsWindowVisible` performs no writes.
-    let is_visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    // An untitled window isn't something a user could sensibly pick by name.
     let title = window_text(hwnd);
-    let is_cloaked = window_filter::is_window_cloaked(hwnd);
-    let ex_style = window_filter::window_ex_style(hwnd);
-    let has_tool_window_style = ex_style & WS_EX_TOOLWINDOW != 0;
-    let has_app_window_style = ex_style & WS_EX_APPWINDOW != 0;
-    let is_representative_window = window_filter::is_root_owner_or_last_active_popup(hwnd);
-
-    if window_filter::is_listable_window(
-        &title,
-        is_visible,
-        is_cloaked,
-        is_representative_window,
-        has_tool_window_style,
-        has_app_window_style,
-    ) {
-        let rank = window_filter::rank_window_for_hwnd(hwnd, &mut state.rank_cache);
+    if window_filter::is_listable_title(&title)
+        && let Ok(exe_path) = window_filter::eligibility_for_hwnd(hwnd)
+    {
+        let rank = window_filter::rank_window_for_hwnd(hwnd, &exe_path, &mut state.rank_cache);
         state.windows.push((hwnd, title, rank));
     }
-
     1 // TRUE: keep enumerating.
 }
 
@@ -1649,6 +1635,8 @@ fn exe_file_name_matches(candidate_file_name: &str, target_exe_path: &Path) -> b
 struct PidWindowsState {
     target_pid: u32,
     windows: Vec<HWND>,
+    /// Why each of the process's other top-level windows was refused.
+    refusals: Vec<window_filter::Refusal>,
 }
 
 unsafe extern "system" fn enum_windows_for_pid_callback(hwnd: HWND, lparam: isize) -> i32 {
@@ -1668,30 +1656,12 @@ unsafe extern "system" fn enum_windows_for_pid_callback(hwnd: HWND, lparam: isiz
         return 1; // TRUE: keep enumerating -- not this process's window.
     }
 
-    // The same Layer 1 canonical-window formula `enum_windows_callback` uses
-    // for the "Apply to Window" picker (issue #27), via the shared
-    // `window_filter::is_canonical_window` predicate -- minus the non-blank
-    // -title requirement `is_listable_window` layers on top of it: a live
-    // re-apply target doesn't need a human-readable title, only to be the
-    // representative top-level window for its process.
-    // Safety: `hwnd` is a live handle; `IsWindowVisible` performs no writes.
-    let is_visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    let is_cloaked = window_filter::is_window_cloaked(hwnd);
-    let ex_style = window_filter::window_ex_style(hwnd);
-    let has_tool_window_style = ex_style & WS_EX_TOOLWINDOW != 0;
-    let has_app_window_style = ex_style & WS_EX_APPWINDOW != 0;
-    let is_representative_window = window_filter::is_root_owner_or_last_active_popup(hwnd);
-
-    if window_filter::is_canonical_window(
-        is_visible,
-        is_cloaked,
-        is_representative_window,
-        has_tool_window_style,
-        has_app_window_style,
-    ) {
-        state.windows.push(hwnd);
+    // The same eligibility check the picker uses, minus its non-blank-title
+    // requirement: a live re-apply target doesn't need a human-readable title.
+    match window_filter::eligibility_for_hwnd(hwnd) {
+        Ok(_) => state.windows.push(hwnd),
+        Err(refusal) => state.refusals.push(refusal),
     }
-
     1 // TRUE: keep enumerating.
 }
 
@@ -1705,10 +1675,11 @@ unsafe extern "system" fn enum_windows_for_pid_callback(hwnd: HWND, lparam: isiz
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
 /// docs.
-fn windows_for_pid(target_pid: u32) -> Vec<HWND> {
+fn windows_for_pid(target_pid: u32) -> (Vec<HWND>, Vec<window_filter::Refusal>) {
     let mut state = PidWindowsState {
         target_pid,
         windows: Vec::new(),
+        refusals: Vec::new(),
     };
     // Safety: `state` outlives this call; see `list_visible_windows`'s
     // identical `EnumWindows` safety comment for why casting it through a
@@ -1719,7 +1690,7 @@ fn windows_for_pid(target_pid: u32) -> Vec<HWND> {
             std::ptr::addr_of_mut!(state) as isize,
         );
     }
-    state.windows
+    (state.windows, state.refusals)
 }
 
 /// Looks up the PID of a running process whose executable path is
@@ -1809,7 +1780,17 @@ fn window_area(hwnd: HWND) -> i64 {
 /// docs; [`choose_candidate_window`] above is the pure decision this
 /// delegates to, and is what's actually unit tested.
 fn resolve_hwnd_for_pid(pid: u32) -> Option<HWND> {
-    let candidates: Vec<(HWND, i64)> = windows_for_pid(pid)
+    let (windows, refusals) = windows_for_pid(pid);
+    if windows.is_empty() && !refusals.is_empty() {
+        let mut reasons: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        reasons.sort();
+        reasons.dedup();
+        log!(
+            "no eligible window for process {pid}: {}",
+            reasons.join("; ")
+        );
+    }
+    let candidates: Vec<(HWND, i64)> = windows
         .into_iter()
         .map(|hwnd| (hwnd, window_area(hwnd)))
         .collect();

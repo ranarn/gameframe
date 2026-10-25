@@ -1,7 +1,7 @@
 //! The tray menu's "Apply to Window" picker's two-layer game-window
 //! filtering/ranking:
 //!
-//! - Layer 1 ([`is_listable_window`]) hard-filters cloaked/owned/tool windows
+//! - Layer 1 ([`check_eligibility`]) hard-filters system-process, dialog, cloaked, owned and tool windows
 //!   out of the list entirely.
 //! - Layer 2 ([`rank_window`]) only ever reorders the remaining list by how
 //!   confidently a window looks like a game (launcher install match, then
@@ -9,7 +9,7 @@
 //!   window, so an unrecognized one stays fully pickable.
 //!
 //! Split the same way as [`crate::win32`]:
-//! - Pure decision logic ([`is_listable_window`], [`rank_window`],
+//! - Pure decision logic ([`check_eligibility`], [`rank_window`],
 //!   [`is_known_engine_window_class`], [`has_known_graphics_module`],
 //!   `matches_known_install`) has no `HWND`/OS dependency and is fully unit
 //!   tested below.
@@ -34,51 +34,13 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GA_ROOTOWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup, GetWindowLongPtrW,
-    GetWindowThreadProcessId,
+    GA_ROOTOWNER, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup, GetWindow,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_APPWINDOW,
+    WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
 };
 
-/// Decides whether a window is worth offering in the tray menu's "Apply to
-/// Window" picker -- Layer 1 of the game-window filtering: hard filters that unconditionally
-/// exclude a window, as opposed to Layer 2's ranking-only signals (see
-/// [`rank_window`]) which never hide a window.
-///
-/// A window is listable if it has a non-blank title (an invisible or
-/// untitled window isn't something a user could sensibly pick by name) and
-/// is otherwise [`is_canonical_window`] -- see that function for the shared
-/// Layer 1 boolean formula (visible, not cloaked, root-owner/last-active-
-/// popup collapsing, tool-window exclusion, app-window override).
-///
-/// Pure logic -- no `HWND`/OS dependency -- so it's unit testable separately
-/// from the real `EnumWindows` callback (`crate::win32::list_visible_windows`)
-/// that calls it; the OS-facing signals themselves are gathered by
-/// [`is_window_cloaked`], [`is_root_owner_or_last_active_popup`], and
-/// [`window_ex_style`].
-pub(crate) fn is_listable_window(
-    title: &str,
-    is_visible: bool,
-    is_cloaked: bool,
-    is_root_owner_or_last_active_popup: bool,
-    has_tool_window_style: bool,
-    has_app_window_style: bool,
-) -> bool {
-    !title.trim().is_empty()
-        && is_canonical_window(
-            is_visible,
-            is_cloaked,
-            is_root_owner_or_last_active_popup,
-            has_tool_window_style,
-            has_app_window_style,
-        )
-}
-
-/// The Layer 1 canonical-window boolean formula shared by [`is_listable_window`]
-/// (the tray menu's "Apply to Window" picker, which additionally requires a
-/// non-blank title on top -- see that function) and
-/// `crate::win32::enum_windows_for_pid_callback` (issue #33's PID-scoped
-/// window resolution, which doesn't need a human-readable title -- it's
-/// machine-driven, matching an already-known process rather than being
-/// picked by name).
+/// The Layer 1 canonical-window boolean formula: the visibility, cloaking,
+/// owner-chain and tool-window rules [check_eligibility] builds on.
 ///
 /// A window is canonical if:
 /// - it's currently visible;
@@ -97,11 +59,7 @@ pub(crate) fn is_listable_window(
 /// the owner-chain/tool-window rules above, per the documented Extended
 /// Window Styles semantics.
 ///
-/// Pure logic -- no `HWND`/OS dependency -- extracted so both call sites'
-/// Layer 1 rules stay a single source of truth instead of two independently
-/// maintained copies (issue #33's iteration-3 review fix: the PID-scoped
-/// callback had re-implemented this formula inline, minus the title check,
-/// with no test coverage of its own for the duplicate).
+/// Pure logic -- no `HWND`/OS dependency.
 pub(crate) fn is_canonical_window(
     is_visible: bool,
     is_cloaked: bool,
@@ -114,11 +72,186 @@ pub(crate) fn is_canonical_window(
         && (has_app_window_style || (is_root_owner_or_last_active_popup && !has_tool_window_style))
 }
 
+/// Executable file names (compared case-insensitively) whose windows must
+/// never be tracked, auto-applied to or stripped: reshaping them breaks the
+/// desktop (taskbar, Start menu, desktop, File Explorer windows) or the shell
+/// hosts around it.
+///
+/// `ApplicationFrameHost.exe` is on the list on purpose: it is the process
+/// that owns the top-level frame of every UWP/Store app, so a tracked entry
+/// keyed on it would match every such app's window and not just one game.
+/// Packaged UWP games are therefore unsupported.
+const SYSTEM_PROCESS_DENYLIST: &[&str] = &[
+    "explorer.exe",
+    "ShellExperienceHost.exe",
+    "StartMenuExperienceHost.exe",
+    "SearchHost.exe",
+    "SearchApp.exe",
+    "TextInputHost.exe",
+    "LockApp.exe",
+    "ApplicationFrameHost.exe",
+    "dwm.exe",
+    "csrss.exe",
+    "winlogon.exe",
+    "taskmgr.exe",
+    "sihost.exe",
+];
+
+/// The window class of standard Win32 dialog boxes.
+const DIALOG_WINDOW_CLASS: &str = "#32770";
+
+/// The per-window signals [`check_eligibility`] decides on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WindowTraits<'a> {
+    pub is_visible: bool,
+    pub is_cloaked: bool,
+    /// The window has an owner (`GetWindow(hwnd, GW_OWNER)` is non-null).
+    pub is_owned: bool,
+    pub is_root_owner_or_last_active_popup: bool,
+    pub has_tool_window_style: bool,
+    pub has_app_window_style: bool,
+    /// `WS_EX_DLGMODALFRAME`, the extended style of dialog-box frames.
+    pub has_dialog_frame_style: bool,
+    pub class_name: &'a str,
+}
+
+/// Why [`check_eligibility`] refused a window; its `Display` text is what gets
+/// logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    UnknownExecutable,
+    OwnExecutable,
+    SystemProcess(String),
+    DialogWindow,
+    OwnedWindow,
+    NotMainWindow,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownExecutable => f.write_str(
+                "the window's executable could not be read (an elevated or protected process?)",
+            ),
+            Self::OwnExecutable => f.write_str("the window belongs to GameFrame itself"),
+            Self::SystemProcess(name) => write!(f, "{name} is a system process"),
+            Self::DialogWindow => f.write_str("the window is a dialog"),
+            Self::OwnedWindow => f.write_str("the window is owned by another window"),
+            Self::NotMainWindow => f.write_str("the window is not a visible main window"),
+        }
+    }
+}
+
+/// Decides whether a window may be tracked, auto-applied to or stripped.
+///
+/// Refuses, in this order: a window whose executable is unknown; GameFrame's
+/// own windows; windows of a [`SYSTEM_PROCESS_DENYLIST`] process; dialogs (the
+/// `#32770` class or `WS_EX_DLGMODALFRAME`, even with `WS_EX_APPWINDOW`);
+/// owned windows without `WS_EX_APPWINDOW`; and anything that is not
+/// [`is_canonical_window`] (hidden, cloaked, tool windows, non-representative
+/// popups).
+///
+/// Pure logic -- no `HWND`/OS dependency; [`eligibility_for_hwnd`] gathers the
+/// signals.
+pub(crate) fn check_eligibility(
+    exe_file_name: Option<&str>,
+    own_exe_file_name: Option<&str>,
+    window: &WindowTraits<'_>,
+) -> Result<(), Refusal> {
+    let Some(exe_file_name) = exe_file_name else {
+        return Err(Refusal::UnknownExecutable);
+    };
+    if own_exe_file_name.is_some_and(|own| own.eq_ignore_ascii_case(exe_file_name)) {
+        return Err(Refusal::OwnExecutable);
+    }
+    if SYSTEM_PROCESS_DENYLIST
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(exe_file_name))
+    {
+        return Err(Refusal::SystemProcess(exe_file_name.to_owned()));
+    }
+    check_window_traits(window)
+}
+
+/// The executable-independent part of [`check_eligibility`]: dialogs, owned
+/// windows and anything that is not [`is_canonical_window`].
+fn check_window_traits(window: &WindowTraits<'_>) -> Result<(), Refusal> {
+    if window.class_name == DIALOG_WINDOW_CLASS || window.has_dialog_frame_style {
+        return Err(Refusal::DialogWindow);
+    }
+    if window.is_owned && !window.has_app_window_style {
+        return Err(Refusal::OwnedWindow);
+    }
+    if !is_canonical_window(
+        window.is_visible,
+        window.is_cloaked,
+        window.is_root_owner_or_last_active_popup,
+        window.has_tool_window_style,
+        window.has_app_window_style,
+    ) {
+        return Err(Refusal::NotMainWindow);
+    }
+    Ok(())
+}
+
+/// Whether a window title is worth offering in the "Apply to Window" picker:
+/// an untitled window isn't something a user could sensibly pick by name.
+pub(crate) fn is_listable_title(title: &str) -> bool {
+    !title.trim().is_empty()
+}
+
+/// GameFrame's own executable file name, resolved once.
+fn own_exe_file_name() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+    })
+    .as_deref()
+}
+
+/// Gathers `hwnd`'s signals and its owning process's executable path (resolved
+/// once), then decides via [`check_eligibility`]. On success returns the
+/// executable path so callers need not resolve it again.
+///
+/// OS-facing: not exercised by this crate's automated tests -- see module
+/// docs.
+pub(crate) fn eligibility_for_hwnd(hwnd: HWND) -> Result<std::path::PathBuf, Refusal> {
+    let ex_style = window_ex_style(hwnd);
+    let class_name = window_class_name(hwnd);
+    // Safety: `hwnd` is a live handle; `IsWindowVisible`/`GetWindow` perform
+    // no writes.
+    let (is_visible, is_owned) = unsafe {
+        (
+            IsWindowVisible(hwnd) != 0,
+            !GetWindow(hwnd, GW_OWNER).is_null(),
+        )
+    };
+    let window = WindowTraits {
+        is_visible,
+        is_cloaked: is_window_cloaked(hwnd),
+        is_owned,
+        is_root_owner_or_last_active_popup: is_root_owner_or_last_active_popup(hwnd),
+        has_tool_window_style: ex_style & WS_EX_TOOLWINDOW != 0,
+        has_app_window_style: ex_style & WS_EX_APPWINDOW != 0,
+        has_dialog_frame_style: ex_style & WS_EX_DLGMODALFRAME != 0,
+        class_name: &class_name,
+    };
+    // The cheap window checks run first: resolving the executable opens the
+    // process, which is wasted on the many windows that fail them anyway.
+    check_window_traits(&window)?;
+    let exe_path = exe_path_for_window(hwnd).ok_or(Refusal::UnknownExecutable)?;
+    let exe_file_name = exe_path.file_name().map(|n| n.to_string_lossy());
+    check_eligibility(exe_file_name.as_deref(), own_exe_file_name(), &window)?;
+    Ok(exe_path)
+}
+
 /// Layer 2 of the game-window filtering: how confidently a window looks
 /// like a game, from weakest to strongest signal (declaration order doubles
 /// as `Ord`/`PartialOrd` ranking, lowest variant first) -- used only to sort
 /// the "Apply to Window" picker's list and/or badge an entry; unlike
-/// [`is_listable_window`]'s Layer-1 hard filters, a low (or [`Unknown`]) rank
+/// [`check_eligibility`]'s Layer-1 hard filters, a low (or [`Unknown`]) rank
 /// never removes a window from the list. An unrecognized window (no launcher
 /// match, no graphics DLL loaded, no known engine window class) always
 /// remains pickable at [`WindowRank::Unknown`].
@@ -247,6 +380,7 @@ pub(crate) struct ProcessRankSignals {
 }
 
 /// Gathers `hwnd`'s Layer-2 signals and combines them via [`rank_window`].
+/// `exe_path` is the already-resolved executable of `hwnd`'s process.
 /// `cache` memoizes only the two genuinely process-level signals
 /// ([`ProcessRankSignals`]: launcher-install match, loaded graphics module)
 /// per PID for the duration of a single `crate::win32::list_visible_windows()`
@@ -268,6 +402,7 @@ pub(crate) struct ProcessRankSignals {
 /// isolation.
 pub(crate) fn rank_window_for_hwnd(
     hwnd: HWND,
+    exe_path: &std::path::Path,
     cache: &mut std::collections::HashMap<u32, ProcessRankSignals>,
 ) -> WindowRank {
     let mut pid: u32 = 0;
@@ -278,9 +413,7 @@ pub(crate) fn rank_window_for_hwnd(
     }
 
     let process_signals = *cache.entry(pid).or_insert_with(|| {
-        let is_launcher_match = process_exe_path(pid)
-            .map(|exe_path| matches_known_install(&exe_path, &known_steam_install_dirs()))
-            .unwrap_or(false);
+        let is_launcher_match = matches_known_install(exe_path, &known_steam_install_dirs());
         let has_graphics_module = has_known_graphics_module(&loaded_module_names(pid));
         ProcessRankSignals {
             is_launcher_match,
@@ -534,7 +667,7 @@ pub(crate) fn window_ex_style(hwnd: HWND) -> u32 {
 /// invisible helper windows) down to one representative per application.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs; the decision that consumes this value ([`is_listable_window`]) is
+/// docs; the decision that consumes this value ([`check_eligibility`]) is
 /// unit tested in isolation.
 pub(crate) fn is_root_owner_or_last_active_popup(hwnd: HWND) -> bool {
     // Safety: `hwnd` is a live handle; `GetAncestor`/`GetLastActivePopup`
@@ -554,7 +687,7 @@ pub(crate) fn is_root_owner_or_last_active_popup(hwnd: HWND) -> bool {
 /// assumed on query failure.
 ///
 /// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs; the decision that consumes this value ([`is_listable_window`]) is
+/// docs; the decision that consumes this value ([`check_eligibility`]) is
 /// unit tested in isolation.
 pub(crate) fn is_window_cloaked(hwnd: HWND) -> bool {
     let mut is_cloaked: i32 = 0;
@@ -577,72 +710,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_listable_window_accepts_a_visible_window_with_a_non_empty_title() {
-        assert!(is_listable_window(
-            "Notepad", true, false, true, false, false
-        ));
+    fn is_canonical_window_accepts_a_visible_window() {
+        assert!(is_canonical_window(true, false, true, false, false));
     }
 
     #[test]
-    fn is_listable_window_rejects_an_invisible_window() {
-        assert!(!is_listable_window(
-            "Notepad", false, false, true, false, false
-        ));
+    fn is_canonical_window_rejects_an_invisible_window() {
+        assert!(!is_canonical_window(false, false, true, false, false));
     }
 
     #[test]
-    fn is_listable_window_rejects_a_visible_window_with_an_empty_title() {
-        assert!(!is_listable_window("", true, false, true, false, false));
+    fn is_canonical_window_rejects_a_cloaked_window() {
+        assert!(!is_canonical_window(true, true, true, false, false));
     }
 
     #[test]
-    fn is_listable_window_rejects_a_visible_window_whose_title_is_only_whitespace() {
-        assert!(!is_listable_window("   ", true, false, true, false, false));
+    fn is_canonical_window_rejects_an_owned_window_that_is_not_its_owners_last_active_popup() {
+        assert!(!is_canonical_window(true, false, false, false, false));
     }
 
     #[test]
-    fn is_listable_window_rejects_a_cloaked_window_even_with_a_visible_non_blank_title() {
-        assert!(!is_listable_window(
-            "Notepad", true, true, true, false, false
-        ));
+    fn is_canonical_window_accepts_a_non_root_owner_window_when_app_window_style_is_set() {
+        assert!(is_canonical_window(true, false, false, false, true));
     }
 
     #[test]
-    fn is_listable_window_rejects_an_owned_window_that_is_not_its_owners_last_active_popup() {
-        assert!(!is_listable_window(
-            "Helper", true, false, false, false, false
-        ));
+    fn is_canonical_window_rejects_a_tool_window() {
+        assert!(!is_canonical_window(true, false, true, true, false));
     }
 
     #[test]
-    fn is_listable_window_accepts_a_non_root_owner_window_when_app_window_style_is_set() {
-        assert!(is_listable_window(
-            "Overlay", true, false, false, false, true
-        ));
+    fn is_canonical_window_accepts_a_tool_window_when_app_window_style_is_also_set() {
+        assert!(is_canonical_window(true, false, true, true, true));
     }
 
     #[test]
-    fn is_listable_window_rejects_a_tool_window() {
-        assert!(!is_listable_window(
-            "Toolbar", true, false, true, true, false
-        ));
-    }
-
-    #[test]
-    fn is_listable_window_accepts_a_tool_window_when_app_window_style_is_also_set() {
-        assert!(is_listable_window("Toolbar", true, false, true, true, true));
-    }
-
-    #[test]
-    fn is_listable_window_app_window_style_overrides_both_a_non_root_owner_and_a_tool_window_together()
+    fn is_canonical_window_app_window_style_overrides_both_a_non_root_owner_and_a_tool_window_together()
      {
         // The strongest form of the documented WS_EX_APPWINDOW override:
         // forces inclusion even when BOTH other Layer-1 rejections
         // (non-representative owner-chain window AND tool-window style)
         // would otherwise apply simultaneously.
-        assert!(is_listable_window(
-            "Overlay", true, false, false, true, true
-        ));
+        assert!(is_canonical_window(true, false, false, true, true));
     }
 
     #[test]
@@ -737,5 +846,200 @@ mod tests {
         let exe_path =
             std::path::PathBuf::from(r"C:\Users\Player\Downloads\SomeIndieGame\game.exe");
         assert!(!matches_known_install(&exe_path, &[install_dir]));
+    }
+
+    #[test]
+    fn is_listable_title_accepts_a_non_blank_title() {
+        assert!(is_listable_title("Notepad"));
+    }
+
+    #[test]
+    fn is_listable_title_rejects_an_empty_title() {
+        assert!(!is_listable_title(""));
+    }
+
+    #[test]
+    fn is_listable_title_rejects_a_whitespace_only_title() {
+        assert!(!is_listable_title("   "));
+    }
+
+    fn game_window() -> WindowTraits<'static> {
+        WindowTraits {
+            is_visible: true,
+            is_cloaked: false,
+            is_owned: false,
+            is_root_owner_or_last_active_popup: true,
+            has_tool_window_style: false,
+            has_app_window_style: false,
+            has_dialog_frame_style: false,
+            class_name: "UnrealWindow",
+        }
+    }
+
+    #[test]
+    fn check_eligibility_accepts_a_normal_top_level_game_window() {
+        assert_eq!(
+            check_eligibility(Some("game.exe"), Some("gameframe.exe"), &game_window()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_every_denylisted_exe_case_insensitively() {
+        for denied in SYSTEM_PROCESS_DENYLIST {
+            for name in [
+                denied.to_string(),
+                denied.to_uppercase(),
+                denied.to_lowercase(),
+            ] {
+                assert_eq!(
+                    check_eligibility(Some(&name), None, &game_window()),
+                    Err(Refusal::SystemProcess(name.clone())),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_eligibility_denylist_covers_the_shell_and_core_system_processes() {
+        for required in [
+            "explorer.exe",
+            "ShellExperienceHost.exe",
+            "StartMenuExperienceHost.exe",
+            "SearchHost.exe",
+            "SearchApp.exe",
+            "TextInputHost.exe",
+            "LockApp.exe",
+            "dwm.exe",
+            "csrss.exe",
+            "winlogon.exe",
+            "taskmgr.exe",
+            "sihost.exe",
+        ] {
+            assert!(
+                check_eligibility(Some(required), None, &game_window()).is_err(),
+                "{required}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_eligibility_refuses_gameframes_own_exe_case_insensitively() {
+        assert_eq!(
+            check_eligibility(Some("GAMEFRAME.EXE"), Some("gameframe.exe"), &game_window()),
+            Err(Refusal::OwnExecutable)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_window_with_an_unknown_exe() {
+        assert_eq!(
+            check_eligibility(None, None, &game_window()),
+            Err(Refusal::UnknownExecutable)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_an_owned_window() {
+        let window = WindowTraits {
+            is_owned: true,
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("game.exe"), None, &window),
+            Err(Refusal::OwnedWindow)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_tool_window() {
+        let window = WindowTraits {
+            has_tool_window_style: true,
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("game.exe"), None, &window),
+            Err(Refusal::NotMainWindow)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_dialog_class_window() {
+        let window = WindowTraits {
+            class_name: "#32770",
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("game.exe"), None, &window),
+            Err(Refusal::DialogWindow)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_dialog_frame_window_even_when_owned_with_app_window_style() {
+        let window = WindowTraits {
+            is_owned: true,
+            has_app_window_style: true,
+            has_dialog_frame_style: true,
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("game.exe"), None, &window),
+            Err(Refusal::DialogWindow)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_hidden_or_cloaked_window() {
+        for window in [
+            WindowTraits {
+                is_visible: false,
+                ..game_window()
+            },
+            WindowTraits {
+                is_cloaked: true,
+                ..game_window()
+            },
+        ] {
+            assert_eq!(
+                check_eligibility(Some("game.exe"), None, &window),
+                Err(Refusal::NotMainWindow)
+            );
+        }
+    }
+
+    #[test]
+    fn check_eligibility_accepts_an_owned_non_dialog_window_with_app_window_style() {
+        let window = WindowTraits {
+            is_owned: true,
+            has_app_window_style: true,
+            ..game_window()
+        };
+        assert_eq!(check_eligibility(Some("game.exe"), None, &window), Ok(()));
+    }
+
+    #[test]
+    fn check_eligibility_refuses_a_non_representative_popup() {
+        let window = WindowTraits {
+            is_root_owner_or_last_active_popup: false,
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("game.exe"), None, &window),
+            Err(Refusal::NotMainWindow)
+        );
+    }
+
+    #[test]
+    fn check_eligibility_reports_a_system_process_before_a_dialog() {
+        let window = WindowTraits {
+            class_name: "#32770",
+            ..game_window()
+        };
+        assert_eq!(
+            check_eligibility(Some("explorer.exe"), None, &window),
+            Err(Refusal::SystemProcess("explorer.exe".to_owned()))
+        );
     }
 }
