@@ -2169,16 +2169,16 @@ mod tests {
     #[test]
     fn from_config_and_to_config_round_trip_the_global_taskbar_flag() {
         let mut config = Config::default();
-        assert!(SettingsState::from_config(&config).hide_taskbar_on_apply);
+        assert!(!SettingsState::from_config(&config).hide_taskbar_on_apply);
 
-        config.hide_taskbar_on_apply = false;
+        config.hide_taskbar_on_apply = true;
         let state = SettingsState::from_config(&config);
-        assert!(!state.hide_taskbar_on_apply);
-        assert!(!state.to_config().hide_taskbar_on_apply);
+        assert!(state.hide_taskbar_on_apply);
+        assert!(state.to_config().hide_taskbar_on_apply);
 
         let mut state = state;
-        state.hide_taskbar_on_apply = true;
-        assert!(state.to_config().hide_taskbar_on_apply);
+        state.hide_taskbar_on_apply = false;
+        assert!(!state.to_config().hide_taskbar_on_apply);
     }
 
     #[test]
