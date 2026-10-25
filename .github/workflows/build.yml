@@ -32,6 +32,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Kept uniform with the other workflows: this workflow only runs for main,
+          # so the expression is always true here.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Stamp version
         if: inputs.version != ''
@@ -43,10 +47,18 @@ jobs:
           $toml = Get-Content Cargo.toml -Raw
           $toml = ([regex]'(?m)^version = "[^"]*"').Replace($toml, "version = `"$env:VERSION`"", 1)
           Set-Content Cargo.toml $toml -NoNewline
-          cargo update --package gameframe --offline
-          $built = (cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json).packages[0].version
+          # pwsh doesn't stop on a failing native command: check every cargo call.
+          cargo update --workspace
+          if ($LASTEXITCODE -ne 0) { throw "cargo update failed ($LASTEXITCODE)" }
+          $meta = cargo metadata --format-version 1 --no-deps --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed ($LASTEXITCODE)" }
+          $built = ($meta | ConvertFrom-Json).packages | Where-Object name -eq 'gameframe' | Select-Object -ExpandProperty version
           if ($built -ne $env:VERSION) { throw "Cargo.toml says $built, expected $env:VERSION" }
-
+          # `cargo update` must have carried the stamp into the lockfile, or the --locked build fails later.
+          $lock = Get-Content Cargo.lock -Raw
+          $m = [regex]::Match($lock, '(?m)^name = "gameframe"\r?\nversion = "([^"]*)"')
+          if (-not $m.Success) { throw 'gameframe entry not found in Cargo.lock' }
+          if ($m.Groups[1].Value -ne $env:VERSION) { throw "Cargo.lock says $($m.Groups[1].Value), expected $env:VERSION" }
       - name: Install Inno Setup 7
         run: |
           $setup = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
