@@ -159,7 +159,7 @@ pub struct Config {
     #[serde(default)]
     pub taskbar_hide_mode: TaskbarHideMode,
     /// Whether applying the Zone also hides the taskbar (using
-    /// `taskbar_hide_mode`).
+    /// `taskbar_hide_mode`). Off by default.
     #[serde(default = "default_hide_taskbar_on_apply")]
     pub hide_taskbar_on_apply: bool,
     /// The game cursor's settings (config table `[cursor]`).
@@ -171,20 +171,20 @@ pub struct Config {
 }
 
 fn default_hide_taskbar_on_apply() -> bool {
-    true
+    false
 }
 
 impl Default for Config {
     /// The starter config written on first run: no Zone, all hotkeys
-    /// unbound, no tracked games yet, and the taskbar hidden fully (no
-    /// hover-reveal) once the Zone is applied.
+    /// unbound, no tracked games yet, and the taskbar left alone when the
+    /// Zone is applied (`hide_taskbar_on_apply` off).
     fn default() -> Self {
         Config {
             zone: None,
             hotkeys: HotkeyBindings::default(),
             tracked_games: Vec::new(),
             taskbar_hide_mode: TaskbarHideMode::default(),
-            hide_taskbar_on_apply: true,
+            hide_taskbar_on_apply: default_hide_taskbar_on_apply(),
             cursor: CursorSettings::default(),
             update_mode: UpdateMode::default(),
         }
@@ -577,7 +577,7 @@ mod tests {
                 },
                 tracked_games: Vec::new(),
                 taskbar_hide_mode: TaskbarHideMode::FullyHidden,
-                hide_taskbar_on_apply: true,
+                hide_taskbar_on_apply: false,
                 cursor: CursorSettings::default(),
                 update_mode: UpdateMode::Auto,
             }
@@ -877,11 +877,36 @@ mod tests {
     }
 
     #[test]
-    fn global_taskbar_flag_is_on_when_there_were_no_games() {
-        assert_global_flag_derivation(true, &[], true);
+    fn global_taskbar_flag_is_off_when_there_were_no_games() {
+        assert_global_flag_derivation(true, &[], false);
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("GameFrame");
         write_config_file(&config_dir, "[hotkeys]\n");
+        assert!(!load_from_disk(&config_dir).unwrap().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn hide_taskbar_on_apply_is_off_by_default() {
+        assert!(!Config::default().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn a_config_file_without_hide_taskbar_on_apply_loads_it_as_off() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert!(!config.hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn an_explicit_hide_taskbar_on_apply_true_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        write_config_file(&config_dir, "hide_taskbar_on_apply = true\n");
+
+        let loaded = load_from_disk(&config_dir).unwrap();
+        assert!(loaded.hide_taskbar_on_apply);
+
+        save(&config_dir, &loaded).unwrap();
         assert!(load_from_disk(&config_dir).unwrap().hide_taskbar_on_apply);
     }
 

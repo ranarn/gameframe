@@ -616,7 +616,7 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// Taskbar auto-hide is set only on the strip direction, not on restore:
 /// using the same fixed global boolean on both directions would leave the
 /// taskbar auto-hidden after a full strip+restore cycle instead of it coming
-/// back, for the common `hide_taskbar_on_apply: true` default.
+/// back, whenever `hide_taskbar_on_apply` is on.
 ///
 /// Returns `true` if GameFrame just relaunched itself elevated and this
 /// process should exit (see [`win32::relaunch_elevated`]); `false` in every
@@ -707,7 +707,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
     // Only set taskbar auto-hide on the strip direction -- setting it again
     // on restore (using the same fixed global boolean) would leave the
     // taskbar auto-hidden after the user exits borderless/game mode instead
-    // of it coming back, for the common `hide_taskbar_on_apply: true` default.
+    // of it coming back, whenever `hide_taskbar_on_apply` is on.
     // Coupling taskbar hide to the Zone apply is about the strip/apply
     // action, not the restore/undo action.
     //
