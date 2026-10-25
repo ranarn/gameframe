@@ -23,7 +23,8 @@ mod zone_editor;
 mod zone_overlay;
 
 fn main() {
-    if !single_instance::acquire() {
+    let wait = single_instance::is_elevated_relaunch(std::env::args()).then_some(single_instance::RELAUNCH_WAIT);
+    if !single_instance::acquire(wait) {
         return;
     }
     if let Err(e) = app::run() {
