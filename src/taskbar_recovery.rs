@@ -407,6 +407,7 @@ pub fn recover_on_startup(dir: &Path) {
         RECOVERY_PENDING.store(true, Ordering::SeqCst);
     }
 }
+
 /// Retries a recovery that failed at startup. Cheap no-op otherwise.
 fn retry_pending_recovery() {
     if !RECOVERY_PENDING.load(Ordering::SeqCst) {
