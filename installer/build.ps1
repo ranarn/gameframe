@@ -1,8 +1,10 @@
 # Builds the GameFrame installer: release exe -> Inno Setup -> target\installer\GameFrame-Setup-<version>.exe
 #
-# Requires cargo-about (pinned in .github/workflows/build.yml; locally:\n# cargo install cargo-about --locked) and Inno Setup 7 (winget install\n# JRSoftware.InnoSetup.7). Only Inno
-# Setup 7 install dirs are searched -- it installs side by side with 6, and an
-# ISCC.exe on PATH could be either.
+# Requires cargo-about (version pinned in .github/workflows/build.yml; locally:
+# cargo install cargo-about --locked --version 0.9.2) and Inno Setup 7
+# (winget install JRSoftware.InnoSetup.7). Only Inno Setup 7 install dirs are
+# searched -- it installs side by side with 6, and an ISCC.exe on PATH could be
+# either.
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -14,6 +16,11 @@ $iscc = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) {
     throw 'ISCC.exe not found -- install Inno Setup 7: winget install JRSoftware.InnoSetup.7'
+}
+
+cargo about --version | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw 'cargo-about not found -- install it: cargo install cargo-about --locked --version 0.9.2'
 }
 
 Push-Location $repo

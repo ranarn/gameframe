@@ -1,6 +1,10 @@
 # cargo-about: generates the third-party notices shipped with the installer
 # (see installer/build.ps1). Keep `accepted` identical to [licenses].allow in
-# deny.toml -- tests/ci check nothing here, so edit both together.
+# deny.toml. Nothing checks that; edit both together.
+#
+# The static "Bundled fonts" section in installer/third-party-notices.hbs is
+# hand-written from epaint_default_fonts 0.37.0 (pulled in by egui). Re-check it
+# whenever egui, and so that crate, is bumped.
 
 accepted = [
     "0BSD",
