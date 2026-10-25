@@ -187,7 +187,7 @@ impl std::error::Error for TrayUiError {
 pub struct Tray {
     icon: TrayIcon,
     menu: Menu,
-    /// The Update to vX.Y.Z item while an update is offered.
+    /// The "Update to vX.Y.Z" item while an update is offered.
     update_item: std::cell::RefCell<Option<MenuItem>>,
     ids: TrayMenuIds,
     apply_to_window_menu: Submenu,
@@ -310,8 +310,8 @@ impl Tray {
         rebuild_apply_to_window_items(&self.apply_to_window_menu);
     }
 
-    /// Adds (or relabels) the Update to v<version> item above Check for
-    /// Updates Now. A failure is logged; the menu stays as it was.
+    /// Adds (or relabels) the "Update to v<version>" item above "Check for
+    /// Updates Now". A failure is logged; the menu stays as it was.
     ///
     /// OS-facing; not exercised by the automated tests (see module docs).
     pub fn show_update_item(&self, version: &str) {
@@ -322,7 +322,7 @@ impl Tray {
             return;
         }
         let item = MenuItem::with_id(self.ids.install_update.clone(), label, true, None);
-        // Just above Check for Updates Now, wherever that sits.
+        // Just above "Check for Updates Now", wherever that sits.
         let position = self
             .menu
             .items()
@@ -335,7 +335,7 @@ impl Tray {
         }
     }
 
-    /// Removes the Update to ... item, if shown.
+    /// Removes the "Update to ..." item, if shown.
     pub fn hide_update_item(&self) {
         if let Some(item) = self.update_item.borrow_mut().take()
             && let Err(e) = self.menu.remove(&item)

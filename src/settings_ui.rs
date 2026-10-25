@@ -100,6 +100,45 @@ pub struct SettingsState {
     hotkey_failures: Vec<BindingReport>,
 }
 
+/// The license shown in the About tab, from `Cargo.toml` (single source).
+const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
+/// The repository's funding config, embedded so the donation link has a
+/// single source of truth. This reaches outside `src/`, so it assumes a
+/// repo-only build: `cargo package`/`publish` without `.github` would break it.
+const FUNDING_YML: &str = include_str!("../.github/FUNDING.yml");
+
+/// The version line for the About tab; the `0.0.0` placeholder that
+/// unreleased builds carry is shown as a development build.
+fn version_label(version: &str) -> String {
+    if version == "0.0.0" {
+        "Version: development build".to_string()
+    } else {
+        format!("Version: {version}")
+    }
+}
+
+/// The first `custom:` URL in a `FUNDING.yml` body, e.g.
+/// `custom: ["https://..."]`. This is an ad-hoc scraper for that single-line
+/// form only; a multi-line or unquoted list yields `None`. The test
+/// `repo_funding_config_yields_a_donation_url` guards the repo file against
+/// drifting into an unsupported form.
+fn funding_custom_url(funding_yml: &str) -> Option<String> {
+    let rest = funding_yml
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("custom:"))?;
+    let start = rest.find("http")?;
+    let url: String = rest[start..]
+        .chars()
+        .take_while(|c| !matches!(c, '"' | '\'' | ']' | ',') && !c.is_whitespace())
+        .collect();
+    Some(url)
+}
+
+fn donation_url() -> Option<String> {
+    funding_custom_url(FUNDING_YML)
+}
+
 /// The Settings window's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
@@ -108,6 +147,8 @@ pub enum SettingsTab {
     Cursor,
     /// Zone, hotkeys, taskbar hiding, startup and updates.
     General,
+    /// Version, license, repository and the optional donation link.
+    About,
 }
 
 /// Which of GameFrame's three hotkey fields a press-to-bind capture applies
@@ -1478,6 +1519,26 @@ impl SettingsApp {
             .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
     }
 
+    /// Renders the About tab: version, license, source link and the
+    /// voluntary donation link.
+    fn about_section(ui: &mut egui::Ui) {
+        ui.heading("GameFrame");
+        ui.label(version_label(env!("CARGO_PKG_VERSION")));
+        ui.label(format!("License: {LICENSE}"));
+        ui.hyperlink_to("Source code", env!("CARGO_PKG_REPOSITORY"));
+        ui.separator();
+        ui.heading("Support");
+        ui.label("GameFrame is free. Donating is entirely optional.");
+        match donation_url() {
+            Some(url) => {
+                ui.hyperlink_to("Donate via PayPal (optional)", url);
+            }
+            None => {
+                ui.label("No donation link is configured in this build.");
+            }
+        }
+    }
+
     /// Renders the "Zone, hotkeys & taskbar" tab.
     fn general_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
@@ -1870,6 +1931,7 @@ impl eframe::App for SettingsApp {
                     SettingsTab::General,
                     "Zone, hotkeys & taskbar",
                 );
+                ui.selectable_value(&mut self.state.tab, SettingsTab::About, "About");
             });
             ui.separator();
 
@@ -1879,6 +1941,7 @@ impl eframe::App for SettingsApp {
                     SettingsTab::Games => self.games_section(ui),
                     SettingsTab::Cursor => self.cursor_section(ui),
                     SettingsTab::General => self.general_section(ui),
+                    SettingsTab::About => Self::about_section(ui),
                 });
         });
     }
@@ -1887,6 +1950,30 @@ impl eframe::App for SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_version_is_shown_as_development_build() {
+        assert_eq!(version_label("0.0.0"), "Version: development build");
+        assert_eq!(version_label("1.2.3"), "Version: 1.2.3");
+    }
+
+    #[test]
+    fn funding_custom_url_is_read_from_the_yaml() {
+        assert_eq!(
+            funding_custom_url("custom: [\"https://example.com/d?x=1\"]\n").as_deref(),
+            Some("https://example.com/d?x=1")
+        );
+        assert_eq!(funding_custom_url("github: someone\n"), None);
+    }
+
+    #[test]
+    fn repo_funding_config_yields_a_donation_url() {
+        assert!(
+            donation_url()
+                .unwrap()
+                .starts_with("https://www.paypal.com/")
+        );
+    }
 
     #[test]
     fn live_apply_failure_message_names_the_game_and_explains_the_fallback() {

@@ -117,6 +117,7 @@ pub(crate) fn schedule_startup_update_check(notifier: UpdateNotifier) {
         log!("couldn't start the startup update check: {e}");
     }
 }
+
 /// Acts on an [`UpdateEvent`] on the event loop's thread.
 pub(crate) fn handle_update_event(
     event: UpdateEvent,
