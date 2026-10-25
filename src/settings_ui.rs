@@ -30,6 +30,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
+/// Title of the Settings window; `crate::instance_channel` finds the window by it.
+pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
+
 /// The editable state backing the Settings window: the single optional
 /// [`Zone`] and the two hotkey binding strings (empty = unbound).
 ///
@@ -974,7 +977,7 @@ fn run_settings_frame(
     // restore that eframe's own persistence machinery already handles.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("GameFrame Settings")
+            .with_title(SETTINGS_TITLE)
             .with_inner_size(settings_window_size(&monitor))
             .with_position(centered_window_position(&monitor, settings_window_size(&monitor)))
             .with_icon(window_icon()),
@@ -982,7 +985,7 @@ fn run_settings_frame(
     };
 
     eframe::run_native(
-        "GameFrame Settings",
+        SETTINGS_TITLE,
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(SettingsApp {
