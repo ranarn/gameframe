@@ -59,17 +59,27 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Registry]
-; Startup task checked: point the Run value at the installed exe, and clear
-; any Task Manager "Disabled" override so it actually runs.
+; The startup task's initial state mirrors the real Run value on an upgrade
+; (see InitializeWizard), so these entries only need to reflect its final state.
+; Checked: point the Run value at the installed exe (same quoted-path format
+; as autostart::set_enabled).
 Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"""; Tasks: startup
-Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: startup
-; Startup task unchecked (e.g. on an upgrade): remove a previous registration.
+; Clear a Task Manager "Disabled" override so a newly chosen autostart actually
+; runs -- but not on an upgrade where the user left the task alone.
+Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: startup; Check: StartupChoiceChanged
+; Unchecked: remove a registration (a no-op when the value is already absent).
 Root: HKCU; Subkey: "{#RunKey}"; ValueName: "{#AppName}"; ValueType: none; Flags: deletevalue dontcreatekey; Tasks: not startup
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+var
+  // Captured when the wizard opens, before this run touches the registry.
+  WasInstalled: Boolean;
+  // The startup task's state when the user first sees it.
+  InitialStartup: Boolean;
+
 procedure StopGameFrame;
 var
   ResultCode: Integer;
@@ -78,10 +88,45 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+procedure SelectStartupFromRegistry;
+begin
+  if InitialStartup then
+    WizardSelectTasks('startup')
+  else
+    WizardSelectTasks('!startup');
+end;
+
+procedure InitializeWizard;
+begin
+  // AppId from [Setup] (the "{{" there is Inno's escape for a literal "{").
+  WasInstalled := RegKeyExists(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{5C28E192-0AB5-4FA5-8874-88144D010E3B}_is1');
+  if WasInstalled then
+  begin
+    // Upgrade: the checkbox shows what the app's toggle last set -- the real
+    // Run value -- not the default or Inno's remembered task state.
+    InitialStartup := RegValueExists(HKEY_CURRENT_USER, '{#RunKey}', '{#AppName}');
+    SelectStartupFromRegistry;
+  end
+  else
+    // Fresh install keeps the task's default (checked).
+    InitialStartup := WizardIsTaskSelected('startup');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  // Inno restores the remembered task selection for a silent run after
+  // InitializeWizard, so re-apply the registry state here unless the caller
+  // chose tasks explicitly with /TASKS.
+  if WasInstalled and WizardSilent and (ExpandConstant('{param:TASKS|}') = '') then
+    SelectStartupFromRegistry;
   StopGameFrame;
   Result := '';
+end;
+
+function StartupChoiceChanged: Boolean;
+begin
+  Result := (not WasInstalled) or (WizardIsTaskSelected('startup') <> InitialStartup);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
