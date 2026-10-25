@@ -91,7 +91,35 @@ jobs:
           name: installer
           path: dist
 
+      # A re-run of this job ("Re-run failed jobs") reuses plan's tag and
+      # build's artifact, but the tag may already exist from the first
+      # attempt. Reuse it when it points at the release commit; refuse when
+      # it points elsewhere.
+      - id: existing
+        name: Detect a tag from an earlier attempt
+        env:
+          PLANNED: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          refs=$(git ls-remote --tags origin "refs/tags/$PLANNED" "refs/tags/$PLANNED^{}")
+          # An annotated tag lists its own object and the peeled commit
+          # (^{}); a lightweight tag lists the commit directly.
+          tag_commit=$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"$refs")
+          if [ -z "$tag_commit" ]; then
+            tag_commit=$(awk '{print $1}' <<<"$refs")
+          fi
+          if [ -z "$tag_commit" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          elif [ "$tag_commit" = "$SHA" ]; then
+            echo "Tag $PLANNED already exists at $SHA; reusing it"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Tag $PLANNED already exists at $tag_commit, not at the release commit $SHA"
+            exit 1
+          fi
+
       - id: release
+        if: steps.existing.outputs.exists != 'true'
         uses: ranarn/release-pilot@0810e9f937aebbe4553ec095205640f6e620a824 # v1.0.9
         with:
           default-bump: none
@@ -106,9 +134,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PLANNED: ${{ needs.plan.outputs.tag }}
           TAG: ${{ steps.release.outputs.tag }}
+          REUSED: ${{ steps.existing.outputs.exists }}
         run: |
-          if [ "$TAG" != "$PLANNED" ]; then
+          if [ "$REUSED" = "true" ]; then
+            if ! gh release view "$PLANNED" >/dev/null 2>&1; then
+              gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --notes ""
+            fi
+          elif [ "$TAG" != "$PLANNED" ]; then
             echo "::error::Release Pilot tagged $TAG, but the installer was built as $PLANNED"
             exit 1
           fi
-          gh release upload "$TAG" dist/*
+          gh release upload "$PLANNED" dist/* --clobber
