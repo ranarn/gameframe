@@ -14,9 +14,14 @@ runs:
         Invoke-WebRequest "https://github.com/EmbarkStudios/cargo-about/releases/download/$env:CARGO_ABOUT_VERSION/cargo-about-$env:CARGO_ABOUT_VERSION-x86_64-pc-windows-msvc.tar.gz" -OutFile $archive
         $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
         if ($hash -ne $env:CARGO_ABOUT_SHA256) { throw "cargo-about checksum mismatch: $hash" }
-        $bin = Join-Path $env:RUNNER_TEMP 'cargo-about'
-        New-Item -ItemType Directory -Force $bin | Out-Null
-        tar -xzf $archive -C $bin --strip-components=1
+        $extract = Join-Path $env:RUNNER_TEMP 'cargo-about'
+        New-Item -ItemType Directory -Force $extract | Out-Null
+        tar -xzf $archive -C $extract --strip-components=1
         if ($LASTEXITCODE -ne 0) { throw "tar failed ($LASTEXITCODE)" }
-        $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-        & (Join-Path $bin 'cargo-about.exe') --version
+        # Cargo's bin dir is already on PATH (rust-toolchain), so no GITHUB_PATH write is needed.
+        $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+        $bin = Join-Path $cargoHome 'bin'
+        New-Item -ItemType Directory -Force $bin | Out-Null
+        Copy-Item (Join-Path $extract 'cargo-about.exe') $bin -Force
+        cargo about --version
+        if ($LASTEXITCODE -ne 0) { throw "cargo-about not on PATH after install ($LASTEXITCODE)" }

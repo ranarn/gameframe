@@ -67,7 +67,7 @@ jobs:
           if ($hash -ne $env:INNO_SETUP_SHA256) { throw "Inno Setup checksum mismatch: $hash" }
           Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER' -Wait
 
-      - uses: ./.github/actions/install-cargo-about
+      - uses: $/.github/actions/install-cargo-about
 
       - name: Build installer
         run: ./installer/build.ps1

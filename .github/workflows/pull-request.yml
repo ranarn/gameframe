@@ -76,7 +76,7 @@ jobs:
         with:
           # Only main saves the cache; PR runs restore it without evicting main's.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: ./.github/actions/install-cargo-about
+      - uses: $/.github/actions/install-cargo-about
       - name: Generate notices
         shell: pwsh
         run: |
