@@ -103,7 +103,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    KillTimer, OBJID_WINDOW, SetTimer, WINEVENT_OUTOFCONTEXT,
 };
 
 /// The config directory the callback reloads the config from on every
@@ -244,6 +244,7 @@ unsafe extern "system" fn window_destroy_callback(
     }
 
     crate::win32::forget_applied_window(hwnd);
+    cancel_drift_recheck(hwnd);
 
     if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
         log!("taskbar auto-restore: armed window {hwnd:?} closed, restoring {restore:?}");
@@ -295,7 +296,73 @@ unsafe extern "system" fn drift_callback(
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };
-    crate::app::handle_applied_window_drift(config_dir, hwnd);
+    check_applied_window_drift(config_dir, hwnd);
+}
+
+/// Window handle -> thread timer id of the one pending deferred drift re-check.
+static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Runs the drift handler for `hwnd`; if it was only rate-limited, schedules
+/// one re-check for when the limit expires (at most one pending per window).
+fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
+    let Some(retry_in) = crate::app::handle_applied_window_drift(config_dir, hwnd) else {
+        return;
+    };
+    let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.contains_key(&(hwnd as isize)) {
+        return;
+    }
+    let delay_ms = u32::try_from(retry_in.as_millis())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    // Safety: a null window makes this a thread timer on the message-loop
+    // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
+    if timer != 0 {
+        pending.insert(hwnd as isize, timer);
+    }
+}
+
+/// Drops `hwnd`'s pending deferred drift re-check, if any.
+fn cancel_drift_recheck(hwnd: HWND) {
+    let timer = DRIFT_RECHECKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&(hwnd as isize));
+    if let Some(timer) = timer {
+        // Safety: `timer` is a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
+}
+
+/// `TIMERPROC` for a deferred drift re-check: re-runs the drift decision for
+/// the window the timer was scheduled for. OS-facing; not unit tested.
+unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usize, _time: u32) {
+    // Safety: `timer` is a thread timer id this module created.
+    unsafe {
+        KillTimer(std::ptr::null_mut(), timer);
+    }
+    let hwnd = {
+        let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(window) = pending
+            .iter()
+            .find_map(|(window, id)| (*id == timer).then_some(*window))
+        else {
+            return;
+        };
+        pending.remove(&window);
+        window as HWND
+    };
+    if !crate::win32::is_applied_window(hwnd) {
+        return;
+    }
+    let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
+        return;
+    };
+    check_applied_window_drift(config_dir, hwnd);
 }
 
 /// The real `WINEVENTPROC` Windows calls on every `EVENT_SYSTEM_FOREGROUND`

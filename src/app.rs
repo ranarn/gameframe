@@ -845,41 +845,46 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 /// window still matches the target, which also stops GameFrame's own
 /// `SetWindowPos` from re-triggering itself. Does not touch the taskbar.
 ///
-/// OS-facing; the drift decision is [`win32::window_drifted`], unit tested.
-pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) {
-    if win32::auto_apply_suppressed(hwnd) {
-        return;
+/// Minimized windows are skipped and re-applies are rate-limited per window.
+/// Returns how long to wait before re-checking when the event was skipped only
+/// because of the rate limit, so a drift that lands inside the limit is still
+/// corrected.
+///
+/// OS-facing; the drift decisions are [`win32::window_drifted`] and the
+/// re-apply decision behind `win32::decide_drift_for_window`, unit tested.
+pub(crate) fn handle_applied_window_drift(
+    config_dir: &Path,
+    hwnd: HWND,
+) -> Option<std::time::Duration> {
+    if win32::auto_apply_suppressed(hwnd) || win32::is_window_minimized(hwnd) {
+        return None;
     }
-    let Some(exe_path) = window_filter::exe_path_for_window(hwnd) else {
-        return;
-    };
-    let Ok(config) = profile_store::load(config_dir) else {
-        return;
-    };
-    let Some((tracked_game, zone)) = resolve_auto_apply(&config, &exe_path) else {
-        return;
-    };
-    let Ok(target_region) = resolve_region(&zone, &primary_monitor_geometry()) else {
-        return;
-    };
-    if !matches!(win32::window_has_drifted(hwnd, target_region), Ok(true)) {
-        return;
+    let exe_path = window_filter::exe_path_for_window(hwnd)?;
+    let config = profile_store::load(config_dir).ok()?;
+    let (tracked_game, zone) = resolve_auto_apply(&config, &exe_path)?;
+    let target_region = resolve_region(&zone, &primary_monitor_geometry()).ok()?;
+    let drifted = matches!(win32::window_has_drifted(hwnd, target_region), Ok(true));
+    match win32::decide_drift_for_window(hwnd, false, drifted) {
+        win32::DriftDecision::Reapply => {}
+        win32::DriftDecision::SkipRateLimited { retry_in } => return Some(retry_in),
+        win32::DriftDecision::SkipMinimized | win32::DriftDecision::SkipNotDrifted => return None,
     }
     if let Err(refusal) = window_filter::eligibility_for_hwnd(hwnd) {
         log!(
             "drift re-apply: refusing the window of {}: {refusal}",
             tracked_game.display_name
         );
-        return;
+        return None;
     }
+    win32::record_drift_attempt(hwnd);
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
         log!(
             "drift re-apply: failed for {}: {e}",
             tracked_game.display_name
         );
     }
+    None
 }
-
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips the
 /// taskbar's *actual* hidden/visible state via [`win32::toggle_taskbar_hide`],
 /// which grounds its decision in the taskbar's real OS-level state rather

@@ -588,15 +588,119 @@ pub fn is_applied_window(hwnd: HWND) -> bool {
         .contains(&(hwnd as isize))
 }
 
+/// Minimum time between two drift re-apply attempts on one window. A game that
+/// keeps restyling itself would otherwise be fought on every location event;
+/// one second still corrects a settings change promptly while capping the
+/// attempts (and any failure log lines) at about one per second per window.
+const DRIFT_REAPPLY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What to do about a location-change event on an applied window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriftDecision {
+    Reapply,
+    /// The window is minimized: its off-screen position is not drift.
+    SkipMinimized,
+    SkipNotDrifted,
+    /// Another attempt on this window happened less than
+    /// [`DRIFT_REAPPLY_MIN_INTERVAL`] ago; the event should be re-checked once
+    /// `retry_in` has passed.
+    SkipRateLimited {
+        retry_in: std::time::Duration,
+    },
+}
+
+/// Pure decision for one drift event. `since_last_attempt` is the time since
+/// this window's previous re-apply attempt, `None` if it has had none.
+fn decide_drift_reapply(
+    minimized: bool,
+    drifted: bool,
+    since_last_attempt: Option<std::time::Duration>,
+) -> DriftDecision {
+    if minimized {
+        DriftDecision::SkipMinimized
+    } else if !drifted {
+        DriftDecision::SkipNotDrifted
+    } else if let Some(since) = since_last_attempt.filter(|d| *d < DRIFT_REAPPLY_MIN_INTERVAL) {
+        DriftDecision::SkipRateLimited {
+            retry_in: DRIFT_REAPPLY_MIN_INTERVAL - since,
+        }
+    } else {
+        DriftDecision::Reapply
+    }
+}
+
+/// Time of each window's last drift re-apply attempt, keyed by window handle.
+#[derive(Debug, Default)]
+struct DriftAttempts {
+    last: std::collections::BTreeMap<isize, std::time::Instant>,
+}
+
+impl DriftAttempts {
+    const fn new() -> Self {
+        Self {
+            last: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Decides for `window` at `now`. Does not record an attempt; the caller
+    /// does that with [`Self::record`] once it actually re-applies.
+    fn decide(
+        &self,
+        window: isize,
+        now: std::time::Instant,
+        minimized: bool,
+        drifted: bool,
+    ) -> DriftDecision {
+        let since = self
+            .last
+            .get(&window)
+            .map(|t| now.saturating_duration_since(*t));
+        decide_drift_reapply(minimized, drifted, since)
+    }
+
+    fn record(&mut self, window: isize, now: std::time::Instant) {
+        self.last.insert(window, now);
+    }
+}
+static DRIFT_ATTEMPTS: std::sync::Mutex<DriftAttempts> =
+    std::sync::Mutex::new(DriftAttempts::new());
+
+/// Whether `hwnd` is minimized (`IsIconic`).
+pub(crate) fn is_window_minimized(hwnd: HWND) -> bool {
+    // Safety: `IsIconic` only reads window state and tolerates a stale handle.
+    unsafe { IsIconic(hwnd) != 0 }
+}
+
+/// Decides whether a drift event on `hwnd` should re-apply the Zone.
+pub(crate) fn decide_drift_for_window(hwnd: HWND, minimized: bool, drifted: bool) -> DriftDecision {
+    DRIFT_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .decide(hwnd as isize, std::time::Instant::now(), minimized, drifted)
+}
+
+/// Records now as the time of `hwnd`'s latest drift re-apply attempt.
+pub(crate) fn record_drift_attempt(hwnd: HWND) {
+    DRIFT_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record(hwnd as isize, std::time::Instant::now());
+}
 /// Forgets `hwnd` (called when it is destroyed) along with its remembered
-/// restore state.
+/// restore state and drift attempt time.
 pub fn forget_applied_window(hwnd: HWND) {
     unmark_applied_window(hwnd);
     lock_store(&RESTORE_STATES).forget(hwnd as isize);
 }
 
-/// Stops the drift watcher treating `hwnd` as GameFrame-placed.
+/// Stops the drift watcher treating `hwnd` as GameFrame-placed and drops its
+/// drift attempt time.
 fn unmark_applied_window(hwnd: HWND) {
+    DRIFT_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .last
+        .remove(&(hwnd as isize));
     APPLIED_WINDOWS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1960,6 +2064,69 @@ mod tests {
         };
 
         assert!(!window_drifted(target, 0x14000000, target));
+    }
+
+    #[test]
+    fn drift_decision_skips_a_minimized_window() {
+        let attempts = DriftAttempts::default();
+
+        assert_eq!(
+            attempts.decide(1, std::time::Instant::now(), true, true),
+            DriftDecision::SkipMinimized
+        );
+    }
+
+    #[test]
+    fn drift_decision_skips_a_window_that_has_not_drifted() {
+        let attempts = DriftAttempts::default();
+
+        assert_eq!(
+            attempts.decide(1, std::time::Instant::now(), false, false),
+            DriftDecision::SkipNotDrifted
+        );
+    }
+
+    #[test]
+    fn drift_decision_rate_limits_repeat_attempts_on_one_window() {
+        let mut attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+        let step = std::time::Duration::from_millis;
+
+        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
+        attempts.record(1, t0);
+        assert_eq!(
+            attempts.decide(1, t0 + step(400), false, true),
+            DriftDecision::SkipRateLimited {
+                retry_in: step(600)
+            }
+        );
+        assert_eq!(
+            attempts.decide(1, t0 + step(1000), false, true),
+            DriftDecision::Reapply
+        );
+    }
+
+    #[test]
+    fn drift_decision_limits_two_windows_independently() {
+        let mut attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+
+        attempts.record(1, t0);
+
+        assert!(matches!(
+            attempts.decide(1, t0, false, true),
+            DriftDecision::SkipRateLimited { .. }
+        ));
+        assert_eq!(attempts.decide(2, t0, false, true), DriftDecision::Reapply);
+    }
+
+    #[test]
+    fn drift_decision_does_not_limit_a_window_that_was_never_recorded() {
+        let attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, false, true), DriftDecision::Reapply);
     }
 
     #[test]
