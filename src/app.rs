@@ -49,6 +49,7 @@
 use crate::autostart;
 use crate::cursor_overlay::CursorOverlay;
 use crate::hotkeys::{Hotkeys, HotkeyAction};
+use crate::instance_channel::{self, Command};
 use crate::launch_watcher;
 use crate::profile_store;
 use crate::region_calc::{resolve_region, Region};
@@ -76,6 +77,10 @@ pub fn run() -> Result<(), TrayUiError> {
     crate::taskbar_recovery::install_panic_hook();
 
     let tray = Tray::new()?;
+
+    // Lets a second launch ask this instance to open Settings (issue #70).
+    // Created on this thread so this thread's pumps dispatch its messages.
+    let instance_channel = instance_channel::Receiver::create();
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
@@ -107,6 +112,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // Stops the game cursor thread, which also restores swapped system
     // cursors (see `crate::cursor_overlay`).
     drop(cursor_overlay);
+    drop(instance_channel);
 
     // Issue #43: if a Zone-apply's taskbar hide is still armed when the
     // user quits via the tray "Exit" item, restore it now -- before `tray`
@@ -226,6 +232,14 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path, 
             DispatchMessageW(&msg);
         }
 
+        // Commands from a second launch (see crate::instance_channel); the
+        // channel's window is dispatched by this pump, so they are queued by now.
+        for command in instance_channel::drain() {
+            match command {
+                Command::OpenSettings => show_settings(tray, &mut hotkeys, config_dir, cursor_overlay),
+            }
+        }
+
         // Refreshes the "Apply to Window" submenu's item list only in
         // response to an actual tray-icon mouse interaction (the mouse
         // entering the icon, or a click on it), rather than unconditionally
@@ -288,31 +302,7 @@ fn run_event_loop(tray: &Tray, mut hotkeys: Option<Hotkeys>, config_dir: &Path, 
                     return;
                 }
                 Some(TrayAction::ShowSettings) => {
-                    // Synchronous/modal-style for this MVP: opening
-                    // Settings blocks this thread until the Settings
-                    // window closes, at which point the egui/wgpu
-                    // context it used is fully dropped and we resume
-                    // pumping tray messages right where we left off.
-                    if let Err(e) = open_settings(config_dir) {
-                        log!("failed to open Settings: {e}");
-                    }
-
-                    // Settings may have changed the hotkey bindings on
-                    // disk (Save persists via `profile_store`) --
-                    // re-register from the freshly saved config so a
-                    // newly bound/changed/removed hotkey takes effect
-                    // immediately, without requiring a full app
-                    // restart. The old `Hotkeys` must be dropped *before*
-                    // registering again (its `Drop` destroys the manager's
-                    // hidden window, which releases its hotkeys): a plain
-                    // `hotkeys = register_hotkeys(..)` evaluates the right
-                    // side first, so every unchanged key failed with
-                    // "already registered" and all hotkeys went dead after
-                    // any Settings visit (#52).
-                    drop(hotkeys.take());
-                    hotkeys = register_hotkeys(config_dir);
-                    cursor_overlay.reload(config_dir);
-                    tray.sync_start_with_windows_check();
+                    show_settings(tray, &mut hotkeys, config_dir, cursor_overlay);
                 }
                 Some(TrayAction::ToggleStartWithWindows) => {
                     // `muda` has already flipped the check mark, but the
@@ -906,10 +896,37 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
     }
 }
 
+/// Opens Settings (what the tray item and a second launch both do) and, once
+/// it closes, applies what it may have changed.
+fn show_settings(tray: &Tray, hotkeys: &mut Option<Hotkeys>, config_dir: &Path, cursor_overlay: &CursorOverlay) {
+    // Synchronous/modal-style for this MVP: opening Settings blocks this
+    // thread until the Settings window closes, at which point the egui/wgpu
+    // context it used is fully dropped and we resume pumping tray messages
+    // right where we left off.
+    if let Err(e) = open_settings(config_dir) {
+        log!("failed to open Settings: {e}");
+    }
+
+    // Settings may have changed the hotkey bindings on disk (Save persists via
+    // `profile_store`) -- re-register from the freshly saved config so a newly
+    // bound/changed/removed hotkey takes effect immediately, without requiring
+    // a full app restart. The old `Hotkeys` must be dropped *before*
+    // registering again (its `Drop` destroys the manager's hidden window,
+    // which releases its hotkeys): a plain `hotkeys = register_hotkeys(..)`
+    // evaluates the right side first, so every unchanged key failed with
+    // "already registered" and all hotkeys went dead after any Settings visit
+    // (#52).
+    drop(hotkeys.take());
+    *hotkeys = register_hotkeys(config_dir);
+    cursor_overlay.reload(config_dir);
+    tray.sync_start_with_windows_check();
+}
 /// Opens the Settings window at `config_dir`. See
 /// [`settings_ui::run_settings_window`] for what "opens" entails (blocks
 /// until closed, persists on Save).
 fn open_settings(config_dir: &Path) -> Result<(), settings_ui::SettingsUiError> {
+    // While open, a second launch's OpenSettings focuses this window instead.
+    let _modal = instance_channel::enter_modal(true);
     settings_ui::run_settings_window(config_dir)
 }
 
