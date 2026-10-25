@@ -184,7 +184,9 @@ fn primary_monitor_scale() -> f32 {
         if hr == 0 && dpi_x > 0 {
             scale_from_dpi(dpi_x)
         } else {
-            log!("zone editor: GetDpiForMonitor failed (hr={hr}, dpi={dpi_x}); assuming 100 % scale");
+            log!(
+                "zone editor: GetDpiForMonitor failed (hr={hr}, dpi={dpi_x}); assuming 100 % scale"
+            );
             1.0
         }
     }

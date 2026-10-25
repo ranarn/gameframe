@@ -637,12 +637,7 @@ impl DriftAttempts {
 
     /// Decides for `window` at `now`. Does not record an attempt; the caller
     /// does that with [`Self::record`] once it actually re-applies.
-    fn decide(
-        &self,
-        window: isize,
-        now: std::time::Instant,
-        drifted: bool,
-    ) -> DriftDecision {
+    fn decide(&self, window: isize, now: std::time::Instant, drifted: bool) -> DriftDecision {
         let since = self
             .last
             .get(&window)

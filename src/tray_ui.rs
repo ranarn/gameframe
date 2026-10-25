@@ -1,7 +1,7 @@
-//! Owns the system tray icon and its four top-level context menu items
-//! ("Show Settings", "Apply to Window", "Start with Windows", "Exit"), plus
-//! the id -> action mapping that lets `app`'s event loop recognize a click on
-//! "Exit" and start the clean-shutdown path.
+//! Owns the system tray icon and its five top-level context menu items
+//! ("Show Settings", "Apply to Window", "Start with Windows", "Check for
+//! Updates Now", "Exit"), plus the id -> action mapping that lets `app`'s
+//! event loop recognize a click on "Exit" and start the clean-shutdown path.
 //!
 //! "Apply to Window" is itself a live [`Submenu`] of currently-visible
 //! top-level windows (see [`Tray::refresh_apply_to_window_menu`] for the
@@ -40,12 +40,14 @@ use windows_sys::Win32::Foundation::HWND;
 pub enum TrayAction {
     ShowSettings,
     ToggleStartWithWindows,
+    CheckForUpdates,
     Exit,
 }
 
 const SHOW_SETTINGS_ID: &str = "gameframe-show-settings";
 const APPLY_TO_WINDOW_ID: &str = "gameframe-apply-to-window";
 const START_WITH_WINDOWS_ID: &str = "gameframe-start-with-windows";
+const CHECK_FOR_UPDATES_ID: &str = "gameframe-check-for-updates";
 const EXIT_ID: &str = "gameframe-exit";
 
 /// Prefix for the dynamically-generated "Apply to Window" submenu items'
@@ -88,6 +90,7 @@ pub struct TrayMenuIds {
     show_settings: MenuId,
     apply_to_window: MenuId,
     start_with_windows: MenuId,
+    check_for_updates: MenuId,
     exit: MenuId,
 }
 
@@ -97,6 +100,7 @@ impl TrayMenuIds {
             show_settings: MenuId::new(SHOW_SETTINGS_ID),
             apply_to_window: MenuId::new(APPLY_TO_WINDOW_ID),
             start_with_windows: MenuId::new(START_WITH_WINDOWS_ID),
+            check_for_updates: MenuId::new(CHECK_FOR_UPDATES_ID),
             exit: MenuId::new(EXIT_ID),
         }
     }
@@ -114,6 +118,8 @@ impl TrayMenuIds {
             Some(TrayAction::ShowSettings)
         } else if *id == self.start_with_windows {
             Some(TrayAction::ToggleStartWithWindows)
+        } else if *id == self.check_for_updates {
+            Some(TrayAction::CheckForUpdates)
         } else if *id == self.exit {
             Some(TrayAction::Exit)
         } else {
@@ -210,6 +216,14 @@ impl Tray {
         );
         menu.append(&start_with_windows_item)
             .map_err(TrayUiError::Menu)?;
+
+        menu.append(&MenuItem::with_id(
+            ids.check_for_updates.clone(),
+            "Check for Updates Now",
+            true,
+            None,
+        ))
+        .map_err(TrayUiError::Menu)?;
 
         menu.append(&MenuItem::with_id(ids.exit.clone(), "Exit", true, None))
             .map_err(TrayUiError::Menu)?;
@@ -353,6 +367,16 @@ mod tests {
         assert_eq!(
             ids.action_for(&MenuId::new(START_WITH_WINDOWS_ID)),
             Some(TrayAction::ToggleStartWithWindows)
+        );
+    }
+
+    #[test]
+    fn action_for_maps_the_check_for_updates_id_to_the_check_for_updates_action() {
+        let ids = TrayMenuIds::new();
+
+        assert_eq!(
+            ids.action_for(&MenuId::new(CHECK_FOR_UPDATES_ID)),
+            Some(TrayAction::CheckForUpdates)
         );
     }
 

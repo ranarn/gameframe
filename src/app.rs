@@ -64,7 +64,8 @@ use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    DispatchMessageW, GetMessageW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    MSG, MessageBoxW, TranslateMessage,
 };
 
 pub fn run() -> Result<(), TrayUiError> {
@@ -353,6 +354,7 @@ fn run_event_loop(
                     }
                     tray.sync_start_with_windows_check();
                 }
+                Some(TrayAction::CheckForUpdates) => check_for_updates_from_tray(),
                 None => {}
             }
         }
@@ -482,8 +484,8 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// [`resolve_tracked_apply`]) and, if it's tracked (or a restore is already
 /// pending for *this same window* -- see below), applies (or reverts) the
 /// border-strip via [`win32::toggle_borderless_on_window`], then,
-/// on a successful strip only, sets the tracked game's taskbar-auto-hide
-/// value absolutely.
+/// on a successful strip only, sets the taskbar absolutely from the global
+/// `hide_taskbar_on_apply` and `taskbar_hide_mode`.
 ///
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
@@ -879,6 +881,54 @@ pub(crate) fn handle_applied_window_drift(
         );
     }
     None
+}
+
+/// Whether the tray's update-check result box is open.
+static UPDATE_RESULT_BOX_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`UPDATE_RESULT_BOX_OPEN`] on drop, so a panic while the box is
+/// shown releases it too.
+struct ResultBoxOpen;
+
+impl Drop for ResultBoxOpen {
+    fn drop(&mut self) {
+        UPDATE_RESULT_BOX_OPEN.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Runs an update check on a worker thread (the event loop never waits on the
+/// network) and shows the result in a message box from that thread. Ignored
+/// while an earlier check is still fetching or its result box is still open.
+fn check_for_updates_from_tray() {
+    use std::sync::atomic::Ordering;
+    if UPDATE_RESULT_BOX_OPEN.swap(true, Ordering::AcqRel) {
+        log!("update check: the previous result is still shown");
+        return;
+    }
+    let box_open = ResultBoxOpen;
+    let started = crate::updater::spawn_check(move |result| {
+        let _box_open = box_open;
+        let icon = if result.is_ok() {
+            MB_ICONINFORMATION
+        } else {
+            MB_ICONWARNING
+        };
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let text = wide(&crate::updater::result_message(&result));
+        let title = wide("GameFrame");
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | icon | MB_SETFOREGROUND,
+            );
+        }
+    });
+    if !started {
+        log!("update check: one is already running");
+    }
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips the

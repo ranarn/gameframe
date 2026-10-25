@@ -1,0 +1,784 @@
+//! Update check: asks GitHub's "latest release" endpoint whether a release
+//! newer than the running build exists.
+//!
+//! The decision logic is pure: [`check`] takes the running version and a
+//! fetch closure, and [`parse_release`], [`Version`] and [`select_asset`] work
+//! on plain strings, so all of it is unit tested without a network. The
+//! network part is [`fetch_latest_release`] (a blocking WinHTTP request, see
+//! [`crate::http`]) and [`spawn_check`], which runs the whole check on a
+//! worker thread so no UI thread ever waits on it.
+//!
+//! A development build (version `0.0.0`) never fetches anything.
+
+use crate::http::HttpError;
+use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The GitHub API host and the path of the latest non-draft, non-pre-release.
+const API_HOST: &str = "api.github.com";
+const LATEST_RELEASE_PATH: &str = "/repos/ranarn/gameframe/releases/latest";
+
+/// The version of the running build; `0.0.0` for local and `main` builds.
+pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const INSTALLER_PREFIX: &str = "GameFrame-Setup-";
+const INSTALLER_SUFFIX: &str = ".exe";
+const DIGEST_PREFIX: &str = "sha256:";
+
+/// Hosts an installer may be downloaded from: release assets are served from
+/// `github.com` and redirected to `objects.githubusercontent.com`.
+const DOWNLOAD_HOSTS: [&str; 2] = ["github.com", "objects.githubusercontent.com"];
+
+/// A plain `x.y.z` version, compared numerically component by component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Version(u32, u32, u32);
+
+impl Version {
+    const DEVELOPMENT: Version = Version(0, 0, 0);
+
+    /// Parses `x.y.z`, with one optional leading `v` (a release tag).
+    /// Anything else, such as a pre-release suffix, is rejected.
+    pub(crate) fn parse(text: &str) -> Result<Self, UpdateError> {
+        let invalid = || UpdateError::InvalidVersion(text.to_string());
+        let mut parts = text.strip_prefix('v').unwrap_or(text).split('.');
+        let mut component = || {
+            let part = parts.next().ok_or_else(invalid)?;
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            part.parse::<u32>().map_err(|_| invalid())
+        };
+        let version = Version(component()?, component()?, component()?);
+        if parts.next().is_some() {
+            return Err(invalid());
+        }
+        Ok(version)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
+
+/// Reasons an update check can fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateError {
+    /// The request itself failed (connection, TLS, timeout, body).
+    Network(String),
+    /// GitHub answered the request with an unexpected HTTP status.
+    HttpStatus(u32),
+    /// The response is not the expected release JSON.
+    Malformed(String),
+    /// A version string is not `x.y.z`.
+    InvalidVersion(String),
+    /// The release has no `GameFrame-Setup-*.exe` asset.
+    NoMatchingAsset,
+    /// The installer asset carries no `digest`.
+    MissingDigest,
+    /// The installer asset's `digest` is not `sha256:` plus 64 hex digits.
+    InvalidDigest(String),
+    /// The installer asset's download URL is not an HTTPS URL on a GitHub
+    /// download host.
+    UntrustedDownloadUrl(String),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::Network(e) => write!(f, "couldn't reach GitHub: {e}"),
+            // A 403 that is not a rate limit looks the same here; telling them
+            // apart needs the `X-RateLimit-Remaining` header, so an automatic
+            // check must not treat this as proof of a rate limit.
+            UpdateError::HttpStatus(403 | 429) => {
+                write!(
+                    f,
+                    "GitHub refused the request (rate limit?), try again later"
+                )
+            }
+            UpdateError::HttpStatus(status) => {
+                write!(f, "GitHub answered with HTTP status {status}")
+            }
+            UpdateError::Malformed(e) => write!(f, "unexpected response from GitHub: {e}"),
+            UpdateError::InvalidVersion(v) => write!(f, "unrecognized version \"{v}\""),
+            UpdateError::NoMatchingAsset => {
+                write!(
+                    f,
+                    "the latest release has no {INSTALLER_PREFIX}*.exe installer"
+                )
+            }
+            UpdateError::MissingDigest => {
+                write!(f, "the latest release's installer has no SHA-256 digest")
+            }
+            UpdateError::InvalidDigest(d) => write!(f, "unrecognized installer digest \"{d}\""),
+            UpdateError::UntrustedDownloadUrl(u) => {
+                write!(f, "the installer's download URL is not a GitHub URL: {u}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {}
+
+/// The installer of a newer release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdateInfo {
+    pub(crate) version: Version,
+    pub(crate) download_url: String,
+    /// The expected SHA-256 of the installer, 64 lowercase hex digits.
+    pub(crate) sha256: String,
+}
+
+/// What a successful check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckOutcome {
+    /// The running build is `0.0.0`; nothing was fetched.
+    DevelopmentBuild,
+    /// GitHub has no published release to compare with.
+    NoReleasePublished,
+    UpToDate,
+    UpdateAvailable(UpdateInfo),
+}
+
+impl CheckOutcome {
+    /// The one-line text shown to the user.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            CheckOutcome::DevelopmentBuild => {
+                "This is a development build; update checks are disabled.".to_string()
+            }
+            CheckOutcome::NoReleasePublished => {
+                "No GameFrame release has been published yet.".to_string()
+            }
+            CheckOutcome::UpToDate => "GameFrame is up to date.".to_string(),
+            CheckOutcome::UpdateAvailable(info) => {
+                format!("Update v{} is available.", info.version)
+            }
+        }
+    }
+}
+
+/// The text shown to the user for a finished check.
+pub(crate) fn result_message(result: &Result<CheckOutcome, UpdateError>) -> String {
+    match result {
+        Ok(outcome) => outcome.message(),
+        Err(e) => format!("Update check failed: {e}"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRelease {
+    tag_name: String,
+    assets: Vec<RawAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+/// The parts of a GitHub release the updater needs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Release {
+    pub(crate) version: Version,
+    assets: Vec<Asset>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Asset {
+    name: String,
+    download_url: String,
+    digest: Option<String>,
+}
+
+/// Parses the JSON of `GET /repos/{owner}/{repo}/releases/latest`.
+pub(crate) fn parse_release(json: &str) -> Result<Release, UpdateError> {
+    let raw: RawRelease =
+        serde_json::from_str(json).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+    Ok(Release {
+        version: Version::parse(&raw.tag_name)?,
+        assets: raw
+            .assets
+            .into_iter()
+            .map(|a| Asset {
+                name: a.name,
+                download_url: a.browser_download_url,
+                digest: a.digest,
+            })
+            .collect(),
+    })
+}
+
+/// Whether `url` is HTTPS on exactly one of [`DOWNLOAD_HOSTS`] (no userinfo,
+/// port or look-alike host).
+fn is_trusted_download_url(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .is_some_and(|host| DOWNLOAD_HOSTS.contains(&host))
+}
+
+/// Picks the `GameFrame-Setup-<release version>.exe` asset (not its `.sha256`
+/// sibling, the notices or an installer of another version) and returns its download URL and expected SHA-256.
+pub(crate) fn select_asset(release: &Release) -> Result<(String, String), UpdateError> {
+    let installer_name = format!("{INSTALLER_PREFIX}{}{INSTALLER_SUFFIX}", release.version);
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == installer_name)
+        .ok_or(UpdateError::NoMatchingAsset)?;
+    if !is_trusted_download_url(&asset.download_url) {
+        return Err(UpdateError::UntrustedDownloadUrl(
+            asset.download_url.clone(),
+        ));
+    }
+    let digest = asset.digest.as_deref().ok_or(UpdateError::MissingDigest)?;
+    let hex = digest
+        .strip_prefix(DIGEST_PREFIX)
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| UpdateError::InvalidDigest(digest.to_string()))?;
+    Ok((asset.download_url.clone(), hex.to_ascii_lowercase()))
+}
+
+/// Runs an update check for the build `current_version`. `fetch` returns the
+/// latest-release JSON, or `None` when no release has been published, and is
+/// not called at all for a development build.
+pub(crate) fn check(
+    current_version: &str,
+    fetch: impl FnOnce() -> Result<Option<String>, UpdateError>,
+) -> Result<CheckOutcome, UpdateError> {
+    let current = Version::parse(current_version)?;
+    if current == Version::DEVELOPMENT {
+        return Ok(CheckOutcome::DevelopmentBuild);
+    }
+    let Some(body) = fetch()? else {
+        return Ok(CheckOutcome::NoReleasePublished);
+    };
+    let release = parse_release(&body)?;
+    if release.version <= current {
+        return Ok(CheckOutcome::UpToDate);
+    }
+    let (download_url, sha256) = select_asset(&release)?;
+    Ok(CheckOutcome::UpdateAvailable(UpdateInfo {
+        version: release.version,
+        download_url,
+        sha256,
+    }))
+}
+
+/// Fetches the latest-release JSON from GitHub; `None` when no release has been
+/// published (a 404). Blocking; never call it on a UI thread (see
+/// [`spawn_check`]).
+fn fetch_latest_release() -> Result<Option<String>, UpdateError> {
+    match crate::http::get_text(API_HOST, LATEST_RELEASE_PATH) {
+        Ok(body) => Ok(Some(body)),
+        Err(HttpError::Status(404)) => Ok(None),
+        Err(HttpError::Status(status)) => Err(UpdateError::HttpStatus(status)),
+        Err(HttpError::Failed(e)) => Err(UpdateError::Network(e)),
+    }
+}
+
+/// Whether a check started by [`spawn_check`] is still running.
+static CHECK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`CHECK_IN_FLIGHT`] set; clears it on drop, so a panicking worker or
+/// a failed thread spawn releases it too.
+struct InFlight;
+
+impl InFlight {
+    /// `None` while another check holds the flag.
+    fn acquire() -> Option<Self> {
+        (!CHECK_IN_FLIGHT.swap(true, Ordering::AcqRel)).then_some(Self)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        CHECK_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Runs a check for the running build on a worker thread and hands the
+/// result to `on_done` there. Logs a failure. Returns `false` (and starts
+/// nothing) while an earlier check is still fetching; the flag is released
+/// before `on_done` runs, so a slow `on_done` (a message box) blocks nothing.
+pub(crate) fn spawn_check(
+    on_done: impl FnOnce(Result<CheckOutcome, UpdateError>) + Send + 'static,
+) -> bool {
+    let Some(in_flight) = InFlight::acquire() else {
+        return false;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("update-check".into())
+        .spawn(move || {
+            let result = check(CURRENT_VERSION, fetch_latest_release);
+            drop(in_flight);
+            if let Err(e) = &result {
+                log!("update check failed: {e}");
+            }
+            on_done(result);
+        });
+    if let Err(e) = spawned {
+        log!("update check: couldn't start the worker thread: {e}");
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const SHA_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A real `releases/latest` response (cli/cli v2.103.2), verbatim except
+    /// that `assets` is cut down to two of its 22 entries.
+    const REAL_RELEASE: &str = r####"{"url":"https://api.github.com/repos/cli/cli/releases/422277825","assets_url":"https://api.github.com/repos/cli/cli/releases/422277825/assets","upload_url":"https://uploads.github.com/repos/cli/cli/releases/422277825/assets{?name,label}","html_url":"https://github.com/cli/cli/releases/tag/v2.103.2","id":422277825,"author":{"login":"github-actions[bot]","id":41898282,"node_id":"MDM6Qm90NDE4OTgyODI=","avatar_url":"https://avatars.githubusercontent.com/in/15368?v=4","gravatar_id":"","url":"https://api.github.com/users/github-actions%5Bbot%5D","html_url":"https://github.com/apps/github-actions","followers_url":"https://api.github.com/users/github-actions%5Bbot%5D/followers","following_url":"https://api.github.com/users/github-actions%5Bbot%5D/following{/other_user}","gists_url":"https://api.github.com/users/github-actions%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.github.com/users/github-actions%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/github-actions%5Bbot%5D/subscriptions","organizations_url":"https://api.github.com/users/github-actions%5Bbot%5D/orgs","repos_url":"https://api.github.com/users/github-actions%5Bbot%5D/repos","events_url":"https://api.github.com/users/github-actions%5Bbot%5D/events{/privacy}","received_events_url":"https://api.github.com/users/github-actions%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"node_id":"RE_kwDODKw3uc4ZK3LB","tag_name":"v2.103.2","target_commitish":"4f2cfe92e3499f8581bf39db77e0a1431fa7b55c","name":"GitHub CLI 2.103.2","draft":false,"immutable":true,"prerelease":false,"created_at":"2026-10-23T20:08:01Z","updated_at":"2026-10-23T20:28:28Z","published_at":"2026-10-23T20:24:12Z","assets":[{"url":"https://api.github.com/repos/cli/cli/releases/assets/670305018","id":670305018,"node_id":"RA_kwDODKw3uc4n9Ar6","name":"gh_2.103.2_checksums.txt","label":"GitHub CLI 2.103.2 checksums","uploader":{"login":"github-actions[bot]","id":41898282,"node_id":"MDM6Qm90NDE4OTgyODI=","avatar_url":"https://avatars.githubusercontent.com/in/15368?v=4","gravatar_id":"","url":"https://api.github.com/users/github-actions%5Bbot%5D","html_url":"https://github.com/apps/github-actions","followers_url":"https://api.github.com/users/github-actions%5Bbot%5D/followers","following_url":"https://api.github.com/users/github-actions%5Bbot%5D/following{/other_user}","gists_url":"https://api.github.com/users/github-actions%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.github.com/users/github-actions%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/github-actions%5Bbot%5D/subscriptions","organizations_url":"https://api.github.com/users/github-actions%5Bbot%5D/orgs","repos_url":"https://api.github.com/users/github-actions%5Bbot%5D/repos","events_url":"https://api.github.com/users/github-actions%5Bbot%5D/events{/privacy}","received_events_url":"https://api.github.com/users/github-actions%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"content_type":"text/plain; charset=utf-8","state":"uploaded","size":1971,"digest":"sha256:414d6009dc7f9f936d70831af818d1a32aa0ff07a77646861efd207356a36b2d","download_count":13395,"created_at":"2026-10-23T20:24:05Z","updated_at":"2026-10-23T20:24:05Z","browser_download_url":"https://github.com/cli/cli/releases/download/v2.103.2/gh_2.103.2_checksums.txt"},{"url":"https://api.github.com/repos/cli/cli/releases/assets/670305194","id":670305194,"node_id":"RA_kwDODKw3uc4n9Auq","name":"gh_2.103.2_windows_amd64.msi","label":"GitHub CLI 2.103.2 windows amd64 installer","uploader":{"login":"github-actions[bot]","id":41898282,"node_id":"MDM6Qm90NDE4OTgyODI=","avatar_url":"https://avatars.githubusercontent.com/in/15368?v=4","gravatar_id":"","url":"https://api.github.com/users/github-actions%5Bbot%5D","html_url":"https://github.com/apps/github-actions","followers_url":"https://api.github.com/users/github-actions%5Bbot%5D/followers","following_url":"https://api.github.com/users/github-actions%5Bbot%5D/following{/other_user}","gists_url":"https://api.github.com/users/github-actions%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.github.com/users/github-actions%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/github-actions%5Bbot%5D/subscriptions","organizations_url":"https://api.github.com/users/github-actions%5Bbot%5D/orgs","repos_url":"https://api.github.com/users/github-actions%5Bbot%5D/repos","events_url":"https://api.github.com/users/github-actions%5Bbot%5D/events{/privacy}","received_events_url":"https://api.github.com/users/github-actions%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"content_type":"application/x-msi","state":"uploaded","size":15446016,"digest":"sha256:7560d893608d4244bf57e06af03f742ae3abed3b88169304eec77b77c0dc7598","download_count":61825,"created_at":"2026-10-23T20:24:09Z","updated_at":"2026-10-23T20:24:10Z","browser_download_url":"https://github.com/cli/cli/releases/download/v2.103.2/gh_2.103.2_windows_amd64.msi"}],"tarball_url":"https://api.github.com/repos/cli/cli/tarball/v2.103.2","zipball_url":"https://api.github.com/repos/cli/cli/zipball/v2.103.2","body":"### 🐛 Fixes\r\n\r\n* Allow server to arbitrate which GitHub App installation tokens can attach files by @martinajir in [#14804](https://github.com/cli/cli/pull/14804)\r\n* Defer `--attach` credential checks to the upload endpoint by @BagToad in [#14805](https://github.com/cli/cli/pull/14805)\r\n\r\n## New Contributors\r\n* @martinajir made their first contribution in https://github.com/cli/cli/pull/14804\r\n\r\n**Full Changelog**: https://github.com/cli/cli/compare/v2.103.1...v2.103.2","reactions":{"url":"https://api.github.com/repos/cli/cli/releases/422277825/reactions","total_count":4,"+1":4,"-1":0,"laugh":0,"hooray":0,"confused":0,"heart":0,"rocket":0,"eyes":0},"mentions_count":2}"####;
+
+    /// A hand-built release shaped like GameFrame's, for asset selection.
+    const FULL_RELEASE: &str = r#"{
+  "url": "https://api.github.com/repos/ranarn/gameframe/releases/100000001",
+  "html_url": "https://github.com/ranarn/gameframe/releases/tag/v1.2.0",
+  "id": 100000001,
+  "tag_name": "v1.2.0",
+  "name": "GameFrame 1.2.0",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-10-01T10:00:00Z",
+  "published_at": "2026-10-01T10:05:00Z",
+  "assets": [
+    {
+      "id": 1,
+      "name": "GameFrame-Setup-1.2.0.exe",
+      "content_type": "application/octet-stream",
+      "state": "uploaded",
+      "size": 6500000,
+      "digest": "sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+      "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe"
+    },
+    {
+      "id": 2,
+      "name": "GameFrame-Setup-1.2.0.exe.sha256",
+      "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe.sha256"
+    },
+    {
+      "id": 3,
+      "name": "THIRD-PARTY-NOTICES.html",
+      "digest": null,
+      "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/THIRD-PARTY-NOTICES.html"
+    }
+  ],
+  "body": "Release notes"
+}"#;
+
+    fn release_json(tag: &str, assets: &str) -> String {
+        format!(r#"{{"tag_name": "{tag}", "assets": [{assets}]}}"#)
+    }
+
+    fn asset_json(name: &str, digest: Option<&str>) -> String {
+        let digest = digest.map_or("null".to_string(), |d| format!("\"{d}\""));
+        format!(
+            r#"{{"name": "{name}", "digest": {digest}, "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/{name}"}}"#
+        )
+    }
+
+    fn installer_json(version: &str) -> String {
+        asset_json(
+            &format!("GameFrame-Setup-{version}.exe"),
+            Some(&format!("sha256:{SHA_A}")),
+        )
+    }
+
+    fn check_json(current: &str, json: &str) -> Result<CheckOutcome, UpdateError> {
+        check(current, || Ok(Some(json.to_string())))
+    }
+
+    #[test]
+    fn parse_release_reads_the_tag_and_assets_of_a_full_response() {
+        let release = parse_release(FULL_RELEASE).unwrap();
+
+        assert_eq!(release.version, Version(1, 2, 0));
+        let (url, sha256) = select_asset(&release).unwrap();
+        assert_eq!(
+            url,
+            "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe"
+        );
+        assert_eq!(sha256, SHA_A);
+    }
+
+    #[test]
+    fn parse_release_reads_the_tag_and_assets_of_a_real_github_response() {
+        let release = parse_release(REAL_RELEASE).unwrap();
+
+        assert_eq!(release.version, Version(2, 103, 2));
+        assert_eq!(release.assets.len(), 2);
+        assert_eq!(release.assets[1].name, "gh_2.103.2_windows_amd64.msi");
+        assert_eq!(
+            release.assets[1].digest.as_deref(),
+            Some("sha256:7560d893608d4244bf57e06af03f742ae3abed3b88169304eec77b77c0dc7598")
+        );
+        assert_eq!(select_asset(&release), Err(UpdateError::NoMatchingAsset));
+    }
+
+    #[test]
+    fn parse_release_rejects_json_that_is_not_a_release() {
+        assert!(matches!(
+            parse_release("not json"),
+            Err(UpdateError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_release(r#"{"message": "Not Found", "status": "404"}"#),
+            Err(UpdateError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_release_rejects_a_missing_tag_or_asset_list() {
+        assert!(matches!(
+            parse_release(r#"{"assets": []}"#),
+            Err(UpdateError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_release(r#"{"tag_name": "v1.0.0"}"#),
+            Err(UpdateError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_release_rejects_an_asset_without_a_download_url() {
+        let json = release_json("v1.0.0", r#"{"name": "GameFrame-Setup-1.0.0.exe"}"#);
+
+        assert!(matches!(
+            parse_release(&json),
+            Err(UpdateError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_release_rejects_a_tag_that_is_not_a_plain_version() {
+        let json = release_json("nightly", "");
+
+        assert_eq!(
+            parse_release(&json),
+            Err(UpdateError::InvalidVersion("nightly".into()))
+        );
+    }
+
+    #[test]
+    fn version_parse_accepts_plain_and_v_prefixed_versions() {
+        assert_eq!(Version::parse("1.2.3"), Ok(Version(1, 2, 3)));
+        assert_eq!(Version::parse("v1.2.3"), Ok(Version(1, 2, 3)));
+        assert_eq!(Version::parse("0.0.0"), Ok(Version(0, 0, 0)));
+    }
+
+    #[test]
+    fn version_parse_rejects_anything_but_three_numeric_components() {
+        for bad in [
+            "",
+            "v",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1..3",
+            "1.2.3-rc1",
+            "vv1.2.3",
+            "V1.2.3",
+            "+1.2.3",
+            " 1.2.3",
+            "1.2.3 ",
+            "99999999999.0.0",
+        ] {
+            assert!(Version::parse(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn versions_compare_numerically_per_component() {
+        assert!(Version(1, 2, 4) > Version(1, 2, 3));
+        assert!(Version(1, 3, 0) > Version(1, 2, 9));
+        assert!(Version(2, 0, 0) > Version(1, 99, 99));
+        assert!(Version(1, 10, 0) > Version(1, 9, 0));
+        assert!(Version(1, 2, 10) > Version(1, 2, 9));
+        assert_eq!(Version(1, 2, 3), Version(1, 2, 3));
+    }
+
+    #[test]
+    fn check_reports_an_update_for_a_newer_release() {
+        let json = release_json("v1.2.0", &installer_json("1.2.0"));
+
+        let outcome = check_json("1.1.9", &json).unwrap();
+
+        assert_eq!(
+            outcome,
+            CheckOutcome::UpdateAvailable(UpdateInfo {
+                version: Version(1, 2, 0),
+                download_url: "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe".into(),
+                sha256: SHA_A.into(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_compares_multi_digit_components_numerically() {
+        let json = release_json("v1.10.0", &installer_json("1.10.0"));
+
+        assert!(matches!(
+            check_json("1.9.0", &json),
+            Ok(CheckOutcome::UpdateAvailable(_))
+        ));
+    }
+
+    #[test]
+    fn check_is_up_to_date_for_an_equal_or_older_release() {
+        let json = release_json("v1.2.0", &installer_json("1.2.0"));
+
+        assert_eq!(check_json("1.2.0", &json), Ok(CheckOutcome::UpToDate));
+        assert_eq!(check_json("1.3.0", &json), Ok(CheckOutcome::UpToDate));
+    }
+
+    #[test]
+    fn check_does_not_need_an_installer_when_already_up_to_date() {
+        let json = release_json("v1.2.0", "");
+
+        assert_eq!(check_json("1.2.0", &json), Ok(CheckOutcome::UpToDate));
+    }
+
+    #[test]
+    fn check_on_a_development_build_never_fetches() {
+        let fetched = Cell::new(false);
+
+        let outcome = check("0.0.0", || {
+            fetched.set(true);
+            Ok(Some(FULL_RELEASE.to_string()))
+        });
+
+        assert_eq!(outcome, Ok(CheckOutcome::DevelopmentBuild));
+        assert!(!fetched.get());
+    }
+
+    #[test]
+    fn check_reports_a_missing_release_as_an_outcome_not_an_error() {
+        let outcome = check("1.0.0", || Ok(None));
+
+        assert_eq!(outcome, Ok(CheckOutcome::NoReleasePublished));
+    }
+
+    #[test]
+    fn rate_limit_and_other_statuses_do_not_claim_github_was_unreachable() {
+        for status in [403, 429, 500] {
+            let message = UpdateError::HttpStatus(status).to_string();
+            assert!(!message.contains("reach"), "{message}");
+        }
+        assert!(
+            UpdateError::HttpStatus(403)
+                .to_string()
+                .contains("rate limit")
+        );
+        assert!(UpdateError::HttpStatus(500).to_string().contains("500"));
+    }
+
+    #[test]
+    fn check_passes_a_fetch_failure_through() {
+        let outcome = check("1.0.0", || Err(UpdateError::Network("timed out".into())));
+
+        assert_eq!(outcome, Err(UpdateError::Network("timed out".into())));
+    }
+
+    #[test]
+    fn check_rejects_an_unparseable_running_version() {
+        assert!(matches!(
+            check("garbage", || Ok(Some(FULL_RELEASE.to_string()))),
+            Err(UpdateError::InvalidVersion(_))
+        ));
+    }
+
+    #[test]
+    fn select_asset_picks_the_installer_among_several_assets() {
+        let assets = [
+            asset_json("THIRD-PARTY-NOTICES.html", None),
+            asset_json(
+                "GameFrame-Setup-1.2.0.exe.sha256",
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+            asset_json(
+                "GameFrame-Portable-1.2.0.exe",
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+            asset_json(
+                "GameFrame-Setup-1.2.0.exe",
+                Some(&format!("sha256:{}", "b".repeat(64))),
+            ),
+        ]
+        .join(",");
+        let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+        let (url, sha256) = select_asset(&release).unwrap();
+
+        assert_eq!(
+            url,
+            "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe"
+        );
+        assert_eq!(sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn select_asset_fails_without_a_matching_asset() {
+        let assets = [
+            asset_json(
+                "GameFrame-Setup-1.2.0.exe.sha256",
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+            asset_json("notes.txt", None),
+        ]
+        .join(",");
+        let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+        assert_eq!(select_asset(&release), Err(UpdateError::NoMatchingAsset));
+        let empty = parse_release(&release_json("v1.2.0", "")).unwrap();
+        assert_eq!(select_asset(&empty), Err(UpdateError::NoMatchingAsset));
+    }
+
+    #[test]
+    fn select_asset_requires_the_installer_of_the_release_version() {
+        for name in [
+            "GameFrame-Setup-.exe",
+            "GameFrame-Setup-1.1.0.exe",
+            "GameFrame-Setup-1.2.0-beta.exe",
+        ] {
+            let assets = asset_json(name, Some(&format!("sha256:{SHA_A}")));
+            let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+            assert_eq!(
+                select_asset(&release),
+                Err(UpdateError::NoMatchingAsset),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_asset_fails_when_the_installer_has_no_digest() {
+        let assets = asset_json("GameFrame-Setup-1.2.0.exe", None);
+        let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+        assert_eq!(select_asset(&release), Err(UpdateError::MissingDigest));
+    }
+
+    #[test]
+    fn select_asset_rejects_an_odd_digest() {
+        for digest in [
+            "".to_string(),
+            "sha256:".to_string(),
+            SHA_A.to_string(),
+            format!("sha1:{SHA_A}"),
+            format!("sha256:{}", &SHA_A[..63]),
+            format!("sha256:{SHA_A}0"),
+            format!("sha256:{}g", &SHA_A[..63]),
+        ] {
+            let assets = asset_json("GameFrame-Setup-1.2.0.exe", Some(&digest));
+            let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+            assert_eq!(
+                select_asset(&release),
+                Err(UpdateError::InvalidDigest(digest.clone())),
+                "{digest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_asset_lowercases_the_digest() {
+        let upper = SHA_A.to_ascii_uppercase();
+        let assets = asset_json(
+            "GameFrame-Setup-1.2.0.exe",
+            Some(&format!("sha256:{upper}")),
+        );
+        let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+        assert_eq!(select_asset(&release).unwrap().1, SHA_A);
+    }
+
+    fn select_with_url(url: &str) -> Result<(String, String), UpdateError> {
+        let json = format!(
+            r#"{{"tag_name": "v1.2.0", "assets": [{{"name": "GameFrame-Setup-1.2.0.exe",
+            "digest": "sha256:{SHA_A}", "browser_download_url": "{url}"}}]}}"#
+        );
+        select_asset(&parse_release(&json).unwrap())
+    }
+
+    #[test]
+    fn select_asset_accepts_https_urls_on_github_download_hosts() {
+        for url in [
+            "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe",
+            "https://objects.githubusercontent.com/x/GameFrame-Setup-1.2.0.exe?a=b",
+        ] {
+            assert_eq!(select_with_url(url).unwrap().0, url);
+        }
+    }
+
+    #[test]
+    fn select_asset_rejects_a_download_url_off_github_or_not_https() {
+        for url in [
+            "http://github.com/a.exe",
+            "https://example.test/a.exe",
+            "https://github.com.evil.test/a.exe",
+            "https://evil.test/github.com/a.exe",
+            "https://github.com@evil.test/a.exe",
+            "https://evil.test#@github.com/a.exe",
+            "https://github.com:8443/a.exe",
+            "https://notgithub.com/a.exe",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    select_with_url(url),
+                    Err(UpdateError::UntrustedDownloadUrl(_))
+                ),
+                "{url:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn in_flight_flag_is_held_until_dropped_even_by_a_panic() {
+        let held = InFlight::acquire().expect("free at first");
+        assert!(InFlight::acquire().is_none());
+        drop(held);
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _held = InFlight::acquire().expect("free after drop");
+            panic!("worker failed");
+        });
+
+        assert!(panicked.is_err());
+        assert!(InFlight::acquire().is_some());
+    }
+
+    #[test]
+    fn result_message_describes_every_outcome() {
+        let info = UpdateInfo {
+            version: Version(1, 2, 0),
+            download_url: "https://github.com/a.exe".into(),
+            sha256: SHA_A.into(),
+        };
+
+        assert_eq!(
+            result_message(&Ok(CheckOutcome::UpToDate)),
+            "GameFrame is up to date."
+        );
+        assert_eq!(
+            result_message(&Ok(CheckOutcome::UpdateAvailable(info))),
+            "Update v1.2.0 is available."
+        );
+        assert!(result_message(&Ok(CheckOutcome::DevelopmentBuild)).contains("development build"));
+        assert!(result_message(&Ok(CheckOutcome::NoReleasePublished)).contains("published"));
+        assert!(
+            result_message(&Err(UpdateError::Network("timed out".into()))).contains("timed out")
+        );
+    }
+}

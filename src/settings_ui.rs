@@ -25,6 +25,7 @@ use crate::profile_store::{
     Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
+use crate::updater::{CheckOutcome, UpdateError};
 use crate::win32;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -102,7 +103,7 @@ pub enum SettingsTab {
     #[default]
     Games,
     Cursor,
-    /// Zone, hotkeys, taskbar hiding and startup.
+    /// Zone, hotkeys, taskbar hiding, startup and updates.
     General,
 }
 
@@ -1080,6 +1081,7 @@ fn run_settings_frame(
                 pending_status_messages: initial_status_messages,
                 keyboard_hook: None,
                 cursor_previews: None,
+                update_check: UpdateCheck::Idle,
             }))
         }),
     )
@@ -1140,6 +1142,20 @@ struct SettingsApp {
     /// Textures for the "Game cursor" section, re-rendered only when the
     /// cursor settings change (see [`Self::refresh_cursor_previews`]).
     cursor_previews: Option<CursorPreviews>,
+    /// The "Check for updates now" button's state; dropped with the window.
+    update_check: UpdateCheck,
+}
+
+/// Progress of the Settings window's update check.
+enum UpdateCheck {
+    Idle,
+    /// Running on a worker thread, which sends the result here.
+    Running(std::sync::mpsc::Receiver<Result<CheckOutcome, UpdateError>>),
+    Done(Result<CheckOutcome, UpdateError>),
+    /// Not started: another check (the tray's) was already running.
+    Busy,
+    /// The worker ended without sending a result.
+    Lost,
 }
 
 /// The rendered game-cursor preview and variant icons, plus the settings
@@ -1480,6 +1496,68 @@ impl SettingsApp {
         ui.separator();
         ui.heading("Startup");
         ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
+
+        ui.separator();
+        ui.heading("Updates");
+        self.update_check_row(ui);
+    }
+
+    /// Renders the "Check for updates now" button and its status line. The
+    /// check runs on a worker thread that wakes the UI when it has a result.
+    fn update_check_row(&mut self, ui: &mut egui::Ui) {
+        if let UpdateCheck::Running(receiver) = &self.update_check {
+            match receiver.try_recv() {
+                Ok(result) => self.update_check = UpdateCheck::Done(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_check = UpdateCheck::Lost;
+                }
+            }
+        }
+
+        ui.horizontal(|ui| {
+            let running = matches!(self.update_check, UpdateCheck::Running(_));
+            if ui
+                .add_enabled(!running, egui::Button::new("Check for updates now"))
+                .clicked()
+            {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let ctx = ui.ctx().clone();
+                let started = crate::updater::spawn_check(move |result| {
+                    let _ = sender.send(result);
+                    ctx.request_repaint();
+                });
+                self.update_check = if started {
+                    UpdateCheck::Running(receiver)
+                } else {
+                    UpdateCheck::Busy
+                };
+            }
+            match &self.update_check {
+                UpdateCheck::Idle => {}
+                UpdateCheck::Running(_) => {
+                    ui.spinner();
+                    ui.label("Checking...");
+                }
+                UpdateCheck::Busy => {
+                    ui.label("Another update check is still running.");
+                }
+                UpdateCheck::Lost => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        "Update check failed: it ended unexpectedly",
+                    );
+                }
+                UpdateCheck::Done(result) => {
+                    let message = crate::updater::result_message(result);
+                    if result.is_ok() {
+                        ui.label(message);
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_RED, message);
+                    }
+                }
+            }
+        });
     }
 
     /// Renders the Zone section: a monitor-outline thumbnail with the Zone
