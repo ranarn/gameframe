@@ -22,7 +22,7 @@ use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::keyboard_hook;
 use crate::profile_store::{
     self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame,
-    Zone,
+    UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
@@ -88,6 +88,9 @@ pub struct SettingsState {
     /// [`Self::from_config`] leaves it `false` and [`run_settings_window`]
     /// fills it from the registry; Save writes it back only if it changed.
     pub start_with_windows: bool,
+    /// What the startup update check does with an available update (the
+    /// radio choice under Updates).
+    pub update_mode: UpdateMode,
     /// The open tab. UI-only (never persisted), but kept here rather than on
     /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
     pub tab: SettingsTab,
@@ -95,6 +98,45 @@ pub struct SettingsState {
     /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
     /// [`Self::hotkey_failure`], which hides one once its binding was edited.
     hotkey_failures: Vec<BindingReport>,
+}
+
+/// The license shown in the About tab, from `Cargo.toml` (single source).
+const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
+/// The repository's funding config, embedded so the donation link has a
+/// single source of truth. This reaches outside `src/`, so it assumes a
+/// repo-only build: `cargo package`/`publish` without `.github` would break it.
+const FUNDING_YML: &str = include_str!("../.github/FUNDING.yml");
+
+/// The version line for the About tab; the `0.0.0` placeholder that
+/// unreleased builds carry is shown as a development build.
+fn version_label(version: &str) -> String {
+    if version == "0.0.0" {
+        "Version: development build".to_string()
+    } else {
+        format!("Version: {version}")
+    }
+}
+
+/// The first `custom:` URL in a `FUNDING.yml` body, e.g.
+/// `custom: ["https://..."]`. This is an ad-hoc scraper for that single-line
+/// form only; a multi-line or unquoted list yields `None`. The test
+/// `repo_funding_config_yields_a_donation_url` guards the repo file against
+/// drifting into an unsupported form.
+fn funding_custom_url(funding_yml: &str) -> Option<String> {
+    let rest = funding_yml
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("custom:"))?;
+    let start = rest.find("http")?;
+    let url: String = rest[start..]
+        .chars()
+        .take_while(|c| !matches!(c, '"' | '\'' | ']' | ',') && !c.is_whitespace())
+        .collect();
+    Some(url)
+}
+
+fn donation_url() -> Option<String> {
+    funding_custom_url(FUNDING_YML)
 }
 
 /// The Settings window's tabs.
@@ -105,6 +147,8 @@ pub enum SettingsTab {
     Cursor,
     /// Zone, hotkeys, taskbar hiding, startup and updates.
     General,
+    /// Version, license, repository and the optional donation link.
+    About,
 }
 
 /// Which of GameFrame's three hotkey fields a press-to-bind capture applies
@@ -152,6 +196,7 @@ impl SettingsState {
             taskbar_hide_mode: config.taskbar_hide_mode,
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
+            update_mode: config.update_mode,
             tab: SettingsTab::default(),
             hotkey_failures: Vec::new(),
         }
@@ -196,6 +241,7 @@ impl SettingsState {
             taskbar_hide_mode: self.taskbar_hide_mode,
             hide_taskbar_on_apply: self.hide_taskbar_on_apply,
             cursor: self.cursor.clone(),
+            update_mode: self.update_mode,
         }
     }
 
@@ -1473,6 +1519,26 @@ impl SettingsApp {
             .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
     }
 
+    /// Renders the About tab: version, license, source link and the
+    /// voluntary donation link.
+    fn about_section(ui: &mut egui::Ui) {
+        ui.heading("GameFrame");
+        ui.label(version_label(env!("CARGO_PKG_VERSION")));
+        ui.label(format!("License: {LICENSE}"));
+        ui.hyperlink_to("Source code", env!("CARGO_PKG_REPOSITORY"));
+        ui.separator();
+        ui.heading("Support");
+        ui.label("GameFrame is free. Donating is entirely optional.");
+        match donation_url() {
+            Some(url) => {
+                ui.hyperlink_to("Donate via PayPal (optional)", url);
+            }
+            None => {
+                ui.label("No donation link is configured in this build.");
+            }
+        }
+    }
+
     /// Renders the "Zone, hotkeys & taskbar" tab.
     fn general_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
@@ -1518,6 +1584,16 @@ impl SettingsApp {
 
         ui.separator();
         ui.heading("Updates");
+        ui.radio_value(
+            &mut self.state.update_mode,
+            UpdateMode::Auto,
+            "Install updates automatically at startup",
+        );
+        ui.radio_value(
+            &mut self.state.update_mode,
+            UpdateMode::Ask,
+            "Ask me (adds a tray item when an update is available)",
+        );
         self.update_check_row(ui);
     }
 
@@ -1548,6 +1624,9 @@ impl SettingsApp {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let ctx = ui.ctx().clone();
                 let started = crate::updater::spawn_check(move |result| {
+                    if matches!(result, Ok(CheckOutcome::UpToDate)) {
+                        crate::update_ui::notify(crate::update_ui::UpdateEvent::UpToDate);
+                    }
                     let _ = sender.send(result);
                     ctx.request_repaint();
                 });
@@ -1614,7 +1693,7 @@ impl SettingsApp {
         if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
             let (sender, receiver) = std::sync::mpsc::channel();
             let ctx = ui.ctx().clone();
-            let started = crate::update_install::spawn_install(info, move |result| {
+            let started = crate::update_ui::spawn_install(info, move |result| {
                 // With the window gone nobody reads the channel; a failure is
                 // then shown in a box so it is never only in the log.
                 if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
@@ -1852,6 +1931,7 @@ impl eframe::App for SettingsApp {
                     SettingsTab::General,
                     "Zone, hotkeys & taskbar",
                 );
+                ui.selectable_value(&mut self.state.tab, SettingsTab::About, "About");
             });
             ui.separator();
 
@@ -1861,6 +1941,7 @@ impl eframe::App for SettingsApp {
                     SettingsTab::Games => self.games_section(ui),
                     SettingsTab::Cursor => self.cursor_section(ui),
                     SettingsTab::General => self.general_section(ui),
+                    SettingsTab::About => Self::about_section(ui),
                 });
         });
     }
@@ -1869,6 +1950,30 @@ impl eframe::App for SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_version_is_shown_as_development_build() {
+        assert_eq!(version_label("0.0.0"), "Version: development build");
+        assert_eq!(version_label("1.2.3"), "Version: 1.2.3");
+    }
+
+    #[test]
+    fn funding_custom_url_is_read_from_the_yaml() {
+        assert_eq!(
+            funding_custom_url("custom: [\"https://example.com/d?x=1\"]\n").as_deref(),
+            Some("https://example.com/d?x=1")
+        );
+        assert_eq!(funding_custom_url("github: someone\n"), None);
+    }
+
+    #[test]
+    fn repo_funding_config_yields_a_donation_url() {
+        assert!(
+            donation_url()
+                .unwrap()
+                .starts_with("https://www.paypal.com/")
+        );
+    }
 
     #[test]
     fn live_apply_failure_message_names_the_game_and_explains_the_fallback() {
@@ -2111,6 +2216,7 @@ mod tests {
                 size: 72,
                 ..CursorSettings::default()
             },
+            update_mode: UpdateMode::Auto,
         };
 
         let state = SettingsState::from_config(&config);
@@ -2178,6 +2284,21 @@ mod tests {
 
         state.clear_hotkey(HotkeyField::ToggleGameCursor);
         assert_eq!(state.to_config().hotkeys.toggle_game_cursor, None);
+    }
+
+    #[test]
+    fn update_mode_round_trips_through_the_settings_state() {
+        for mode in [UpdateMode::Auto, UpdateMode::Ask] {
+            let config = Config {
+                update_mode: mode,
+                ..Config::default()
+            };
+
+            let state = SettingsState::from_config(&config);
+
+            assert_eq!(state.update_mode, mode);
+            assert_eq!(state.to_config().update_mode, mode);
+        }
     }
 
     #[test]
