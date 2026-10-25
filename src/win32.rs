@@ -36,6 +36,8 @@
 
 use crate::profile_store::TaskbarHideMode;
 use crate::region_calc::Region;
+// Note: `taskbar_recovery` also uses this module (a deliberate cycle: the hide
+// paths here are the single place every hide/restore passes through).
 use crate::taskbar_recovery;
 
 /// The style bits removed to strip a window's border for the borderless
@@ -665,7 +667,7 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
 /// module docs.
 pub fn show_taskbar() -> Result<(), Win32Error> {
     show_taskbar_window()?;
-    taskbar_recovery::mark_restored();
+    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
     Ok(())
 }
 
@@ -712,6 +714,8 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
             let current_flags = read_appbar_flags(hwnd);
             let current = state_from_flags(current_flags);
             let restore = plan_taskbar_hide(mode, current);
+            // `write_appbar_state` cannot fail; if it ever can, keep the handle
+            // and `undo_hide` it on the error path.
             let _ = taskbar_recovery::mark_hidden(restore);
             write_appbar_state(hwnd, current_flags, TaskbarAutohideState::AutoHidden);
             Ok(restore)
@@ -729,7 +733,7 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
         TaskbarHideRestore::FullyHidden => show_taskbar(),
         TaskbarHideRestore::HoverReveal(state) => {
             set_appbar_state(state)?;
-            taskbar_recovery::mark_restored();
+            taskbar_recovery::mark_restored(remembered);
             Ok(())
         }
     }
@@ -1011,7 +1015,7 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
                 return Err(e);
             }
             if !hide {
-                taskbar_recovery::mark_restored();
+                taskbar_recovery::mark_restored(TaskbarHideRestore::HoverReveal(target));
             }
             Ok(())
         }
