@@ -137,8 +137,17 @@ jobs:
           REUSED: ${{ steps.existing.outputs.exists }}
         run: |
           if [ "$REUSED" = "true" ]; then
-            if ! gh release view "$PLANNED" >/dev/null 2>&1; then
-              gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --notes ""
+            # Only a genuine "not found" may create a draft; any other
+            # failure (network, auth, rate limit) must fail the job rather
+            # than risk a duplicate draft.
+            if err=$(gh release view "$PLANNED" 2>&1 >/dev/null); then
+              echo "Found the existing release for $PLANNED"
+            elif grep -qi 'release not found' <<<"$err"; then
+              echo "::warning::No release exists for $PLANNED; creating a draft with generated notes. Review the notes before publishing."
+              gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --generate-notes
+            else
+              echo "::error::Could not look up the release for $PLANNED: $err"
+              exit 1
             fi
           elif [ "$TAG" != "$PLANNED" ]; then
             echo "::error::Release Pilot tagged $TAG, but the installer was built as $PLANNED"
