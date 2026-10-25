@@ -410,6 +410,22 @@ fn focus_settings_window() -> bool {
     true
 }
 
+/// Brings the open Settings window to the front (what the tray's Settings item
+/// does while Settings is already open). `false` if it doesn't exist yet.
+pub fn focus_settings() -> bool {
+    focus_settings_window()
+}
+
+/// Queues a `Quit` from inside this process (the tray's Exit item or an
+/// elevated relaunch while Settings is open): the Settings loop closes itself
+/// on [`quit_pending`] and the main loop then exits.
+pub fn queue_quit() {
+    enqueue(
+        &mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()),
+        Command::Quit,
+    );
+}
+
 /// Asks this process's Settings window to close, as its close button would
 /// (the Settings loop then returns and discards unsaved edits). `false` if not
 /// found.
