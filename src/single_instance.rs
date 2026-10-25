@@ -3,22 +3,96 @@
 //! WinEvent hooks fighting over the same windows).
 //!
 //! Uses a named mutex in the session's `Local\` namespace, so each logged-in
-//! user gets their own instance. The handle is deliberately never closed --
-//! the OS releases it when the process exits, which is exactly the lifetime
-//! the guard needs.
+//! user gets their own instance. The winning handle is deliberately never
+//! closed -- the OS releases it when the process exits, which is exactly the
+//! lifetime the guard needs. Handles from lost attempts are closed at once so
+//! retrying doesn't leak one handle per attempt.
+//!
+//! An elevated relaunch (see `win32::relaunch_elevated`) starts the new
+//! process before the old one has exited, so a process started with
+//! [`ELEVATED_RELAUNCH_FLAG`] polls for the mutex for a few seconds instead
+//! of giving up on the first attempt.
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 /// Same GUID as the installer's `AppId`, so the name can't collide with
 /// another app's mutex.
 const MUTEX_NAME: &str = "Local\\GameFrame-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
+/// Command-line flag passed to the elevated child by `relaunch_elevated`.
+pub const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
+
+/// How long an elevated relaunch waits for the old instance to exit.
+pub const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
+
+/// Polling interval while waiting for the old instance to release the mutex.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What to do after one attempt at taking the mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// This process owns the instance; start up.
+    Proceed,
+    /// Another instance still holds it; try again after a short sleep.
+    Retry,
+    /// Another instance holds it and we are not (or no longer) waiting.
+    GiveUp,
+}
+
+/// Pure retry decision. `owned` is the attempt result, `elapsed` the time
+/// since the first attempt, `wait` the allowed total (`None` = single attempt,
+/// the normal launch).
+pub fn decide(owned: bool, elapsed: Duration, wait: Option<Duration>) -> Decision {
+    if owned {
+        return Decision::Proceed;
+    }
+    match wait {
+        Some(limit) if elapsed < limit => Decision::Retry,
+        _ => Decision::GiveUp,
+    }
+}
+
+/// Whether the process arguments (program name first) carry the elevated
+/// relaunch flag.
+pub fn is_elevated_relaunch<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().skip(1).any(|a| a.as_ref() == ELEVATED_RELAUNCH_FLAG)
+}
+
 /// Returns `true` if this process is the only running GameFrame, `false` if
-/// another instance already holds the mutex. If the mutex can't be created
-/// at all, returns `true` -- failing open beats refusing to start.
-pub fn acquire() -> bool {
-    let name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+/// another instance holds the mutex. With `wait`, keeps polling for up to
+/// that long (an elevated relaunch waiting for the old process to exit); a
+/// timeout is logged. If the mutex can't be created at all, returns `true` --
+/// failing open beats refusing to start.
+pub fn acquire(wait: Option<Duration>) -> bool {
+    let start = Instant::now();
+    loop {
+        let owned = try_acquire(MUTEX_NAME);
+        match decide(owned, start.elapsed(), wait) {
+            Decision::Proceed => return true,
+            Decision::Retry => std::thread::sleep(POLL_INTERVAL),
+            Decision::GiveUp => {
+                if let Some(limit) = wait {
+                    log!(
+                        "elevated relaunch: previous instance still held the single-instance mutex after {limit:?}; exiting"
+                    );
+                }
+                return false;
+            }
+        }
+    }
+}
+
+/// One attempt. On success the handle is intentionally kept open for the
+/// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
+fn try_acquire(mutex_name: &str) -> bool {
+    let name: Vec<u16> = mutex_name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
     // call; null security attributes are valid. GetLastError is read
     // immediately after, before any other API call can overwrite it.
@@ -26,5 +100,58 @@ pub fn acquire() -> bool {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         (handle, GetLastError())
     };
-    handle.is_null() || last_error != ERROR_ALREADY_EXISTS
+    if handle.is_null() {
+        return true;
+    }
+    if last_error == ERROR_ALREADY_EXISTS {
+        // SAFETY: `handle` is a valid mutex handle we just received and
+        // haven't closed; this drops our reference to the existing mutex.
+        unsafe { CloseHandle(handle) };
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WAIT: Option<Duration> = Some(Duration::from_secs(5));
+
+    #[test]
+    fn owning_the_mutex_proceeds_regardless_of_wait() {
+        assert_eq!(decide(true, Duration::ZERO, None), Decision::Proceed);
+        assert_eq!(decide(true, Duration::from_secs(9), WAIT), Decision::Proceed);
+    }
+
+    #[test]
+    fn normal_launch_gives_up_on_first_failed_attempt() {
+        assert_eq!(decide(false, Duration::ZERO, None), Decision::GiveUp);
+    }
+
+    #[test]
+    fn elevated_relaunch_retries_until_timeout() {
+        assert_eq!(decide(false, Duration::ZERO, WAIT), Decision::Retry);
+        assert_eq!(decide(false, Duration::from_millis(4999), WAIT), Decision::Retry);
+        assert_eq!(decide(false, Duration::from_secs(5), WAIT), Decision::GiveUp);
+        assert_eq!(decide(false, Duration::from_secs(6), WAIT), Decision::GiveUp);
+    }
+
+    #[test]
+    fn a_held_mutex_makes_further_attempts_fail() {
+        // Own name, so a running GameFrame can't interfere.
+        let name = format!("Local\\GameFrame-test-{}", std::process::id());
+        assert!(try_acquire(&name));
+        for _ in 0..3 {
+            assert!(!try_acquire(&name));
+        }
+    }
+
+    #[test]
+    fn flag_is_detected_after_program_name_only() {
+        assert!(is_elevated_relaunch(["gameframe.exe", "--elevated-relaunch"]));
+        assert!(!is_elevated_relaunch(["gameframe.exe"]));
+        assert!(!is_elevated_relaunch(["--elevated-relaunch"]));
+        assert!(!is_elevated_relaunch(["gameframe.exe", "--other"]));
+    }
 }

@@ -1284,13 +1284,16 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
     let exe_path = std::env::current_exe().map_err(Win32Error::Os)?;
     let verb = encode_wide("runas");
     let file = encode_wide(exe_path.to_string_lossy().as_ref());
+    // The flag tells the child to wait for this (old) instance to release
+    // the single-instance mutex instead of exiting on first contact.
+    let params = encode_wide(crate::single_instance::ELEVATED_RELAUNCH_FLAG);
 
-    // Safety: `verb` and `file` are valid, null-terminated UTF-16 buffers
-    // kept alive for the duration of this call; the remaining pointer
-    // arguments (`hwnd`, `lpparameters`, `lpdirectory`) are null, which
+    // Safety: `verb`, `file` and `params` are valid, null-terminated UTF-16
+    // buffers kept alive for the duration of this call; the remaining
+    // pointer arguments (`hwnd`, `lpdirectory`) are null, which
     // `ShellExecuteW` documents as valid ("use current/none").
     let result = unsafe {
-        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), std::ptr::null(), SW_SHOWNORMAL)
     };
     // Per ShellExecuteW's documented contract, a return value greater than
     // 32 indicates success; anything else IS the failure code itself (e.g.

@@ -23,7 +23,14 @@ mod zone_editor;
 mod zone_overlay;
 
 fn main() {
-    if !single_instance::acquire() {
+    let wait = single_instance::is_elevated_relaunch(std::env::args()).then_some(single_instance::RELAUNCH_WAIT);
+    if wait.is_some() {
+        // Only an elevated relaunch can time out, so only it opens the log
+        // this early: the release build has no console, and a timeout would
+        // otherwise be lost. A normal second launch leaves the log alone.
+        logging::init(&app::config_dir());
+    }
+    if !single_instance::acquire(wait) {
         return;
     }
     if let Err(e) = app::run() {
