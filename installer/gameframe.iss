@@ -15,11 +15,14 @@
 #define AppName "GameFrame"
 #define AppExe "gameframe.exe"
 #define RunKey "Software\Microsoft\Windows\CurrentVersion\Run"
+; Never change AppGuid: it is the AppId, i.e. how an upgrade finds the existing install.
+#define AppGuid "5C28E192-0AB5-4FA5-8874-88144D010E3B"
+#define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{" + AppGuid + "}_is1"
 #define StartupApprovedKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 [Setup]
 ; Never change AppId: it's how an upgrade finds the existing install.
-AppId={{5C28E192-0AB5-4FA5-8874-88144D010E3B}
+AppId={{{#AppGuid}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -77,8 +80,12 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 var
   // Captured when the wizard opens, before this run touches the registry.
   WasInstalled: Boolean;
-  // The startup task's state when the user first sees it.
+  // The real Run value at that moment: what the app's toggle last set. It is
+  // also the baseline StartupChoiceChanged compares the final task against.
   InitialStartup: Boolean;
+  // The Tasks page applies InitialStartup only the first time it is shown, so
+  // the user's own tick/untick survives going Back and Next.
+  StartupApplied: Boolean;
 
 procedure StopGameFrame;
 var
@@ -94,32 +101,42 @@ begin
     WizardSelectTasks('startup')
   else
     WizardSelectTasks('!startup');
+  StartupApplied := True;
 end;
 
 procedure InitializeWizard;
 begin
-  // AppId from [Setup] (the "{{" there is Inno's escape for a literal "{").
-  WasInstalled := RegKeyExists(HKEY_CURRENT_USER,
-    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{5C28E192-0AB5-4FA5-8874-88144D010E3B}_is1');
-  if WasInstalled then
-  begin
-    // Upgrade: the checkbox shows what the app's toggle last set -- the real
-    // Run value -- not the default or Inno's remembered task state.
-    InitialStartup := RegValueExists(HKEY_CURRENT_USER, '{#RunKey}', '{#AppName}');
+  WasInstalled := RegKeyExists(HKEY_CURRENT_USER, '{#UninstallKey}');
+  // Upgrade: remember what the app's toggle last set -- the real Run value.
+  // Inno restores its own remembered task selection after this point, so the
+  // selection itself is applied later (CurPageChanged / PrepareToInstall).
+  // A fresh install keeps the task's default (checked).
+  InitialStartup := WasInstalled and RegValueExists(HKEY_CURRENT_USER, '{#RunKey}', '{#AppName}');
+end;
+
+// Upgrade, first application, and the caller did not choose tasks with /TASKS.
+function ShouldApplyRegistryStartup: Boolean;
+begin
+  Result := WasInstalled and not StartupApplied and (ExpandConstant('{param:TASKS|}') = '');
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  // Upgrade: override Inno's remembered selection with the real
+  // Run value, once, when the Tasks page first appears (Inno raises this for\n  // the page even in silent runs, after its restore).
+  if (CurPageID = wpSelectTasks) and ShouldApplyRegistryStartup then
     SelectStartupFromRegistry;
-  end
-  else
-    // Fresh install keeps the task's default (checked).
-    InitialStartup := WizardIsTaskSelected('startup');
+  Log(Format('startup-task: page=%d installed=%d registry=%d selected=%d applied=%d', [
+    CurPageID, Ord(WasInstalled), Ord(InitialStartup), Ord(WizardIsTaskSelected('startup')), Ord(StartupApplied)]));
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  // Inno restores the remembered task selection for a silent run after
-  // InitializeWizard, so re-apply the registry state here unless the caller
-  // chose tasks explicitly with /TASKS.
-  if WasInstalled and WizardSilent and (ExpandConstant('{param:TASKS|}') = '') then
+  // Safety net in case the Tasks page was never raised.
+  if ShouldApplyRegistryStartup then
     SelectStartupFromRegistry;
+  Log(Format('startup-task: PrepareToInstall installed=%d registry=%d selected=%d applied=%d', [
+    Ord(WasInstalled), Ord(InitialStartup), Ord(WizardIsTaskSelected('startup')), Ord(StartupApplied)]));
   StopGameFrame;
   Result := '';
 end;
