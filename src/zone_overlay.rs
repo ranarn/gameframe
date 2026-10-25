@@ -18,12 +18,14 @@
 //! [`crate::win32::hide_taskbar`] (mode-aware as of issue #42 -- see
 //! [`crate::profile_store::TaskbarHideMode`]), restoring exactly the
 //! previous state via [`crate::win32::restore_taskbar`] once the session
-//! ends -- Save, Cancel, the window being closed any other way, or even a
-//! panic partway through (an RAII guard, [`TaskbarRestoreGuard`], holds the
-//! remembered [`crate::win32::TaskbarHideRestore`] and restores it on drop,
-//! so a stack unwind through `eframe::run_native` -- e.g. a wgpu
-//! device-lost panic on sleep/resume or an external-monitor unplug -- still
-//! restores the taskbar instead of leaving it stuck hidden).
+//! ends -- Save, Cancel, or the window being closed any other way (an RAII
+//! guard, [`TaskbarRestoreGuard`], holds the remembered
+//! [`crate::win32::TaskbarHideRestore`] and restores it on drop, covering
+//! early returns). A panic is covered separately: the release profile is
+//! `panic = "abort"`, so the guard's `Drop` does NOT run then; instead the
+//! panic hook ([`crate::taskbar_recovery::install_panic_hook`]) restores the
+//! taskbar before the abort, and a kill is covered by the marker file
+//! restored at the next start (see [`crate::taskbar_recovery`]).
 //!
 //! OS/GPU-facing: not exercised by this crate's automated tests, for the
 //! same reason [`crate::settings_ui::run_settings_window`] isn't -- a
@@ -78,8 +80,9 @@ impl std::error::Error for ZoneOverlayError {
 /// Hides the taskbar for the session using whichever technique `mode`
 /// selects (see module docs) and always restores exactly the state found
 /// beforehand before returning -- whether the window ran cleanly, failed to
-/// run, or `eframe::run_native` panicked partway through -- via the
-/// [`TaskbarRestoreGuard`] RAII guard held across the call.
+/// run, or returned early -- via the [`TaskbarRestoreGuard`] RAII guard held
+/// across the call. A panic mid-session is handled by the panic hook, not
+/// the guard (see the module docs).
 pub fn run_zone_editor_overlay(
     initial: Option<Zone>,
     mode: TaskbarHideMode,
@@ -89,14 +92,12 @@ pub fn run_zone_editor_overlay(
 
     let remembered_taskbar_state = win32::hide_taskbar(mode).map_err(ZoneOverlayError::Taskbar)?;
 
-    // RAII guard, not a manual "call restore after run_native" step: the
-    // latter is skipped entirely if `eframe::run_native` panics mid-session
-    // (a real possibility with wgpu/eframe on GPU-driver events such as
-    // device-lost on sleep/resume or an external-monitor unplug/replug),
-    // which would leave the taskbar stuck forced into auto-hide. `Drop`
-    // still runs while a panic unwinds the stack, so holding the guard
-    // across the `run_native` call below restores the taskbar on every
-    // exit path -- normal return, early `?` propagation, and panic alike.
+    // RAII guard, not a manual "call restore after run_native" step, so
+    // every non-panic exit path -- normal return and early `?` propagation
+    // -- restores the taskbar. It does not run on a panic in the release
+    // build (`panic = "abort"`); the panic hook installed at startup
+    // (`crate::taskbar_recovery`) restores the taskbar in that case, e.g.
+    // after a wgpu device-lost panic on sleep/resume or a monitor unplug.
     let _taskbar_restore_guard = TaskbarRestoreGuard::new(remembered_taskbar_state);
 
     let state = match initial {
@@ -126,16 +127,13 @@ pub fn run_zone_editor_overlay(
 /// RAII guard that restores the taskbar's remembered state (which technique
 /// hid it, plus whatever it needs to restore exactly -- see
 /// [`win32::TaskbarHideRestore`]) when dropped, whether that happens via
-/// normal return, early `?` propagation, or a panic unwinding through
-/// `eframe::run_native`. A manual "hide, call, then restore" sequence skips
-/// the restore step entirely if the call in between panics; `Drop` runs
-/// during unwinding regardless, so holding one of these across the call
-/// closes that gap.
+/// normal return or early `?` propagation. It does not cover a panic in the
+/// release build (`panic = "abort"` skips destructors); the panic hook in
+/// `crate::taskbar_recovery` does.
 ///
 /// `restore_taskbar`'s own error is logged rather than propagated or
-/// unwrapped -- a `Drop` impl that itself panics while already unwinding
-/// from another panic aborts the process, which would be strictly worse
-/// than a taskbar left stuck hidden.
+/// unwrapped -- a `Drop` impl must not panic (it could run during a debug
+/// build's unwind, where a second panic aborts).
 struct TaskbarRestoreGuard {
     remembered: win32::TaskbarHideRestore,
 }

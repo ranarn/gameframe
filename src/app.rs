@@ -68,6 +68,13 @@ pub fn run() -> Result<(), TrayUiError> {
     let config_dir = config_dir();
     crate::logging::init(&config_dir);
     log!("GameFrame {} started", env!("CARGO_PKG_VERSION"));
+
+    // Issue #68: undo a taskbar hide a crashed or killed run left behind,
+    // before anything in this run can hide it, then guard against panics.
+    crate::taskbar_recovery::init(&config_dir);
+    crate::taskbar_recovery::recover_on_startup(&config_dir);
+    crate::taskbar_recovery::install_panic_hook();
+
     let tray = Tray::new()?;
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
@@ -111,6 +118,8 @@ pub fn run() -> Result<(), TrayUiError> {
         && let Err(e) = win32::restore_taskbar(restore) {
             log!("failed to restore taskbar on exit: {e}");
         }
+    // Anything still hidden (e.g. the manual hotkey toggle), and the marker.
+    crate::taskbar_recovery::restore_on_exit();
 
     if let Some(hook) = launch_watcher_hook {
         launch_watcher::unregister(hook);
