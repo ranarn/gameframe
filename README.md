@@ -56,7 +56,10 @@ cargo build --release  # target\release\gameframe.exe
 The release build is a single self-contained executable; the C runtime is statically linked.
 
 To build the installer, install [Inno Setup 7](https://jrsoftware.org/isinfo.php)
-(`winget install JRSoftware.InnoSetup.7`) and run `.\installer\build.ps1`. The result is
+(`winget install JRSoftware.InnoSetup.7`) and
+[cargo-about](https://github.com/EmbarkStudios/cargo-about)
+(`cargo install cargo-about --locked --version 0.9.2`, generates the third-party license
+notices), then run `.\installer\build.ps1`. The result is
 `target\installer\GameFrame-Setup-<version>.exe`.
 
 ## Support

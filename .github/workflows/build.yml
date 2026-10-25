@@ -67,6 +67,8 @@ jobs:
           if ($hash -ne $env:INNO_SETUP_SHA256) { throw "Inno Setup checksum mismatch: $hash" }
           Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER' -Wait
 
+      - uses: $/.github/actions/install-cargo-about
+
       - name: Build installer
         run: ./installer/build.ps1
 
@@ -80,5 +82,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer
-          path: target/installer/GameFrame-Setup-*
+          path: |
+            target/installer/GameFrame-Setup-*
+            target/installer/GameFrame-Third-Party-Notices.txt
           if-no-files-found: error
