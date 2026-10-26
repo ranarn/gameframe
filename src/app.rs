@@ -92,6 +92,8 @@ pub fn run() -> Result<(), TrayUiError> {
     // Lets a second launch ask this instance to open Settings.
     // Created on this thread so this thread's pumps dispatch its messages.
     let instance_channel = instance_channel::Receiver::create();
+    // Needs that channel's window to ping; pings run on their own thread.
+    sync_hang_watchdog(&config_dir);
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
@@ -271,6 +273,7 @@ fn run_event_loop(
             DispatchMessageW(&msg);
         }
 
+        crate::watchdog::step("event loop: second-launch commands");
         // Commands from a second launch (see crate::instance_channel); the
         // channel's window is dispatched by this pump, so they are queued by now.
         let commands = instance_channel::drain();
@@ -361,6 +364,7 @@ fn drain_events(
         updates,
     } = *ctx;
     let settings_open = settings != SettingsMode::Closed;
+    crate::watchdog::step("drain_events: update events");
     // Results of the startup update check and of installs started from
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
@@ -404,6 +408,7 @@ fn drain_events(
     // at no extra cost. No crate-native "menu about to show" event exists
     // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
     // comment).
+    crate::watchdog::step("drain_events: tray icon events");
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
         if matches!(
             event,
@@ -414,6 +419,7 @@ fn drain_events(
         }
     }
 
+    crate::watchdog::step("drain_events: tray menu events");
     while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
             handle_apply_to_window(config_dir, target_hwnd);
@@ -462,6 +468,7 @@ fn drain_events(
         }
     }
 
+    crate::watchdog::step("drain_events: hotkey events");
     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
         // Only act on the key-down edge; the crate also emits a
         // `Released` event on key-up (see `global_hotkey`'s Windows
@@ -1182,8 +1189,16 @@ fn show_settings(
     // "already registered" and all hotkeys went dead after any Settings visit.
     drop(hotkeys.take());
     (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
+    sync_hang_watchdog(config_dir);
     cursor_overlay.reload(config_dir);
     tray.sync_start_with_windows_check();
+}
+
+/// Starts or stops the hang watchdog to match the saved `log_ui_hangs`
+/// setting (on if the config can't be read).
+fn sync_hang_watchdog(config_dir: &Path) {
+    let enabled = profile_store::load(config_dir).is_ok_and(|c| c.log_ui_hangs);
+    crate::watchdog::set_enabled(enabled);
 }
 
 /// Opens the Settings window at `config_dir`. See

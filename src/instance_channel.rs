@@ -410,6 +410,22 @@ pub fn focus_settings_window() -> bool {
     true
 }
 
+/// This process's command window (owned by the thread that created the
+/// [`Receiver`]), if it exists. Lets [`crate::watchdog`] ping the main thread.
+pub fn command_window() -> Option<HWND> {
+    let class = wide(CLASS_NAME);
+    // SAFETY: plain Win32 call; `class` outlives it.
+    let hwnd = unsafe {
+        FindWindowExW(
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            class.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    (!hwnd.is_null()).then_some(hwnd)
+}
+
 /// Queues a `Quit` from inside this process (the tray's Exit item or an
 /// elevated relaunch while Settings is open): the Settings loop closes itself
 /// on [`quit_pending`] and the main loop then exits.

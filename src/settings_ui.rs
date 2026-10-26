@@ -91,6 +91,8 @@ pub struct SettingsState {
     /// What the startup update check does with an available update (the
     /// radio choice under Updates).
     pub update_mode: UpdateMode,
+    /// The Log UI hangs (diagnostics) checkbox.
+    pub log_ui_hangs: bool,
     /// The open tab. UI-only (never persisted), but kept here rather than on
     /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
     pub tab: SettingsTab,
@@ -187,6 +189,7 @@ impl SettingsState {
             hide_taskbar_on_apply: config.hide_taskbar_on_apply,
             start_with_windows: false,
             update_mode: config.update_mode,
+            log_ui_hangs: config.log_ui_hangs,
             tab: SettingsTab::default(),
             hotkey_failures: Vec::new(),
         }
@@ -232,6 +235,7 @@ impl SettingsState {
             hide_taskbar_on_apply: self.hide_taskbar_on_apply,
             cursor: self.cursor.clone(),
             update_mode: self.update_mode,
+            log_ui_hangs: self.log_ui_hangs,
         }
     }
 
@@ -1647,6 +1651,13 @@ impl SettingsApp<'_> {
             "Ask me (adds a tray item when an update is available)",
         );
         self.update_check_row(ui);
+
+        ui.separator();
+        ui.heading("Diagnostics");
+        ui.checkbox(&mut self.state.log_ui_hangs, "Log UI hangs (diagnostics)");
+        ui.label(
+            "Writes a line to the log when GameFrame stops responding. Takes effect when you save.",
+        );
     }
 
     /// Renders the "Check for updates now" button and its status line. The
@@ -2330,6 +2341,7 @@ mod tests {
                 ..CursorSettings::default()
             },
             update_mode: UpdateMode::Auto,
+            log_ui_hangs: true,
         };
 
         let state = SettingsState::from_config(&config);
@@ -2397,6 +2409,19 @@ mod tests {
 
         state.clear_hotkey(HotkeyField::ToggleGameCursor);
         assert_eq!(state.to_config().hotkeys.toggle_game_cursor, None);
+    }
+
+    #[test]
+    fn log_ui_hangs_round_trips_through_the_settings_state() {
+        for value in [true, false] {
+            let config = Config {
+                log_ui_hangs: value,
+                ..Config::default()
+            };
+            let state = SettingsState::from_config(&config);
+            assert_eq!(state.log_ui_hangs, value);
+            assert_eq!(state.to_config().log_ui_hangs, value);
+        }
     }
 
     #[test]

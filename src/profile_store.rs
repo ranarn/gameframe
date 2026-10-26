@@ -168,10 +168,18 @@ pub struct Config {
     /// What the startup update check does with an available update.
     #[serde(default)]
     pub update_mode: UpdateMode,
+    /// Whether the main-thread hang watchdog runs and logs UI stalls
+    /// (crate::watchdog). On by default; a config without the field means on.
+    #[serde(default = "default_log_ui_hangs")]
+    pub log_ui_hangs: bool,
 }
 
 fn default_hide_taskbar_on_apply() -> bool {
     false
+}
+
+fn default_log_ui_hangs() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -187,6 +195,7 @@ impl Default for Config {
             hide_taskbar_on_apply: default_hide_taskbar_on_apply(),
             cursor: CursorSettings::default(),
             update_mode: UpdateMode::default(),
+            log_ui_hangs: default_log_ui_hangs(),
         }
     }
 }
@@ -305,6 +314,7 @@ pub fn convert_legacy_config(mut table: toml::Table) -> Option<Config> {
         hide_taskbar_on_apply: legacy.hide_taskbar_on_apply,
         cursor: CursorSettings::default(),
         update_mode: UpdateMode::default(),
+        log_ui_hangs: default_log_ui_hangs(),
     })
 }
 
@@ -580,6 +590,7 @@ mod tests {
                 hide_taskbar_on_apply: false,
                 cursor: CursorSettings::default(),
                 update_mode: UpdateMode::Auto,
+                log_ui_hangs: true,
             }
         );
         assert!(config_dir.join(CONFIG_FILE_NAME).exists());
@@ -615,12 +626,38 @@ mod tests {
                 ..CursorSettings::default()
             },
             update_mode: UpdateMode::Ask,
+            log_ui_hangs: false,
         };
         save(&config_dir, &written).unwrap();
 
         let loaded = load_from_disk(&config_dir).unwrap();
 
         assert_eq!(loaded, written);
+    }
+
+    #[test]
+    fn log_ui_hangs_defaults_to_on_when_the_config_has_no_such_field() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert!(config.log_ui_hangs);
+        assert!(Config::default().log_ui_hangs);
+    }
+
+    #[test]
+    fn log_ui_hangs_round_trips_both_values_through_the_config_file() {
+        for value in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("GameFrame");
+            let written = Config {
+                log_ui_hangs: value,
+                ..Config::default()
+            };
+            save(&config_dir, &written).unwrap();
+
+            let loaded = load_from_disk(&config_dir).unwrap();
+
+            assert_eq!(loaded.log_ui_hangs, value);
+        }
     }
 
     #[test]
