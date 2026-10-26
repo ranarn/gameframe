@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{ERROR_TIMEOUT, GetLastError, SetLastError};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
@@ -42,6 +43,8 @@ pub struct StallTracker {
     /// When a ping last came back answered: a stall began no earlier than that.
     last_answered: Option<Instant>,
     last_logged: Option<Instant>,
+    /// Consecutive unanswered pings; a stall is only reported from the second.
+    misses: u32,
 }
 
 impl StallTracker {
@@ -51,7 +54,8 @@ impl StallTracker {
     /// A stall is dated from the last answered ping, not from the first missed
     /// one: the thread may have been stuck since just after that answer, so
     /// the reported time can overshoot by up to one ping interval but never
-    /// undershoot.
+    /// undershoot. One missed ping is never enough to log: it needs two in a
+    /// row, so a window torn down mid-ping cannot raise a false alarm.
     pub fn observe(
         &mut self,
         ping_started: Instant,
@@ -59,6 +63,7 @@ impl StallTracker {
         answered: bool,
     ) -> Option<Verdict> {
         if answered {
+            self.misses = 0;
             self.last_answered = Some(now);
             let since = self.stalled_since.take()?;
             // A stall that never reached a log line has no recovery line either.
@@ -67,6 +72,7 @@ impl StallTracker {
                 stalled_for: now.saturating_duration_since(since),
             });
         }
+        self.misses += 1;
         let since = *self
             .stalled_since
             .get_or_insert(self.last_answered.unwrap_or(ping_started));
@@ -74,7 +80,7 @@ impl StallTracker {
         let due = self
             .last_logged
             .is_none_or(|t| now.saturating_duration_since(t) >= LOG_INTERVAL);
-        if stalled_for >= STALL_THRESHOLD && due {
+        if self.misses >= 2 && stalled_for >= STALL_THRESHOLD && due {
             self.last_logged = Some(now);
             return Some(Verdict::Stalled { stalled_for });
         }
@@ -154,6 +160,7 @@ pub fn set_enabled(enabled: bool) {
 fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
     let mut tracker = StallTracker::default();
     let mut warned_no_window = false;
+    let mut warned_wrong_thread = false;
     loop {
         match stop.recv_timeout(PING_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -174,8 +181,15 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
         let (ping_started, answered) = unsafe {
             let mut pid = 0u32;
             if GetWindowThreadProcessId(hwnd, &mut pid) != main_thread {
-                continue; // Not the main thread's window; nothing to ping.
+                // Not the main thread's window; nothing to ping. Say so once.
+                if !warned_wrong_thread {
+                    warned_wrong_thread = true;
+                    log!("hang watchdog: the ping window is not on the main thread; not watching");
+                }
+                continue;
             }
+            warned_wrong_thread = false;
+            SetLastError(0);
             let started = Instant::now();
             let mut result = 0usize;
             // Answered only while the main thread pumps.
@@ -188,6 +202,15 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                 STALL_THRESHOLD.as_millis() as u32,
                 &mut result,
             );
+            if ok == 0 {
+                // A timeout (or a hung-window abort, which may leave the error
+                // at 0) is a miss. Anything else, e.g. the window destroyed
+                // mid-ping, says nothing about the main thread: skip it.
+                let err = GetLastError();
+                if err != 0 && err != ERROR_TIMEOUT {
+                    continue;
+                }
+            }
             (started, ok != 0)
         };
         match tracker.observe(ping_started, Instant::now(), answered) {
@@ -254,23 +277,24 @@ mod tests {
     fn a_continuing_stall_logs_at_most_every_ten_seconds() {
         let base = Instant::now();
         let mut t = StallTracker::default();
-        assert!(miss(&mut t, base, 0, 3).is_some());
-        assert_eq!(miss(&mut t, base, 3, 6), None);
+        assert_eq!(miss(&mut t, base, 0, 3), None);
+        assert!(miss(&mut t, base, 3, 6).is_some());
         assert_eq!(miss(&mut t, base, 6, 9), None);
+        assert_eq!(miss(&mut t, base, 12, 15), None);
         assert_eq!(
-            miss(&mut t, base, 10, 13),
+            miss(&mut t, base, 13, 16),
             Some(Verdict::Stalled {
-                stalled_for: Duration::from_secs(13)
+                stalled_for: Duration::from_secs(16)
             })
         );
-        assert_eq!(miss(&mut t, base, 13, 16), None);
     }
 
     #[test]
     fn recovery_after_a_logged_stall_reports_the_total_time_once() {
         let base = Instant::now();
         let mut t = StallTracker::default();
-        assert!(miss(&mut t, base, 0, 3).is_some());
+        assert_eq!(miss(&mut t, base, 0, 3), None);
+        assert!(miss(&mut t, base, 3, 6).is_some());
         assert_eq!(
             t.observe(secs(base, 7), secs(base, 8), true),
             Some(Verdict::Recovered {
@@ -292,8 +316,9 @@ mod tests {
     fn a_second_stall_starts_a_fresh_count() {
         let base = Instant::now();
         let mut t = StallTracker::default();
-        assert!(miss(&mut t, base, 0, 3).is_some());
-        assert!(t.observe(secs(base, 4), secs(base, 5), true).is_some());
+        assert_eq!(miss(&mut t, base, 0, 3), None);
+        assert!(miss(&mut t, base, 3, 6).is_some());
+        assert!(t.observe(secs(base, 7), secs(base, 8), true).is_some());
         // Healthy in between, then a new stall counted from the last answer.
         assert_eq!(t.observe(secs(base, 19), secs(base, 20), true), None);
         assert_eq!(miss(&mut t, base, 20, 21), None);
@@ -310,11 +335,12 @@ mod tests {
         let base = Instant::now();
         let mut t = StallTracker::default();
         assert_eq!(t.observe(secs(base, 0), secs(base, 1), true), None);
-        // The next ping fails at once (hung window): 3 s after the last answer.
+        // Two pings in a row fail at once (hung window): dated from the last answer.
+        assert_eq!(miss(&mut t, base, 4, 4), None);
         assert_eq!(
-            miss(&mut t, base, 4, 4),
+            miss(&mut t, base, 7, 7),
             Some(Verdict::Stalled {
-                stalled_for: Duration::from_secs(3)
+                stalled_for: Duration::from_secs(6)
             })
         );
         assert_eq!(
@@ -323,6 +349,27 @@ mod tests {
                 stalled_for: Duration::from_secs(8)
             })
         );
+    }
+
+    #[test]
+    fn a_single_missed_ping_never_logs_even_when_old_enough() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(t.observe(secs(base, 0), secs(base, 1), true), None);
+        // 30 s later one ping misses: well past the threshold, but only one miss.
+        assert_eq!(miss(&mut t, base, 30, 30), None);
+        // The window answers again: no stall happened, so no recovery line.
+        assert_eq!(t.observe(secs(base, 33), secs(base, 33), true), None);
+    }
+
+    #[test]
+    fn an_answer_between_misses_resets_the_count() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(miss(&mut t, base, 0, 3), None);
+        assert_eq!(t.observe(secs(base, 3), secs(base, 4), true), None);
+        // A later lone miss is again only the first.
+        assert_eq!(miss(&mut t, base, 10, 13), None);
     }
 
     // One test: the breadcrumb is process-global, so parallel tests would race.
@@ -338,6 +385,7 @@ mod tests {
         }
         assert_eq!(crumb().0, "test step");
     }
+
     #[test]
     fn disabling_stops_the_thread_and_enabling_twice_runs_only_one() {
         set_enabled(true);
