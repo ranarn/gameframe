@@ -67,7 +67,9 @@ impl StallTracker {
                 stalled_for: now.saturating_duration_since(since),
             });
         }
-        let since = *self.stalled_since.get_or_insert(self.last_answered.unwrap_or(ping_started));
+        let since = *self
+            .stalled_since
+            .get_or_insert(self.last_answered.unwrap_or(ping_started));
         let stalled_for = now.saturating_duration_since(since);
         let due = self
             .last_logged

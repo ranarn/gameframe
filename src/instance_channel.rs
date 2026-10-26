@@ -421,12 +421,7 @@ pub fn command_window() -> Option<HWND> {
         let pid = GetCurrentProcessId();
         let mut prev: HWND = std::ptr::null_mut();
         loop {
-            let hwnd = FindWindowExW(
-                HWND_MESSAGE,
-                prev,
-                class.as_ptr(),
-                std::ptr::null(),
-            );
+            let hwnd = FindWindowExW(HWND_MESSAGE, prev, class.as_ptr(), std::ptr::null());
             if hwnd.is_null() {
                 return None;
             }
