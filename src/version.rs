@@ -7,7 +7,7 @@ const DEV_VERSION: &str = "0.0.0";
 /// The version line for the About tab and the Settings footer; the `0.0.0`
 /// placeholder that unreleased builds carry is shown as a development build.
 pub fn version_label(version: &str) -> String {
-    if version == DEV_VERSION {
+    if is_dev(version) {
         "Version: development build".to_string()
     } else {
         format!("Version: {version}")
@@ -16,11 +16,17 @@ pub fn version_label(version: &str) -> String {
 
 /// The tray icon's hover text for `version`, e.g. "GameFrame 0.3.0".
 pub fn tooltip_text(version: &str) -> String {
-    if version == DEV_VERSION {
+    if is_dev(version) {
         "GameFrame (development build)".to_string()
     } else {
         format!("GameFrame {version}")
     }
+}
+
+/// Whether `version` is the unreleased-build placeholder; the one place the
+/// development-build rule lives.
+fn is_dev(version: &str) -> bool {
+    version == DEV_VERSION
 }
 
 /// [`version_label`] for the running build.
