@@ -23,6 +23,7 @@ mod update_install;
 mod update_ui;
 mod updater;
 mod version;
+mod watchdog;
 mod win32;
 mod window_filter;
 mod zone_editor;
