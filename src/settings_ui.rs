@@ -108,16 +108,6 @@ const LICENSE: &str = env!("CARGO_PKG_LICENSE");
 /// repo-only build: `cargo package`/`publish` without `.github` would break it.
 const FUNDING_YML: &str = include_str!("../.github/FUNDING.yml");
 
-/// The version line for the About tab; the `0.0.0` placeholder that
-/// unreleased builds carry is shown as a development build.
-fn version_label(version: &str) -> String {
-    if version == "0.0.0" {
-        "Version: development build".to_string()
-    } else {
-        format!("Version: {version}")
-    }
-}
-
 /// The first `custom:` URL in a `FUNDING.yml` body, e.g.
 /// `custom: ["https://..."]`. This is an ad-hoc scraper for that single-line
 /// form only; a multi-line or unquoted list yields `None`. The test
@@ -1585,7 +1575,7 @@ impl SettingsApp<'_> {
     /// voluntary donation link.
     fn about_section(ui: &mut egui::Ui) {
         ui.heading("GameFrame");
-        ui.label(version_label(env!("CARGO_PKG_VERSION")));
+        ui.label(crate::version::current_label());
         ui.label(format!("License: {LICENSE}"));
         ui.hyperlink_to("Source code", env!("CARGO_PKG_REPOSITORY"));
         ui.separator();
@@ -1972,6 +1962,13 @@ impl eframe::App for SettingsApp<'_> {
                     *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(crate::version::current_label())
+                            .weak()
+                            .small(),
+                    );
+                });
             });
             ui.add_space(2.0);
         });
@@ -2071,12 +2068,6 @@ mod tests {
     fn merge_cursor_enabled_keeps_the_users_change_in_settings() {
         assert!(merge_cursor_enabled(false, true, false));
         assert!(!merge_cursor_enabled(true, false, true));
-    }
-
-    #[test]
-    fn dev_version_is_shown_as_development_build() {
-        assert_eq!(version_label("0.0.0"), "Version: development build");
-        assert_eq!(version_label("1.2.3"), "Version: 1.2.3");
     }
 
     #[test]

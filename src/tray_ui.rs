@@ -48,9 +48,6 @@ pub enum TrayAction {
     Exit,
 }
 
-/// The tray icon's hover text when no update is downloading.
-pub const DEFAULT_TOOLTIP: &str = "GameFrame";
-
 const SHOW_SETTINGS_ID: &str = "gameframe-show-settings";
 const APPLY_TO_WINDOW_ID: &str = "gameframe-apply-to-window";
 const START_WITH_WINDOWS_ID: &str = "gameframe-start-with-windows";
@@ -248,7 +245,7 @@ impl Tray {
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_icon(icon)
-            .with_tooltip(DEFAULT_TOOLTIP)
+            .with_tooltip(crate::version::current_tooltip())
             .build()
             .map_err(TrayUiError::Tray)?;
 
