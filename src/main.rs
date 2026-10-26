@@ -7,6 +7,7 @@ mod logging;
 mod app;
 mod autostart;
 mod cursor_overlay;
+mod debug_watchdog; // [DEBUG-a4f2]
 mod cursor_style;
 mod hotkeys;
 mod http;

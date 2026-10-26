@@ -92,6 +92,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // Lets a second launch ask this instance to open Settings.
     // Created on this thread so this thread's pumps dispatch its messages.
     let instance_channel = instance_channel::Receiver::create();
+    crate::debug_watchdog::start(); // [DEBUG-a4f2]
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
@@ -361,6 +362,7 @@ fn drain_events(
         updates,
     } = *ctx;
     let settings_open = settings != SettingsMode::Closed;
+    crate::debug_watchdog::step("drain_events: update events"); // [DEBUG-a4f2]
     // Results of the startup update check and of installs started from
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
@@ -404,6 +406,7 @@ fn drain_events(
     // at no extra cost. No crate-native "menu about to show" event exists
     // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
     // comment).
+    crate::debug_watchdog::step("drain_events: tray icon events"); // [DEBUG-a4f2]
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
         if matches!(
             event,
@@ -414,6 +417,7 @@ fn drain_events(
         }
     }
 
+    crate::debug_watchdog::step("drain_events: menu events"); // [DEBUG-a4f2]
     while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
             handle_apply_to_window(config_dir, target_hwnd);
@@ -462,6 +466,7 @@ fn drain_events(
         }
     }
 
+    crate::debug_watchdog::step("drain_events: hotkey events"); // [DEBUG-a4f2]
     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
         // Only act on the key-down edge; the crate also emits a
         // `Released` event on key-up (see `global_hotkey`'s Windows
@@ -502,6 +507,7 @@ fn drain_events(
         }
     }
 
+    crate::debug_watchdog::step("drain_events: done (back in UI loop)"); // [DEBUG-a4f2]
     Drained::default()
 }
 

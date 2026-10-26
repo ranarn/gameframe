@@ -232,6 +232,7 @@ unsafe extern "system" fn window_destroy_callback(
         return;
     }
 
+    crate::debug_watchdog::step("destroy hook"); // [DEBUG-a4f2]
     crate::win32::forget_applied_window(hwnd);
     cancel_drift_recheck(hwnd);
 
@@ -285,7 +286,9 @@ unsafe extern "system" fn drift_callback(
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };
+    crate::debug_watchdog::step("drift hook: re-check"); // [DEBUG-a4f2]
     check_applied_window_drift(config_dir, hwnd);
+    crate::debug_watchdog::step("drift hook: done"); // [DEBUG-a4f2]
 }
 
 /// Window handle -> thread timer id of the one pending deferred drift re-check.
@@ -388,5 +391,7 @@ unsafe extern "system" fn win_event_callback(
         return;
     };
 
+    crate::debug_watchdog::step("foreground hook: auto-apply"); // [DEBUG-a4f2]
     crate::app::handle_auto_apply_launch(config_dir, hwnd);
+    crate::debug_watchdog::step("foreground hook: done"); // [DEBUG-a4f2]
 }
