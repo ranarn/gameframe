@@ -93,7 +93,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // Created on this thread so this thread's pumps dispatch its messages.
     let instance_channel = instance_channel::Receiver::create();
     // Needs that channel's window to ping; pings run on their own thread.
-    sync_hang_watchdog(&config_dir);
+    sync_hang_watchdog(&config_dir, true);
 
     // First run (no Zone yet): open the zone editor once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
@@ -133,6 +133,9 @@ pub fn run() -> Result<(), TrayUiError> {
         &cursor_overlay,
         &updates,
     );
+
+    // Before the channel's window goes: the watchdog pings it.
+    crate::watchdog::set_enabled(false);
 
     // Stops the game cursor thread (see `crate::cursor_overlay`).
     drop(cursor_overlay);
@@ -263,11 +266,14 @@ fn run_event_loop(
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
+        // Waiting here is healthy; the label tells an idle pump from a stuck step.
+        crate::watchdog::step("event loop: waiting for a message");
         // 0 (WM_QUIT) or -1 (error) both mean: stop pumping.
         let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if ret <= 0 {
             return;
         }
+        crate::watchdog::step("event loop: dispatching a message");
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1173,11 +1179,16 @@ fn show_settings(
                 // Settings closes on a queued Quit and the main loop exits.
                 instance_channel::queue_quit();
             }
+            // Back in Settings' frame loop (rendering, window messages): a stall
+            // from here until the next tick happened in Settings itself (#128).
+            crate::watchdog::step("settings: frame loop");
         }
     };
+    crate::watchdog::step("settings: opening window");
     if let Err(e) = open_settings(config_dir, hotkey_reports, &mut on_tick) {
         log!("failed to open Settings: {e}");
     }
+    crate::watchdog::step("settings: closed, re-registering hotkeys");
 
     // Settings may have changed the hotkey bindings on disk (Save persists via
     // `profile_store`) -- re-register from the freshly saved config so a newly
@@ -1189,16 +1200,24 @@ fn show_settings(
     // "already registered" and all hotkeys went dead after any Settings visit.
     drop(hotkeys.take());
     (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
-    sync_hang_watchdog(config_dir);
+    sync_hang_watchdog(config_dir, false);
     cursor_overlay.reload(config_dir);
     tray.sync_start_with_windows_check();
 }
 
 /// Starts or stops the hang watchdog to match the saved `log_ui_hangs`
-/// setting (on if the config can't be read).
-fn sync_hang_watchdog(config_dir: &Path) {
-    let enabled = profile_store::load(config_dir).is_ok_and(|c| c.log_ui_hangs);
-    crate::watchdog::set_enabled(enabled);
+/// setting. If the config can't be read the watchdog keeps its current state,
+/// except at startup, where it starts (a diagnostic fails on).
+fn sync_hang_watchdog(config_dir: &Path, startup: bool) {
+    match profile_store::load(config_dir) {
+        Ok(config) => crate::watchdog::set_enabled(config.log_ui_hangs),
+        Err(e) => {
+            log!("hang watchdog: could not read the config: {e}");
+            if startup {
+                crate::watchdog::set_enabled(true);
+            }
+        }
+    }
 }
 
 /// Opens the Settings window at `config_dir`. See

@@ -39,12 +39,19 @@ pub enum Verdict {
 #[derive(Debug, Default)]
 pub struct StallTracker {
     stalled_since: Option<Instant>,
+    /// When a ping last came back answered: a stall began no earlier than that.
+    last_answered: Option<Instant>,
     last_logged: Option<Instant>,
 }
 
 impl StallTracker {
     /// Records one ping. `ping_started` is when it was sent, `now` when it
     /// returned, `answered` whether the main thread replied in time.
+    ///
+    /// A stall is dated from the last answered ping, not from the first missed
+    /// one: the thread may have been stuck since just after that answer, so
+    /// the reported time can overshoot by up to one ping interval but never
+    /// undershoot.
     pub fn observe(
         &mut self,
         ping_started: Instant,
@@ -52,6 +59,7 @@ impl StallTracker {
         answered: bool,
     ) -> Option<Verdict> {
         if answered {
+            self.last_answered = Some(now);
             let since = self.stalled_since.take()?;
             // A stall that never reached a log line has no recovery line either.
             self.last_logged.take()?;
@@ -59,7 +67,7 @@ impl StallTracker {
                 stalled_for: now.saturating_duration_since(since),
             });
         }
-        let since = *self.stalled_since.get_or_insert(ping_started);
+        let since = *self.stalled_since.get_or_insert(self.last_answered.unwrap_or(ping_started));
         let stalled_for = now.saturating_duration_since(since);
         let due = self
             .last_logged
@@ -79,9 +87,30 @@ fn crumb() -> MutexGuard<'static, (&'static str, Option<Instant>)> {
     CRUMB.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Marks entry into a step that could block, on the calling thread.
+/// Marks entry into a step that could block, on the calling thread. Until the
+/// next call it stays the "last step", so a long-running step hands back to
+/// an idle or enclosing label when it finishes.
 pub fn step(label: &'static str) {
     *crumb() = (label, Some(Instant::now()));
+}
+
+/// Sets the breadcrumb until the returned guard drops, then restores the
+/// previous one. For hook callbacks that run inside whatever the thread was
+/// doing: once they return, the report names that again, not the finished hook.
+pub fn scoped(label: &'static str) -> Scoped {
+    let mut c = crumb();
+    let previous = *c;
+    *c = (label, Some(Instant::now()));
+    Scoped(previous)
+}
+
+/// Restores the previous breadcrumb on drop; see [`scoped`].
+pub struct Scoped((&'static str, Option<Instant>));
+
+impl Drop for Scoped {
+    fn drop(&mut self) {
+        *crumb() = self.0;
+    }
 }
 
 /// Sender whose drop tells the running watchdog thread to stop.
@@ -130,12 +159,14 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
             _ => return,
         }
         let Some(hwnd) = crate::instance_channel::command_window() else {
+            // Normal around startup and shutdown.
             if !warned_no_window {
                 warned_no_window = true;
                 log!("hang watchdog: no window to ping yet; idle until it exists");
             }
             continue;
         };
+        warned_no_window = false;
         // SAFETY: plain Win32 calls on a handle just looked up; a stale
         // handle only makes them fail.
         let (ping_started, answered) = unsafe {
@@ -159,9 +190,11 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
         };
         match tracker.observe(ping_started, Instant::now(), answered) {
             Some(Verdict::Stalled { stalled_for }) => {
+                // `log!` takes the global log lock: if the main thread is stuck
+                // inside a log write, this line waits for it. Accepted.
                 let (label, entered) = *crumb();
                 log!(
-                    "UI thread not responding for {:.1}s; last step '{}' entered {} ago",
+                    "UI thread not responding for ~{:.1}s; last step '{}' entered {} ago",
                     stalled_for.as_secs_f32(),
                     label,
                     entered.map_or_else(
@@ -172,7 +205,7 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
             }
             Some(Verdict::Recovered { stalled_for }) => {
                 log!(
-                    "UI thread responding again after a stall of {:.1}s",
+                    "UI thread responding again after a stall of ~{:.1}s",
                     stalled_for.as_secs_f32()
                 );
             }
@@ -259,6 +292,8 @@ mod tests {
         let mut t = StallTracker::default();
         assert!(miss(&mut t, base, 0, 3).is_some());
         assert!(t.observe(secs(base, 4), secs(base, 5), true).is_some());
+        // Healthy in between, then a new stall counted from the last answer.
+        assert_eq!(t.observe(secs(base, 19), secs(base, 20), true), None);
         assert_eq!(miss(&mut t, base, 20, 21), None);
         assert_eq!(
             miss(&mut t, base, 21, 24),
@@ -269,13 +304,38 @@ mod tests {
     }
 
     #[test]
-    fn step_records_the_latest_label() {
+    fn a_stall_is_dated_from_the_last_answered_ping() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(t.observe(secs(base, 0), secs(base, 1), true), None);
+        // The next ping fails at once (hung window): 3 s after the last answer.
+        assert_eq!(
+            miss(&mut t, base, 4, 4),
+            Some(Verdict::Stalled {
+                stalled_for: Duration::from_secs(3)
+            })
+        );
+        assert_eq!(
+            t.observe(secs(base, 8), secs(base, 9), true),
+            Some(Verdict::Recovered {
+                stalled_for: Duration::from_secs(8)
+            })
+        );
+    }
+
+    // One test: the breadcrumb is process-global, so parallel tests would race.
+    #[test]
+    fn step_records_the_latest_label_and_scoped_restores_the_previous() {
         step("test step");
         let (label, entered) = *crumb();
         assert_eq!(label, "test step");
         assert!(entered.is_some());
+        {
+            let _inner = scoped("inner");
+            assert_eq!(crumb().0, "inner");
+        }
+        assert_eq!(crumb().0, "test step");
     }
-
     #[test]
     fn disabling_stops_the_thread_and_enabling_twice_runs_only_one() {
         set_enabled(true);
