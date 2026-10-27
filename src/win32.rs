@@ -1030,8 +1030,10 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
         log!("taskbar judgement: GetWindowRect failed; rect is a zeroed placeholder");
     }
     let windows_auto_hide = read_appbar_flags(taskbar) & ABS_AUTOHIDE != 0;
+    // Without a real rect, position and cover can't be judged: fall back to
+    // visibility alone, exactly as under Windows' auto-hide.
     let verdict = judge_taskbar_hidden(
-        windows_auto_hide,
+        windows_auto_hide || !rect_ok,
         visible,
         (rect.left, rect.top, rect.right, rect.bottom),
         monitor,
@@ -1425,7 +1427,7 @@ pub fn set_taskbar_hide_absolute_armed(
     if hide {
         if is_taskbar_hide_session_active() {
             // A taskbar the hotkey showed in the meantime goes away again
-            // when the game is returned to. `hide_taskbar_completely` marks
+            // when the game is returned to. `hide_taskbar_window` marks
             // the recovery record hidden first (the hotkey show cleared it)
             // and hides; the session's remembered restore is not touched.
             let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
@@ -1520,7 +1522,10 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
     // The hotkey can appear to do nothing after long uptime. Log what it saw
     // and what it left behind so a report comes with evidence.
     // One gather feeds the log line and the decision, so they cannot disagree.
-    let judgement = gather_taskbar_judgement(find_taskbar_window()?);
+    let taskbar = find_taskbar_window().inspect_err(|_| {
+        log!("taskbar hotkey ({mode:?}): before: Shell_TrayWnd not found");
+    })?;
+    let judgement = gather_taskbar_judgement(taskbar);
     log!(
         "taskbar hotkey ({mode:?}): before: {}",
         describe_taskbar(&judgement)
