@@ -247,22 +247,22 @@ pub fn judge_taskbar_hidden(
     None
 }
 
-/// The `ABM_SETSTATE` `lParam` for re-sending the appbar state read just
-/// before: the flags verbatim, no bit flipped, so the user's own
-/// auto-hide/always-on-top settings are preserved exactly.
-fn unchanged_appbar_lparam(read_flags: u32) -> isize {
-    read_flags as isize
+/// Re-sends the appbar state unchanged: `read` supplies the flags and `send`
+/// receives them verbatim as the `ABM_SETSTATE` `lParam` -- no bit flipped,
+/// so the user's own auto-hide/always-on-top settings are preserved exactly.
+fn resend_appbar_state(read: impl FnOnce() -> u32, send: impl FnOnce(isize)) {
+    send(read() as isize);
 }
 
 /// Whether joining an already-active hide session must re-issue the OS hide:
-/// only in `FullyHidden`, and only when the taskbar is actually on screen
-/// (`judged_hidden` is `None`). The session's restore value and recovery
-/// marker are never touched either way.
+/// only in `FullyHidden`, and whenever the taskbar is `WS_VISIBLE` (any
+/// verdict but `NotVisible`) -- on top, covered by the returning game, or
+/// off its monitor. The session's restore value is never touched.
 fn should_rehide_on_join(
     mode: TaskbarHideMode,
     judged_hidden: Option<TaskbarHiddenReason>,
 ) -> bool {
-    mode == TaskbarHideMode::FullyHidden && judged_hidden.is_none()
+    mode == TaskbarHideMode::FullyHidden && judged_hidden != Some(TaskbarHiddenReason::NotVisible)
 }
 
 /// Reasons a live Win32 window-manipulation call can fail.
@@ -915,7 +915,10 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Marker first: a kill right after the hide is then covered.
     let _ = taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
-    hide_taskbar_window(hwnd);
+    // Safety: `hwnd` is a live handle; `ShowWindow` takes a plain command.
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
     Ok(())
 }
 
@@ -928,26 +931,14 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// module docs.
 pub fn show_taskbar() -> Result<(), Win32Error> {
-    show_taskbar_window()?;
-    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
-    Ok(())
-}
-
-/// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar`], with no marker
-/// bookkeeping (so the panic hook can use it without touching any lock).
-fn show_taskbar_window() -> Result<(), Win32Error> {
-    let hwnd = find_taskbar_window()?;
-    // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
-    // performs no writes through pointers, only a plain `i32` command.
-    unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-    }
+    let hwnd = show_taskbar_window()?;
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
-    // covered or that slid away (#52). Mirror the manual auto-hide off/on
-    // workaround: re-send the appbar state read just now, unchanged, then
-    // raise without activating.
-    let flags = read_appbar_flags(hwnd);
-    send_appbar_setstate(hwnd, unchanged_appbar_lparam(flags));
+    // covered or that slid away. Re-send the appbar state read just now,
+    // unchanged, then raise without activating.
+    resend_appbar_state(
+        || read_appbar_flags(hwnd),
+        |lparam| send_appbar_setstate(hwnd, lparam),
+    );
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
     // SWP_NOSIZE, and SWP_NOACTIVATE keeps focus where it is.
     unsafe {
@@ -961,21 +952,37 @@ fn show_taskbar_window() -> Result<(), Win32Error> {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
     Ok(())
 }
 
-/// Bare `ShowWindow(SW_HIDE)` on the taskbar, with no recovery-marker
-/// bookkeeping (the marker already says "hidden" when a session re-hides).
-fn hide_taskbar_window(hwnd: HWND) {
-    // Safety: `hwnd` is a live handle; `ShowWindow` takes a plain command.
+/// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar`] and the panic
+/// hook's [`restore_taskbar_raw`]: one call, no marker bookkeeping, no lock,
+/// nothing else, so it stays safe there. Returns the taskbar handle.
+fn show_taskbar_window() -> Result<HWND, Win32Error> {
+    let hwnd = find_taskbar_window()?;
+    // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
+    // performs no writes through pointers, only a plain `i32` command.
     unsafe {
-        ShowWindow(hwnd, SW_HIDE);
+        ShowWindow(hwnd, SW_SHOW);
     }
+    Ok(hwnd)
+}
+
+/// What [`gather_taskbar_judgement`] read from the OS, with the verdict
+/// [`judge_taskbar_hidden`] drew from it.
+#[derive(Clone, Copy)]
+struct TaskbarJudgement {
+    taskbar: HWND,
+    verdict: Option<TaskbarHiddenReason>,
+    visible: bool,
+    rect: RECT,
+    on_top_at_center: bool,
 }
 
 /// Gathers the plain inputs for [`judge_taskbar_hidden`] from the OS and
-/// returns them with the verdict: `(verdict, visible, taskbar rect, on_top)`.
-fn gather_taskbar_judgement(taskbar: HWND) -> (Option<TaskbarHiddenReason>, bool, RECT, bool) {
+/// judges them.
+fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
     let mut rect = RECT {
         left: 0,
         top: 0,
@@ -1011,7 +1018,13 @@ fn gather_taskbar_judgement(taskbar: HWND) -> (Option<TaskbarHiddenReason>, bool
         monitor,
         on_top,
     );
-    (verdict, visible, rect, on_top)
+    TaskbarJudgement {
+        taskbar,
+        verdict,
+        visible,
+        rect,
+        on_top_at_center: on_top,
+    }
 }
 
 /// Hides the taskbar using whichever technique `mode` selects, remembering
@@ -1074,7 +1087,7 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
 /// which must not touch a lock the panicking thread may already hold.
 pub(crate) fn restore_taskbar_raw(remembered: TaskbarHideRestore) -> Result<(), Win32Error> {
     match remembered {
-        TaskbarHideRestore::FullyHidden => show_taskbar_window(),
+        TaskbarHideRestore::FullyHidden => show_taskbar_window().map(|_| ()),
         TaskbarHideRestore::HoverReveal(state) => set_appbar_state(state),
     }
 }
@@ -1365,10 +1378,11 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 /// [`set_taskbar_hide_absolute`]'s plain absolute set) when no hidden
 /// session is currently active; if one already is (another tracked game's
 /// hide is already in effect), `hwnd` just joins that session via
-/// [`join_taskbar_hide_session`] -- no redundant OS call, and critically,
-/// no re-capture of the remembered restore value (which would silently
-/// discard the true pre-first-hide state; see [`ARMED_TASKBAR_RESTORE`]'s doc
-/// comment).
+/// [`join_taskbar_hide_session`] -- with no re-capture of the remembered
+/// restore value (which would silently discard the true pre-first-hide
+/// state; see [`ARMED_TASKBAR_RESTORE`]'s doc comment). In `FullyHidden` it
+/// additionally re-hides a taskbar that is still `WS_VISIBLE` (e.g. one the
+/// hotkey showed), re-marking the recovery record hidden first.
 ///
 /// The `hide == false` path only issues the real OS show
 /// ([`set_taskbar_hide_absolute`]) when `hwnd` is the *last* armed window
@@ -1391,20 +1405,22 @@ pub fn set_taskbar_hide_absolute_armed(
 ) -> Result<(), Win32Error> {
     if hide {
         if is_taskbar_hide_session_active() {
-            // A taskbar the hotkey showed in the meantime must go away again
-            // when the game is returned to (#52). Only the OS hide is
-            // re-issued: no restore re-capture, no recovery-marker change.
-            let judged = find_taskbar_window()
-                .ok()
-                .map(|t| (t, gather_taskbar_judgement(t).0));
-            let rehide = judged.is_some_and(|(_, v)| should_rehide_on_join(mode, v));
+            // A taskbar the hotkey showed in the meantime goes away again
+            // when the game is returned to. `hide_taskbar_completely` marks
+            // the recovery record hidden first (the hotkey show cleared it)
+            // and hides; the session's remembered restore is not touched.
+            let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
+            let rehide = judgement
+                .as_ref()
+                .is_some_and(|j| should_rehide_on_join(mode, j.verdict));
             log!(
-                "taskbar hide for {hwnd:?}: joining the active session (judged hidden={:?}, re-hide={rehide}); {}",
-                judged.and_then(|(_, v)| v),
-                taskbar_debug_state()
+                "taskbar hide for {hwnd:?}: joining the active session (re-hide={rehide}); {}",
+                judgement
+                    .as_ref()
+                    .map_or_else(|| "Shell_TrayWnd not found".to_string(), describe_taskbar)
             );
-            if rehide && let Some((taskbar, _)) = judged {
-                hide_taskbar_window(taskbar);
+            if rehide {
+                hide_taskbar_completely()?;
             }
             join_taskbar_hide_session(hwnd);
             Ok(())
@@ -1450,14 +1466,15 @@ pub fn set_taskbar_hide_absolute_armed(
 /// press then does the opposite of what was expected). Grounding the
 /// decision in the real OS state on every press removes that drift entirely.
 ///
-/// OS-facing: locates the real taskbar window and reads its actual state.
-/// Not exercised by this crate's automated tests -- see module docs.
-fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
-    let hwnd = find_taskbar_window()?;
+/// OS-facing: `judgement` is the just-gathered state of the real taskbar
+/// (`HoverReveal` additionally reads its appbar flags). Not exercised by this
+/// crate's automated tests -- see module docs.
+fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &TaskbarJudgement) -> bool {
     match mode {
-        TaskbarHideMode::FullyHidden => Ok(gather_taskbar_judgement(hwnd).0.is_some()),
+        TaskbarHideMode::FullyHidden => judgement.verdict.is_some(),
         TaskbarHideMode::HoverReveal => {
-            Ok(state_from_flags(read_appbar_flags(hwnd)) == TaskbarAutohideState::AutoHidden)
+            state_from_flags(read_appbar_flags(judgement.taskbar))
+                == TaskbarAutohideState::AutoHidden
         }
     }
 }
@@ -1481,18 +1498,16 @@ fn is_taskbar_hidden(mode: TaskbarHideMode) -> Result<bool, Win32Error> {
 pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
     // The hotkey can appear to do nothing after long uptime. Log what it saw
     // and what it left behind so a report comes with evidence.
+    // One gather feeds the log line and the decision, so they cannot disagree.
+    let judgement = gather_taskbar_judgement(find_taskbar_window()?);
     log!(
         "taskbar hotkey ({mode:?}): before: {}",
-        taskbar_debug_state()
+        describe_taskbar(&judgement)
     );
-    let hidden = is_taskbar_hidden(mode)?;
-    let reason = if hidden && mode == TaskbarHideMode::FullyHidden {
-        find_taskbar_window()
-            .ok()
-            .and_then(|t| gather_taskbar_judgement(t).0)
-    } else {
-        None
-    };
+    let hidden = is_taskbar_hidden(mode, &judgement);
+    let reason = judgement
+        .verdict
+        .filter(|_| mode == TaskbarHideMode::FullyHidden);
     let result = set_taskbar_hide_absolute(!hidden, mode);
     log!(
         "taskbar hotkey: judged hidden={hidden} (reason={reason:?}), so {} -> {result:?}; after: {}",
@@ -1507,10 +1522,21 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
 /// topmost window at its own center (it can be `WS_VISIBLE` yet covered),
 /// the foreground window, and the armed hide session.
 pub fn taskbar_debug_state() -> String {
-    let Ok(taskbar) = find_taskbar_window() else {
-        return "Shell_TrayWnd not found".to_string();
-    };
-    let (verdict, visible, rect, on_top) = gather_taskbar_judgement(taskbar);
+    match find_taskbar_window() {
+        Ok(taskbar) => describe_taskbar(&gather_taskbar_judgement(taskbar)),
+        Err(_) => "Shell_TrayWnd not found".to_string(),
+    }
+}
+
+/// [`taskbar_debug_state`] for an already-gathered judgement.
+fn describe_taskbar(judgement: &TaskbarJudgement) -> String {
+    let TaskbarJudgement {
+        taskbar,
+        verdict,
+        visible,
+        rect,
+        on_top_at_center: on_top,
+    } = *judgement;
     // Safety: plain query, no arguments.
     let foreground = unsafe { GetForegroundWindow() };
     let flags = read_appbar_flags(taskbar);
@@ -2683,28 +2709,34 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_appbar_lparam_passes_the_read_flags_through_with_no_bit_flipped() {
+    fn resend_appbar_state_sends_exactly_the_flags_it_read_with_no_bit_flipped() {
         for flags in [
             0,
             ABS_AUTOHIDE,
             ABS_ALWAYSONTOP,
             ABS_AUTOHIDE | ABS_ALWAYSONTOP,
         ] {
-            assert_eq!(unchanged_appbar_lparam(flags), flags as isize);
+            let mut sent = None;
+            resend_appbar_state(|| flags, |lparam| sent = Some(lparam));
+            assert_eq!(sent, Some(flags as isize));
         }
     }
 
     #[test]
-    fn should_rehide_on_join_only_when_fully_hidden_and_the_taskbar_is_actually_visible() {
+    fn should_rehide_on_join_whenever_fully_hidden_and_the_taskbar_is_still_ws_visible() {
         use TaskbarHideMode::{FullyHidden, HoverReveal};
         assert!(should_rehide_on_join(FullyHidden, None));
-        assert!(!should_rehide_on_join(
+        assert!(should_rehide_on_join(
             FullyHidden,
-            Some(TaskbarHiddenReason::NotVisible)
+            Some(TaskbarHiddenReason::Covered)
+        ));
+        assert!(should_rehide_on_join(
+            FullyHidden,
+            Some(TaskbarHiddenReason::OffMonitor)
         ));
         assert!(!should_rehide_on_join(
             FullyHidden,
-            Some(TaskbarHiddenReason::Covered)
+            Some(TaskbarHiddenReason::NotVisible)
         ));
         assert!(!should_rehide_on_join(HoverReveal, None));
     }
