@@ -31,9 +31,9 @@ Uninstall from Settings > Apps.
   Changing it re-applies it to every running tracked game.
 - **Tracked games** — listed under **Games** in Settings, each with its own **Auto-apply** (place
   the game in the Zone when it launches) and **Game cursor** switch.
-- **Taskbar hiding** — optionally hide the taskbar while a tracked game is in the Zone, either
-  fully hidden or Windows' hover-to-reveal auto-hide. The taskbar comes back when the game closes
-  or GameFrame exits.
+- **Taskbar hiding** — off by default; optionally hide the taskbar while a tracked game is in the
+  Zone, either fully hidden or Windows' hover-to-reveal auto-hide. The taskbar comes back when the
+  game closes or GameFrame exits.
 - **Game cursor** — a large, high-contrast pointer for games whose own cursor is easy to lose:
   several shapes, or an enlarged copy of the game's own cursor, with size, color, opacity, border
   and glow. Shown only over tracked games; shake the mouse to make it pulse. It never touches the

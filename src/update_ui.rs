@@ -8,7 +8,7 @@
 
 use crate::app::{show_message_box, show_warning_box};
 use crate::profile_store;
-use crate::tray_ui::{self, Tray};
+use crate::tray_ui::Tray;
 use crate::updater::{CheckOutcome, SpawnError, StartupAction, UpdateError, UpdateInfo};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -163,7 +163,7 @@ pub(crate) fn handle_update_event(
             tray.set_tooltip(&format!("GameFrame - installing update v{version}..."));
         }
         UpdateEvent::InstallFailed => {
-            tray.set_tooltip(tray_ui::DEFAULT_TOOLTIP);
+            tray.set_tooltip(&crate::version::current_tooltip());
             // Ask mode: offer the update again.
             if let Some(info) = offered_update {
                 tray.show_update_item(&info.version.to_string());

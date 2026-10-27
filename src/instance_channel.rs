@@ -396,7 +396,7 @@ fn find_settings_window() -> Option<HWND> {
 }
 
 /// Brings this process's Settings window to the front. `false` if not found.
-fn focus_settings_window() -> bool {
+pub fn focus_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;
     };
@@ -408,6 +408,41 @@ fn focus_settings_window() -> bool {
         SetForegroundWindow(hwnd);
     }
     true
+}
+
+/// This process's command window (owned by the thread that created the
+/// [`Receiver`]), if it exists. Lets [`crate::watchdog`] ping the main thread.
+/// Windows of another GameFrame process (an elevated relaunch overlapping the
+/// old instance) share the class name and are skipped.
+pub fn command_window() -> Option<HWND> {
+    let class = wide(CLASS_NAME);
+    // SAFETY: plain Win32 calls; `class` outlives them.
+    unsafe {
+        let pid = GetCurrentProcessId();
+        let mut prev: HWND = std::ptr::null_mut();
+        loop {
+            let hwnd = FindWindowExW(HWND_MESSAGE, prev, class.as_ptr(), std::ptr::null());
+            if hwnd.is_null() {
+                return None;
+            }
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut owner);
+            if owner == pid {
+                return Some(hwnd);
+            }
+            prev = hwnd;
+        }
+    }
+}
+
+/// Queues a `Quit` from inside this process (the tray's Exit item or an
+/// elevated relaunch while Settings is open): the Settings loop closes itself
+/// on [`quit_pending`] and the main loop then exits.
+pub fn queue_quit() {
+    enqueue(
+        &mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()),
+        Command::Quit,
+    );
 }
 
 /// Asks this process's Settings window to close, as its close button would

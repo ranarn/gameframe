@@ -232,6 +232,7 @@ unsafe extern "system" fn window_destroy_callback(
         return;
     }
 
+    let _crumb = crate::watchdog::scoped("destroy hook");
     crate::win32::forget_applied_window(hwnd);
     cancel_drift_recheck(hwnd);
 
@@ -285,6 +286,7 @@ unsafe extern "system" fn drift_callback(
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };
+    let _crumb = crate::watchdog::scoped("drift hook: re-check");
     check_applied_window_drift(config_dir, hwnd);
 }
 
@@ -347,6 +349,7 @@ unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usi
         pending.remove(&window);
         window as HWND
     };
+    let _crumb = crate::watchdog::scoped("drift timer: re-check");
     if !crate::win32::is_applied_window(hwnd) {
         return;
     }
@@ -388,5 +391,6 @@ unsafe extern "system" fn win_event_callback(
         return;
     };
 
+    let _crumb = crate::watchdog::scoped("foreground hook: auto-apply");
     crate::app::handle_auto_apply_launch(config_dir, hwnd);
 }
