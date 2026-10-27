@@ -218,8 +218,14 @@ pub enum TaskbarHiddenReason {
 /// "Meaningfully on its monitor" means at least half the taskbar's area
 /// intersects `monitor` (rects are `(left, top, right, bottom)`).
 ///
+/// With Windows' own auto-hide on (`windows_auto_hide`), a taskbar slid off
+/// its monitor and not under its own center is Windows' normal resting
+/// state, not one GameFrame hid, so only `visible` decides; otherwise every
+/// hotkey press would "show" and the hotkey could never hide it again.
+///
 /// Pure decision logic -- no OS call.
 pub fn judge_taskbar_hidden(
+    windows_auto_hide: bool,
     visible: bool,
     taskbar: (i32, i32, i32, i32),
     monitor: (i32, i32, i32, i32),
@@ -227,6 +233,9 @@ pub fn judge_taskbar_hidden(
 ) -> Option<TaskbarHiddenReason> {
     if !visible {
         return Some(TaskbarHiddenReason::NotVisible);
+    }
+    if windows_auto_hide {
+        return None;
     }
     let area = |l: i32, t: i32, r: i32, b: i32| {
         (r as i64 - l as i64).max(0) * (b as i64 - t as i64).max(0)
@@ -997,8 +1006,8 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // Safety: plain queries on a live handle with valid out-pointers.
-    let (visible, on_top, monitor_ok) = unsafe {
-        GetWindowRect(taskbar, &mut rect);
+    let (visible, on_top, monitor_ok, rect_ok) = unsafe {
+        let rect_ok = GetWindowRect(taskbar, &mut rect) != 0;
         let center = POINT {
             x: (rect.left + rect.right) / 2,
             y: (rect.top + rect.bottom) / 2,
@@ -1007,7 +1016,7 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
         let on_top = !at_center.is_null() && GetAncestor(at_center, GA_ROOT) == taskbar;
         let monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
         let monitor_ok = GetMonitorInfoW(monitor, &mut info) != 0;
-        (IsWindowVisible(taskbar) != 0, on_top, monitor_ok)
+        (IsWindowVisible(taskbar) != 0, on_top, monitor_ok, rect_ok)
     };
     let m = info.rcMonitor;
     // If the monitor cannot be read, don't claim "off monitor": use the
@@ -1017,7 +1026,12 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
     } else {
         (rect.left, rect.top, rect.right, rect.bottom)
     };
+    if !rect_ok {
+        log!("taskbar judgement: GetWindowRect failed; rect is a zeroed placeholder");
+    }
+    let windows_auto_hide = read_appbar_flags(taskbar) & ABS_AUTOHIDE != 0;
     let verdict = judge_taskbar_hidden(
+        windows_auto_hide,
         visible,
         (rect.left, rect.top, rect.right, rect.bottom),
         monitor,
@@ -1428,7 +1442,6 @@ pub fn set_taskbar_hide_absolute_armed(
             // `hwnd` out of the armed set.
             join_taskbar_hide_session(hwnd);
             if rehide && let Some(j) = judgement {
-                // Reuse the handle from the gather: no second lookup.
                 hide_taskbar_window(j.taskbar);
             }
             Ok(())
@@ -2690,20 +2703,20 @@ mod tests {
     #[test]
     fn judge_taskbar_hidden_reports_a_non_visible_taskbar_as_hidden() {
         assert_eq!(
-            judge_taskbar_hidden(false, BAR, MONITOR, true),
+            judge_taskbar_hidden(false, false, BAR, MONITOR, true),
             Some(TaskbarHiddenReason::NotVisible)
         );
     }
 
     #[test]
     fn judge_taskbar_hidden_reports_a_visible_on_screen_topmost_taskbar_as_not_hidden() {
-        assert_eq!(judge_taskbar_hidden(true, BAR, MONITOR, true), None);
+        assert_eq!(judge_taskbar_hidden(false, true, BAR, MONITOR, true), None);
     }
 
     #[test]
     fn judge_taskbar_hidden_reports_a_visible_taskbar_off_its_monitor_as_hidden() {
         assert_eq!(
-            judge_taskbar_hidden(true, (0, 1080, 1920, 1120), MONITOR, true),
+            judge_taskbar_hidden(false, true, (0, 1080, 1920, 1120), MONITOR, true),
             Some(TaskbarHiddenReason::OffMonitor)
         );
     }
@@ -2712,7 +2725,7 @@ mod tests {
     fn judge_taskbar_hidden_treats_exactly_half_on_the_monitor_as_on_screen() {
         // 40px tall bar, 20px of it inside the monitor.
         assert_eq!(
-            judge_taskbar_hidden(true, (0, 1060, 1920, 1100), MONITOR, true),
+            judge_taskbar_hidden(false, true, (0, 1060, 1920, 1100), MONITOR, true),
             None
         );
     }
@@ -2720,7 +2733,7 @@ mod tests {
     #[test]
     fn judge_taskbar_hidden_treats_just_under_half_on_the_monitor_as_off_monitor() {
         assert_eq!(
-            judge_taskbar_hidden(true, (0, 1061, 1920, 1101), MONITOR, true),
+            judge_taskbar_hidden(false, true, (0, 1061, 1920, 1101), MONITOR, true),
             Some(TaskbarHiddenReason::OffMonitor)
         );
     }
@@ -2728,7 +2741,7 @@ mod tests {
     #[test]
     fn judge_taskbar_hidden_reports_a_zero_area_rect_as_off_monitor() {
         assert_eq!(
-            judge_taskbar_hidden(true, (0, 1040, 0, 1040), MONITOR, true),
+            judge_taskbar_hidden(false, true, (0, 1040, 0, 1040), MONITOR, true),
             Some(TaskbarHiddenReason::OffMonitor)
         );
     }
@@ -2736,8 +2749,26 @@ mod tests {
     #[test]
     fn judge_taskbar_hidden_reports_a_visible_on_screen_but_covered_taskbar_as_hidden() {
         assert_eq!(
-            judge_taskbar_hidden(true, BAR, MONITOR, false),
+            judge_taskbar_hidden(false, true, BAR, MONITOR, false),
             Some(TaskbarHiddenReason::Covered)
+        );
+    }
+
+    #[test]
+    fn judge_taskbar_hidden_with_windows_auto_hide_ignores_a_slid_off_taskbar() {
+        // Slid off the bottom edge and not under its own center: Windows'
+        // auto-hide resting state, so the hotkey must be able to hide it.
+        assert_eq!(
+            judge_taskbar_hidden(true, true, (0, 1078, 1920, 1118), MONITOR, false),
+            None
+        );
+    }
+
+    #[test]
+    fn judge_taskbar_hidden_with_windows_auto_hide_still_reports_not_visible() {
+        assert_eq!(
+            judge_taskbar_hidden(true, false, BAR, MONITOR, true),
+            Some(TaskbarHiddenReason::NotVisible)
         );
     }
 
