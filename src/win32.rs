@@ -912,14 +912,19 @@ pub fn foreground_window() -> Option<HWND> {
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// module docs.
 pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
-    let hwnd = find_taskbar_window()?;
+    hide_taskbar_window(find_taskbar_window()?);
+    Ok(())
+}
+
+/// [`hide_taskbar_completely`] on an already-resolved taskbar handle.
+fn hide_taskbar_window(hwnd: HWND) {
     // Marker first: a kill right after the hide is then covered.
     let _ = taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
-    // Safety: `hwnd` is a live handle; `ShowWindow` takes a plain command.
+    // Safety: `hwnd` is a live handle just resolved by the caller; `ShowWindow`
+    // performs no writes through pointers, only a plain `i32` command.
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
     }
-    Ok(())
 }
 
 /// Shows the real taskbar via `ShowWindow(Shell_TrayWnd, SW_SHOW)` -- undoes
@@ -1419,10 +1424,13 @@ pub fn set_taskbar_hide_absolute_armed(
                     .as_ref()
                     .map_or_else(|| "Shell_TrayWnd not found".to_string(), describe_taskbar)
             );
-            if rehide {
-                hide_taskbar_completely()?;
-            }
+            // Join first: the re-hide is best-effort and must not leave
+            // `hwnd` out of the armed set.
             join_taskbar_hide_session(hwnd);
+            if rehide && let Some(j) = judgement {
+                // Reuse the handle from the gather: no second lookup.
+                hide_taskbar_window(j.taskbar);
+            }
             Ok(())
         } else {
             let restore = hide_taskbar(mode)?;
@@ -2696,6 +2704,31 @@ mod tests {
     fn judge_taskbar_hidden_reports_a_visible_taskbar_off_its_monitor_as_hidden() {
         assert_eq!(
             judge_taskbar_hidden(true, (0, 1080, 1920, 1120), MONITOR, true),
+            Some(TaskbarHiddenReason::OffMonitor)
+        );
+    }
+
+    #[test]
+    fn judge_taskbar_hidden_treats_exactly_half_on_the_monitor_as_on_screen() {
+        // 40px tall bar, 20px of it inside the monitor.
+        assert_eq!(
+            judge_taskbar_hidden(true, (0, 1060, 1920, 1100), MONITOR, true),
+            None
+        );
+    }
+
+    #[test]
+    fn judge_taskbar_hidden_treats_just_under_half_on_the_monitor_as_off_monitor() {
+        assert_eq!(
+            judge_taskbar_hidden(true, (0, 1061, 1920, 1101), MONITOR, true),
+            Some(TaskbarHiddenReason::OffMonitor)
+        );
+    }
+
+    #[test]
+    fn judge_taskbar_hidden_reports_a_zero_area_rect_as_off_monitor() {
+        assert_eq!(
+            judge_taskbar_hidden(true, (0, 1040, 0, 1040), MONITOR, true),
             Some(TaskbarHiddenReason::OffMonitor)
         );
     }
