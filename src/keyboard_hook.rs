@@ -196,18 +196,14 @@ mod tests {
         assert!(!should_suppress(0x42, true));
     }
 
+    // Both cases share the global flag, so they run sequentially in one test.
     #[test]
-    fn take_suppressed_ctrl_escape_returns_true_once_then_resets_to_false() {
-        CTRL_ESCAPE_SUPPRESSED.store(true, Ordering::SeqCst);
-
-        assert!(take_suppressed_ctrl_escape());
-        assert!(!take_suppressed_ctrl_escape());
-    }
-
-    #[test]
-    fn take_suppressed_ctrl_escape_is_false_when_nothing_has_set_it() {
+    fn take_suppressed_ctrl_escape_is_false_until_set_then_true_once() {
         CTRL_ESCAPE_SUPPRESSED.store(false, Ordering::SeqCst);
+        assert!(!take_suppressed_ctrl_escape());
 
+        CTRL_ESCAPE_SUPPRESSED.store(true, Ordering::SeqCst);
+        assert!(take_suppressed_ctrl_escape());
         assert!(!take_suppressed_ctrl_escape());
     }
 }

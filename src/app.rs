@@ -770,7 +770,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
                 Ok(()) => return true,
                 Err(relaunch_err) => log!("failed to relaunch elevated: {relaunch_err}"),
             }
-        } else {
+        } else if !e.is_window_hung() {
             log!("borderless toggle failed: {e}");
         }
         return false;
@@ -793,6 +793,8 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
             config.hide_taskbar_on_apply,
             config.taskbar_hide_mode,
         )
+        // A hung Explorer was already logged once where it was found.
+        && !e.is_window_hung()
     {
         log!(
             "borderless toggle: failed to set the taskbar for {}: {e}",
@@ -887,7 +889,9 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     };
 
     if let Err(e) = win32::apply_borderless_to_window(target_hwnd, target_region) {
-        log!("apply to window failed: {e}");
+        if !e.is_window_hung() {
+            log!("apply to window failed: {e}");
+        }
         return;
     }
     win32::remember_applied_window(target_hwnd);
@@ -902,7 +906,8 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         target_hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
-    ) {
+    ) && !e.is_window_hung()
+    {
         log!(
             "apply to window: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
@@ -990,10 +995,12 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     };
 
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        log!(
-            "launch detection: failed to apply borderless treatment to {}: {e}",
-            tracked_game.display_name
-        );
+        if !e.is_window_hung() {
+            log!(
+                "launch detection: failed to apply borderless treatment to {}: {e}",
+                tracked_game.display_name
+            );
+        }
         return;
     }
     // Lets the location-change watcher re-apply if the game later resizes
@@ -1007,7 +1014,8 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
-    ) {
+    ) && !e.is_window_hung()
+    {
         log!(
             "launch detection: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
@@ -1024,8 +1032,9 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 ///
 /// Minimized windows are skipped and re-applies are rate-limited per window.
 /// Returns how long to wait before re-checking when the event was skipped only
-/// because of the rate limit, so a drift that lands inside the limit is still
-/// corrected.
+/// because of the rate limit (so a drift that lands inside the limit is still
+/// corrected) or because the window is hung (HUNG_RECHECK_INTERVAL, so it is
+/// retried once it responds again).
 ///
 /// OS-facing; the drift decisions are [`win32::window_drifted`] and the
 /// re-apply decision behind `win32::decide_drift_for_window`, unit tested.
@@ -1057,13 +1066,19 @@ pub(crate) fn handle_applied_window_drift(
         );
         return None;
     }
-    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        log!(
-            "drift re-apply: failed for {}: {e}",
-            tracked_game.display_name
-        );
+    match win32::apply_borderless_to_window(hwnd, target_region) {
+        // Already logged once by the hung check. A hung window produces no
+        // location-change events, so poll it until it responds.
+        Err(e) if e.is_window_hung() => Some(win32::HUNG_RECHECK_INTERVAL),
+        Err(e) => {
+            log!(
+                "drift re-apply: failed for {}: {e}",
+                tracked_game.display_name
+            );
+            None
+        }
+        Ok(()) => None,
     }
-    None
 }
 
 /// Whether one of the tray's update message boxes is open.
@@ -1151,7 +1166,9 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
         }
     };
 
-    if let Err(e) = taskbar::toggle_taskbar_hide(mode) {
+    if let Err(e) = taskbar::toggle_taskbar_hide(mode)
+        && !e.is_window_hung()
+    {
         log!("taskbar auto-hide toggle failed: {e}");
     }
 }

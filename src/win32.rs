@@ -296,6 +296,10 @@ pub enum Win32Error {
     /// taskbar's own window couldn't be located, so the taskbar-autohide
     /// toggle has nothing to send `SHAppBarMessage` to.
     TaskbarNotFound,
+    /// The target window's thread is not responding (`IsHungAppWindow`), so
+    /// no call into it was made; the next auto-apply, or the drift re-check
+    /// the drift handler schedules ([`HUNG_RECHECK_INTERVAL`]), retries.
+    WindowHung,
 }
 
 impl Win32Error {
@@ -331,12 +335,20 @@ impl Win32Error {
         const ERROR_ACCESS_DENIED: i32 = 5;
         matches!(self, Win32Error::Os(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED))
     }
+
+    /// Whether the call was skipped because the target window is hung. The
+    /// skip is already logged once per window by the win32 layer, so callers
+    /// leave it out of their own failure logs.
+    pub fn is_window_hung(&self) -> bool {
+        matches!(self, Win32Error::WindowHung)
+    }
 }
 
 impl std::fmt::Display for Win32Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Win32Error::WindowMinimized => write!(f, "window is minimized"),
+            Win32Error::WindowHung => write!(f, "window is not responding"),
             Win32Error::Os(e) => write!(f, "Win32 window manipulation failed: {e}"),
             Win32Error::Hresult(hr) => write!(
                 f,
@@ -354,6 +366,7 @@ impl std::error::Error for Win32Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Win32Error::WindowMinimized => None,
+            Win32Error::WindowHung => None,
             Win32Error::Os(e) => Some(e),
             Win32Error::Hresult(_) => None,
             Win32Error::TaskbarNotFound => None,
@@ -379,9 +392,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor, GetForegroundWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindowVisible, SET_WINDOW_POS_FLAGS, SW_HIDE,
-    SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WindowFromPoint,
+    GetWindowThreadProcessId, HWND_TOP, IsHungAppWindow, IsIconic, IsWindowVisible,
+    SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, ShowWindowAsync, WindowFromPoint,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -463,8 +477,15 @@ fn get_window_region(hwnd: HWND) -> Result<Region, Win32Error> {
 /// be recalculated/repainted -- without it, a target region that happens to
 /// already match the window's current bounds could leave the title bar
 /// visually unchanged despite the style change underneath.
+///
+/// Uses `SWP_ASYNCWINDOWPOS`: the call queues the move to the owning thread
+/// and returns, so a busy game cannot block the caller. `Ok` therefore means
+/// "queued"; the window has not necessarily moved yet, so a rect read right
+/// after must not be taken as the result (the drift watcher re-checks on the
+/// location-change event the move itself raises).
 fn set_window_region(hwnd: HWND, region: Region) -> Result<(), Win32Error> {
-    const FLAGS: SET_WINDOW_POS_FLAGS = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED;
+    const FLAGS: SET_WINDOW_POS_FLAGS =
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS;
     // Safety: `hwnd` is a live handle; `SetWindowPos` takes only plain
     // integers besides it.
     let ok = unsafe {
@@ -755,10 +776,11 @@ pub(crate) fn record_drift_attempt(hwnd: HWND) {
 }
 
 /// Forgets `hwnd` (called when it is destroyed) along with its remembered
-/// restore state and drift attempt time.
+/// restore state, drift attempt time and hung-window log entry.
 pub fn forget_applied_window(hwnd: HWND) {
     unmark_applied_window(hwnd);
     lock_store(&RESTORE_STATES).forget(hwnd as isize);
+    lock_hung_log().logged.remove(&(hwnd as isize));
 }
 
 /// Stops the drift watcher treating `hwnd` as GameFrame-placed and drops its
@@ -783,6 +805,82 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
         get_window_style(hwnd)?,
         target,
     ))
+}
+
+/// What one apply request does to a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyDecision {
+    Apply,
+    /// The window already has the stripped style and the Zone rect: no style
+    /// or position call is made (the same check the drift path uses).
+    SkipInPlace,
+    /// The window's thread is not responding: no call is made.
+    SkipHung,
+}
+
+/// Pure decision for one apply request. A hung window wins over everything
+/// else, since even reading it back would be pointless.
+pub(crate) fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
+    if hung {
+        ApplyDecision::SkipHung
+    } else if drifted {
+        ApplyDecision::Apply
+    } else {
+        ApplyDecision::SkipInPlace
+    }
+}
+
+/// Windows whose hung skip is already logged, so a hung game costs one log
+/// line, not one per foreground event.
+#[derive(Debug, Default)]
+struct HungSkipLog {
+    logged: std::collections::BTreeSet<isize>,
+}
+
+impl HungSkipLog {
+    const fn new() -> Self {
+        Self {
+            logged: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Records one apply request on `window`; true when its skip should be
+    /// logged (first time since it was last responsive). A responsive window
+    /// re-arms the log.
+    fn note(&mut self, window: isize, hung: bool) -> bool {
+        if hung {
+            self.logged.insert(window)
+        } else {
+            self.logged.remove(&window);
+            false
+        }
+    }
+}
+
+static HUNG_SKIP_LOG: std::sync::Mutex<HungSkipLog> = std::sync::Mutex::new(HungSkipLog::new());
+
+/// How long the drift handler waits before re-checking a window it skipped
+/// because it was not responding.
+pub(crate) const HUNG_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poison-tolerant lock on [`HUNG_SKIP_LOG`]: the set has no invariant a panic
+/// could break.
+fn lock_hung_log() -> std::sync::MutexGuard<'static, HungSkipLog> {
+    HUNG_SKIP_LOG.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether `hwnd`'s thread has stopped pumping messages (`IsHungAppWindow`).
+/// Logs the first request on a window that is hung. Every blocking call into
+/// a foreign window (a game or the taskbar) comes after this check.
+pub(crate) fn is_window_hung_logged(hwnd: HWND) -> bool {
+    // Safety: `IsHungAppWindow` only reads window state and tolerates a stale
+    // handle.
+    let hung = unsafe { IsHungAppWindow(hwnd) } != 0;
+    let first = lock_hung_log().note(hwnd as isize, hung);
+    if first {
+        log!("window {hwnd:?} is not responding; skipping calls into it until it is");
+    }
+    hung
 }
 
 /// Strips a window's border and moves/resizes it to `target_region`: the
@@ -824,6 +922,18 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         return Err(Win32Error::WindowMinimized);
     }
 
+    let hung = is_window_hung_logged(hwnd);
+    let drifted = !hung && window_has_drifted(hwnd, target_region).unwrap_or(true);
+    match decide_apply(hung, drifted) {
+        ApplyDecision::SkipHung => return Err(Win32Error::WindowHung),
+        // Already stripped and in place: no style or position call (every
+        // foreground switch lands here). The corner preference is only a DWM
+        // attribute write that does not wait on the game's thread, and a
+        // window first seen already in place still needs it.
+        ApplyDecision::SkipInPlace => return disable_rounded_corners(hwnd),
+        ApplyDecision::Apply => {}
+    }
+
     let live_style = get_window_style(hwnd)?;
     let live_region = get_window_region(hwnd)?;
     let new_style = strip_border_style(live_style);
@@ -861,6 +971,10 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
     // Safety: `hwnd` is a live handle; `IsIconic` performs no writes.
     if unsafe { IsIconic(hwnd) } != 0 {
         return Err(Win32Error::WindowMinimized);
+    }
+    // Both directions write to the game (style, then position).
+    if is_window_hung_logged(hwnd) {
+        return Err(Win32Error::WindowHung);
     }
 
     let live_style = get_window_style(hwnd)?;
@@ -922,11 +1036,15 @@ pub fn foreground_window() -> Option<HWND> {
 /// OS-facing: sends a real `ShowWindow` call. Not exercised by this crate's
 /// automated tests -- see module docs.
 ///
+/// Synchronous on purpose, so a later show can never be overtaken by a queued
+/// hide; the caller checks [`is_window_hung_logged`] first and skips a hung
+/// Explorer (never queue a hide behind a later show).
+///
 /// # Unmarked: call through `crate::taskbar`
 /// Does not touch the recovery marker; only `crate::taskbar` may call it.
 pub(crate) fn hide_taskbar_window(hwnd: HWND) {
-    // Safety: `hwnd` is a live handle just resolved by the caller; `ShowWindow`
-    // performs no writes through pointers, only a plain `i32` command.
+    // Safety: `hwnd` is a live handle just resolved by the caller;
+    // `ShowWindow` takes a plain `i32` command and writes through no pointers.
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
     }
@@ -945,11 +1063,20 @@ pub(crate) fn hide_taskbar_window(hwnd: HWND) {
 /// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
     let hwnd = show_taskbar_window()?;
+    // A hung Explorer got only the posted show: the appbar re-send and the
+    // raise below would block on it. The failure keeps the recovery mark, so
+    // a later restore or the next start finishes the job.
+    if taskbar_is_hung(hwnd) {
+        return Err(Win32Error::WindowHung);
+    }
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
     // covered or that slid away. Re-send the appbar state read just now,
     // unchanged, then raise without activating.
-    let flags = read_appbar_flags(hwnd);
-    resend_appbar_state(|| flags, |lparam| send_appbar_setstate(hwnd, lparam));
+    // Unknown flags (Explorer hung since the check above) are not guessed.
+    let flags = read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?;
+    let mut sent = Ok(());
+    resend_appbar_state(|| flags, |lparam| sent = send_appbar_setstate(hwnd, lparam));
+    sent?;
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
     // SWP_NOSIZE, and SWP_NOACTIVATE keeps focus where it is.
     unsafe {
@@ -960,10 +1087,17 @@ pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         );
     }
     Ok(flags)
+}
+
+/// Whether the taskbar's thread has stopped pumping messages, logged once per
+/// hung episode (callers rely on that and don't log `WindowHung` again). Not
+/// used on the panic hook's bare show, which must take no lock.
+fn taskbar_is_hung(hwnd: HWND) -> bool {
+    is_window_hung_logged(hwnd)
 }
 
 /// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar_full`] and the panic
@@ -971,10 +1105,16 @@ pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
 /// nothing else, so it stays safe there. Returns the taskbar handle.
 fn show_taskbar_window() -> Result<HWND, Win32Error> {
     let hwnd = find_taskbar_window()?;
-    // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
-    // performs no writes through pointers, only a plain `i32` command.
+    // Safety: `hwnd` is a live handle just resolved above; neither call
+    // writes through pointers, only a plain `i32` command. A hung Explorer
+    // gets the show posted instead of sent, so neither the panic hook nor the
+    // UI thread waits on it.
     unsafe {
-        ShowWindow(hwnd, SW_SHOW);
+        if IsHungAppWindow(hwnd) != 0 {
+            ShowWindowAsync(hwnd, SW_SHOW);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
     }
     Ok(hwnd)
 }
@@ -1025,7 +1165,9 @@ pub(crate) fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
     if !rect_ok {
         log!("taskbar judgement: GetWindowRect failed; rect is a zeroed placeholder");
     }
-    let windows_auto_hide = read_appbar_flags(taskbar) & ABS_AUTOHIDE != 0;
+    // Unknown flags (Explorer hung) are judged like Windows' auto-hide:
+    // visibility alone decides, so nothing is acted on from a guess.
+    let windows_auto_hide = read_appbar_flags(taskbar).is_none_or(|f| f & ABS_AUTOHIDE != 0);
     // Without a real rect, position and cover can't be judged: fall back to
     // visibility alone, exactly as under Windows' auto-hide.
     let verdict = judge_taskbar_hidden(
@@ -1073,12 +1215,13 @@ pub(crate) fn restore_taskbar_raw(
 }
 
 /// Reads the taskbar as it really is: `(window visible, appbar auto-hide
-/// state)`. Used by startup recovery. OS-facing.
-pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Error> {
+/// state). Used by startup recovery. The state is None when Explorer is
+/// hung (unknown, not AlwaysVisible). OS-facing.
+pub(crate) fn observe_taskbar() -> Result<(bool, Option<TaskbarAutohideState>), Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Safety: `hwnd` is a live handle just resolved above.
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    Ok((visible, state_from_flags(read_appbar_flags(hwnd))))
+    Ok((visible, read_appbar_flags(hwnd).map(state_from_flags)))
 }
 
 /// Whether the taskbar is already hidden by any means, for the zone editor's
@@ -1086,7 +1229,8 @@ pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Err
 /// auto-hide flag set (a HoverReveal hide, or the user's own auto-hide
 /// setting). Either way the editor must not take ownership of it. Direct
 /// reads only, no on-screen judgement. `false` when the taskbar cannot be
-/// found.
+/// found; `true` when its auto-hide state is unknown (Explorer hung), so the
+/// editor leaves it alone.
 ///
 /// OS-facing; not exercised by this crate's automated tests -- see module docs.
 pub fn taskbar_hidden_flag() -> bool {
@@ -1095,7 +1239,7 @@ pub fn taskbar_hidden_flag() -> bool {
     };
     // Safety: plain query on a live handle.
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    !visible || read_appbar_flags(hwnd) & ABS_AUTOHIDE != 0
+    !visible || read_appbar_flags(hwnd).is_none_or(|f| f & ABS_AUTOHIDE != 0)
 }
 
 /// `crate::taskbar::taskbar_debug_state` for an already-gathered judgement;
@@ -1111,7 +1255,8 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
     } = *judgement;
     // Safety: plain query, no arguments.
     let foreground = unsafe { GetForegroundWindow() };
-    let flags = read_appbar_flags(taskbar);
+    let flags =
+        read_appbar_flags(taskbar).map_or_else(|| "unknown".to_string(), |f| format!("{f:#x}"));
     let foreground_exe = if foreground.is_null() {
         "none".to_string()
     } else {
@@ -1125,7 +1270,7 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
     };
     let (armed, has_restore) = armed;
     format!(
-        "visible={visible} appbar_flags={flags:#x} rect=({},{})-({},{}) on_top_at_center={on_top} \
+        "visible={visible} appbar_flags={flags} rect=({},{})-({},{}) on_top_at_center={on_top} \
          judged_hidden={verdict:?} foreground={foreground:?} ({foreground_exe}) armed_windows={armed} armed_restore={has_restore}",
         rect.left, rect.top, rect.right, rect.bottom
     )
@@ -1152,9 +1297,9 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
 /// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
-    let current_flags = read_appbar_flags(hwnd);
-    write_appbar_state(hwnd, current_flags, state);
-    Ok(())
+    // Never write from a guessed value: that would clear always-on-top.
+    let current_flags = read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?;
+    write_appbar_state(hwnd, current_flags, state)
 }
 
 /// Sends the actual `SHAppBarMessage(ABM_SETSTATE, ...)` write, given a
@@ -1166,12 +1311,22 @@ pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32E
 ///
 /// # Unmarked: call through `crate::taskbar`
 /// Does not touch the recovery marker; only `crate::taskbar` may call it.
-pub(crate) fn write_appbar_state(hwnd: HWND, current_flags: u32, state: TaskbarAutohideState) {
-    send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize);
+pub(crate) fn write_appbar_state(
+    hwnd: HWND,
+    current_flags: u32,
+    state: TaskbarAutohideState,
+) -> Result<(), Win32Error> {
+    send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize)
 }
 
-/// Sends `SHAppBarMessage(ABM_SETSTATE)` with the given full-state `lParam`.
-fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
+/// Sends SHAppBarMessage(ABM_SETSTATE) with the given full-state lParam.
+/// Fails with [Win32Error::WindowHung] without sending when Explorer is hung
+/// (the call is sent to its thread and would block), so callers keep their
+/// recovery mark.
+fn send_appbar_setstate(hwnd: HWND, lparam: isize) -> Result<(), Win32Error> {
+    if taskbar_is_hung(hwnd) {
+        return Err(Win32Error::WindowHung);
+    }
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
     data.hWnd = hwnd;
@@ -1184,6 +1339,7 @@ fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
     unsafe {
         SHAppBarMessage(ABM_SETSTATE, &mut data);
     }
+    Ok(())
 }
 
 /// Reads the appbar's current `ABM_GETSTATE` flags (a combination of
@@ -1192,7 +1348,14 @@ fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
 /// always-on-top bit -- see [`apply_autohide_state`]'s doc comment) and
 /// `crate::taskbar::hide_taskbar`'s `HoverReveal` arm (which needs only the auto-hide bit, via
 /// [`state_from_flags`]).
-pub(crate) fn read_appbar_flags(hwnd: HWND) -> u32 {
+///
+/// Returns None (flags unknown) without calling when the taskbar's thread
+/// is hung: ABM_GETSTATE is sent to Explorer and would block on it. Callers
+/// must not treat unknown as `0` (no auto-hide, not always-on-top).
+pub(crate) fn read_appbar_flags(hwnd: HWND) -> Option<u32> {
+    if taskbar_is_hung(hwnd) {
+        return None;
+    }
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
     data.hWnd = hwnd;
@@ -1202,7 +1365,7 @@ pub(crate) fn read_appbar_flags(hwnd: HWND) -> u32 {
     // `ABM_GETSTATE` contract; `SHAppBarMessage` takes only `dwMessage` and a
     // pointer to `data`, both valid here. `ABM_GETSTATE` does not read
     // `data.lParam`, so it's left zeroed.
-    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+    Some(unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 })
 }
 
 /// Interprets `ABM_GETSTATE`'s raw flags (as read by [`read_appbar_flags`])
@@ -1697,6 +1860,44 @@ mod tests {
         };
 
         assert!(!window_drifted(target, 0x14000000, target));
+    }
+
+    #[test]
+    fn apply_is_skipped_for_a_window_already_in_place() {
+        assert_eq!(decide_apply(false, false), ApplyDecision::SkipInPlace);
+    }
+
+    #[test]
+    fn apply_goes_ahead_for_a_window_that_drifted() {
+        assert_eq!(decide_apply(false, true), ApplyDecision::Apply);
+    }
+
+    #[test]
+    fn apply_is_skipped_for_a_hung_window_whatever_its_state() {
+        assert_eq!(decide_apply(true, true), ApplyDecision::SkipHung);
+        assert_eq!(decide_apply(true, false), ApplyDecision::SkipHung);
+    }
+
+    #[test]
+    fn a_hung_window_is_logged_once_until_it_responds_again() {
+        let mut log = HungSkipLog::default();
+
+        assert!(log.note(7, true));
+        assert!(!log.note(7, true));
+        assert!(log.note(8, true), "another window has its own line");
+        assert!(!log.note(7, false));
+        assert!(log.note(7, true), "a recovered window logs a new hang");
+    }
+
+    #[test]
+    fn win32_error_window_hung_is_flagged_and_displays() {
+        assert!(Win32Error::WindowHung.is_window_hung());
+        assert!(!Win32Error::WindowMinimized.is_window_hung());
+        assert!(!Win32Error::WindowHung.is_access_denied());
+        assert_eq!(
+            Win32Error::WindowHung.to_string(),
+            "window is not responding"
+        );
     }
 
     #[test]
