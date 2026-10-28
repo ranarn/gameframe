@@ -264,14 +264,17 @@ fn resend_appbar_state(read: impl FnOnce() -> u32, send: impl FnOnce(isize)) {
 }
 
 /// Whether joining an already-active hide session must re-issue the OS hide:
-/// only in `FullyHidden`, and whenever the taskbar is `WS_VISIBLE` (any
-/// verdict but `NotVisible`) -- on top, covered by the returning game, or
-/// off its monitor. The session's restore value is never touched.
+/// only when the *session* was started with `FullyHidden` (its remembered
+/// restore, not the currently configured mode -- a mode changed mid-session
+/// applies from the next session), and whenever the taskbar is `WS_VISIBLE`
+/// (any verdict but `NotVisible`) -- on top, covered by the returning game,
+/// or off its monitor. The session's restore value is never touched.
 fn should_rehide_on_join(
-    mode: TaskbarHideMode,
+    session: Option<TaskbarHideRestore>,
     judged_hidden: Option<TaskbarHiddenReason>,
 ) -> bool {
-    mode == TaskbarHideMode::FullyHidden && judged_hidden != Some(TaskbarHiddenReason::NotVisible)
+    session == Some(TaskbarHideRestore::FullyHidden)
+        && judged_hidden != Some(TaskbarHiddenReason::NotVisible)
 }
 
 /// Reasons a live Win32 window-manipulation call can fail.
@@ -1191,6 +1194,12 @@ impl ArmedTaskbarWindows {
         self.windows.len() == 1 && self.windows.contains(&hwnd_id)
     }
 
+    /// The technique the active session was started with (its remembered
+    /// restore value), read-only; `None` when no session is active.
+    fn session_restore(&self) -> Option<TaskbarHideRestore> {
+        self.restore
+    }
+
     /// Starts a brand new hidden session: arms `hwnd_id` and remembers
     /// `restore` as what to restore to once the session ends. Callers must
     /// only call this when [`Self::is_active`] was `false` beforehand (a
@@ -1262,6 +1271,12 @@ fn is_last_armed_window(hwnd: HWND) -> bool {
 /// [`ArmedTaskbarWindows::is_active`].
 fn is_taskbar_hide_session_active() -> bool {
     with_armed_taskbar_windows(|state| state.is_active())
+}
+
+/// The active session's hide technique -- see
+/// [`ArmedTaskbarWindows::session_restore`].
+fn taskbar_hide_session_restore() -> Option<TaskbarHideRestore> {
+    with_armed_taskbar_windows(|state| state.session_restore())
 }
 
 /// Starts a brand new hidden session for `hwnd`, remembering `restore` as
@@ -1401,9 +1416,11 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 /// hide is already in effect), `hwnd` just joins that session via
 /// [`join_taskbar_hide_session`] -- with no re-capture of the remembered
 /// restore value (which would silently discard the true pre-first-hide
-/// state; see [`ARMED_TASKBAR_RESTORE`]'s doc comment). In `FullyHidden` it
-/// additionally re-hides a taskbar that is still `WS_VISIBLE` (e.g. one the
-/// hotkey showed), re-marking the recovery record hidden first.
+/// state; see [`ARMED_TASKBAR_RESTORE`]'s doc comment). When the *session* was
+/// started in `FullyHidden` (not merely the currently configured `mode`, which
+/// may have changed since) it additionally re-hides a taskbar that is still
+/// `WS_VISIBLE` (e.g. one the hotkey showed), re-marking the recovery record
+/// hidden first.
 ///
 /// The `hide == false` path only issues the real OS show
 /// ([`set_taskbar_hide_absolute`]) when `hwnd` is the *last* armed window
@@ -1431,9 +1448,10 @@ pub fn set_taskbar_hide_absolute_armed(
             // the recovery record hidden first (the hotkey show cleared it)
             // and hides; the session's remembered restore is not touched.
             let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
+            let session = taskbar_hide_session_restore();
             let rehide = judgement
                 .as_ref()
-                .is_some_and(|j| should_rehide_on_join(mode, j.verdict));
+                .is_some_and(|j| should_rehide_on_join(session, j.verdict));
             log!(
                 "taskbar hide for {hwnd:?}: joining the active session (re-hide={rehide}); {}",
                 judgement
@@ -2792,22 +2810,54 @@ mod tests {
     }
 
     #[test]
-    fn should_rehide_on_join_whenever_fully_hidden_and_the_taskbar_is_still_ws_visible() {
-        use TaskbarHideMode::{FullyHidden, HoverReveal};
-        assert!(should_rehide_on_join(FullyHidden, None));
+    fn should_rehide_on_join_for_a_fully_hidden_session_whenever_the_taskbar_is_still_ws_visible() {
+        let session = Some(TaskbarHideRestore::FullyHidden);
+        assert!(should_rehide_on_join(session, None));
         assert!(should_rehide_on_join(
-            FullyHidden,
+            session,
             Some(TaskbarHiddenReason::Covered)
         ));
         assert!(should_rehide_on_join(
-            FullyHidden,
+            session,
             Some(TaskbarHiddenReason::OffMonitor)
         ));
         assert!(!should_rehide_on_join(
-            FullyHidden,
+            session,
             Some(TaskbarHiddenReason::NotVisible)
         ));
-        assert!(!should_rehide_on_join(HoverReveal, None));
+    }
+
+    #[test]
+    fn should_rehide_on_join_never_for_a_hover_reveal_session_whatever_the_verdict() {
+        // The session was started in HoverReveal; a configured mode that has
+        // since changed to FullyHidden must not make the join SW_HIDE.
+        let session = Some(TaskbarHideRestore::HoverReveal(
+            TaskbarAutohideState::AlwaysVisible,
+        ));
+        for verdict in [
+            None,
+            Some(TaskbarHiddenReason::Covered),
+            Some(TaskbarHiddenReason::OffMonitor),
+            Some(TaskbarHiddenReason::NotVisible),
+        ] {
+            assert!(!should_rehide_on_join(session, verdict));
+        }
+    }
+
+    #[test]
+    fn should_rehide_on_join_never_without_a_session() {
+        assert!(!should_rehide_on_join(None, None));
+    }
+
+    #[test]
+    fn armed_state_exposes_the_session_restore_and_not_after_the_session_ends() {
+        let mut state = ArmedTaskbarWindows::default();
+        assert_eq!(state.session_restore(), None);
+        state.start(1, TaskbarHideRestore::FullyHidden);
+        state.join(2);
+        assert_eq!(state.session_restore(), Some(TaskbarHideRestore::FullyHidden));
+        state.take_all();
+        assert_eq!(state.session_restore(), None);
     }
 
     #[test]
