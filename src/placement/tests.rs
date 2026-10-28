@@ -605,6 +605,17 @@ fn the_notices_tell_the_reasons_apart() {
 }
 
 #[test]
+fn the_untracked_notice_only_points_to_the_tray_menu_for_the_hotkey() {
+    let outcome = Outcome::Declined(Declined::NotTracked);
+
+    let hotkey = failure_notice(Trigger::Hotkey, &outcome).unwrap();
+    let tray = failure_notice(Trigger::Tray, &outcome).unwrap();
+
+    assert!(hotkey.contains("tray menu"));
+    assert!(!tray.contains("tray menu"));
+}
+
+#[test]
 fn tray_apply_tracks_a_new_game_with_auto_apply_and_saves_before_placing() {
     let ops = FakeOps::new(Config {
         zone: Some(A_ZONE),

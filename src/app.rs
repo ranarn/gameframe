@@ -643,11 +643,19 @@ fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
         log!("borderless toggle failed (access denied); requesting elevation");
         match win32::relaunch_elevated() {
             Ok(()) => return true,
-            Err(relaunch_err) => log!("failed to relaunch elevated: {relaunch_err}"),
+            Err(relaunch_err) => {
+                log!("failed to relaunch elevated: {relaunch_err}");
+                tray.notify(ELEVATION_FAILED_NOTICE);
+            }
         }
     }
     false
 }
+
+/// Shown when the elevated relaunch after an access-denied hotkey press fails
+/// or its UAC prompt is declined. That press stayed quiet until now, so this is
+/// the one notice for it.
+const ELEVATION_FAILED_NOTICE: &str = "GameFrame needs administrator rights to change this window, and the elevation was cancelled or failed.";
 
 /// The notice for a failed restore of the foreground window by the borderless
 /// hotkey. An access-denied press is answered by the elevation request instead.

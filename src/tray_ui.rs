@@ -178,6 +178,11 @@ impl std::error::Error for TrayUiError {
 /// icons from 1 with a process-wide counter and GameFrame creates exactly one
 /// (`tray-icon` 0.26 has no accessor for it). A wrong value only makes the
 /// balloon fail, which [`crate::notice::notify`] answers with a message box.
+///
+/// Verified against `tray-icon` 0.26.1: `counter.rs` starts its process-wide
+/// `COUNTER` at 1, `next()` is a `fetch_add`, and the result is the `uID` that
+/// `register_tray_icon` passes to `Shell_NotifyIconW`. Holds only while
+/// `Tray::new` runs once per process; recheck on a `tray-icon` bump.
 const TRAY_ICON_UID: u32 = 1;
 
 /// The live system tray icon and its context menu.

@@ -144,8 +144,11 @@ pub(crate) fn failure_notice(trigger: Trigger, outcome: &Outcome) -> Option<Stri
         Outcome::Declined(Declined::NoZone) => {
             "No Zone is set, so nothing was applied. Draw one in Settings first."
         }
-        Outcome::Declined(Declined::NotTracked) => {
+        Outcome::Declined(Declined::NotTracked) if trigger == Trigger::Hotkey => {
             "This window's program isn't a tracked game. Add it in Settings, or pick the window under Apply to Window in the tray menu."
+        }
+        Outcome::Declined(Declined::NotTracked) => {
+            "This window's program isn't a tracked game. Add it in Settings."
         }
         Outcome::Declined(Declined::ProcessUnreadable) => {
             "GameFrame couldn't tell which program owns this window."

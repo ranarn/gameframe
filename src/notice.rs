@@ -6,6 +6,8 @@
 //! warning box on a worker thread says the same, so the failure is never only
 //! in the log.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
     NIF_INFO, NIIF_WARNING, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -13,16 +15,37 @@ use windows_sys::Win32::UI::Shell::{
 
 const TITLE: &str = "GameFrame";
 
-/// Copies `text` into the fixed buffer `dst`, truncated so a terminating NUL
-/// always fits (the balloon fields are fixed-size, NUL-terminated UTF-16).
+/// Copies `text` into the fixed buffer `dst` (fixed-size, NUL-terminated
+/// UTF-16). Text that does not fit is cut and ends in an ellipsis, so the
+/// reader can tell it was shortened; a surrogate pair is never split.
 fn fill_wide(dst: &mut [u16], text: &str) {
     let max = dst.len().saturating_sub(1);
-    let mut written = 0;
-    for unit in text.encode_utf16().take(max) {
-        dst[written] = unit;
-        written += 1;
-    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let written = if units.len() <= max {
+        dst[..units.len()].copy_from_slice(&units);
+        units.len()
+    } else if max > 0 {
+        let mut keep = max - 1;
+        // Do not end on the high half of a surrogate pair.
+        if keep > 0 && (0xD800..0xDC00).contains(&units[keep - 1]) {
+            keep -= 1;
+        }
+        dst[..keep].copy_from_slice(&units[..keep]);
+        dst[keep] = 0x2026; // ellipsis
+        keep + 1
+    } else {
+        0
+    };
     dst[written..].fill(0);
+}
+
+/// Whether a fallback message box is open. At most one at a time, so repeated
+/// failing presses cannot stack boxes.
+static FALLBACK_BOX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Claims `flag`; `false` when it was already claimed.
+fn try_claim(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
 }
 
 /// Shows `text` as a warning balloon on the tray icon `(hwnd, uid)`. Returns
@@ -51,9 +74,16 @@ pub(crate) fn notify(hwnd: HWND, uid: u32, text: &str) {
         return;
     }
     log!("notice: the tray balloon was refused; using a message box");
+    if !try_claim(&FALLBACK_BOX_OPEN) {
+        log!("notice: a message box is already open; not opening another");
+        return;
+    }
     let text = text.to_string();
     // Detached on purpose: the box may stay open and must not stall the pump.
-    std::thread::spawn(move || crate::message_box::show_warning_box(&text));
+    std::thread::spawn(move || {
+        crate::message_box::show_warning_box(&text);
+        FALLBACK_BOX_OPEN.store(false, Ordering::Release);
+    });
 }
 
 /// A warning box for a failure with no tray to show a balloon from (start-up).
@@ -82,13 +112,42 @@ mod tests {
     }
 
     #[test]
-    fn fill_wide_truncates_to_leave_room_for_the_terminator() {
+    fn fill_wide_truncates_with_an_ellipsis_and_keeps_the_terminator() {
         let mut buf = [0xffffu16; 4];
 
         fill_wide(&mut buf, "abcdef");
 
-        assert_eq!(text_of(&buf), "abc");
+        assert_eq!(text_of(&buf), "ab\u{2026}");
         assert_eq!(buf[3], 0);
+    }
+
+    #[test]
+    fn fill_wide_text_that_exactly_fits_is_not_marked_truncated() {
+        let mut buf = [0xffffu16; 4];
+
+        fill_wide(&mut buf, "abc");
+
+        assert_eq!(text_of(&buf), "abc");
+    }
+
+    #[test]
+    fn fill_wide_never_splits_a_surrogate_pair() {
+        let mut buf = [0xffffu16; 4];
+
+        // "a" + U+1F600 (two units) + "b": the cut would land mid-pair.
+        fill_wide(&mut buf, "a\u{1F600}b");
+
+        assert_eq!(text_of(&buf), "a\u{2026}");
+    }
+
+    #[test]
+    fn only_the_first_claim_on_the_fallback_box_succeeds() {
+        let flag = AtomicBool::new(false);
+
+        assert!(try_claim(&flag));
+        assert!(!try_claim(&flag));
+        flag.store(false, Ordering::Release);
+        assert!(try_claim(&flag));
     }
 
     #[test]

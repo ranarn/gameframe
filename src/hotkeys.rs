@@ -84,26 +84,29 @@ pub(crate) fn new_failure_notice(
     previous: &[BindingReport],
     now: &[BindingReport],
 ) -> Option<String> {
-    let lines: Vec<String> = now
-        .iter()
-        .filter_map(|report| {
-            let BindingOutcome::Failed(reason) = &report.outcome else {
-                return None;
-            };
-            let known = previous.iter().any(|p| {
-                p.action == report.action
-                    && p.binding == report.binding
-                    && matches!(p.outcome, BindingOutcome::Failed(_))
-            });
-            (!known).then(|| format!("{} ({}): {reason}", report.binding, report.action.label()))
-        })
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
+    let mut fresh = now.iter().filter_map(|report| {
+        let BindingOutcome::Failed(reason) = &report.outcome else {
+            return None;
+        };
+        let known = previous.iter().any(|p| {
+            p.action == report.action
+                && p.binding == report.binding
+                && matches!(p.outcome, BindingOutcome::Failed(_))
+        });
+        (!known).then_some((report, reason))
+    });
+    let (first, reason) = fresh.next()?;
+    let more = fresh.count();
+    // One balloon holds ~255 characters: name the first failure, put its
+    // reason before anything else, and only count the rest.
+    let others = match more {
+        0 => String::new(),
+        n => format!(" (+{n} more failed)"),
+    };
     Some(format!(
-        "Couldn't register {}.\nChange it in Settings.",
-        lines.join("; ")
+        "Couldn't register {} ({}): {reason}{others}. Change it in Settings.",
+        first.binding,
+        first.action.label()
     ))
 }
 
@@ -497,6 +500,19 @@ mod tests {
         // A different combination failing for the same action is new.
         let rebound = a_report("Ctrl+F5", BindingOutcome::Failed("x".to_string()));
         assert!(new_failure_notice(&[failed], &[rebound]).is_some());
+    }
+
+    #[test]
+    fn several_new_failures_name_the_first_and_count_the_rest() {
+        let failed = |b: &str| a_report(b, BindingOutcome::Failed("in use".to_string()));
+        let now = [failed("Ctrl+F4"), failed("Ctrl+F5"), failed("Ctrl+F6")];
+
+        let notice = new_failure_notice(&[], &now).unwrap();
+
+        assert!(notice.contains("Ctrl+F4"));
+        assert!(!notice.contains("Ctrl+F5"));
+        assert!(notice.contains("+2 more"));
+        assert!(notice.encode_utf16().count() < 255);
     }
 
     #[test]
