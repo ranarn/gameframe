@@ -815,8 +815,7 @@ mod tests {
 
     #[test]
     fn dropping_the_settings_guard_discards_open_settings_but_keeps_quit() {
-        // Serializes tests that touch the global queue, and resets it after.
-        static LOCK: Mutex<()> = Mutex::new(());
+        // The only test that touches the global queue; reset it afterwards.
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -824,12 +823,11 @@ mod tests {
                 SETTINGS_OPEN.store(false, Ordering::SeqCst);
             }
         }
-        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _reset = Reset;
 
         let guard = enter_settings();
         {
-            let mut q = QUEUE.lock().unwrap();
+            let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             enqueue(&mut q, Command::OpenSettings);
             enqueue(&mut q, Command::Quit);
         }
