@@ -675,18 +675,31 @@ pub fn allow_auto_apply(hwnd: HWND) {
 /// location-change watcher can cheaply (one mutex lock + scan) ignore every
 /// other window's move events.
 pub fn remember_applied_window(hwnd: HWND) {
+    let pid = window_process_id(hwnd);
+    {
+        let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+        match windows.iter_mut().find(|(h, _)| *h == hwnd as isize) {
+            // A reused handle (or one first seen with an unreadable pid) takes
+            // the live owner's pid instead of keeping a stale one.
+            Some(entry) => {
+                if pid != 0 {
+                    entry.1 = pid;
+                }
+            }
+            None => windows.push((hwnd as isize, pid)),
+        }
+    }
+    crate::launch_watcher::sync_drift_hooks();
+}
+
+/// The process id owning `hwnd`, 0 when it can't be read (stale handle).
+fn window_process_id(hwnd: HWND) -> u32 {
     let mut pid: u32 = 0;
     // Safety: `&mut pid` is a valid out-pointer; a stale handle just yields 0.
     unsafe {
         GetWindowThreadProcessId(hwnd, &mut pid);
     }
-    {
-        let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
-        if !windows.iter().any(|(h, _)| *h == hwnd as isize) {
-            windows.push((hwnd as isize, pid));
-        }
-    }
-    crate::launch_watcher::sync_drift_hooks();
+    pid
 }
 
 /// Whether `hwnd` was previously registered via [`remember_applied_window`].
@@ -699,14 +712,50 @@ pub fn is_applied_window(hwnd: HWND) -> bool {
 }
 
 /// Process ids owning at least one applied window (never 0).
-pub fn applied_window_pids() -> std::collections::BTreeSet<u32> {
-    APPLIED_WINDOWS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+fn pids_of(entries: &[(isize, u32)]) -> std::collections::BTreeSet<u32> {
+    entries
         .iter()
         .map(|(_, pid)| *pid)
         .filter(|pid| *pid != 0)
         .collect()
+}
+
+/// Brings registry `entries` in line with the live windows. `probe` maps a
+/// window handle to `None` when it is no longer a window, else its owning pid
+/// (0 if unreadable). Dead windows (killed without an `EVENT_OBJECT_DESTROY`)
+/// are dropped, and an entry whose pid was unknown or changed takes the live
+/// one. Returns whether any entry still has no pid, so the caller re-checks later.
+fn reconcile_entries(
+    entries: &mut Vec<(isize, u32)>,
+    probe: impl Fn(isize) -> Option<u32>,
+) -> bool {
+    entries.retain_mut(|(hwnd, pid)| match probe(*hwnd) {
+        None => false,
+        Some(live) => {
+            if live != 0 {
+                *pid = live;
+            }
+            true
+        }
+    });
+    entries.iter().any(|(_, pid)| *pid == 0)
+}
+
+/// Reconciles the applied-window registry with the live windows (see
+/// [`reconcile_entries`]) and returns the pids owning applied windows plus
+/// whether some window's pid is still unknown.
+pub fn refresh_applied_window_pids() -> (std::collections::BTreeSet<u32>, bool) {
+    let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    let unresolved = reconcile_entries(&mut windows, |h| {
+        let hwnd = h as HWND;
+        // Safety: `IsWindow` tolerates any handle value.
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) } == 0 {
+            None
+        } else {
+            Some(window_process_id(hwnd))
+        }
+    });
+    (pids_of(&windows), unresolved)
 }
 
 /// Minimum time between two drift re-apply attempts on one window. A game that
@@ -1993,6 +2042,50 @@ mod tests {
 
         assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
         assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
+    }
+
+    #[test]
+    fn two_windows_of_one_process_keep_its_pid_when_one_is_removed() {
+        let mut entries = vec![(1isize, 42u32), (2, 42), (3, 7)];
+        assert_eq!(pids_of(&entries), [7, 42].into_iter().collect());
+        entries.retain(|(h, _)| *h != 1);
+        assert_eq!(pids_of(&entries), [7, 42].into_iter().collect());
+        entries.retain(|(h, _)| *h != 2);
+        assert_eq!(pids_of(&entries), [7].into_iter().collect());
+    }
+
+    #[test]
+    fn unknown_pids_never_count_as_a_process() {
+        assert!(pids_of(&[(1, 0)]).is_empty());
+    }
+
+    #[test]
+    fn reconcile_drops_dead_windows() {
+        let mut entries = vec![(1isize, 42u32), (2, 43)];
+        let unresolved = reconcile_entries(&mut entries, |h| (h == 2).then_some(43));
+        assert_eq!(entries, vec![(2, 43)]);
+        assert!(!unresolved);
+    }
+
+    #[test]
+    fn reconcile_fills_in_a_pid_that_was_unreadable_before() {
+        let mut entries = vec![(1isize, 0u32)];
+        assert!(!reconcile_entries(&mut entries, |_| Some(42)));
+        assert_eq!(entries, vec![(1, 42)]);
+    }
+
+    #[test]
+    fn reconcile_reports_a_pid_that_is_still_unreadable() {
+        let mut entries = vec![(1isize, 0u32)];
+        assert!(reconcile_entries(&mut entries, |_| Some(0)));
+        assert_eq!(entries, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn reconcile_follows_a_reused_handle_to_its_new_owner() {
+        let mut entries = vec![(1isize, 42u32)];
+        reconcile_entries(&mut entries, |_| Some(99));
+        assert_eq!(entries, vec![(1, 99)]);
     }
 
     #[test]

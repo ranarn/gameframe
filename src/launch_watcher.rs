@@ -281,13 +281,32 @@ static DRIFT_WATCHER_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Game process id -> its `EVENT_OBJECT_LOCATIONCHANGE` hook handle.
+///
+/// The mutex is held across `SetWinEventHook`/`UnhookWinEvent`. That is safe
+/// because every caller runs on the message-loop thread (asserted in
+/// [`sync_drift_hooks`]) and out-of-context hook callbacks are only delivered
+/// by that thread's `DispatchMessageW`, never re-entrantly from inside those
+/// calls, so no callback can try to take the lock while it is held.
 static DRIFT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<u32, isize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Id of the message-loop thread, recorded by [`enable_drift_watcher`].
+static DRIFT_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How long a failed hook registration or an unreadable pid waits before
+/// [`sync_drift_hooks`] tries again.
+const DRIFT_SYNC_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Thread timer id of the pending [`sync_drift_hooks`] retry, 0 if none.
+static DRIFT_SYNC_TIMER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Arms the drift watcher. Hooks are then registered per applied game process
 /// by [`sync_drift_hooks`], which must run on this same (message-loop) thread;
 /// no hook exists while nothing is applied. OS-facing.
 pub fn enable_drift_watcher() {
+    // Safety: no arguments or preconditions.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    DRIFT_THREAD_ID.store(thread, std::sync::atomic::Ordering::SeqCst);
     DRIFT_WATCHER_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
     sync_drift_hooks();
 }
@@ -303,13 +322,24 @@ pub fn disable_drift_watcher() {
 /// Zone (e.g. Last Epoch after an in-game settings change) is put back, while
 /// the rest of the desktop's move events never reach this process. Each hook is
 /// scoped to one game pid with `WINEVENT_SKIPOWNPROCESS`. Same
-/// thread/message-loop requirements as [`register`]. OS-facing.
+/// thread/message-loop requirements as [`register`]. If a registration fails or
+/// a window's pid can't be read, a timer re-runs this after
+/// [`DRIFT_SYNC_RETRY`]. OS-facing.
 pub fn sync_drift_hooks() {
     let enabled = DRIFT_WATCHER_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
-    let applied = if enabled {
-        crate::win32::applied_window_pids()
+    if enabled {
+        // Safety: no arguments or preconditions.
+        let here = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        debug_assert_eq!(
+            here,
+            DRIFT_THREAD_ID.load(std::sync::atomic::Ordering::SeqCst),
+            "sync_drift_hooks must run on the message-loop thread"
+        );
+    }
+    let (applied, mut needs_retry) = if enabled {
+        crate::win32::refresh_applied_window_pids()
     } else {
-        std::collections::BTreeSet::new()
+        (std::collections::BTreeSet::new(), false)
     };
     let mut hooks = DRIFT_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
     let hooked = hooks.keys().copied().collect();
@@ -337,11 +367,44 @@ pub fn sync_drift_hooks() {
             )
         };
         if hook.is_null() {
-            log!("drift watcher: SetWinEventHook failed for pid {pid}; retried on the next change");
+            log!("drift watcher: SetWinEventHook failed for pid {pid}; retrying shortly");
+            needs_retry = true;
         } else {
             hooks.insert(pid, hook as isize);
         }
     }
+    drop(hooks);
+    if needs_retry {
+        schedule_drift_sync_retry();
+    }
+}
+
+/// Arms the one pending [`sync_drift_hooks`] retry timer, if not armed yet.
+fn schedule_drift_sync_retry() {
+    use std::sync::atomic::Ordering;
+    if DRIFT_SYNC_TIMER.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let delay_ms = u32::try_from(DRIFT_SYNC_RETRY.as_millis()).unwrap_or(u32::MAX);
+    // Safety: a null window makes this a thread timer on the message-loop
+    // thread, delivered to `drift_sync_timer` by `DispatchMessageW`.
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_sync_timer)) };
+    if timer == 0 {
+        log!("drift watcher: SetTimer failed; hooks are retried on the next window change");
+    } else {
+        DRIFT_SYNC_TIMER.store(timer, Ordering::SeqCst);
+    }
+}
+
+/// `TIMERPROC` for the [`sync_drift_hooks`] retry. OS-facing; not unit tested.
+unsafe extern "system" fn drift_sync_timer(_hwnd: HWND, _msg: u32, timer: usize, _time: u32) {
+    // Safety: `timer` is a thread timer id this module created.
+    unsafe {
+        KillTimer(std::ptr::null_mut(), timer);
+    }
+    DRIFT_SYNC_TIMER.store(0, std::sync::atomic::Ordering::SeqCst);
+    let _crumb = crate::watchdog::scoped("drift timer: hook sync");
+    sync_drift_hooks();
 }
 
 /// `EVENT_OBJECT_LOCATIONCHANGE` fires very often system-wide, so this
