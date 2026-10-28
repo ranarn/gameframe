@@ -212,6 +212,16 @@ impl SettingsState {
         }
     }
 
+    /// The tick context for the Settings window: hotkeys are swallowed while a
+    /// hotkey capture is in progress.
+    pub fn tick_context(&self) -> TickContext {
+        if self.capturing.is_some() {
+            TickContext::SettingsCapturing
+        } else {
+            TickContext::Settings
+        }
+    }
+
     /// Adopts a `cursor.enabled` change made outside Settings while it is open
     /// (the game-cursor hotkey persists it straight to disk), so the checkbox
     /// shows it and Save writes it. Other unsaved edits are left alone.
@@ -1968,12 +1978,7 @@ fn save_exit(
     state: &mut SettingsState,
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> SettingsExit {
-    let context = if state.capturing.is_some() {
-        TickContext::SettingsCapturing
-    } else {
-        TickContext::Settings
-    };
-    if let Some(enabled) = on_tick(context) {
+    if let Some(enabled) = on_tick(state.tick_context()) {
         state.apply_external_cursor_enabled(enabled);
     }
     SettingsExit::Saved(state.to_config(), state.start_with_windows)
@@ -1986,12 +1991,7 @@ impl eframe::App for SettingsApp<'_> {
         // so pressing a bound combo to rebind it doesn't also run its action.
         // A game-cursor hotkey press while Settings is open changed
         // `cursor.enabled` on disk: show it in the checkbox so Save keeps it.
-        let context = if self.state.capturing.is_some() {
-            TickContext::SettingsCapturing
-        } else {
-            TickContext::Settings
-        };
-        if let Some(enabled) = (self.on_tick)(context) {
+        if let Some(enabled) = (self.on_tick)(self.state.tick_context()) {
             self.state.apply_external_cursor_enabled(enabled);
         }
 

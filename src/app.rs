@@ -374,6 +374,7 @@ fn hotkey_allowed(context: Option<TickContext>, action: HotkeyAction) -> bool {
         Some(TickContext::Settings) | None => true,
     }
 }
+
 /// What one pass of [`drain_events`] asks its caller to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
@@ -409,8 +410,9 @@ fn drain_events(
         updates,
     } = *ctx;
     let settings_open = settings.is_some();
-    // Set by the hotkey loop; every return reports it, so a toggle that was
-    // already persisted never goes unreported.
+    // Set by the hotkey loop. The two tray returns come before that loop, so
+    // it is still `None` there; the borderless-elevated exit return is the one
+    // that must report a toggle already persisted.
     let mut cursor_enabled = None;
     crate::watchdog::step("drain_events: update events");
     // Results of the startup update check and of installs started from
@@ -1206,8 +1208,7 @@ fn show_settings(
     let mut on_tick = {
         let hotkeys = &*hotkeys;
         move |context: TickContext| -> Option<bool> {
-            let mode = Some(context);
-            let drained = drain_events(ctx, hotkeys, offered_update, mode);
+            let drained = drain_events(ctx, hotkeys, offered_update, Some(context));
             if drained.exit {
                 // Settings closes on a queued Quit and the main loop exits.
                 instance_channel::queue_quit();
