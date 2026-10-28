@@ -22,8 +22,14 @@ elevated only when the borderless hotkey's window manipulation was denied for
 lack of rights and you accept the UAC prompt. It moves and restyles other
 applications' windows, hides the taskbar, installs a low-level keyboard hook only
 while you are binding a hotkey, and never injects into game processes or reads
-their memory. To rank windows in the Apply to Window picker it queries a
-process's executable path and loaded-module list through standard Windows APIs.
+their memory. It queries a process's executable path through standard Windows
+APIs: when the foreground window changes (to auto-apply a tracked game's Zone),
+when an applied window is moved or closed, on each borderless hotkey press, on
+each taskbar hotkey press (to log the foreground window for diagnostics), while
+the game-cursor overlay checks the window under the cursor, when listing windows
+for the picker or a tracked game's re-apply, and when matching a tracked game's
+executable against running processes. The loaded-module list is read only to
+rank windows in the Apply to Window picker.
 The only network traffic is the update check and the download that follows it.
 GameFrame checks about 20 seconds after it starts (and again when you choose
 "Check for Updates Now" in the tray or Settings). With the default setting

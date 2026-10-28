@@ -16,7 +16,8 @@ body:
       description: >
         Shown in GameFrame's Settings > About. Also in Windows Settings > Apps >
         GameFrame, and in the most recent `GameFrame <version> started` line of
-        `%APPDATA%\GameFrame\gameframe.log`.
+        `%APPDATA%\GameFrame\gameframe.log` (or `gameframe.old.log` next to it,
+        if the log has rotated).
     validations:
       required: true
   - type: input
@@ -33,7 +34,8 @@ body:
     attributes:
       label: Log
       description: >
-        Relevant lines from `%APPDATA%\GameFrame\gameframe.log`. It contains
-        window titles and executable paths, so remove anything you'd rather
+        Relevant lines from `%APPDATA%\GameFrame\gameframe.log` (and
+        `gameframe.old.log`, the rotated log, if the problem is older). They
+        contain window titles and executable paths, so remove anything you'd rather
         not share.
       render: text
