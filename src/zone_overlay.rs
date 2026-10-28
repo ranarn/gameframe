@@ -58,8 +58,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// Drawn size of a resize handle square, in egui points (scales with DPI, so
 /// it stays usable at 100-200 %).
 const HANDLE_DRAW_PT: f32 = 28.0;
-/// Grab size of a handle (and half-width of the edge bands is half of this),
-/// in egui points; larger than the drawn handle.
+/// Grab size of a handle, in egui points; larger than the drawn handle. Edge
+/// bands extend half of this on each side of the outline.
 const HANDLE_HIT_PT: f32 = 40.0;
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
@@ -505,11 +505,13 @@ impl OverlayApp {
             let press = point_from_points(press.x, press.y, scale);
             match hit_test(&zone, press, grab_px) {
                 Some(Target::Resize(handle)) => {
-                    self.state.apply(Action::Grab(handle));
+                    self.state.apply(Action::Grab(handle, press));
                 }
                 Some(Target::Move) => {
                     self.state.apply(Action::GrabMove(press));
                 }
+                // A press outside the Zone is ignored: a new Zone can't be
+                // drawn from the Placed state (same as before moving existed).
                 None => {}
             }
         }
@@ -639,6 +641,30 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
         Handle::Nw => egui::pos2(x, y),
         Handle::Se => egui::pos2(x + w, y + h),
         Handle::Sw => egui::pos2(x, y + h),
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_matches_the_grab_target() {
+        use egui::CursorIcon::*;
+        let cases = [
+            (Handle::N, ResizeVertical),
+            (Handle::S, ResizeVertical),
+            (Handle::E, ResizeHorizontal),
+            (Handle::W, ResizeHorizontal),
+            (Handle::Nw, ResizeNwSe),
+            (Handle::Se, ResizeNwSe),
+            (Handle::Ne, ResizeNeSw),
+            (Handle::Sw, ResizeNeSw),
+        ];
+        for (handle, icon) in cases {
+            assert_eq!(cursor_for(Target::Resize(handle)), icon, "{handle:?}");
+        }
+        assert_eq!(cursor_for(Target::Move), Move);
     }
 }
 
