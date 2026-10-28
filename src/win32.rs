@@ -2855,7 +2855,10 @@ mod tests {
         assert_eq!(state.session_restore(), None);
         state.start(1, TaskbarHideRestore::FullyHidden);
         state.join(2);
-        assert_eq!(state.session_restore(), Some(TaskbarHideRestore::FullyHidden));
+        assert_eq!(
+            state.session_restore(),
+            Some(TaskbarHideRestore::FullyHidden)
+        );
         state.take_all();
         assert_eq!(state.session_restore(), None);
     }
