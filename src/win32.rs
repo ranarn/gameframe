@@ -43,23 +43,56 @@ use crate::region_calc::Region;
 /// resizable sizing border, and `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX`/`WS_SYSMENU`
 /// the title-bar buttons/system menu that have no purpose once the title bar
 /// is gone.
+/// `WS_MAXIMIZE` is deliberately *not* in the mask: it is window state owned by
+/// `SW_RESTORE` ([`restore_maximized_window`]), and clearing it by hand on a
+/// still-maximized window would leave the OS state inconsistent.
 const BORDERLESS_STYLE_MASK: u32 =
     WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
 
+/// The extended-style edge bits removed to strip a window: the sunken client
+/// edge, the raised window edge and the dialog frame all draw a border that
+/// survives removing `WS_CAPTION`/`WS_THICKFRAME`.
+const BORDERLESS_EX_STYLE_MASK: u32 = WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME;
+
 /// Removes the border/title-bar style bits from a raw `GWL_STYLE` value,
-/// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`)
-/// untouched. Pure bit manipulation -- no `HWND` involved.
+/// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`,
+/// `WS_MAXIMIZE`) untouched. Pure bit manipulation -- no `HWND`
+/// involved.
 pub fn strip_border_style(style: u32) -> u32 {
     style & !BORDERLESS_STYLE_MASK
+}
+
+/// Removes the border-drawing extended-style bits from a raw `GWL_EXSTYLE`
+/// value, leaving every other bit (e.g. `WS_EX_TOPMOST`, `WS_EX_APPWINDOW`)
+/// untouched.
+pub fn strip_border_ex_style(ex_style: u32) -> u32 {
+    ex_style & !BORDERLESS_EX_STYLE_MASK
 }
 
 /// What a foreground window looked like immediately before the borderless
 /// hotkey most recently stripped its border -- remembered so a second press
 /// of the same hotkey can restore it exactly.
+///
+/// `style` never carries `WS_MAXIMIZE` (see [`RestoreState::new`]) and, for a
+/// window that was maximized, `region` is its normal (un-maximized) rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoreState {
     pub style: u32,
+    pub ex_style: u32,
     pub region: Region,
+}
+
+impl RestoreState {
+    /// Builds the state to remember for a window with the given live styles.
+    /// A maximized window is remembered un-maximized: restoring must not
+    /// write `WS_MAXIMIZE` back onto a window that is no longer maximized.
+    pub fn new(style: u32, ex_style: u32, region: Region) -> Self {
+        Self {
+            style: style & !WS_MAXIMIZE,
+            ex_style,
+            region,
+        }
+    }
 }
 
 /// The window action the borderless-toggle hotkey should perform next.
@@ -86,15 +119,13 @@ pub enum ToggleAction {
 pub fn plan_toggle(
     remembered: Option<RestoreState>,
     live_style: u32,
+    live_ex_style: u32,
     live_region: Region,
     target_region: Region,
 ) -> (ToggleAction, Option<RestoreState>) {
     match remembered {
         None => {
-            let restore = RestoreState {
-                style: live_style,
-                region: live_region,
-            };
+            let restore = RestoreState::new(live_style, live_ex_style, live_region);
             let new_style = strip_border_style(live_style);
             (
                 ToggleAction::MakeBorderless {
@@ -109,7 +140,8 @@ pub fn plan_toggle(
 }
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 /// The current on/off state of the taskbar auto-hide toggle -- fully
@@ -391,12 +423,13 @@ use windows_sys::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN, SHAppBarMessage, SHQueryUserNotificationState, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsHungAppWindow, IsIconic, IsWindowVisible,
-    SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, ShowWindowAsync, WindowFromPoint,
+    EnumWindows, FindWindowW, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_TOP, IsHungAppWindow, IsIconic, IsWindowVisible, IsZoomed,
+    SET_WINDOW_POS_FLAGS, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, ShowWindowAsync, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT,
+    WindowFromPoint,
 };
 
 /// Reads a window's current `GWL_STYLE` value.
@@ -407,11 +440,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// first and a non-zero `GetLastError()` afterwards is the real failure
 /// signal.
 fn get_window_style(hwnd: HWND) -> Result<u32, Win32Error> {
+    get_window_long(hwnd, GWL_STYLE)
+}
+
+/// Reads a window's current `GWL_EXSTYLE` value (see [`get_window_style`]).
+fn get_window_ex_style(hwnd: HWND) -> Result<u32, Win32Error> {
+    get_window_long(hwnd, GWL_EXSTYLE)
+}
+
+/// Reads a window long (`GWL_STYLE` or `GWL_EXSTYLE`) with the
+/// `SetLastError(0)` / zero-return protocol described on [`get_window_style`].
+/// The `isize` result is truncated to `u32`; all style bits live in the low 32.
+fn get_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> Result<u32, Win32Error> {
     // Safety: `hwnd` is a live handle; `GetWindowLongPtrW` performs no writes
     // and takes no pointers besides `hwnd` itself.
     let style = unsafe {
         windows_sys::Win32::Foundation::SetLastError(0);
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let style = GetWindowLongPtrW(hwnd, index);
         if style == 0 {
             let last_error = windows_sys::Win32::Foundation::GetLastError();
             if last_error != 0 {
@@ -435,11 +480,22 @@ fn get_window_style(hwnd: HWND) -> Result<u32, Win32Error> {
 /// unambiguous success regardless of what `GetLastError()` reports
 /// afterwards.
 fn set_window_style(hwnd: HWND, style: u32) -> Result<(), Win32Error> {
+    set_window_long(hwnd, GWL_STYLE, style)
+}
+
+/// Writes a new `GWL_EXSTYLE` value to a window (see [`set_window_style`]).
+fn set_window_ex_style(hwnd: HWND, ex_style: u32) -> Result<(), Win32Error> {
+    set_window_long(hwnd, GWL_EXSTYLE, ex_style)
+}
+
+/// Writes a window long (`GWL_STYLE` or `GWL_EXSTYLE`) with the
+/// `SetLastError(0)` / zero-return protocol described on [`set_window_style`].
+fn set_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: u32) -> Result<(), Win32Error> {
     // Safety: `hwnd` is a live handle; `SetWindowLongPtrW` performs no reads
     // besides `hwnd`/`style` and takes no pointers.
     unsafe {
         windows_sys::Win32::Foundation::SetLastError(0);
-        let previous_style = SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+        let previous_style = SetWindowLongPtrW(hwnd, index, style as isize);
         if previous_style == 0 {
             let last_error = windows_sys::Win32::Foundation::GetLastError();
             if last_error != 0 {
@@ -468,6 +524,48 @@ fn get_window_region(hwnd: HWND) -> Result<Region, Win32Error> {
         width: rect.right - rect.left,
         height: rect.bottom - rect.top,
     })
+}
+
+/// The region to remember as a window's original look: its bounding rect, or,
+/// for a maximized window (whose rect is the full-screen one, not somewhere
+/// restorable), its normal rect from `GetWindowPlacement`.
+fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Error> {
+    if !maximized {
+        return get_window_region(hwnd);
+    }
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    // Safety: `hwnd` is a live handle; `placement` is a valid out-pointer
+    // with `length` set, as `GetWindowPlacement` requires.
+    if unsafe { GetWindowPlacement(hwnd, &mut placement) } == 0 {
+        // No fallback to the full-screen rect: remembering it would restore
+        // the window full-screen without its maximize state.
+        log!("GetWindowPlacement failed for maximized window {hwnd:?}; aborting");
+        return Err(Win32Error::Os(std::io::Error::last_os_error()));
+    }
+    let rect = placement.rcNormalPosition;
+    Ok(Region {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    })
+}
+
+/// Un-maximizes `hwnd` synchronously, so the style/rect writes that follow
+/// never race a still-queued restore. The caller has already passed the hung
+/// check (`is_window_hung_logged`), so this cannot block on a hung window.
+fn restore_maximized_window(hwnd: HWND) {
+    // Safety: `hwnd` is a live handle; `ShowWindow` takes plain integers.
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+}
+
+/// Whether `hwnd` is currently maximized.
+fn is_maximized(hwnd: HWND) -> bool {
+    // Safety: `IsZoomed` only reads window state.
+    unsafe { IsZoomed(hwnd) != 0 }
 }
 
 /// Moves/resizes a window to `region` without changing its z-order or
@@ -548,6 +646,12 @@ fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
 /// Used by the in-game-resize watcher so it only re-applies when the game
 /// actually changed the window -- which also keeps GameFrame's own
 /// `SetWindowPos` (which fires another location-change event) from looping.
+///
+/// `WS_MAXIMIZE` and the leftover extended-style edges
+/// ([`strip_border_ex_style`]) are deliberately not drift: a game that
+/// maximizes itself or re-adds an edge would otherwise be re-applied on every
+/// location event (a maximized window already differs by bounds). They are
+/// still handled whenever an apply does run.
 pub fn window_drifted(current_region: Region, current_style: u32, target: Region) -> bool {
     current_region != target || strip_border_style(current_style) != current_style
 }
@@ -586,7 +690,11 @@ impl RestoreStore {
     /// truer original to go back to, and the hotkey must not claim a restore
     /// it cannot do.
     fn record_if_absent(&mut self, window: isize, state: RestoreState) {
-        if strip_border_style(state.style) == state.style {
+        // `WS_MAXIMIZE` is not a border: a maximized borderless window has
+        // nothing to restore either.
+        let borderless = strip_border_style(state.style) == state.style & !WS_MAXIMIZE
+            && strip_border_ex_style(state.ex_style) == state.ex_style;
+        if borderless {
             return;
         }
         self.states.entry(window).or_insert(state);
@@ -623,12 +731,19 @@ fn toggle_with_store<E>(
     store: &std::sync::Mutex<RestoreStore>,
     window: isize,
     live_style: u32,
+    live_ex_style: u32,
     live_region: Region,
     target_region: Region,
     mutate: impl FnOnce(ToggleAction) -> Result<(), E>,
 ) -> Result<(), E> {
     let remembered = lock_store(store).get(window);
-    let (action, next_state) = plan_toggle(remembered, live_style, live_region, target_region);
+    let (action, next_state) = plan_toggle(
+        remembered,
+        live_style,
+        live_ex_style,
+        live_region,
+        target_region,
+    );
     match action {
         ToggleAction::MakeBorderless { .. } => {
             {
@@ -1096,6 +1211,20 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     }
 
     let hung = is_window_hung_logged(hwnd);
+    // A maximized window is un-maximized first (synchronously, behind the hung
+    // check) so the Zone rect is not overridden by the maximized state. Its
+    // normal rect and both styles are read before the restore, so a failed
+    // read aborts before the window is touched.
+    let maximized = !hung && is_maximized(hwnd);
+    let pre_read = if maximized {
+        let region = get_restorable_region(hwnd, true)?;
+        let style = get_window_style(hwnd)?;
+        let ex_style = get_window_ex_style(hwnd)?;
+        restore_maximized_window(hwnd);
+        Some((style, ex_style, region))
+    } else {
+        None
+    };
     let drifted = !hung && window_has_drifted(hwnd, target_region).unwrap_or(true);
     match decide_apply(hung, drifted) {
         ApplyDecision::SkipHung => return Err(Win32Error::WindowHung),
@@ -1107,20 +1236,23 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         ApplyDecision::Apply => {}
     }
 
-    let live_style = get_window_style(hwnd)?;
-    let live_region = get_window_region(hwnd)?;
-    let new_style = strip_border_style(live_style);
-    set_window_style(hwnd, new_style)?;
+    let (live_style, live_ex_style, live_region) = match pre_read {
+        Some(read) => read,
+        None => (
+            get_window_style(hwnd)?,
+            get_window_ex_style(hwnd)?,
+            get_window_region(hwnd)?,
+        ),
+    };
+    set_window_style(hwnd, strip_border_style(live_style))?;
     // Recorded once the first mutation succeeded, so a window GameFrame could
     // not change (e.g. an elevated game) never gets a restore entry; the
     // remaining calls below can still fail with the original already safe.
     lock_store(&RESTORE_STATES).record_if_absent(
         hwnd as isize,
-        RestoreState {
-            style: live_style,
-            region: live_region,
-        },
+        RestoreState::new(live_style, live_ex_style, live_region),
     );
+    set_window_ex_style(hwnd, strip_border_ex_style(live_ex_style))?;
     set_window_region(hwnd, target_region)?;
     disable_rounded_corners(hwnd)?;
     Ok(())
@@ -1151,12 +1283,15 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
     }
 
     let live_style = get_window_style(hwnd)?;
-    let live_region = get_window_region(hwnd)?;
+    let live_ex_style = get_window_ex_style(hwnd)?;
+    // A maximized window remembers its normal rect, not the full-screen one.
+    let live_region = get_restorable_region(hwnd, live_style & WS_MAXIMIZE != 0)?;
 
     toggle_with_store(
         &RESTORE_STATES,
         hwnd as isize,
         live_style,
+        live_ex_style,
         live_region,
         target_region,
         |action| match action {
@@ -1173,7 +1308,14 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
             // succeeded; a failure partway keeps the only copy of the
             // original state so a retry can recover it.
             ToggleAction::Restore(restore) => {
+                // Re-maximized since the strip: un-maximize through the OS
+                // (hung check already passed) rather than overwriting the
+                // style and clearing WS_MAXIMIZE by hand.
+                if is_maximized(hwnd) {
+                    restore_maximized_window(hwnd);
+                }
                 set_window_style(hwnd, restore.style)?;
+                set_window_ex_style(hwnd, restore.ex_style)?;
                 set_window_region(hwnd, restore.region)?;
                 reset_corner_preference(hwnd)?;
                 // A restored window is no longer GameFrame-placed: stop the
@@ -2057,6 +2199,83 @@ mod tests {
     }
 
     #[test]
+    fn strip_border_ex_style_removes_the_leftover_edge_bits() {
+        const WS_EX_TOPMOST: u32 = 0x8;
+        let ex = WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+
+        assert_eq!(strip_border_ex_style(ex), WS_EX_TOPMOST);
+    }
+
+    #[test]
+    fn strip_border_style_leaves_the_maximized_state_to_sw_restore() {
+        const WS_VISIBLE: u32 = 0x10000000;
+
+        assert_eq!(
+            strip_border_style(WS_MAXIMIZE | WS_CAPTION | WS_VISIBLE),
+            WS_MAXIMIZE | WS_VISIBLE
+        );
+    }
+
+    #[test]
+    fn window_drifted_ignores_a_maximized_flag_when_bounds_match() {
+        let target = Region {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+
+        assert!(!window_drifted(target, 0x14000000 | WS_MAXIMIZE, target));
+    }
+
+    #[test]
+    fn a_maximized_window_is_remembered_un_maximized() {
+        let state = RestoreState::new(WS_CAPTION | WS_MAXIMIZE, WS_EX_WINDOWEDGE, ORIGINAL);
+
+        assert_eq!(state.style, WS_CAPTION);
+        assert_eq!(state.ex_style, WS_EX_WINDOWEDGE);
+        assert_eq!(state.region, ORIGINAL);
+    }
+
+    #[test]
+    fn a_window_with_only_leftover_edges_still_gets_a_restore_state() {
+        let mut store = RestoreStore::new();
+        let state = RestoreState::new(0, WS_EX_CLIENTEDGE, ORIGINAL);
+
+        store.record_if_absent(1, state);
+
+        assert_eq!(store.get(1), Some(state));
+    }
+
+    #[test]
+    fn a_maximized_but_borderless_window_gets_no_restore_state() {
+        let mut store = RestoreStore::new();
+
+        store.record_if_absent(1, RestoreState::new(WS_MAXIMIZE, 0, ORIGINAL));
+
+        assert_eq!(store.get(1), None);
+    }
+
+    #[test]
+    fn the_ex_style_round_trips_through_a_toggle() {
+        let store = std::sync::Mutex::new(RestoreStore::new());
+        let ex = WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME;
+        let mut seen = Vec::new();
+
+        for _ in 0..2 {
+            let _ = toggle_with_store(&store, 1, BORDERED, ex, ORIGINAL, TARGET, |a| {
+                seen.push(a);
+                Ok::<(), ()>(())
+            });
+        }
+
+        assert_eq!(
+            seen[1],
+            ToggleAction::Restore(RestoreState::new(BORDERED, ex, ORIGINAL))
+        );
+    }
+
+    #[test]
     fn apply_is_skipped_for_a_window_already_in_place() {
         assert_eq!(decide_apply(false, false), ApplyDecision::SkipInPlace);
     }
@@ -2319,7 +2538,7 @@ mod tests {
             height: 1080,
         };
 
-        let (action, next_state) = plan_toggle(None, live_style, live_region, target_region);
+        let (action, next_state) = plan_toggle(None, live_style, 0, live_region, target_region);
 
         assert_eq!(
             action,
@@ -2332,6 +2551,7 @@ mod tests {
             next_state,
             Some(RestoreState {
                 style: live_style,
+                ex_style: 0,
                 region: live_region
             })
         );
@@ -2341,6 +2561,7 @@ mod tests {
     fn plan_toggle_with_a_remembered_state_restores_it_and_forgets_it() {
         let remembered = RestoreState {
             style: WS_CAPTION | WS_THICKFRAME,
+            ex_style: 0,
             region: Region {
                 x: 10,
                 y: 20,
@@ -2359,8 +2580,13 @@ mod tests {
             height: 1080,
         };
 
-        let (action, next_state) =
-            plan_toggle(Some(remembered), live_style, target_region, target_region);
+        let (action, next_state) = plan_toggle(
+            Some(remembered),
+            live_style,
+            0,
+            target_region,
+            target_region,
+        );
 
         assert_eq!(action, ToggleAction::Restore(remembered));
         assert_eq!(next_state, None);
@@ -2383,7 +2609,7 @@ mod tests {
         };
 
         let (first_action, state_after_first) =
-            plan_toggle(None, original_style, original_region, target_region);
+            plan_toggle(None, original_style, 0, original_region, target_region);
         let ToggleAction::MakeBorderless {
             new_style: stripped_style,
             ..
@@ -2395,6 +2621,7 @@ mod tests {
         let (second_action, state_after_second) = plan_toggle(
             state_after_first,
             stripped_style,
+            0,
             target_region,
             target_region,
         );
@@ -2403,6 +2630,7 @@ mod tests {
             second_action,
             ToggleAction::Restore(RestoreState {
                 style: original_style,
+                ex_style: 0,
                 region: original_region
             })
         );
@@ -2429,7 +2657,7 @@ mod tests {
         mutate_result: Result<(), ()>,
     ) -> Vec<ToggleAction> {
         let mut seen = Vec::new();
-        let _ = toggle_with_store(store, window, BORDERED, ORIGINAL, TARGET, |action| {
+        let _ = toggle_with_store(store, window, BORDERED, 0, ORIGINAL, TARGET, |action| {
             seen.push(action);
             mutate_result
         });
@@ -2447,6 +2675,7 @@ mod tests {
             lock_store(&store).get(1),
             Some(RestoreState {
                 style: BORDERED,
+                ex_style: 0,
                 region: ORIGINAL
             })
         );
@@ -2463,6 +2692,7 @@ mod tests {
             actions,
             vec![ToggleAction::Restore(RestoreState {
                 style: BORDERED,
+                ex_style: 0,
                 region: ORIGINAL
             })]
         );
@@ -2516,6 +2746,7 @@ mod tests {
         let mut store = RestoreStore::new();
         let original = RestoreState {
             style: BORDERED,
+            ex_style: 0,
             region: ORIGINAL,
         };
         store.record_if_absent(1, original);
@@ -2524,6 +2755,7 @@ mod tests {
             1,
             RestoreState {
                 style: BORDERED | WS_MINIMIZEBOX,
+                ex_style: 0,
                 region: TARGET,
             },
         );
@@ -2539,6 +2771,7 @@ mod tests {
             1,
             RestoreState {
                 style: strip_border_style(BORDERED),
+                ex_style: 0,
                 region: ORIGINAL,
             },
         );
@@ -2551,14 +2784,9 @@ mod tests {
         let store = std::sync::Mutex::new(RestoreStore::new());
         let borderless = strip_border_style(BORDERED);
 
-        let _ = toggle_with_store(
-            &store,
-            1,
-            borderless,
-            ORIGINAL,
-            TARGET,
-            |_| Ok::<(), ()>(()),
-        );
+        let _ = toggle_with_store(&store, 1, borderless, 0, ORIGINAL, TARGET, |_| {
+            Ok::<(), ()>(())
+        });
 
         assert_eq!(lock_store(&store).get(1), None);
     }
