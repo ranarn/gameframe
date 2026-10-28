@@ -56,7 +56,8 @@ pub fn init(dir: &Path) {
 }
 
 /// Marks this process as the single-instance owner, which lets it rotate the
-/// log. Until called, a process only appends. Call after [`init`].
+/// log. Until called, a process only appends. Call after [`init`]: before it
+/// there is no log file to mark, and the call does nothing.
 pub fn claim_rotation() {
     if let Some(file) = LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         file.owner = true;
