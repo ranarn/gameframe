@@ -518,7 +518,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement)
 /// visible hides via
 /// [`set_taskbar_hide_absolute`]; currently hidden shows via the same.
 ///
-/// Fully independent of [`crate::win32::toggle_borderless_on_window`]'s
+/// Fully independent of [`crate::win32::restore_window`]'s
 /// `RestoreState`, and of [`set_taskbar_hide_absolute_armed`]'s
 /// `ARMED_TASKBAR_RESTORE` bookkeeping -- this reads only the taskbar's real
 /// OS-level visibility, never any tracked-game config or armed-window state,

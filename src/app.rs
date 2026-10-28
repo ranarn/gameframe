@@ -54,7 +54,6 @@ use crate::launch_watcher;
 use crate::message_box::show_message_box;
 use crate::placement::{self, Outcome, Trigger};
 use crate::profile_store;
-use crate::region_calc::Region;
 use crate::settings_ui::{self, TickContext};
 use crate::taskbar;
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
@@ -609,15 +608,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
     };
 
     let error = if win32::has_restore_state(fg_hwnd) {
-        // `plan_toggle`'s `Restore` arm never reads the target region, so
-        // this placeholder is inert.
-        let unused = Region {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        };
-        match win32::toggle_borderless_on_window(fg_hwnd, unused) {
+        match win32::restore_window(fg_hwnd) {
             Ok(()) => return false,
             Err(e) => {
                 if !e.is_access_denied() && !e.is_window_hung() {

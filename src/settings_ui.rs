@@ -75,8 +75,8 @@ pub struct SettingsState {
     pub duplicate_hotkey_error: Option<String>,
     /// The tracked-games list, editable in place by the Settings "Games"
     /// section (auto-apply per row, and immediate
-    /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
-    /// entries are added.
+    /// no-confirmation removal) -- entries are added by
+    /// [`crate::placement::apply_zone`]'s `Trigger::Tray` branch.
     pub tracked_games: Vec<TrackedGame>,
     /// Which technique GameFrame uses to hide the taskbar whenever any call
     /// site hides it -- `FullyHidden` (the default, no hover-reveal) or
@@ -560,14 +560,19 @@ fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
         .filter_map(|game| {
             let hwnd = win32::resolve_running_window(&game.exe_path)?;
             match placement::apply_zone(config_dir, hwnd, placement::Trigger::LiveReapply) {
-                placement::Outcome::Applied | placement::Outcome::Skipped => None,
-                placement::Outcome::RegionFailed | placement::Outcome::Failed(_) => {
+                placement::Outcome::Applied
+                | placement::Outcome::Skipped
+                | placement::Outcome::RetryIn(_) => None,
+                placement::Outcome::Refused
+                | placement::Outcome::RegionFailed
+                | placement::Outcome::Failed(_) => {
                     Some(live_apply_failure_message(&game.display_name))
                 }
             }
         })
         .collect()
 }
+
 /// `true` for egui's eight physical modifier-key variants (Shift/Control/Alt/
 /// Super, left or right). A press of one of these alone must never complete
 /// a hotkey capture -- only combined with a subsequent non-modifier key.
@@ -1086,8 +1091,6 @@ pub fn run_settings_window(
                         match persist_zone(config_dir, Some(zone)) {
                             Ok(saved) => {
                                 latest_state.set_zone(zone);
-                                // The on-disk taskbar settings, not the
-                                // unsaved Settings state.
                                 status_messages =
                                     live_reapply_all(config_dir, &saved.tracked_games);
                             }
