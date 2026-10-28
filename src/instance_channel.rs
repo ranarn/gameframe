@@ -14,6 +14,14 @@
 //! meanwhile are queued and handled once the loop is pumping again. Queued
 //! commands are de-duplicated, so repeated launches open Settings once.
 //!
+//! Enqueue fallback: an `OpenSettings` that arrives while Settings is flagged
+//! open but its window does not exist yet is queued. When Settings closes
+//! ([`SettingsGuard`] drops) such an `OpenSettings` is discarded, so Settings
+//! does not reopen by itself; other queued commands (`Quit`) are kept. The
+//! main loop then keeps taking batches until the queue is empty
+//! ([`dispatch_commands`]), so those commands run right after Settings
+//! returns instead of at the next message.
+//!
 //! Elevation: the receiver allows the message through UIPI with
 //! `ChangeWindowMessageFilterEx`, so a normal launch can signal an elevated
 //! instance. The sender grants the receiver the right to take the foreground
@@ -185,6 +193,39 @@ fn enqueue(queue: &mut VecDeque<Command>, command: Command) {
     }
 }
 
+/// Drops a queued `OpenSettings`, keeping every other command in order. Run
+/// when Settings closes: an `OpenSettings` that arrived while it was open (or
+/// opening) was already answered by that window, and must not reopen it.
+fn discard_open_settings(queue: &mut VecDeque<Command>) {
+    queue.retain(|&c| c != Command::OpenSettings);
+}
+
+/// The main loop's command handling: takes batches via `take` until one is
+/// empty, so commands queued while `open_settings` blocked are handled right
+/// after it returns, without waiting for another message. Returns `true` when
+/// the loop must exit (a `Quit`, which wins over everything else).
+pub fn dispatch_commands(
+    mut take: impl FnMut() -> Vec<Command>,
+    mut open_settings: impl FnMut(),
+) -> bool {
+    loop {
+        let commands = take();
+        if commands.is_empty() {
+            return false;
+        }
+        if wants_quit(&commands) {
+            return true;
+        }
+        for command in commands {
+            match command {
+                Command::OpenSettings => open_settings(),
+                // Unreachable after `wants_quit`; exit rather than ignore.
+                Command::Quit => return true,
+            }
+        }
+    }
+}
+
 static QUEUE: Mutex<VecDeque<Command>> = Mutex::new(VecDeque::new());
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
 
@@ -221,6 +262,8 @@ pub fn enter_settings() -> SettingsGuard {
 impl Drop for SettingsGuard {
     fn drop(&mut self) {
         SETTINGS_OPEN.store(false, Ordering::SeqCst);
+        // Same thread as the window procedure, so nothing can queue in between.
+        discard_open_settings(&mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -742,6 +785,45 @@ mod tests {
     #[test]
     fn open_settings_focuses_the_window_when_settings_is_already_open() {
         assert_eq!(route(Command::OpenSettings, true), Route::FocusSettings);
+    }
+
+    #[test]
+    fn open_settings_queued_while_settings_was_open_is_dropped_but_quit_is_kept() {
+        let mut queue = VecDeque::new();
+        enqueue(&mut queue, Command::OpenSettings);
+        enqueue(&mut queue, Command::Quit);
+        discard_open_settings(&mut queue);
+        assert_eq!(Vec::from(queue), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn commands_queued_during_settings_run_once_it_returns_without_another_message() {
+        use std::cell::RefCell;
+        let queue = RefCell::new(VecDeque::from([Command::OpenSettings]));
+        let take = || queue.borrow_mut().drain(..).collect::<Vec<_>>();
+        let mut opened = 0;
+        let quit = dispatch_commands(take, || {
+            opened += 1;
+            // Queued while Settings is open; the guard's drop then discards
+            // the OpenSettings but not the Quit.
+            let mut q = queue.borrow_mut();
+            enqueue(&mut q, Command::OpenSettings);
+            enqueue(&mut q, Command::Quit);
+            discard_open_settings(&mut q);
+        });
+        assert!(quit);
+        assert_eq!(opened, 1);
+    }
+
+    #[test]
+    fn dispatch_stops_when_the_queue_is_empty() {
+        let mut batches = vec![vec![], vec![Command::OpenSettings]];
+        let mut opened = 0;
+        assert!(!dispatch_commands(
+            || batches.pop().unwrap(),
+            || opened += 1
+        ));
+        assert_eq!(opened, 1);
     }
 
     #[test]
