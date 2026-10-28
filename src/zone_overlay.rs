@@ -249,7 +249,7 @@ fn strip_window_frame(hwnd: HWND) -> Result<bool, win32::Win32Error> {
 /// the window's scale factor, and so egui's `pixels_per_point`, from the same
 /// monitor DPI; every conversion after startup goes through [`scale_of`].
 /// Falls back to 100 % if the query fails.
-fn primary_monitor_scale() -> f32 {
+pub(crate) fn primary_monitor_scale() -> f32 {
     // Safety: `MonitorFromPoint` takes a point by value; `GetDpiForMonitor`
     // writes only to the two `u32` out-params, which outlive the call.
     unsafe {

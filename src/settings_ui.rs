@@ -28,6 +28,7 @@ use crate::region_calc::{MonitorGeometry, Region, resolve_region};
 use crate::taskbar;
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
+use crate::zone_editor::pixels_to_points;
 use crate::zone_overlay;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
@@ -376,23 +377,77 @@ pub struct NormalizedRegion {
 /// [`centered_window_position`] so the two never drift apart.
 const SETTINGS_WINDOW_SIZE: [f32; 2] = [560.0, 800.0];
 
-/// [`SETTINGS_WINDOW_SIZE`], shortened to fit `monitor` (leaving room for the
-/// taskbar and title bar) -- the content scrolls, so Save/Cancel stay
-/// reachable on small screens.
-fn settings_window_size(monitor: &MonitorGeometry) -> [f32; 2] {
-    let [width, height] = SETTINGS_WINDOW_SIZE;
-    [width, height.min(monitor.height as f32 - 120.0).max(300.0)]
+/// Points reserved below the window's inner size for the title bar and frame,
+/// so the whole outer window fits in the work area.
+const SETTINGS_WINDOW_CHROME: f32 = 48.0;
+
+/// Smallest height the Settings window is shrunk to, unless the work area is
+/// smaller still.
+const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 300.0;
+
+/// The Settings window's inner size and top-left position, both in egui
+/// points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SettingsViewport {
+    size: [f32; 2],
+    position: [f32; 2],
 }
 
-/// Computes the top-left position that centers a window of `window_size` on
-/// `monitor`. Pure arithmetic, no OS dependency -- mirrors the
-/// `region_calc::resolve_region` / `zone_editor::normalize` pure/OS-facing
-/// split.
-fn centered_window_position(monitor: &MonitorGeometry, window_size: [f32; 2]) -> [f32; 2] {
-    [
-        monitor.x as f32 + (monitor.width as f32 - window_size[0]) / 2.0,
-        monitor.y as f32 + (monitor.height as f32 - window_size[1]) / 2.0,
-    ]
+/// Computes the Settings window's size and position in egui points so it opens
+/// fully inside `work_area` (physical pixels, excluding the taskbar) at the
+/// monitor scale factor `scale`. The fixed [`SETTINGS_WINDOW_SIZE`] is in
+/// points and is shrunk to fit; the window is centered in the work area. Pure
+/// arithmetic, no OS dependency.
+fn settings_viewport(work_area: &MonitorGeometry, scale: f32) -> SettingsViewport {
+    let area_x = pixels_to_points(work_area.x, scale);
+    let area_y = pixels_to_points(work_area.y, scale);
+    let area_width = pixels_to_points(work_area.width, scale);
+    let area_height = pixels_to_points(work_area.height, scale);
+
+    let [wanted_width, wanted_height] = SETTINGS_WINDOW_SIZE;
+    let max_height = (area_height - SETTINGS_WINDOW_CHROME).max(0.0);
+    let width = wanted_width.min(area_width);
+    let height = wanted_height
+        .min(max_height)
+        .max(SETTINGS_WINDOW_MIN_HEIGHT.min(max_height));
+
+    SettingsViewport {
+        size: [width, height],
+        position: [
+            area_x + (area_width - width) / 2.0,
+            area_y + (area_height - height - SETTINGS_WINDOW_CHROME).max(0.0) / 2.0,
+        ],
+    }
+}
+
+/// The primary monitor's work area (the monitor minus the taskbar) in physical
+/// pixels, falling back to the full monitor if the query fails.
+///
+/// OS-facing -- not exercised by the automated tests.
+fn primary_work_area() -> MonitorGeometry {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // Safety: `SPI_GETWORKAREA` writes one `RECT` through the pointer, which
+    // outlives the call.
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) };
+    if ok == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        log!("settings: SPI_GETWORKAREA failed; using the full monitor");
+        return primary_monitor_geometry();
+    }
+    MonitorGeometry {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    }
 }
 
 fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedRegion {
@@ -1164,17 +1219,15 @@ fn run_settings_frame(
     let exit_for_app = Rc::clone(&exit);
     let config_dir = config_dir.to_path_buf();
 
-    // Window geometry is not persisted, so the window opens centered on the
-    // monitor every time.
+    // Window geometry is not persisted, so the window opens centered in the
+    // work area every time, sized in points via the monitor's scale factor.
+    let viewport = settings_viewport(&primary_work_area(), zone_overlay::primary_monitor_scale());
     let native_options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_TITLE)
-            .with_inner_size(settings_window_size(&monitor))
-            .with_position(centered_window_position(
-                &monitor,
-                settings_window_size(&monitor),
-            ))
+            .with_inner_size(viewport.size)
+            .with_position(viewport.position)
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -3008,27 +3061,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn centered_window_position_centers_a_window_within_the_monitor() {
-        let monitor = test_monitor();
+    fn work_area_1440p() -> MonitorGeometry {
+        // 2560x1440 minus a 48 px taskbar at the bottom.
+        MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1392,
+        }
+    }
 
-        let position = centered_window_position(&monitor, [440.0, 560.0]);
-
-        assert_eq!(position, [740.0, 260.0]);
+    /// The whole outer window (inner size plus chrome) lies inside the work
+    /// area, in points.
+    fn assert_fits(view: SettingsViewport, work_area: &MonitorGeometry, scale: f32) {
+        let area_x = pixels_to_points(work_area.x, scale);
+        let area_y = pixels_to_points(work_area.y, scale);
+        let area_w = pixels_to_points(work_area.width, scale);
+        let area_h = pixels_to_points(work_area.height, scale);
+        assert!(view.position[0] >= area_x - 0.01, "{view:?}");
+        assert!(view.position[1] >= area_y - 0.01, "{view:?}");
+        assert!(
+            view.position[0] + view.size[0] <= area_x + area_w + 0.01,
+            "{view:?}"
+        );
+        assert!(
+            view.position[1] + view.size[1] + SETTINGS_WINDOW_CHROME <= area_y + area_h + 0.01,
+            "{view:?}"
+        );
     }
 
     #[test]
-    fn centered_window_position_accounts_for_a_monitor_with_a_non_zero_origin() {
-        let monitor = MonitorGeometry {
-            x: -2560,
-            y: 0,
-            width: 2560,
-            height: 1440,
+    fn settings_viewport_at_100_percent_keeps_the_full_size_and_centers() {
+        let view = settings_viewport(&work_area_1440p(), 1.0);
+
+        assert_eq!(view.size, [560.0, 800.0]);
+        assert_eq!(view.position, [1000.0, 272.0]);
+        assert_fits(view, &work_area_1440p(), 1.0);
+    }
+
+    #[test]
+    fn settings_viewport_fits_the_work_area_at_125_150_and_200_percent() {
+        for scale in [1.25_f32, 1.5, 2.0] {
+            let view = settings_viewport(&work_area_1440p(), scale);
+            assert_fits(view, &work_area_1440p(), scale);
+        }
+    }
+
+    #[test]
+    fn settings_viewport_shrinks_the_height_at_150_percent_on_1440p() {
+        // 1392 px / 1.5 = 928 pt of work area; 800 pt + chrome still fits.
+        let view = settings_viewport(&work_area_1440p(), 1.5);
+        assert_eq!(view.size, [560.0, 800.0]);
+
+        // At 200 %: 696 pt of work area -> height shrinks to 648.
+        let view = settings_viewport(&work_area_1440p(), 2.0);
+        assert_eq!(view.size, [560.0, 648.0]);
+    }
+
+    #[test]
+    fn settings_viewport_accounts_for_a_work_area_with_a_non_zero_origin() {
+        // Taskbar on the left and top.
+        let work_area = MonitorGeometry {
+            x: 100,
+            y: 50,
+            width: 1820,
+            height: 1030,
         };
+        let view = settings_viewport(&work_area, 1.25);
+        assert!(view.position[0] >= 80.0);
+        assert!(view.position[1] >= 40.0);
+        assert_fits(view, &work_area, 1.25);
+    }
 
-        let position = centered_window_position(&monitor, [440.0, 560.0]);
-
-        assert_eq!(position, [-1500.0, 440.0]);
+    #[test]
+    fn settings_viewport_clamps_to_a_work_area_smaller_than_the_window() {
+        let work_area = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 250,
+        };
+        let view = settings_viewport(&work_area, 1.0);
+        assert_eq!(view.size[0], 400.0);
+        assert_fits(view, &work_area, 1.0);
     }
 
     #[test]
