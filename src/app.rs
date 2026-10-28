@@ -9,7 +9,7 @@
 //! [`crate::profile_store::TaskbarHideMode`]) via [`crate::win32`]. The
 //! borderless and taskbar hotkey mechanics are fully independent: the
 //! borderless toggle keeps its restore state per window in [`win32`], while
-//! the taskbar toggle ([`win32::toggle_taskbar_hide`]) keeps none at all,
+//! the taskbar toggle ([`taskbar::toggle_taskbar_hide`]) keeps none at all,
 //! instead reading the taskbar's real OS-level state on every press --
 //! either can be pressed without the other having been used first. A click
 //! on one of the "Apply to Window" submenu's dynamically-listed windows
@@ -32,8 +32,8 @@
 //!
 //! The taskbar is also restored automatically, with no hotkey press required:
 //! every apply-path call site above that hides the taskbar for a specific
-//! window arms [`win32::set_taskbar_hide_absolute_armed`]'s remembered
-//! restore for that window (see `win32::ARMED_TASKBAR_RESTORE`'s doc
+//! window arms [`taskbar::set_taskbar_hide_absolute_armed`]'s remembered
+//! restore for that window (see `taskbar::ARMED_TASKBAR_RESTORE`'s doc
 //! comment). [`crate::launch_watcher`] registers a second `SetWinEventHook`
 //! scoped to `EVENT_OBJECT_DESTROY` and restores the taskbar automatically
 //! when the armed window closes; [`run`] additionally checks the same armed
@@ -54,6 +54,7 @@ use crate::launch_watcher;
 use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
 use crate::settings_ui::{self, TickContext, primary_monitor_geometry};
+use crate::taskbar;
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::update_ui::{
     Failure, UpdateEvent, UpdateEvents, handle_update_event, schedule_startup_update_check,
@@ -149,7 +150,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // instance left to bring it back.
     // Then anything still hidden (e.g. the manual hotkey toggle), the exit
     // safety net, and the marker.
-    crate::taskbar_recovery::restore_all_for_exit();
+    crate::taskbar::restore_all_for_exit();
 
     if let Some(hook) = launch_watcher_hook {
         launch_watcher::unregister(hook);
@@ -805,7 +806,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
     // automatically restores the taskbar with no hotkey press required.
     if !is_restoring
         && let Some((tracked_game, _)) = &tracked
-        && let Err(e) = win32::set_taskbar_hide_absolute_armed(
+        && let Err(e) = taskbar::set_taskbar_hide_absolute_armed(
             fg_hwnd,
             config.hide_taskbar_on_apply,
             config.taskbar_hide_mode,
@@ -915,7 +916,7 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     // `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute`: arms `target_hwnd` so closing it later
     // automatically restores the taskbar with no hotkey press required.
-    if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+    if let Err(e) = taskbar::set_taskbar_hide_absolute_armed(
         target_hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
@@ -1020,7 +1021,7 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     // `set_taskbar_hide_absolute_armed` rather than the plain
     // `set_taskbar_hide_absolute`: arms `hwnd` so closing the game later
     // automatically restores the taskbar with no hotkey press required.
-    if let Err(e) = win32::set_taskbar_hide_absolute_armed(
+    if let Err(e) = taskbar::set_taskbar_hide_absolute_armed(
         hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
@@ -1165,7 +1166,7 @@ fn offer_install(info: crate::updater::UpdateInfo) {
 }
 
 /// Reacts to a press of the taskbar-autohide-toggle hotkey: flips the
-/// taskbar's *actual* hidden/visible state via [`win32::toggle_taskbar_hide`],
+/// taskbar's *actual* hidden/visible state via [`taskbar::toggle_taskbar_hide`],
 /// which grounds its decision in the taskbar's real OS-level state rather
 /// than a remembered flag -- see that function's doc comment for why (a
 /// remembered flag drifts out of sync with reality the moment a tracked
@@ -1189,7 +1190,7 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
         }
     };
 
-    if let Err(e) = win32::toggle_taskbar_hide(mode) {
+    if let Err(e) = taskbar::toggle_taskbar_hide(mode) {
         log!("taskbar auto-hide toggle failed: {e}");
     }
 }

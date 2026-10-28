@@ -25,6 +25,7 @@ use crate::profile_store::{
     UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
+use crate::taskbar;
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
 use crate::zone_overlay;
@@ -504,7 +505,7 @@ pub(crate) fn persist_zone(
 }
 
 /// Attempts the live re-apply for a single tracked game, via
-/// [`win32::resolve_running_window`] + [`win32::live_reapply_running_window`].
+/// [`win32::resolve_running_window`] + [`taskbar::live_reapply_running_window`].
 /// Returns `Some(message)` only when an attempt was actually made and failed
 /// (the game was running, but repositioning it hit an OS-level error) -- a
 /// game that isn't currently running is silently skipped (`None`) *before*
@@ -514,7 +515,7 @@ pub(crate) fn persist_zone(
 /// live-apply failure.
 ///
 /// OS-facing (delegates to [`win32::resolve_running_window`]/
-/// [`win32::live_reapply_running_window`], which perform the real toolhelp
+/// [`taskbar::live_reapply_running_window`], which perform the real toolhelp
 /// snapshot/window enumeration/repositioning) -- not exercised by this
 /// crate's automated tests, per this crate's established convention;
 /// [`live_apply_failure_message`] above is the pure decision this delegates
@@ -543,7 +544,7 @@ fn live_reapply_tracked_game(
         }
     };
 
-    match win32::live_reapply_running_window(
+    match taskbar::live_reapply_running_window(
         hwnd,
         &game.display_name,
         hide_taskbar_on_apply,

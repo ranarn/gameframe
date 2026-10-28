@@ -419,7 +419,7 @@ unsafe extern "system" fn session_wndproc(
 #[cfg(not(test))]
 fn end_session_restore() {
     log!("session ending: restoring the taskbar");
-    crate::taskbar_recovery::restore_all_for_exit();
+    crate::taskbar::restore_all_for_exit();
 }
 
 /// Tests count the calls instead of touching the real taskbar.

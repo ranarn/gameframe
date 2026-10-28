@@ -20,7 +20,7 @@
 //! Limitation: only the primary taskbar (`Shell_TrayWnd`) is handled;
 //! secondary-monitor taskbars are not touched by GameFrame at all.
 
-use crate::win32::{self, TaskbarAutohideState, TaskbarHideRestore};
+use crate::win32::{self, ShowKind, TaskbarAutohideState, TaskbarHideRestore};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -58,15 +58,6 @@ pub enum RecoveryAction {
     ShowTaskbar,
     /// Write this appbar auto-hide state back.
     SetAppbarState(TaskbarAutohideState),
-}
-
-/// Which `FullyHidden` restore a path performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShowKind {
-    /// A bare `ShowWindow(SW_SHOW)`: one lock-free call, nothing else.
-    Bare,
-    /// `SW_SHOW`, the appbar state re-send and the `HWND_TOP` raise (#52).
-    Full,
 }
 
 /// The restore paths that do not go through the normal in-memory bookkeeping.
@@ -474,7 +465,7 @@ pub fn undo_hide(undo: HideUndo) {
 /// clearing that part of the record; the marker is removed once no technique
 /// remains. (A restore to the user's own auto-hide state clears it too: the
 /// taskbar is then back in a state GameFrame is not responsible for.)
-pub fn mark_restored(restore: TaskbarHideRestore) {
+fn mark_restored(restore: TaskbarHideRestore) {
     let mut rec = record();
     rec.restore(restore);
     persist(*rec);
@@ -489,10 +480,13 @@ fn currently_hidden() -> HideRecord {
 /// (e.g. the manual hotkey toggle), restore it, which also clears the marker.
 /// A marker kept by a failed startup recovery is left alone unless the retry
 /// now succeeds.
-pub fn restore_on_exit() {
+///
+/// Call `crate::taskbar::restore_all_for_exit` instead: it also restores the
+/// armed session first, which a direct call here would skip.
+pub(crate) fn restore_on_exit() {
     retry_pending_recovery();
     for restore in currently_hidden().techniques() {
-        if let Err(e) = win32::restore_taskbar(restore) {
+        if let Err(e) = restore_marked(restore) {
             log!("failed to restore taskbar on exit: {e}");
         }
     }
@@ -501,7 +495,7 @@ pub fn restore_on_exit() {
     let visible = win32::observe_taskbar().ok().map(|(visible, _)| visible);
     if needs_exit_safety_show(HID_FULLY_THIS_RUN.load(Ordering::SeqCst), visible) {
         log!("taskbar still hidden at exit although this run hid it; showing it");
-        if let Err(e) = win32::show_taskbar() {
+        if let Err(e) = restore_marked(TaskbarHideRestore::FullyHidden) {
             log!("failed to show the taskbar at exit: {e}");
         }
     }
@@ -512,16 +506,34 @@ pub fn restore_on_exit() {
     persist(*rec);
 }
 
-/// The whole graceful-exit restore: the armed session's hide first, then
-/// [`restore_on_exit`]. Shared by the tray Exit path and `WM_ENDSESSION`;
-/// idempotent, so running both is harmless.
-pub fn restore_all_for_exit() {
-    if let Some(restore) = win32::take_any_armed_taskbar_restore()
-        && let Err(e) = win32::restore_taskbar(restore)
-    {
-        log!("failed to restore taskbar on exit: {e}");
+/// Restores the technique `restore` names and clears its mark. The single
+/// marked restore: `crate::taskbar::restore_taskbar`/`show_taskbar` and the
+/// exit path all go through it.
+pub(crate) fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
+    restore_marked_with(
+        restore,
+        // Also ends the FullyHidden session for the flags-changed log.
+        || win32::show_taskbar_full(finish_session_flags),
+        win32::set_appbar_state,
+        mark_restored,
+    )
+}
+
+/// Core of [`restore_marked`] with the OS steps and the marker bookkeeping
+/// injected, so the dispatch-then-clear contract is testable: pick the OS step
+/// for `restore`, and only if it succeeds, clear that technique's mark.
+fn restore_marked_with<E>(
+    restore: TaskbarHideRestore,
+    show_full: impl FnOnce() -> Result<(), E>,
+    set_appbar: impl FnOnce(TaskbarAutohideState) -> Result<(), E>,
+    mark: impl FnOnce(TaskbarHideRestore),
+) -> Result<(), E> {
+    match restore {
+        TaskbarHideRestore::FullyHidden => show_full()?,
+        TaskbarHideRestore::HoverReveal(state) => set_appbar(state)?,
     }
-    restore_on_exit();
+    mark(restore);
+    Ok(())
 }
 
 /// Performs the recovery for `marker` against the real taskbar and clears the
@@ -537,10 +549,12 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
             RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(
                 TaskbarHideRestore::FullyHidden,
                 show_kind_for(RawRestorePath::Startup),
+                finish_session_flags,
             )?,
             RecoveryAction::SetAppbarState(state) => win32::restore_taskbar_raw(
                 TaskbarHideRestore::HoverReveal(state),
                 show_kind_for(RawRestorePath::Startup),
+                finish_session_flags,
             )?,
         }
     }
@@ -617,7 +631,10 @@ fn restore_for_panic() {
         return;
     }
     for restore in techniques {
-        let _ = win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook));
+        // The panic hook shows bare, which never calls back (and must not
+        // touch the session lock).
+        let _ =
+            win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook), |_| {});
     }
     if let Some(dir) = dir {
         let _ = clear_marker_file(dir);
@@ -638,6 +655,62 @@ mod tests {
 
     fn observed(visible: bool, autohide: TaskbarAutohideState) -> ObservedTaskbar {
         ObservedTaskbar { visible, autohide }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        ShowFull,
+        SetAppbar(TaskbarAutohideState),
+        Marked(TaskbarHideRestore),
+    }
+
+    /// Runs `restore_marked_with` with recording fakes; the OS steps fail when
+    /// `os_fails`. Returns the result and the ordered steps taken.
+    fn run_restore(
+        restore: TaskbarHideRestore,
+        os_fails: bool,
+    ) -> (Result<(), &'static str>, Vec<Step>) {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let outcome = |step: Step| {
+            steps.borrow_mut().push(step);
+            if os_fails { Err("os") } else { Ok(()) }
+        };
+        let result = restore_marked_with(
+            restore,
+            || outcome(Step::ShowFull),
+            |s| outcome(Step::SetAppbar(s)),
+            |r| steps.borrow_mut().push(Step::Marked(r)),
+        );
+        (result, steps.into_inner())
+    }
+
+    #[test]
+    fn restoring_fully_hidden_shows_fully_then_clears_only_that_mark() {
+        let (result, steps) = run_restore(FULLY, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(steps, vec![Step::ShowFull, Step::Marked(FULLY)]);
+    }
+
+    #[test]
+    fn restoring_hover_reveal_sets_the_prior_state_then_clears_only_that_mark() {
+        let (result, steps) = run_restore(HOVER_FROM_AUTO, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            steps,
+            vec![Step::SetAppbar(AutoHidden), Step::Marked(HOVER_FROM_AUTO)]
+        );
+    }
+
+    #[test]
+    fn a_failed_os_restore_leaves_the_mark_in_place() {
+        for restore in [FULLY, HOVER_FROM_VISIBLE] {
+            let (result, steps) = run_restore(restore, true);
+            assert_eq!(result, Err("os"));
+            assert!(
+                !steps.iter().any(|s| matches!(s, Step::Marked(_))),
+                "{steps:?}"
+            );
+        }
     }
 
     #[test]

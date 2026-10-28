@@ -15,7 +15,7 @@
 //!
 //! Drives [`crate::zone_editor::AppState`] from real pointer input. The
 //! taskbar is left as found when the editor opens; a control-box toggle hides
-//! it via [`crate::win32::hide_taskbar`] (mode-aware -- see
+//! it via [`crate::taskbar::hide_taskbar`] (mode-aware -- see
 //! [`crate::profile_store::TaskbarHideMode`]) and shows it again; the toggle
 //! is disabled when the taskbar was already hidden at open. When the
 //! session ends -- Save, Cancel, or the window being closed any other way --
