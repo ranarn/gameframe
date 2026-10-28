@@ -114,7 +114,7 @@ pub fn find_tracked_game<'a>(games: &'a [TrackedGame], exe_path: &Path) -> Optio
 /// wherever a call site hides the taskbar (the borderless-toggle strip
 /// direction, the tray "Apply to Window"/launch-detection apply paths, the
 /// manual taskbar-autohide-toggle hotkey, and the zone-editor overlay's
-/// force-on session), via `win32::plan_taskbar_hide`/`win32::hide_taskbar`.
+/// taskbar toggle), via `win32::plan_taskbar_hide`/`win32::hide_taskbar`.
 ///
 /// `#[default]` is `FullyHidden`, so `#[serde(default)]` on
 /// [`Config::taskbar_hide_mode`] resolves a config file without this field to

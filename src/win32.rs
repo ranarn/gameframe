@@ -140,7 +140,7 @@ fn taskbar_autohide_state_from_bool(auto_hide: bool) -> TaskbarAutohideState {
 /// state: recording *which technique* hid the taskbar
 /// (not just an appbar flag value) so a later restore always undoes exactly
 /// that, even if [`crate::profile_store::TaskbarHideMode`] changes in
-/// between (e.g. the zone editor forces the taskbar hidden in `FullyHidden`
+/// between (e.g. the zone editor's taskbar toggle hides it in `FullyHidden`
 /// mode, the user flips the setting to `HoverReveal` mid-session, then
 /// closes the editor -- restoring must still call [`show_taskbar`], not
 /// write an appbar state that would do nothing to a `ShowWindow`-hidden
@@ -1066,7 +1066,7 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
 /// Hides the taskbar using whichever technique `mode` selects, remembering
 /// which one was used so it can be undone later -- called by the
 /// taskbar-autohide hotkey's "on" direction (via [`toggle_taskbar_hide`]),
-/// the zone-editor overlay's force-on session, and every
+/// the zone-editor overlay's taskbar toggle, and every
 /// apply-path call site that hides the taskbar for a specific window (via
 /// [`set_taskbar_hide_absolute_armed`]) -- all callers that need a "hide
 /// now, restore exactly this later" round trip rather than a bare absolute
@@ -1529,6 +1529,23 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &TaskbarJudgement) -> boo
                 == TaskbarAutohideState::AutoHidden
         }
     }
+}
+
+/// Whether the taskbar is already hidden by any means, for the zone editor's
+/// one read at open: not `WS_VISIBLE` (a FullyHidden hide), or Windows'
+/// auto-hide flag set (a HoverReveal hide, or the user's own auto-hide
+/// setting). Either way the editor must not take ownership of it. Direct
+/// reads only, no on-screen judgement. `false` when the taskbar cannot be
+/// found.
+///
+/// OS-facing; not exercised by this crate's automated tests -- see module docs.
+pub fn taskbar_hidden_flag() -> bool {
+    let Ok(hwnd) = find_taskbar_window() else {
+        return false;
+    };
+    // Safety: plain query on a live handle.
+    let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    !visible || read_appbar_flags(hwnd) & ABS_AUTOHIDE != 0
 }
 
 /// Toggles the taskbar's hidden/visible state on/off -- the manual global
