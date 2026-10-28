@@ -153,7 +153,6 @@ impl AppState {
                             anchor: p,
                             current: p,
                         };
-                        log::debug!("drawing from corner");
                     }
                     _ => self.reject("`start` is only legal from Empty"),
                 }
@@ -163,7 +162,6 @@ impl AppState {
                 match &mut self.editor {
                     EditorState::Dragging { current, .. } => {
                         *current = p;
-                        log::debug!("live preview updated");
                     }
                     EditorState::Resizing {
                         original,
@@ -176,7 +174,6 @@ impl AppState {
                             y: p.y + offset.y,
                         };
                         *live = apply_handle_drag(*original, *handle, target, self.monitor);
-                        log::debug!("live resize updated");
                     }
                     EditorState::Moving {
                         original,
@@ -184,7 +181,6 @@ impl AppState {
                         live,
                     } => {
                         *live = move_zone(*original, *grab, p, self.monitor);
-                        log::debug!("live move updated");
                     }
                     _ => self.reject("`drag` needs an active draw or resize"),
                 }
@@ -195,15 +191,12 @@ impl AppState {
                     EditorState::Dragging { anchor, current } => {
                         let zone = normalize(*anchor, *current, self.monitor);
                         self.editor = EditorState::Placed { zone };
-                        log::debug!("zone drawn");
                     }
                     EditorState::Resizing { live, .. } => {
                         self.editor = EditorState::Placed { zone: *live };
-                        log::debug!("resize committed");
                     }
                     EditorState::Moving { live, .. } => {
                         self.editor = EditorState::Placed { zone: *live };
-                        log::debug!("move committed");
                     }
                     _ => self.reject("nothing to commit"),
                 }
@@ -219,7 +212,6 @@ impl AppState {
                             offset,
                             live: *zone,
                         };
-                        log::debug!("resizing via {handle:?}");
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -233,7 +225,6 @@ impl AppState {
                             grab: p,
                             live: *zone,
                         };
-                        log::debug!("moving zone");
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -242,7 +233,7 @@ impl AppState {
             Action::Save => match &self.editor {
                 EditorState::Placed { zone, .. } => {
                     let zone = *zone;
-                    log::info!("saved: {zone:?}");
+                    log!("zone editor: saved {zone:?}");
                     Some(SessionOutcome::Saved(zone))
                 }
                 _ => {
@@ -255,14 +246,13 @@ impl AppState {
                 // prototype this was lifted from). The caller (`zone_overlay`) drops the whole
                 // `AppState` as soon as `apply` returns `Some(outcome)`, so it never re-reads
                 // `editor` after a session-ending outcome -- resetting it here would be dead work.
-                log::debug!("cancelled -- discarded any in-progress edit");
                 Some(SessionOutcome::Cancelled)
             }
         }
     }
 
     fn reject(&self, reason: &str) {
-        log::warn!("zone editor reject: {reason}");
+        log!("zone editor: rejected: {reason}");
     }
 
     /// The short user-facing hint for the editor's current state, or `None`
