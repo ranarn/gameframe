@@ -392,6 +392,10 @@ end;
 
 procedure InitializeWizard;
 begin
+  // Only per-user installs are supported (PrivilegesRequired=lowest, so setup
+  // never installs for all users and never writes HKLM). HKLM's Uninstall key
+  // is therefore deliberately not looked up: an admin-mode (HKLM) install
+  // would count as fresh here.
   WasInstalled := RegKeyExists(HKEY_CURRENT_USER, '{#UninstallKey}');
   // Upgrade: remember what the app's toggle last set -- the real Run value.
   // Inno restores its own remembered task selection after this point, so the
@@ -400,10 +404,75 @@ begin
   InitialStartup := WasInstalled and RegValueExists(HKEY_CURRENT_USER, '{#RunKey}', '{#AppName}');
 end;
 
-// Upgrade, first application, and the caller did not choose tasks with /TASKS.
-function ShouldApplyRegistryStartup: Boolean;
+// The value of command-line switch Name ("/NAME=value", or "-NAME=value"), read
+// from ParamStr rather than {param:}: {param:} returns '' both for a missing
+// switch and for an empty "/NAME=", so it can't tell them apart. Found is True
+// when the switch is present at all (including with an empty or no value).
+function CmdLineSwitch(Name: String; var Found: Boolean): String;
+var
+  I, P: Integer;
+  Arg: String;
 begin
-  Result := WasInstalled and not StartupApplied and (ExpandConstant('{param:TASKS|}') = '');
+  Result := '';
+  Found := False;
+  for I := 1 to ParamCount do
+  begin
+    Arg := ParamStr(I);
+    if (Length(Arg) > Length(Name) + 1) and ((Arg[1] = '/') or (Arg[1] = '-')) and
+       (CompareText(Copy(Arg, 2, Length(Name)), Name) = 0) and
+       ((Length(Arg) = Length(Name) + 1) or (Arg[Length(Name) + 2] = '=')) then
+    begin
+      Found := True;
+      P := Length(Name) + 3;
+      Result := Copy(Arg, P, Length(Arg));
+    end;
+  end;
+  // Also catch the bare "/NAME" (length equals Length(Name) + 1).
+  if not Found then
+    for I := 1 to ParamCount do
+    begin
+      Arg := ParamStr(I);
+      if (Length(Arg) = Length(Name) + 1) and ((Arg[1] = '/') or (Arg[1] = '-')) and
+         (CompareText(Copy(Arg, 2, Length(Name)), Name) = 0) then
+        Found := True;
+    end;
+end;
+
+// Whether a comma-separated task list (as in /TASKS or /MERGETASKS) names the
+// startup task, with or without a leading "!".
+function TaskListNamesStartup(List: String): Boolean;
+var
+  Item: String;
+  P: Integer;
+begin
+  Result := False;
+  List := List + ',';
+  repeat
+    P := Pos(',', List);
+    Item := Trim(Copy(List, 1, P - 1));
+    Delete(List, 1, P);
+    if (Length(Item) > 0) and (Item[1] = '!') then
+      Delete(Item, 1, 1);
+    if CompareText(Trim(Item), 'startup') = 0 then
+      Result := True;
+  until List = '';
+end;
+
+// Upgrade, first application, and the caller made no explicit task choice:
+//  - /TASKS (any value, including an explicit empty "/TASKS=" meaning "no
+//    tasks") is honoured as given;
+//  - /MERGETASKS naming startup ("startup" or "!startup") wins over the
+//    registry, so a silent upgrade can force the task either way.
+// Only the HKCU Uninstall key is looked up (see InitializeWizard).
+function ShouldApplyRegistryStartup: Boolean;
+var
+  TasksGiven, MergeGiven: Boolean;
+  MergeValue: String;
+begin
+  CmdLineSwitch('TASKS', TasksGiven);
+  MergeValue := CmdLineSwitch('MERGETASKS', MergeGiven);
+  Result := WasInstalled and not StartupApplied and not TasksGiven and
+            not (MergeGiven and TaskListNamesStartup(MergeValue));
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
