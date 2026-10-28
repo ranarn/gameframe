@@ -101,9 +101,14 @@ impl std::error::Error for ZoneOverlayError {
 /// the [`TaskbarRestoreGuard`] RAII guard held across the call. A panic
 /// mid-session is handled by the panic hook, not the guard (see the module
 /// docs).
+///
+/// `on_tick` is called every frame (at least every
+/// [`crate::instance_channel::QUIT_POLL`]) so the main loop's tray, hotkey and
+/// update events keep being handled while this window blocks that loop.
 pub fn run_zone_editor_overlay(
     initial: Option<Zone>,
     mode: TaskbarHideMode,
+    on_tick: &mut dyn FnMut(),
 ) -> Result<Option<Zone>, ZoneOverlayError> {
     let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
     let monitor = Monitor {
@@ -169,6 +174,7 @@ pub fn run_zone_editor_overlay(
                 hwnd,
                 taskbar,
                 taskbar_mode: mode,
+                on_tick,
             };
             app.strip_frame();
             Ok(Box::new(app))
@@ -310,7 +316,9 @@ fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOption
 
 /// The live egui app backing the overlay window. Torn down entirely when
 /// [`run_zone_editor_overlay`] returns -- nothing here outlives that call.
-struct OverlayApp {
+struct OverlayApp<'a> {
+    /// See [`run_zone_editor_overlay`].
+    on_tick: &'a mut dyn FnMut(),
     state: AppState,
     outcome: Rc<RefCell<Option<SessionOutcome>>>,
     /// The overlay's window, for [`strip_window_frame`] (egui #8750).
@@ -321,7 +329,7 @@ struct OverlayApp {
     taskbar_mode: TaskbarHideMode,
 }
 
-impl eframe::App for OverlayApp {
+impl eframe::App for OverlayApp<'_> {
     /// Fully transparent clear color -- otherwise eframe/wgpu paints an
     /// opaque background behind the egui content even with
     /// `with_transparent(true)` on the viewport.
@@ -330,6 +338,7 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        (self.on_tick)();
         self.strip_frame();
         self.draw_dim_and_zone(ui);
         self.handle_draw_interaction(ui);
@@ -351,7 +360,7 @@ impl eframe::App for OverlayApp {
     }
 }
 
-impl OverlayApp {
+impl OverlayApp<'_> {
     /// Keeps the window frame stripped (egui #8750). Logs each strip, and
     /// each failing frame's error.
     fn strip_frame(&self) {
