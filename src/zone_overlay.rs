@@ -110,7 +110,7 @@ pub fn run_zone_editor_overlay(
     mode: TaskbarHideMode,
     on_tick: &mut dyn FnMut(),
 ) -> Result<Option<Zone>, ZoneOverlayError> {
-    let monitor_geometry = crate::settings_ui::primary_monitor_geometry();
+    let monitor_geometry = crate::win32::primary_monitor_geometry();
     let monitor = Monitor {
         width: monitor_geometry.width,
         height: monitor_geometry.height,

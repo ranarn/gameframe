@@ -33,8 +33,7 @@
 //! process-wide [`OnceLock`], and read back by the callback on every event.
 //! The config itself is deliberately *not* stored here -- the callback
 //! reads the current (cached) config on every foreground-change event (via
-//! `profile_store::load`), as [`crate::app::handle_toggle_borderless`] and
-//! [`crate::app::handle_apply_to_window`] do on each trigger.
+//! `profile_store::load`), as every [`crate::placement::apply_zone`] trigger does.
 //!
 //! # Cargo features
 //!
@@ -50,9 +49,9 @@
 //! the real callback) -- not exercised by this crate's automated tests, per
 //! this crate's convention for OS-facing modules like `tray_ui`/`app`
 //! (verified by hand only). The match-against-tracked-games decision the
-//! callback delegates to ([`crate::app::resolve_auto_apply`], via
-//! [`crate::app::handle_auto_apply_launch`]) is the pure, unit-tested part
-//! -- see that function's own doc comment and tests in `crate::app::tests`.
+//! callback delegates to ([`crate::placement::resolve_auto_apply`], via
+//! [`crate::placement::handle_auto_apply_launch`]) is the pure, unit-tested
+//! part -- see the tests in `crate::placement::tests`.
 //!
 //! # Taskbar auto-restore on window close
 //!
@@ -449,7 +448,7 @@ static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, usize>
 /// window is hung, schedules one re-check for when the limit expires or after
 /// the hung re-check interval (at most one pending per window).
 fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
-    let Some(retry_in) = crate::app::handle_applied_window_drift(config_dir, hwnd) else {
+    let Some(retry_in) = crate::placement::handle_applied_window_drift(config_dir, hwnd) else {
         return;
     };
     let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
@@ -515,7 +514,7 @@ unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usi
 /// change, delivered on the calling thread's message loop (see module
 /// docs). Filters defensively (a null `hwnd`) before delegating the actual
 /// match-against-tracked-games decision and any resulting apply to
-/// [`crate::app::handle_auto_apply_launch`].
+/// [`crate::placement::handle_auto_apply_launch`].
 ///
 /// `idobject`/`idchild`/`ideventthread`/`dwmseventtime` are unused:
 /// `EVENT_SYSTEM_FOREGROUND`'s own documented semantics are specifically
@@ -544,7 +543,7 @@ unsafe extern "system" fn win_event_callback(
     };
 
     let _crumb = crate::watchdog::scoped("foreground hook: auto-apply");
-    crate::app::handle_auto_apply_launch(config_dir, hwnd);
+    crate::placement::handle_auto_apply_launch(config_dir, hwnd);
 }
 
 #[cfg(test)]

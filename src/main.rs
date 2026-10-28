@@ -15,6 +15,7 @@ mod instance_channel;
 mod keyboard_hook;
 mod launch_watcher;
 mod message_box;
+mod placement;
 mod profile_store;
 mod region_calc;
 mod settings_ui;

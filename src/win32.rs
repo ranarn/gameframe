@@ -36,7 +36,7 @@
 //! [`RestoreState`]; the two toggles share no state.
 
 use crate::profile_store::TaskbarHideMode;
-use crate::region_calc::Region;
+use crate::region_calc::{MonitorGeometry, Region};
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
@@ -2112,29 +2112,24 @@ pub(crate) fn resolve_running_window(exe_path: &Path) -> Option<HWND> {
     resolve_hwnd_for_pid(pid)
 }
 
-/// The outcome of a single tracked game's live re-apply attempt (see
-/// `crate::taskbar::live_reapply_running_window`), for the caller (`crate::settings_ui`) to
-/// decide what -- if anything -- to surface in its non-blocking status line.
+/// Queries the primary monitor's geometry via a minimal Win32 call.
 ///
-/// Deliberately has no `NotRunning` variant: whether the game is currently
-/// running is decided by the caller *before* the live re-apply
-/// (`crate::taskbar::live_reapply_running_window`) or a region is ever invoked -- via [`resolve_running_window`] -- so that a not-running
-/// game always short-circuits ahead of any region-resolution error and is
-/// never routed through this type at all (region resolution must never run,
-/// let alone be reported as a failure, for a game that was never actually
-/// running).
-pub(crate) enum LiveApplyOutcome {
-    /// The window was found and successfully repositioned (taskbar-autohide
-    /// may or may not have also been set -- a failure there is only logged,
-    /// never escalated, matching every other apply path's established
-    /// "gate taskbar-set on border-apply success, but don't fail the whole
-    /// operation over a taskbar-only failure" pattern).
-    Applied,
-    /// The window was found, but repositioning it failed (e.g. access
-    /// denied). Deliberately never triggers [`relaunch_elevated`] -- see this
-    /// function's doc comment for why reactive elevation must stay scoped to
-    /// the hotkey path only.
-    Failed(Win32Error),
+/// OS-facing -- not exercised by this crate's automated tests. Only the
+/// primary monitor is supported (see `region_calc` module docs).
+pub fn primary_monitor_geometry() -> MonitorGeometry {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+    // Safety: `GetSystemMetrics` is a simple, side-effect-free Win32 query
+    // that takes a plain integer index and returns a plain integer; no
+    // pointers or lifetimes are involved.
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    MonitorGeometry {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
 }
 
 #[cfg(test)]
