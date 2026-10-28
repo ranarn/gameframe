@@ -391,7 +391,6 @@ pub fn note_session_start_flags(flags: u32) {
 /// hook): logs both values if the appbar flags differ from the session start
 /// (Windows' auto-hide was toggled meanwhile).
 /// Log only; the normal show happens regardless.
-#[cfg_attr(test, allow(dead_code))] // tests fake the OS show that calls it
 pub fn finish_session_flags(flags_now: u32) {
     let start = SESSION_START_FLAGS
         .lock()
@@ -535,21 +534,44 @@ fn os_taskbar_visible() -> Option<bool> {
     win32::observe_taskbar().ok().map(|(visible, _)| visible)
 }
 
-// Tests never touch the real taskbar: the OS-facing steps are no-ops, so the
-// real exit path (`restore_on_exit`) can run against a temp marker directory.
+/// Test builds fake the OS-facing steps (no-ops) so the real exit path
+/// (`restore_on_exit`) can run against a temp marker directory, unless an
+/// `#[ignore]`d real-taskbar test opts in here: those hide the real taskbar
+/// and need the real show to bring it back.
 #[cfg(test)]
-fn os_show_full() -> Result<(), win32::Win32Error> {
-    Ok(())
+pub(crate) static REAL_OS_IN_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn real_os_in_tests() -> bool {
+    REAL_OS_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
-fn os_set_appbar(_: TaskbarAutohideState) -> Result<(), win32::Win32Error> {
-    Ok(())
+fn os_show_full() -> Result<(), win32::Win32Error> {
+    if real_os_in_tests() {
+        win32::show_taskbar_full().map(finish_session_flags)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn os_set_appbar(state: TaskbarAutohideState) -> Result<(), win32::Win32Error> {
+    if real_os_in_tests() {
+        win32::set_appbar_state(state)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 fn os_taskbar_visible() -> Option<bool> {
-    None
+    if real_os_in_tests() {
+        win32::observe_taskbar().ok().map(|(visible, _)| visible)
+    } else {
+        None
+    }
 }
 
 /// Core of [`restore_marked`] with the OS steps and the marker bookkeeping

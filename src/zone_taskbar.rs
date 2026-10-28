@@ -12,8 +12,8 @@
 //!   currently has it hidden.
 //!
 //! The toggle label follows the session's own state, never a per-click OS
-//! re-read. Only the `win32` hide/restore primitives are used, so the
-//! crash-recovery marker ([`crate::taskbar_recovery`]) stays right and the
+//! re-read. Only the marked `taskbar` hide/restore entry points are used, so
+//! the crash-recovery marker ([`crate::taskbar_recovery`]) stays right and the
 //! editor leaves no record behind beyond what they manage. The decisions take
 //! the OS actions as closures, so they are unit tested without a real
 //! taskbar.
