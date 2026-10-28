@@ -338,6 +338,9 @@ impl eframe::App for OverlayApp<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Heartbeat for the hang watchdog; idle again when the frame is built.
+        crate::watchdog::beat();
+        let _idle = crate::watchdog::IdleOnDrop;
         (self.on_tick)();
         self.strip_frame();
         self.draw_dim_and_zone(ui);

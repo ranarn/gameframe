@@ -308,12 +308,14 @@ fn run_event_loop(
     loop {
         // Waiting here is healthy; the label tells an idle pump from a stuck step.
         crate::watchdog::step("event loop: waiting for a message");
+        crate::watchdog::idle();
         // 0 (WM_QUIT) or -1 (error) both mean: stop pumping.
         let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if ret <= 0 {
             return;
         }
         crate::watchdog::step("event loop: dispatching a message");
+        crate::watchdog::beat();
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1220,9 +1222,13 @@ fn show_settings(
         }
     };
     crate::watchdog::step("settings: opening window");
+    // Window and GPU setup can take a while and are not a hang: idle until
+    // Settings' first `ui()` beats; busy again once it has closed.
+    crate::watchdog::idle();
     if let Err(e) = open_settings(config_dir, hotkey_reports, &mut on_tick) {
         log!("failed to open Settings: {e}");
     }
+    crate::watchdog::beat();
     crate::watchdog::step("settings: closed, re-registering hotkeys");
 
     // Settings may have changed the hotkey bindings on disk (Save persists via
