@@ -6,9 +6,9 @@
 //! - Opening the editor leaves the taskbar alone and reads its state once.
 //! - Hidden at open (by a game, the hotkey or the user's own Windows
 //!   auto-hide): the toggle is locked and closing does nothing.
-//! - Visible at open: the toggle hides it with [`win32::hide_taskbar`],
+//! - Visible at open: the toggle hides it with [`taskbar::hide_taskbar`],
 //!   capturing the [`win32::TaskbarHideRestore`], and shows it again with
-//!   [`win32::restore_taskbar`]. Closing restores it only if the session
+//!   [`taskbar::restore_taskbar`]. Closing restores it only if the session
 //!   currently has it hidden.
 //!
 //! The toggle label follows the session's own state, never a per-click OS
@@ -19,6 +19,7 @@
 //! taskbar.
 
 use crate::profile_store::TaskbarHideMode;
+use crate::taskbar;
 use crate::win32;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -97,7 +98,7 @@ impl TaskbarSession {
     /// Performs the toggle with `mode` against the real taskbar, logging a
     /// failure.
     pub(crate) fn toggle(&mut self, mode: TaskbarHideMode) {
-        self.toggle_with(|| win32::hide_taskbar(mode), win32::restore_taskbar);
+        self.toggle_with(|| taskbar::hide_taskbar(mode), taskbar::restore_taskbar);
         if let Some(error) = &self.error {
             log!("zone editor: {error}");
         }
@@ -144,7 +145,7 @@ impl TaskbarRestoreGuard {
 
 impl Drop for TaskbarRestoreGuard {
     fn drop(&mut self) {
-        match restore_on_close(&self.session, win32::restore_taskbar) {
+        match restore_on_close(&self.session, taskbar::restore_taskbar) {
             CloseOutcome::NothingToDo | CloseOutcome::Restored => {}
             CloseOutcome::Busy => log!("zone editor: taskbar state busy at close; not restored"),
             CloseOutcome::Failed(e) => {

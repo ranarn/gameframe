@@ -80,8 +80,8 @@
 //!
 //! The callback delegates the actual "does this closed window match
 //! whatever's currently armed" decision, and the restore itself, to
-//! [`crate::win32::take_armed_taskbar_restore_for_window`]/
-//! [`crate::win32::restore_taskbar`] -- see those functions' doc comments,
+//! [`crate::taskbar::take_armed_taskbar_restore_for_window`]/
+//! [`crate::taskbar::restore_taskbar`] -- see those functions' doc comments,
 //! and `crate::win32`'s private `ARMED_TASKBAR_RESTORE` static, for the
 //! armed-state design (including why an unrelated window's destroy event
 //! is a cheap
@@ -208,8 +208,8 @@ pub fn register_taskbar_restore_watcher() -> Option<HWINEVENTHOOK> {
 /// comment).
 ///
 /// Delegates the actual armed-window match + restore to
-/// [`crate::win32::take_armed_taskbar_restore_for_window`]/
-/// [`crate::win32::restore_taskbar`] -- an unrelated window's destroy event
+/// [`crate::taskbar::take_armed_taskbar_restore_for_window`]/
+/// [`crate::taskbar::restore_taskbar`] -- an unrelated window's destroy event
 /// costs one mutex lock and one pointer comparison inside that call, no
 /// real Win32 call at all, so the common case adds no measurable cost.
 ///
@@ -236,9 +236,9 @@ unsafe extern "system" fn window_destroy_callback(
     crate::win32::forget_applied_window(hwnd);
     cancel_drift_recheck(hwnd);
 
-    if let Some(restore) = crate::win32::take_armed_taskbar_restore_for_window(hwnd) {
+    if let Some(restore) = crate::taskbar::take_armed_taskbar_restore_for_window(hwnd) {
         log!("taskbar auto-restore: armed window {hwnd:?} closed, restoring {restore:?}");
-        if let Err(e) = crate::win32::restore_taskbar(restore) {
+        if let Err(e) = crate::taskbar::restore_taskbar(restore) {
             log!("taskbar auto-restore on window close failed: {e}");
         }
     }

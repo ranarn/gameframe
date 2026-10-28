@@ -20,7 +20,7 @@
 //! Limitation: only the primary taskbar (`Shell_TrayWnd`) is handled;
 //! secondary-monitor taskbars are not touched by GameFrame at all.
 
-use crate::win32::{self, TaskbarAutohideState, TaskbarHideRestore};
+use crate::win32::{self, ShowKind, TaskbarAutohideState, TaskbarHideRestore};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -58,15 +58,6 @@ pub enum RecoveryAction {
     ShowTaskbar,
     /// Write this appbar auto-hide state back.
     SetAppbarState(TaskbarAutohideState),
-}
-
-/// Which `FullyHidden` restore a path performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShowKind {
-    /// A bare `ShowWindow(SW_SHOW)`: one lock-free call, nothing else.
-    Bare,
-    /// `SW_SHOW`, the appbar state re-send and the `HWND_TOP` raise (#52).
-    Full,
 }
 
 /// The restore paths that do not go through the normal in-memory bookkeeping.
@@ -492,7 +483,7 @@ fn currently_hidden() -> HideRecord {
 pub fn restore_on_exit() {
     retry_pending_recovery();
     for restore in currently_hidden().techniques() {
-        if let Err(e) = win32::restore_taskbar(restore) {
+        if let Err(e) = restore_marked(restore) {
             log!("failed to restore taskbar on exit: {e}");
         }
     }
@@ -501,7 +492,7 @@ pub fn restore_on_exit() {
     let visible = win32::observe_taskbar().ok().map(|(visible, _)| visible);
     if needs_exit_safety_show(HID_FULLY_THIS_RUN.load(Ordering::SeqCst), visible) {
         log!("taskbar still hidden at exit although this run hid it; showing it");
-        if let Err(e) = win32::show_taskbar() {
+        if let Err(e) = restore_marked(TaskbarHideRestore::FullyHidden) {
             log!("failed to show the taskbar at exit: {e}");
         }
     }
@@ -512,16 +503,19 @@ pub fn restore_on_exit() {
     persist(*rec);
 }
 
-/// The whole graceful-exit restore: the armed session's hide first, then
-/// [`restore_on_exit`]. Shared by the tray Exit path and `WM_ENDSESSION`;
-/// idempotent, so running both is harmless.
-pub fn restore_all_for_exit() {
-    if let Some(restore) = win32::take_any_armed_taskbar_restore()
-        && let Err(e) = win32::restore_taskbar(restore)
-    {
-        log!("failed to restore taskbar on exit: {e}");
+/// Restores the technique `restore` names and clears its mark. Mirrors
+/// `crate::taskbar::restore_taskbar`, which sits above this module and so
+/// cannot be called from here.
+fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
+    match restore {
+        TaskbarHideRestore::FullyHidden => {
+            // Also ends the FullyHidden session for the flags-changed log.
+            win32::show_taskbar_full(finish_session_flags)?;
+        }
+        TaskbarHideRestore::HoverReveal(state) => win32::set_appbar_state(state)?,
     }
-    restore_on_exit();
+    mark_restored(restore);
+    Ok(())
 }
 
 /// Performs the recovery for `marker` against the real taskbar and clears the
@@ -537,10 +531,12 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
             RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(
                 TaskbarHideRestore::FullyHidden,
                 show_kind_for(RawRestorePath::Startup),
+                finish_session_flags,
             )?,
             RecoveryAction::SetAppbarState(state) => win32::restore_taskbar_raw(
                 TaskbarHideRestore::HoverReveal(state),
                 show_kind_for(RawRestorePath::Startup),
+                finish_session_flags,
             )?,
         }
     }
@@ -617,7 +613,10 @@ fn restore_for_panic() {
         return;
     }
     for restore in techniques {
-        let _ = win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook));
+        // The panic hook shows bare, which never calls back (and must not
+        // touch the session lock).
+        let _ =
+            win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook), |_| {});
     }
     if let Some(dir) = dir {
         let _ = clear_marker_file(dir);
