@@ -15,6 +15,7 @@ mod instance_channel;
 mod keyboard_hook;
 mod launch_watcher;
 mod message_box;
+mod notice;
 mod placement;
 mod profile_store;
 mod region_calc;
@@ -86,6 +87,11 @@ fn main() {
     logging::flush();
     if let Err(e) = result {
         log!("gameframe failed to start: {e}");
+        logging::flush();
+        // The release build has no console: without a box the user sees nothing.
+        notice::notify_blocking(&format!(
+            "GameFrame couldn't start: {e}\n\nSee the log in %APPDATA%\\GameFrame for details."
+        ));
         std::process::exit(1);
     }
 }

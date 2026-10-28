@@ -174,6 +174,12 @@ impl std::error::Error for TrayUiError {
     }
 }
 
+/// The `uID` `tray-icon` gives the shell for its icon: the crate numbers its
+/// icons from 1 with a process-wide counter and GameFrame creates exactly one
+/// (`tray-icon` 0.26 has no accessor for it). A wrong value only makes the
+/// balloon fail, which [`crate::notice::notify`] answers with a message box.
+const TRAY_ICON_UID: u32 = 1;
+
 /// The live system tray icon and its context menu.
 ///
 /// Reference-counted internally by `tray_icon::TrayIcon`; the OS icon
@@ -340,6 +346,12 @@ impl Tray {
         if let Err(e) = self.icon.set_tooltip(Some(text)) {
             log!("couldn't set the tray tooltip: {e}");
         }
+    }
+
+    /// Tells the user `text` right now: a balloon on this icon (see
+    /// [`crate::notice`]), a message box if the OS refuses it. Never blocks.
+    pub fn notify(&self, text: &str) {
+        crate::notice::notify(self.icon.window_handle(), TRAY_ICON_UID, text);
     }
 
     /// Re-reads the registry ([`crate::autostart::is_enabled`], the single

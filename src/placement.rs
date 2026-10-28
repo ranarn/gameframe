@@ -93,10 +93,13 @@ impl Trigger {
 pub(crate) enum Outcome {
     /// The window was placed (or already in place).
     Applied,
-    /// Nothing was attempted: not tracked, no Zone, restored by the user, not
-    /// drifted, or the config could not be read. Already logged where it is
-    /// worth logging.
+    /// Nothing was attempted by an automatic trigger: not tracked, no Zone,
+    /// restored by the user, not drifted, or the config could not be read.
+    /// Already logged where it is worth logging. (A user-triggered apply that
+    /// attempts nothing reports why, as [`Outcome::Declined`].)
     Skipped,
+    /// A user-triggered apply attempted nothing, for this reason.
+    Declined(Declined),
     /// The eligibility filter refused the window (logged).
     Refused,
     /// The Zone does not resolve against the monitor.
@@ -106,6 +109,66 @@ pub(crate) enum Outcome {
     /// A drift event arrived inside the re-apply rate limit: check again after
     /// this long, so a drift that lands inside the limit is still corrected.
     RetryIn(Duration),
+}
+
+/// Why a user-triggered [`apply_zone`] attempted nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Declined {
+    /// The config could not be read.
+    ConfigUnreadable,
+    /// The window's process could not be read.
+    ProcessUnreadable,
+    /// The window's program is not a tracked game.
+    NotTracked,
+    /// No Zone is set.
+    NoZone,
+}
+
+/// The [`Outcome`] for an apply that attempted nothing: automatic triggers stay
+/// quiet ([`Outcome::Skipped`]), the others say why.
+fn declined(trigger: Trigger, reason: Declined) -> Outcome {
+    if trigger.is_automatic() {
+        Outcome::Skipped
+    } else {
+        Outcome::Declined(reason)
+    }
+}
+
+/// The plain-language notice for a failed `outcome` of a `trigger` the user
+/// pressed or clicked ([`Trigger::Tray`], [`Trigger::Hotkey`]), or `None` when
+/// there is nothing to tell: success, an automatic skip, or an access-denied
+/// hotkey press (answered by the elevation request instead).
+pub(crate) fn failure_notice(trigger: Trigger, outcome: &Outcome) -> Option<String> {
+    let text = match outcome {
+        Outcome::Applied | Outcome::Skipped | Outcome::RetryIn(_) => return None,
+        Outcome::Declined(Declined::NoZone) => {
+            "No Zone is set, so nothing was applied. Draw one in Settings first."
+        }
+        Outcome::Declined(Declined::NotTracked) => {
+            "This window's program isn't a tracked game. Add it in Settings, or pick the window under Apply to Window in the tray menu."
+        }
+        Outcome::Declined(Declined::ProcessUnreadable) => {
+            "GameFrame couldn't tell which program owns this window."
+        }
+        Outcome::Declined(Declined::ConfigUnreadable) => {
+            "GameFrame couldn't read its settings file, so nothing was applied. See the log."
+        }
+        Outcome::Refused => {
+            "GameFrame won't move this window (it isn't an ordinary application window). See the log."
+        }
+        Outcome::RegionFailed => {
+            "The Zone doesn't fit the monitor this window is on. Draw it again in Settings."
+        }
+        Outcome::Failed(e) if e.is_window_hung() => {
+            "This window isn't responding, so it couldn't be moved. Try again once it responds."
+        }
+        Outcome::Failed(e) if trigger == Trigger::Hotkey && e.is_access_denied() => return None,
+        Outcome::Failed(e) if e.is_access_denied() => {
+            "Windows denied access to this window. Run GameFrame as administrator to move windows of elevated programs."
+        }
+        Outcome::Failed(e) => return Some(format!("Couldn't move this window: {e}")),
+    };
+    Some(text.to_string())
 }
 
 /// The OS and config calls [`apply_zone`] makes.
@@ -203,7 +266,7 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
             if should_log_failure(ops, hwnd, trigger) {
                 log!("{label}: failed to load config: {e}");
             }
-            return Outcome::Skipped;
+            return declined(trigger, Declined::ConfigUnreadable);
         }
     };
 
@@ -237,7 +300,7 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
                 "{label}: no Zone is set; {} is tracked but nothing was applied",
                 game.display_name
             );
-            return Outcome::Skipped;
+            return Outcome::Declined(Declined::NoZone);
         };
         (game, zone, true)
     } else {
@@ -245,7 +308,7 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
             if !trigger.is_automatic() {
                 log!("{label}: not applying (the window's process cannot be read)");
             }
-            return Outcome::Skipped;
+            return declined(trigger, Declined::ProcessUnreadable);
         };
         let resolved = if trigger.requires_auto_apply() {
             resolve_auto_apply(&config, &exe_path)
@@ -266,7 +329,12 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
                     );
                 }
             }
-            return Outcome::Skipped;
+            let reason = if config.zone.is_none() {
+                Declined::NoZone
+            } else {
+                Declined::NotTracked
+            };
+            return declined(trigger, reason);
         };
         (game, zone, false)
     };

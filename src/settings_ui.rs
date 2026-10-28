@@ -570,6 +570,7 @@ fn live_apply_status(display_name: &str, outcome: &placement::Outcome) -> Option
     match outcome {
         placement::Outcome::Applied
         | placement::Outcome::Skipped
+        | placement::Outcome::Declined(_)
         | placement::Outcome::RetryIn(_)
         // Refused by the eligibility filter: it would be refused on the next
         // launch too, so the "used next launch" message would be wrong;
@@ -926,6 +927,22 @@ impl std::fmt::Display for SettingsUiError {
             SettingsUiError::Config(e) => write!(f, "failed to load/save the config: {e}"),
             SettingsUiError::Window(e) => write!(f, "failed to open the Settings window: {e}"),
             SettingsUiError::Autostart(e) => write!(f, "failed to change Start with Windows: {e}"),
+        }
+    }
+}
+
+impl SettingsUiError {
+    /// The plain-language notice for the user when Settings could not open or
+    /// its Save did not go through (the technical detail stays in the log).
+    pub(crate) fn notice(&self) -> &'static str {
+        match self {
+            SettingsUiError::Config(_) => {
+                "Settings couldn't read or write GameFrame's settings file, so your changes may not have been saved. See the log."
+            }
+            SettingsUiError::Window(_) => "Settings couldn't open its window. See the log.",
+            SettingsUiError::Autostart(_) => {
+                "Your settings were saved, but Start with Windows couldn't be changed. See the log."
+            }
         }
     }
 }
@@ -2203,6 +2220,24 @@ mod tests {
         state.apply_external_cursor_enabled(true);
 
         assert_eq!(state.cursor.size, size);
+    }
+
+    #[test]
+    fn settings_errors_map_to_distinct_plain_language_notices() {
+        let save = SettingsUiError::Config(ProfileStoreError::Io(std::io::Error::other("disk")));
+        let autostart =
+            SettingsUiError::Autostart(AutostartError::CurrentExe(std::io::Error::other("exe")));
+
+        assert!(save.notice().contains("settings file"));
+        assert!(autostart.notice().contains("Start with Windows"));
+        assert_ne!(save.notice(), autostart.notice());
+    }
+
+    #[test]
+    fn a_declined_live_reapply_stays_off_the_status_line() {
+        let declined = placement::Outcome::Declined(placement::Declined::NoZone);
+
+        assert_eq!(live_apply_status("Thing", &declined), None);
     }
 
     #[test]

@@ -483,7 +483,10 @@ fn drain_events(
     crate::watchdog::step("drain_events: tray menu events");
     while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
-            placement::apply_zone(config_dir, target_hwnd, Trigger::Tray);
+            let outcome = placement::apply_zone(config_dir, target_hwnd, Trigger::Tray);
+            if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
+                tray.notify(&notice);
+            }
             // A newly tracked game gets the game cursor right away.
             cursor_overlay.reload(config_dir);
             continue;
@@ -558,7 +561,7 @@ fn drain_events(
         }
         match action {
             Some(HotkeyAction::ToggleBorderless) => {
-                if handle_toggle_borderless(config_dir) {
+                if handle_toggle_borderless(config_dir, tray) {
                     // GameFrame relaunched itself elevated to complete a
                     // manipulation that failed for lack of permissions;
                     // this (unelevated) instance's job is done.
@@ -603,8 +606,9 @@ fn drain_events(
 ///
 /// Returns `true` if GameFrame just relaunched itself elevated and this
 /// process should exit (see [`win32::relaunch_elevated`]); `false` in every
-/// other case (success, or a failure that was just logged).
-fn handle_toggle_borderless(config_dir: &Path) -> bool {
+/// other case (success, or a failure that was just logged and shown to the
+/// user through `tray`, at most once per press).
+fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
     let Some(fg_hwnd) = win32::foreground_window() else {
         log!("borderless toggle: no foreground window; ignoring");
         return false;
@@ -617,13 +621,20 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
                 if !e.is_access_denied() && !e.is_window_hung() {
                     log!("borderless toggle failed: {e}");
                 }
+                if let Some(notice) = restore_failure_notice(&e) {
+                    tray.notify(&notice);
+                }
                 e
             }
         }
     } else {
-        match placement::apply_zone(config_dir, fg_hwnd, Trigger::Hotkey) {
+        let outcome = placement::apply_zone(config_dir, fg_hwnd, Trigger::Hotkey);
+        if let Some(notice) = placement::failure_notice(Trigger::Hotkey, &outcome) {
+            tray.notify(&notice);
+        }
+        match outcome {
             Outcome::Failed(e) => e,
-            // Placed, or skipped and already logged.
+            // Placed, or declined/skipped and already reported.
             _ => return false,
         }
     };
@@ -636,6 +647,18 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// The notice for a failed restore of the foreground window by the borderless
+/// hotkey. An access-denied press is answered by the elevation request instead.
+fn restore_failure_notice(error: &win32::Win32Error) -> Option<String> {
+    if error.is_access_denied() {
+        None
+    } else if error.is_window_hung() {
+        Some("This window isn't responding, so its border couldn't be restored. Try again once it responds.".to_string())
+    } else {
+        Some(format!("Couldn't restore this window: {error}"))
+    }
 }
 
 /// Whether one of the tray's update message boxes is open.
@@ -799,6 +822,7 @@ fn show_settings(
     crate::watchdog::idle();
     if let Err(e) = open_settings(config_dir, hotkey_reports, &mut on_tick) {
         log!("failed to open Settings: {e}");
+        tray.notify(e.notice());
     }
     crate::watchdog::beat();
     crate::watchdog::step("settings: closed, re-registering hotkeys");
@@ -812,7 +836,13 @@ fn show_settings(
     // evaluates the right side first, so every unchanged key failed with
     // "already registered" and all hotkeys went dead after any Settings visit.
     drop(hotkeys.take());
+    let previous_reports = std::mem::take(hotkey_reports);
     (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
+    // Right after Save, not only on reopening Settings: one notice for the
+    // bindings that just started failing (not for ones already reported).
+    if let Some(notice) = crate::hotkeys::new_failure_notice(&previous_reports, hotkey_reports) {
+        tray.notify(&notice);
+    }
     sync_hang_watchdog(config_dir, false);
     cursor_overlay.reload(config_dir);
     tray.sync_start_with_windows_check();
@@ -892,6 +922,24 @@ mod tests {
                 action
             ));
         }
+    }
+
+    #[test]
+    fn a_failed_restore_is_explained_unless_elevation_answers_it() {
+        use crate::win32::Win32Error;
+        let denied = Win32Error::Os(std::io::Error::from_raw_os_error(5));
+
+        assert_eq!(restore_failure_notice(&denied), None);
+        assert!(
+            restore_failure_notice(&Win32Error::WindowHung)
+                .unwrap()
+                .contains("isn't responding")
+        );
+        assert!(
+            restore_failure_notice(&Win32Error::WindowMinimized)
+                .unwrap()
+                .starts_with("Couldn't restore")
+        );
     }
 
     #[test]
