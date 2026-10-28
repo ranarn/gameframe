@@ -156,6 +156,8 @@ function TranslateMessage(var Msg: TMsg): Longint;
   external 'TranslateMessage@user32.dll stdcall';
 function DispatchMessage(var Msg: TMsg): Longint;
   external 'DispatchMessageW@user32.dll stdcall';
+function GetTickCount: Cardinal;
+  external 'GetTickCount@kernel32.dll stdcall';
 function CreateFile(FileName: String; Access, ShareMode, Security, Disposition, Flags, Template: Longint): Longint;
   external 'CreateFileW@kernel32.dll stdcall';
 
@@ -186,18 +188,26 @@ begin
   end;
 end;
 
+// Milliseconds since a GetTickCount reading (unsigned, so it survives the
+// 49-day wrap).
+function ElapsedSince(Start: Cardinal): Integer;
+begin
+  Result := Integer(GetTickCount - Start);
+end;
+
 // Sleeps for the given time in short slices, pumping the message queue between
 // them so the wizard keeps repainting and answering the user.
 procedure PumpSleep(Ms: Integer);
 var
-  Waited: Integer;
+  Start: Cardinal;
 begin
-  Waited := 0;
-  while Waited < Ms do
+  // Real elapsed time, not a count of slices: a modal dialog (the Cancel
+  // confirmation) inside PumpMessages must not stretch the wait.
+  Start := GetTickCount;
+  while ElapsedSince(Start) < Ms do
   begin
     PumpMessages;
     Sleep(50);
-    Waited := Waited + 50;
   end;
   PumpMessages;
 end;
@@ -251,18 +261,23 @@ end;
 // True while something still holds gameframe.exe open without write sharing,
 // i.e. the process image is still mapped. The mutex disappears while the
 // process is still shutting down, so it does not prove the file is replaceable.
-// Only a sharing violation counts as locked; any other failure (missing file on
-// a fresh install, access denied on a read-only or ACL-protected exe) is
-// treated as unlocked on purpose -- waiting would not help, and the wait is
-// only an optimisation before Inno's own copy retry.
+// Any open failure except "not found" counts as locked: a running exe may be
+// reported as a sharing violation or another code. A missing file (fresh
+// install: ERROR_FILE_NOT_FOUND, or ERROR_PATH_NOT_FOUND when {app} does not
+// exist yet) is unlocked. The wait is capped and only an optimisation before
+// Inno's own copy retry, so a permanently unopenable exe (e.g. an ACL-protected
+// one) costs at most ExitWaitMs.
 function ExeLocked: Boolean;
 var
-  Handle: Longint;
+  Handle, LastError: Longint;
 begin
   Handle := CreateFile(ExpandConstant('{app}\{#AppExe}'), $40000000 { GENERIC_WRITE },
                        0 { no sharing }, 0, 3 { OPEN_EXISTING }, 0, 0);
   if Handle = -1 { INVALID_HANDLE_VALUE } then
-    Result := DLLGetLastError = 32 { ERROR_SHARING_VIOLATION }
+    begin
+      LastError := DLLGetLastError;
+      Result := (LastError <> 2 { ERROR_FILE_NOT_FOUND }) and (LastError <> 3 { ERROR_PATH_NOT_FOUND });
+    end
   else
   begin
     Result := False;
@@ -274,28 +289,28 @@ end;
 // that follows does not hit the lock of a process that is still exiting.
 procedure WaitForExeUnlocked;
 var
-  Waited: Integer;
+  Start: Cardinal;
   Locked: Boolean;
 begin
-  Waited := 0;
+  Start := GetTickCount;
   Locked := ExeLocked;
-  while Locked and (Waited < {#ExitWaitMs}) do
+  while Locked and (ElapsedSince(Start) < {#ExitWaitMs}) do
   begin
     PumpSleep(100);
-    Waited := Waited + 100;
     Locked := ExeLocked;
   end;
   if Locked then
     Log('gameframe.exe is still locked; continuing (the file copy retries)')
   else
-    Log(Format('gameframe.exe is writable after %d ms', [Waited]));
+    Log(Format('gameframe.exe is writable after %d ms', [ElapsedSince(Start)]));
 end;
 
 // Tries to get GameFrame out of the way. False when it is still running and
 // setup cannot stop it (typically because it is elevated).
-function StopGameFrame: Boolean;
+function StopGameFrameCore: Boolean;
 var
-  ResultCode, Waited, QuitWait: Integer;
+  ResultCode, QuitWait: Integer;
+  Start: Cardinal;
 begin
   // A running gameframe.exe locks the file being replaced/removed. Ask it to
   // exit through its normal path (restores the taskbar and borderless
@@ -321,12 +336,9 @@ begin
     // Older build: nothing will act on the request, so only allow for the
     // startup race where the window appears just after the mutex.
     QuitWait := {#NoWindowWaitMs};
-  Waited := 0;
-  while GameFrameRunning and (Waited < QuitWait) do
-  begin
+  Start := GetTickCount;
+  while GameFrameRunning and (ElapsedSince(Start) < QuitWait) do
     PumpSleep(100);
-    Waited := Waited + 100;
-  end;
   if GameFrameRunning then
   begin
     Log('GameFrame did not quit in time; force-killing it');
@@ -342,18 +354,40 @@ begin
       Exit;
     end;
     // taskkill succeeded: a slow exit is not elevation, so keep waiting.
-    Waited := 0;
-    while GameFrameRunning and (Waited < {#KillWaitMs}) do
-    begin
+    Start := GetTickCount;
+    while GameFrameRunning and (ElapsedSince(Start) < {#KillWaitMs}) do
       PumpSleep(100);
-      Waited := Waited + 100;
-    end;
     if GameFrameRunning then
       Log('GameFrame is still running after a successful taskkill; continuing');
   end
   else
     Log('GameFrame quit cleanly');
   WaitForExeUnlocked;
+end;
+
+// StopGameFrameCore with the wizard's Next/Back buttons disabled for the
+// duration, so they can't be clicked mid-wait (the pump keeps the wizard live).
+// Cancel stays enabled and goes through Inno's own confirmation. Setup only:
+// the uninstaller has no WizardForm. Prior states are restored, not forced on.
+function StopGameFrame: Boolean;
+var
+  NextWas, BackWas: Boolean;
+begin
+  if IsUninstaller then
+  begin
+    Result := StopGameFrameCore;
+    Exit;
+  end;
+  NextWas := WizardForm.NextButton.Enabled;
+  BackWas := WizardForm.BackButton.Enabled;
+  WizardForm.NextButton.Enabled := False;
+  WizardForm.BackButton.Enabled := False;
+  try
+    Result := StopGameFrameCore;
+  finally
+    WizardForm.NextButton.Enabled := NextWas;
+    WizardForm.BackButton.Enabled := BackWas;
+  end;
 end;
 
 // StopGameFrame, with the "cannot stop it" case handed to the user: an
@@ -407,10 +441,10 @@ end;
 // The value of command-line switch Name ("/NAME=value", or "-NAME=value"), read
 // from ParamStr rather than {param:}: {param:} returns '' both for a missing
 // switch and for an empty "/NAME=", so it can't tell them apart. Found is True
-// when the switch is present at all (including with an empty or no value).
+// when the switch is present as "/NAME=" (value possibly empty); a bare "/NAME" is not found.
 function CmdLineSwitch(Name: String; var Found: Boolean): String;
 var
-  I, P: Integer;
+  I: Integer;
   Arg: String;
 begin
   Result := '';
@@ -418,24 +452,16 @@ begin
   for I := 1 to ParamCount do
   begin
     Arg := ParamStr(I);
-    if (Length(Arg) > Length(Name) + 1) and ((Arg[1] = '/') or (Arg[1] = '-')) and
+    // Only "/NAME=" counts: a bare "/NAME" has no value to honour, so it is not
+    // an explicit choice.
+    if (Length(Arg) >= Length(Name) + 2) and ((Arg[1] = '/') or (Arg[1] = '-')) and
        (CompareText(Copy(Arg, 2, Length(Name)), Name) = 0) and
-       ((Length(Arg) = Length(Name) + 1) or (Arg[Length(Name) + 2] = '=')) then
+       (Arg[Length(Name) + 2] = '=') then
     begin
       Found := True;
-      P := Length(Name) + 3;
-      Result := Copy(Arg, P, Length(Arg));
+      Result := Copy(Arg, Length(Name) + 3, Length(Arg));
     end;
   end;
-  // Also catch the bare "/NAME" (length equals Length(Name) + 1).
-  if not Found then
-    for I := 1 to ParamCount do
-    begin
-      Arg := ParamStr(I);
-      if (Length(Arg) = Length(Name) + 1) and ((Arg[1] = '/') or (Arg[1] = '-')) and
-         (CompareText(Copy(Arg, 2, Length(Name)), Name) = 0) then
-        Found := True;
-    end;
 end;
 
 // Whether a comma-separated task list (as in /TASKS or /MERGETASKS) names the
