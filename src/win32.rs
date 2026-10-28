@@ -96,8 +96,8 @@ impl RestoreState {
 }
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 /// The current on/off state of the taskbar auto-hide toggle -- fully
@@ -444,12 +444,12 @@ fn set_window_ex_style(hwnd: HWND, ex_style: u32) -> Result<(), Win32Error> {
 
 /// Writes a window long (`GWL_STYLE` or `GWL_EXSTYLE`) with the
 /// `SetLastError(0)` / zero-return protocol described on [`set_window_style`].
-fn set_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: u32) -> Result<(), Win32Error> {
+fn set_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, value: u32) -> Result<(), Win32Error> {
     // Safety: `hwnd` is a live handle; `SetWindowLongPtrW` performs no reads
-    // besides `hwnd`/`style` and takes no pointers.
+    // besides `hwnd`/`value` and takes no pointers.
     unsafe {
         windows_sys::Win32::Foundation::SetLastError(0);
-        let previous_style = SetWindowLongPtrW(hwnd, index, style as isize);
+        let previous_style = SetWindowLongPtrW(hwnd, index, value as isize);
         if previous_style == 0 {
             let last_error = windows_sys::Win32::Foundation::GetLastError();
             if last_error != 0 {
@@ -498,12 +498,46 @@ fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Err
         return Err(Win32Error::Os(std::io::Error::last_os_error()));
     }
     let rect = placement.rcNormalPosition;
-    Ok(Region {
+    let normal = Region {
         x: rect.left,
         y: rect.top,
         width: rect.right - rect.left,
         height: rect.bottom - rect.top,
-    })
+    };
+    // `rcNormalPosition` is in workspace coordinates for tool windows.
+    if get_window_ex_style(hwnd)? & WS_EX_TOOLWINDOW != 0 {
+        let origin = work_area_origin(hwnd)?;
+        return Ok(workspace_to_screen(normal, origin));
+    }
+    Ok(normal)
+}
+
+/// Pure: converts a rect in workspace coordinates (relative to the top-left of
+/// the monitor's work area, as `rcNormalPosition` is for `WS_EX_TOOLWINDOW`
+/// windows) to screen coordinates, given the work area's screen origin.
+fn workspace_to_screen(region: Region, work_origin: (i32, i32)) -> Region {
+    Region {
+        x: region.x + work_origin.0,
+        y: region.y + work_origin.1,
+        ..region
+    }
+}
+
+/// The screen position of the top-left of the work area of the monitor `hwnd`
+/// is on.
+fn work_area_origin(hwnd: HWND) -> Result<(i32, i32), Win32Error> {
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // Safety: `hwnd` is a live handle; `info` is a valid out-pointer with
+    // `cbSize` set, as `GetMonitorInfoW` requires.
+    let ok = unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &mut info)
+    };
+    if ok == 0 {
+        return Err(Win32Error::Os(std::io::Error::last_os_error()));
+    }
+    Ok((info.rcWork.left, info.rcWork.top))
 }
 
 /// Un-maximizes `hwnd` synchronously, so the style/rect writes that follow
@@ -1152,7 +1186,8 @@ pub(crate) fn is_window_hung_logged(hwnd: HWND) -> bool {
 /// foreground window at all). Reads `hwnd`'s current style itself, so callers
 /// only need a target `HWND` and region.
 ///
-/// Once the style change succeeds, records the window's pre-strip
+/// After the first mutation that took effect (the un-maximize for a maximized
+/// window, otherwise the style change), records the window's pre-strip
 /// style/region as its [`RestoreState`] unless it already has one, so the
 /// borderless hotkey can later restore a window placed by any path (tray
 /// picker, auto-apply, drift re-apply) to its original look. A window that
@@ -1187,6 +1222,14 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         let style = get_window_style(hwnd)?;
         let ex_style = get_window_ex_style(hwnd)?;
         restore_maximized_window(hwnd);
+        // The un-maximize is the first mutation: record the original now, so
+        // a later failure (or a SkipInPlace) cannot strand the window
+        // un-maximized with no way back. Only when it really took effect, so
+        // a window GameFrame cannot change (e.g. elevated) gets no entry.
+        if !is_maximized(hwnd) {
+            lock_store(&RESTORE_STATES)
+                .record_if_absent(hwnd as isize, RestoreState::new(style, ex_style, region));
+        }
         Some((style, ex_style, region))
     } else {
         None
@@ -1211,8 +1254,9 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         ),
     };
     set_window_style(hwnd, strip_border_style(live_style))?;
-    // Recorded once the first mutation succeeded, so a window GameFrame could
-    // not change (e.g. an elevated game) never gets a restore entry; the
+    // Recorded once the style change succeeded (a no-op for a maximized
+    // window, already recorded at its un-maximize), so a window GameFrame
+    // could not change (e.g. an elevated game) never gets a restore entry; the
     // remaining calls below can still fail with the original already safe.
     lock_store(&RESTORE_STATES).record_if_absent(
         hwnd as isize,
@@ -2191,6 +2235,28 @@ mod tests {
         let seen = restore(&store, 1, Ok(()));
 
         assert_eq!(seen, vec![state]);
+    }
+
+    #[test]
+    fn a_tool_window_rect_is_moved_from_workspace_to_screen_coordinates() {
+        let rect = Region {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+
+        let screen = workspace_to_screen(rect, (1920, 40));
+
+        assert_eq!(
+            screen,
+            Region {
+                x: 1930,
+                y: 60,
+                width: 300,
+                height: 200,
+            }
+        );
     }
 
     #[test]
