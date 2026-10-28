@@ -551,6 +551,16 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_outside_any_menu_or_drag_is_not_user_modal() {
+        // The real GetGUIThreadInfo query on this (test) thread, which is in
+        // no menu or move/size loop; an unknown thread id fails and counts as
+        // not modal.
+        let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        assert!(!thread_in_user_modal(current));
+        assert!(!thread_in_user_modal(0));
+    }
+
+    #[test]
     fn a_frozen_busy_heartbeat_is_a_stall_even_when_the_ping_is_answered() {
         let base = Instant::now();
         let mut t = StallTracker::default();
