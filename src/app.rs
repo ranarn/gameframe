@@ -770,7 +770,7 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
                 Ok(()) => return true,
                 Err(relaunch_err) => log!("failed to relaunch elevated: {relaunch_err}"),
             }
-        } else {
+        } else if !e.is_window_hung() {
             log!("borderless toggle failed: {e}");
         }
         return false;
@@ -887,7 +887,9 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
     };
 
     if let Err(e) = win32::apply_borderless_to_window(target_hwnd, target_region) {
-        log!("apply to window failed: {e}");
+        if !e.is_window_hung() {
+            log!("apply to window failed: {e}");
+        }
         return;
     }
     win32::remember_applied_window(target_hwnd);
@@ -990,10 +992,12 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
     };
 
     if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        log!(
-            "launch detection: failed to apply borderless treatment to {}: {e}",
-            tracked_game.display_name
-        );
+        if !e.is_window_hung() {
+            log!(
+                "launch detection: failed to apply borderless treatment to {}: {e}",
+                tracked_game.display_name
+            );
+        }
         return;
     }
     // Lets the location-change watcher re-apply if the game later resizes
@@ -1057,7 +1061,9 @@ pub(crate) fn handle_applied_window_drift(
         );
         return None;
     }
-    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
+    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region)
+        && !e.is_window_hung()
+    {
         log!(
             "drift re-apply: failed for {}: {e}",
             tracked_game.display_name

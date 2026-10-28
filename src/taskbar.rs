@@ -435,7 +435,7 @@ pub fn set_taskbar_hide_absolute_armed(
             let restore = hide_taskbar(mode)?;
             start_taskbar_hide_session(hwnd, restore);
             log!(
-                "taskbar hide for {hwnd:?}: started a session ({mode:?}); {}",
+                "taskbar hide for {hwnd:?}: started a session ({mode:?}); {} (a FullyHidden hide is posted, so visibility may lag)",
                 taskbar_debug_state()
             );
             Ok(())
