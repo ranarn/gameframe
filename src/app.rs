@@ -903,6 +903,8 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         return;
     }
     win32::remember_applied_window(target_hwnd);
+    // A user-requested placement lifts the drift re-apply cap.
+    win32::reset_drift_cap(target_hwnd);
     // Picking the window from the tray is an explicit request, which
     // overrides an earlier hotkey restore of it.
     win32::allow_auto_apply(target_hwnd);
@@ -1062,7 +1064,20 @@ pub(crate) fn handle_applied_window_drift(
     match win32::decide_drift_for_window(hwnd, drifted) {
         win32::DriftDecision::Reapply => {}
         win32::DriftDecision::SkipRateLimited { retry_in } => return Some(retry_in),
-        win32::DriftDecision::SkipNotDrifted => return None,
+        win32::DriftDecision::SkipCapped => {
+            // Logged when the cap first stops a re-apply, not before.
+            if win32::note_drift_capped(hwnd) {
+                log!(
+                    "drift re-apply: {} keeps resizing itself; leaving it alone",
+                    tracked_game.display_name
+                );
+            }
+            return None;
+        }
+        // No re-check timer for either: re-checking is what fights a game.
+        win32::DriftDecision::SkipNotDrifted | win32::DriftDecision::SkipFullscreen => {
+            return None;
+        }
     }
     // Recorded before the eligibility check so a refused window is rate
     // limited (and logged) like any other attempt.

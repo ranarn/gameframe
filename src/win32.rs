@@ -387,7 +387,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::UI::Shell::{
-    ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage, ShellExecuteW,
+    ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, QUERY_USER_NOTIFICATION_STATE,
+    QUNS_RUNNING_D3D_FULL_SCREEN, SHAppBarMessage, SHQueryUserNotificationState, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor, GetForegroundWindow,
@@ -764,11 +765,24 @@ pub fn refresh_applied_window_pids() -> (std::collections::BTreeSet<u32>, bool) 
 /// attempts (and any failure log lines) at about one per second per window.
 const DRIFT_REAPPLY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Consecutive drift re-applies on one window within
+/// [`DRIFT_REAPPLY_CAP_WINDOW`] after which GameFrame stops re-applying it.
+const DRIFT_REAPPLY_CAP: usize = 3;
+
+/// The span [`DRIFT_REAPPLY_CAP`] re-applies must fall in to cap a window.
+const DRIFT_REAPPLY_CAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What to do about a location-change event on an applied window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriftDecision {
     Reapply,
     SkipNotDrifted,
+    /// The window is in exclusive fullscreen (see [`is_fullscreen`]): left alone.
+    SkipFullscreen,
+    /// The window drifted back [`DRIFT_REAPPLY_CAP`] times within
+    /// [`DRIFT_REAPPLY_CAP_WINDOW`] and was re-applied each time; it is left
+    /// alone until the user applies or restores it, or it is destroyed.
+    SkipCapped,
     /// Another attempt on this window happened less than
     /// [`DRIFT_REAPPLY_MIN_INTERVAL`] ago; the event should be re-checked once
     /// `retry_in` has passed.
@@ -781,10 +795,16 @@ pub(crate) enum DriftDecision {
 /// this window's previous re-apply attempt, `None` if it has had none.
 fn decide_drift_reapply(
     drifted: bool,
+    fullscreen: bool,
+    capped: bool,
     since_last_attempt: Option<std::time::Duration>,
 ) -> DriftDecision {
     if !drifted {
         DriftDecision::SkipNotDrifted
+    } else if fullscreen {
+        DriftDecision::SkipFullscreen
+    } else if capped {
+        DriftDecision::SkipCapped
     } else if let Some(since) = since_last_attempt.filter(|d| *d < DRIFT_REAPPLY_MIN_INTERVAL) {
         DriftDecision::SkipRateLimited {
             retry_in: DRIFT_REAPPLY_MIN_INTERVAL - since,
@@ -794,31 +814,64 @@ fn decide_drift_reapply(
     }
 }
 
-/// Time of each window's last drift re-apply attempt, keyed by window handle.
+/// Recent drift re-apply attempts of each window (keyed by window handle) and
+/// the windows that hit [`DRIFT_REAPPLY_CAP`].
 #[derive(Debug, Default)]
 struct DriftAttempts {
-    last: std::collections::BTreeMap<isize, std::time::Instant>,
+    recent: std::collections::BTreeMap<isize, Vec<std::time::Instant>>,
+    capped: std::collections::BTreeSet<isize>,
+    /// Capped windows whose cap is already logged.
+    cap_logged: std::collections::BTreeSet<isize>,
 }
 
 impl DriftAttempts {
     const fn new() -> Self {
         Self {
-            last: std::collections::BTreeMap::new(),
+            recent: std::collections::BTreeMap::new(),
+            capped: std::collections::BTreeSet::new(),
+            cap_logged: std::collections::BTreeSet::new(),
         }
     }
 
     /// Decides for `window` at `now`. Does not record an attempt; the caller
     /// does that with [`Self::record`] once it actually re-applies.
-    fn decide(&self, window: isize, now: std::time::Instant, drifted: bool) -> DriftDecision {
+    fn decide(
+        &self,
+        window: isize,
+        now: std::time::Instant,
+        drifted: bool,
+        fullscreen: bool,
+    ) -> DriftDecision {
         let since = self
-            .last
+            .recent
             .get(&window)
+            .and_then(|attempts| attempts.last())
             .map(|t| now.saturating_duration_since(*t));
-        decide_drift_reapply(drifted, since)
+        decide_drift_reapply(drifted, fullscreen, self.capped.contains(&window), since)
     }
 
+    /// Records a re-apply attempt. The attempt that reaches the cap caps the
+    /// window: later events are skipped ([`DriftDecision::SkipCapped`]).
     fn record(&mut self, window: isize, now: std::time::Instant) {
-        self.last.insert(window, now);
+        let attempts = self.recent.entry(window).or_default();
+        attempts.retain(|t| now.saturating_duration_since(*t) < DRIFT_REAPPLY_CAP_WINDOW);
+        attempts.push(now);
+        if attempts.len() >= DRIFT_REAPPLY_CAP {
+            self.capped.insert(window);
+        }
+    }
+
+    /// Notes that a skipped event of `window` is being reported. True the first
+    /// time since the cap was set, so the caller logs it once.
+    fn note_capped(&mut self, window: isize) -> bool {
+        self.cap_logged.insert(window)
+    }
+
+    /// Forgets `window`'s attempts and lifts its cap.
+    fn reset(&mut self, window: isize) {
+        self.recent.remove(&window);
+        self.capped.remove(&window);
+        self.cap_logged.remove(&window);
     }
 }
 
@@ -833,10 +886,17 @@ pub(crate) fn is_window_minimized(hwnd: HWND) -> bool {
 
 /// Decides whether a drift event on `hwnd` should re-apply the Zone.
 pub(crate) fn decide_drift_for_window(hwnd: HWND, drifted: bool) -> DriftDecision {
+    // Only a drifted window needs the live fullscreen read.
+    let fullscreen = drifted && window_is_fullscreen(hwnd);
     DRIFT_ATTEMPTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .decide(hwnd as isize, std::time::Instant::now(), drifted)
+        .decide(
+            hwnd as isize,
+            std::time::Instant::now(),
+            drifted,
+            fullscreen,
+        )
 }
 
 /// Records now as the time of `hwnd`'s latest drift re-apply attempt.
@@ -845,6 +905,47 @@ pub(crate) fn record_drift_attempt(hwnd: HWND) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .record(hwnd as isize, std::time::Instant::now());
+}
+
+/// True the first time a capped `hwnd`'s event is skipped, so the caller logs
+/// the cap once, when it actually stops a re-apply.
+pub(crate) fn note_drift_capped(hwnd: HWND) -> bool {
+    DRIFT_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .note_capped(hwnd as isize)
+}
+
+/// Lifts `hwnd`'s drift re-apply cap and forgets its recent attempts. Called
+/// for a placement the user asked for (the hotkey or the tray picker).
+pub fn reset_drift_cap(hwnd: HWND) {
+    DRIFT_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .reset(hwnd as isize);
+}
+
+/// Pure decision: is a window in exclusive fullscreen? `d3d_fullscreen` is
+/// `SHQueryUserNotificationState() == QUNS_RUNNING_D3D_FULL_SCREEN`, which is
+/// system-wide, so it only counts for the foreground window. Only the drift
+/// re-apply of a window GameFrame already placed asks: that window sits in the
+/// smaller Zone, so the signal then means the game itself went fullscreen.
+/// Auto-apply never asks, since the same signal can be reported for a
+/// borderless window covering its monitor, which GameFrame must shrink.
+pub(crate) fn is_fullscreen(d3d_fullscreen: bool, foreground: bool) -> bool {
+    d3d_fullscreen && foreground
+}
+
+/// Reads the shell's notification state and applies [`is_fullscreen`] to
+/// `hwnd`. OS-facing.
+pub(crate) fn window_is_fullscreen(hwnd: HWND) -> bool {
+    let mut state: QUERY_USER_NOTIFICATION_STATE = 0;
+    // Safety: `state` is a valid out-pointer.
+    let d3d = unsafe { SHQueryUserNotificationState(&mut state) } >= 0
+        && state == QUNS_RUNNING_D3D_FULL_SCREEN;
+    // Safety: `GetForegroundWindow` takes no arguments.
+    let foreground = unsafe { GetForegroundWindow() } == hwnd;
+    is_fullscreen(d3d, foreground)
 }
 
 /// Forgets `hwnd` (called when it is destroyed) along with its remembered
@@ -861,8 +962,7 @@ fn unmark_applied_window(hwnd: HWND) {
     DRIFT_ATTEMPTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .last
-        .remove(&(hwnd as isize));
+        .reset(hwnd as isize);
     APPLIED_WINDOWS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1065,7 +1165,10 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
             // pre-strip state was already committed by
             // [`toggle_with_store`], so a partial failure here still leaves
             // the original restorable.
-            ToggleAction::MakeBorderless { region, .. } => apply_borderless_to_window(hwnd, region),
+            ToggleAction::MakeBorderless { region, .. } => {
+                reset_drift_cap(hwnd);
+                apply_borderless_to_window(hwnd, region)
+            }
             // The entry is only removed once all three restore calls
             // succeeded; a failure partway keeps the only copy of the
             // original state so a retry can recover it.
@@ -1970,6 +2073,99 @@ mod tests {
     }
 
     #[test]
+    fn d3d_fullscreen_only_counts_for_the_foreground_window() {
+        assert!(is_fullscreen(true, true));
+        assert!(!is_fullscreen(true, false));
+        assert!(!is_fullscreen(false, true));
+    }
+
+    #[test]
+    fn drift_decision_leaves_a_fullscreen_window_alone() {
+        let attempts = DriftAttempts::default();
+
+        assert_eq!(
+            attempts.decide(1, std::time::Instant::now(), true, true),
+            DriftDecision::SkipFullscreen
+        );
+    }
+
+    #[test]
+    fn drift_reapply_runs_three_times_within_a_minute_then_stops() {
+        let mut attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+
+        for i in 0..3 {
+            let now = t0 + secs(2 * i);
+            assert_eq!(
+                attempts.decide(1, now, true, false),
+                DriftDecision::Reapply,
+                "attempt {} still runs",
+                i + 1
+            );
+            attempts.record(1, now);
+        }
+        // Sticky: even long after the minute, until reset.
+        assert_eq!(
+            attempts.decide(1, t0 + secs(300), true, false),
+            DriftDecision::SkipCapped
+        );
+        // Another window is unaffected.
+        assert_eq!(
+            attempts.decide(2, t0 + secs(5), true, false),
+            DriftDecision::Reapply
+        );
+    }
+
+    #[test]
+    fn a_capped_window_is_reported_once_until_reset() {
+        let mut attempts = DriftAttempts::default();
+
+        assert!(attempts.note_capped(1));
+        assert!(!attempts.note_capped(1));
+        assert!(attempts.note_capped(2), "another window has its own line");
+
+        attempts.reset(1);
+
+        assert!(attempts.note_capped(1), "a reset window reports a new cap");
+    }
+
+    #[test]
+    fn drift_attempts_spread_over_more_than_a_minute_never_cap() {
+        let mut attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+
+        for i in 0..6 {
+            attempts.record(1, t0 + secs(40 * i));
+        }
+        assert_eq!(
+            attempts.decide(1, t0 + secs(240), true, false),
+            DriftDecision::Reapply
+        );
+    }
+
+    #[test]
+    fn resetting_a_window_lifts_its_drift_cap() {
+        let mut attempts = DriftAttempts::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..3 {
+            attempts.record(1, t0 + std::time::Duration::from_secs(i));
+        }
+        assert_eq!(
+            attempts.decide(1, t0 + std::time::Duration::from_secs(10), true, false),
+            DriftDecision::SkipCapped
+        );
+
+        attempts.reset(1);
+
+        assert_eq!(
+            attempts.decide(1, t0 + std::time::Duration::from_secs(10), true, false),
+            DriftDecision::Reapply
+        );
+    }
+
+    #[test]
     fn a_hung_window_is_logged_once_until_it_responds_again() {
         let mut log = HungSkipLog::default();
 
@@ -1996,7 +2192,7 @@ mod tests {
         let attempts = DriftAttempts::default();
 
         assert_eq!(
-            attempts.decide(1, std::time::Instant::now(), false),
+            attempts.decide(1, std::time::Instant::now(), false, false),
             DriftDecision::SkipNotDrifted
         );
     }
@@ -2007,16 +2203,16 @@ mod tests {
         let t0 = std::time::Instant::now();
         let step = std::time::Duration::from_millis;
 
-        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true, false), DriftDecision::Reapply);
         attempts.record(1, t0);
         assert_eq!(
-            attempts.decide(1, t0 + step(400), true),
+            attempts.decide(1, t0 + step(400), true, false),
             DriftDecision::SkipRateLimited {
                 retry_in: step(600)
             }
         );
         assert_eq!(
-            attempts.decide(1, t0 + step(1000), true),
+            attempts.decide(1, t0 + step(1000), true, false),
             DriftDecision::Reapply
         );
     }
@@ -2029,10 +2225,10 @@ mod tests {
         attempts.record(1, t0);
 
         assert!(matches!(
-            attempts.decide(1, t0, true),
+            attempts.decide(1, t0, true, false),
             DriftDecision::SkipRateLimited { .. }
         ));
-        assert_eq!(attempts.decide(2, t0, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(2, t0, true, false), DriftDecision::Reapply);
     }
 
     #[test]
@@ -2040,8 +2236,8 @@ mod tests {
         let attempts = DriftAttempts::default();
         let t0 = std::time::Instant::now();
 
-        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
-        assert_eq!(attempts.decide(1, t0, true), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true, false), DriftDecision::Reapply);
+        assert_eq!(attempts.decide(1, t0, true, false), DriftDecision::Reapply);
     }
 
     #[test]
