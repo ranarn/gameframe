@@ -32,7 +32,7 @@ fn funding_custom_url(funding_yml: &str) -> Option<String> {
             .take_while(|&c| !c.is_whitespace() && !(in_list && matches!(c, ',' | ']')))
             .collect(),
     };
-    url.starts_with("http").then_some(url)
+    url.starts_with("https://").then_some(url)
 }
 
 fn donation_url() -> Option<String> {
@@ -95,6 +95,16 @@ mod tests {
             funding_custom_url("custom: [https://one.example, https://two.example]\n").as_deref(),
             Some("https://one.example")
         );
+    }
+
+    #[test]
+    fn funding_custom_url_yields_none_for_an_empty_or_block_list_or_a_non_https_value() {
+        assert_eq!(funding_custom_url("custom: []\n"), None);
+        assert_eq!(
+            funding_custom_url("custom:\n  - https://one.example\n"),
+            None
+        );
+        assert_eq!(funding_custom_url("custom: http://plain.example\n"), None);
     }
 
     #[test]

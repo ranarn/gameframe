@@ -1,5 +1,6 @@
-//! Modal message boxes titled "GameFrame", shared by the tray's update flow
-//! ([`crate::app`]) and the install flow ([`crate::update_ui`]).
+//! Modal message boxes titled "GameFrame", shared by the tray and first-run
+//! flows ([`crate::app`]), the install flow ([`crate::update_ui`]) and
+//! Settings ([`crate::settings_ui`]).
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW,
