@@ -76,17 +76,6 @@ impl StallTracker {
             });
         }
         self.misses += 1;
-        self.observe_miss(ping_started, now)
-    }
-
-    /// Records a ping that told nothing about the main thread (e.g. the window
-    /// vanished mid-ping). It breaks a run of misses: miss, skip, miss is not
-    /// two in a row.
-    pub fn skip(&mut self) {
-        self.misses = 0;
-    }
-
-    fn observe_miss(&mut self, ping_started: Instant, now: Instant) -> Option<Verdict> {
         let since = *self
             .stalled_since
             .get_or_insert(self.last_answered.unwrap_or(ping_started));
@@ -99,6 +88,13 @@ impl StallTracker {
             return Some(Verdict::Stalled { stalled_for });
         }
         None
+    }
+
+    /// Records a ping that told nothing about the main thread (no window, the
+    /// window vanished mid-ping). It breaks a run of misses: miss, skip, miss
+    /// is not two in a row.
+    pub fn skip(&mut self) {
+        self.misses = 0;
     }
 }
 
@@ -171,15 +167,18 @@ struct Running {
 }
 
 static STATE: Mutex<Option<Running>> = Mutex::new(None);
-/// Watchdog threads currently alive (0 or 1 in practice; tests read it).
+/// Watchdog threads currently alive (tests read it). Normally 0 or 1; it can
+/// read 2 briefly after a disable straight followed by an enable, until the
+/// old thread wakes (its channel is already disconnected, so that is at once)
+/// and exits. Accepted: there is never a lasting double ping.
 static ALIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// Decrements [`ALIVE`] when the thread ends, including by panic.
-struct AliveGuard;
+/// Decrements its counter when the thread ends, including by panic.
+struct AliveGuard(&'static AtomicUsize);
 
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        ALIVE.fetch_sub(1, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -188,6 +187,9 @@ impl Drop for AliveGuard {
 fn ensure_running(slot: &mut Option<Running>, start: impl FnOnce() -> Option<Running>) {
     if slot.as_ref().is_some_and(|r| !r.thread.is_finished()) {
         return;
+    }
+    if slot.is_some() {
+        log!("hang watchdog: its thread had died; restarting it");
     }
     *slot = start();
 }
@@ -210,7 +212,7 @@ pub fn set_enabled(enabled: bool) {
         let spawned = std::thread::Builder::new()
             .name("hang-watchdog".into())
             .spawn(move || {
-                let _alive = AliveGuard;
+                let _alive = AliveGuard(&ALIVE);
                 run(main_thread, rx);
             });
         match spawned {
@@ -241,6 +243,7 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                 warned_no_window = true;
                 log!("hang watchdog: no window to ping yet; idle until it exists");
             }
+            tracker.skip();
             continue;
         };
         warned_no_window = false;
@@ -254,6 +257,7 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                     warned_wrong_thread = true;
                     log!("hang watchdog: the ping window is not on the main thread; not watching");
                 }
+                tracker.skip();
                 continue;
             }
             warned_wrong_thread = false;
@@ -487,7 +491,12 @@ mod tests {
     fn finished_running() -> Running {
         let (stop, _rx) = mpsc::channel();
         let thread = std::thread::spawn(|| {});
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !thread.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "helper thread did not finish within 5 s"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         Running {
@@ -506,6 +515,18 @@ mod tests {
         });
         assert_eq!(started, 1);
         assert!(slot.is_some());
+    }
+
+    #[test]
+    fn a_panicking_thread_still_decrements_its_alive_count() {
+        static COUNT: AtomicUsize = AtomicUsize::new(1);
+        let handle = std::thread::spawn(|| {
+            let _alive = AliveGuard(&COUNT);
+            // The default hook prints the message to stderr; harmless here.
+            panic!("deliberate panic to test the drop guard");
+        });
+        assert!(handle.join().is_err());
+        assert_eq!(COUNT.load(Ordering::SeqCst), 0);
     }
 
     #[test]
