@@ -95,7 +95,7 @@ pub fn run() -> Result<(), TrayUiError> {
     // Needs that channel's window to ping; pings run on their own thread.
     sync_hang_watchdog(&config_dir, true);
 
-    // First run (no Zone yet): open the zone editor once, now that the tray is up.
+    // First run (no Zone yet): offer to set one up once, now that the tray is up.
     prompt_for_zone_if_unset(&config_dir);
 
     let (hotkeys, hotkey_reports) = register_hotkeys(&config_dir);
@@ -164,13 +164,45 @@ pub fn run() -> Result<(), TrayUiError> {
     Ok(())
 }
 
-/// Opens the zone editor blank when the loaded config has no Zone (see
-/// [`profile_store::should_prompt_for_zone`]), persisting the Zone on Save
-/// exactly like Settings' "Draw zone" does. Cancel, a close, or any failure
-/// leaves the Zone unset and startup simply continues -- there is no
-/// re-prompt this session. No window is placed here either way.
+/// The user's answer to the first-run Zone prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRunChoice {
+    SetUpNow,
+    Skip,
+}
+
+impl FirstRunChoice {
+    /// Maps the prompt's `MessageBoxW` result: Yes sets up; anything else
+    /// (No, closing the box) skips, so startup never gets stuck.
+    fn from_message_box_result(result: i32) -> Self {
+        if result == IDYES {
+            Self::SetUpNow
+        } else {
+            Self::Skip
+        }
+    }
+}
+
+const FIRST_RUN_PROMPT: &str = "Welcome to GameFrame!\n\n\
+A Zone is the area of your screen that games are placed into.\n\n\
+Yes: set up the Zone now (draw it on screen).\n\
+No: skip for now (set it up later in Settings; Settings stays limited until then).\n\n\
+Set up the Zone now?";
+
+/// When the loaded config has no Zone (see
+/// [`profile_store::should_prompt_for_zone`]), explains what a Zone is and
+/// asks whether to set it up now or skip. "Set up now" opens the zone editor
+/// blank, persisting the Zone on Save exactly like Settings' "Draw zone" does.
+/// Skip, Cancel, a close, or any failure leaves the Zone unset and startup
+/// simply continues -- there is no re-prompt this session. No window is
+/// placed and the taskbar is never touched here.
 ///
-/// OS-facing (opens a real window), so not unit-tested; the decision itself is.
+/// The prompt is a native message box on this (main) thread: its modal loop
+/// pumps messages, so instance-channel commands are queued and handled by the
+/// main loop afterwards, like during the editor.
+///
+/// OS-facing (opens real windows), so not unit-tested; the decision and the
+/// answer mapping are.
 fn prompt_for_zone_if_unset(config_dir: &Path) {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
@@ -180,6 +212,11 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
         }
     };
     if !profile_store::should_prompt_for_zone(&config) {
+        return;
+    }
+
+    let answer = show_message_box(FIRST_RUN_PROMPT, MB_YESNO | MB_ICONINFORMATION);
+    if FirstRunChoice::from_message_box_result(answer) == FirstRunChoice::Skip {
         return;
     }
 
@@ -1247,6 +1284,23 @@ mod tests {
     use crate::profile_store::{Config, TrackedGame, Zone};
     use global_hotkey::hotkey::HotKey;
     use std::path::PathBuf;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDNO;
+
+    #[test]
+    fn first_run_choice_sets_up_only_on_yes() {
+        assert_eq!(
+            FirstRunChoice::from_message_box_result(IDYES),
+            FirstRunChoice::SetUpNow
+        );
+        assert_eq!(
+            FirstRunChoice::from_message_box_result(IDNO),
+            FirstRunChoice::Skip
+        );
+        assert_eq!(
+            FirstRunChoice::from_message_box_result(0),
+            FirstRunChoice::Skip
+        );
+    }
 
     #[test]
     fn should_block_untracked_toggle_blocks_an_untracked_strip() {

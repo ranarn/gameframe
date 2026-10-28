@@ -430,6 +430,18 @@ pub enum ZoneView {
     Unresolvable(String),
 }
 
+/// Whether the Games and Cursor tabs' controls are usable: only once a Zone
+/// exists (even one that doesn't fit this monitor -- the user already made
+/// it). Without one they are greyed out and the Zone section says why.
+pub fn zone_dependent_tabs_enabled(zone: Option<&Zone>) -> bool {
+    zone.is_some()
+}
+
+/// Shown on the greyed-out tabs while no Zone exists.
+const ZONE_REQUIRED_NOTE: &str = "A Zone must be configured first. Open the \"Zone, hotkeys & taskbar\" tab and click \"Draw zone\".";
+/// Shown in the Zone section itself while no Zone exists.
+const ZONE_SECTION_REQUIRED_NOTE: &str = "A Zone must be configured first: click \"Draw zone\" to set the screen area games are placed into.";
+
 /// Decides what the Zone section shows for `zone` against `monitor` -- the
 /// pure data behind the thumbnail painter and the red unresolvable reason.
 pub fn zone_view(zone: Option<&Zone>, monitor: &MonitorGeometry) -> ZoneView {
@@ -1860,6 +1872,7 @@ impl SettingsApp<'_> {
                     }
                     None => {
                         ui.label("No zone set");
+                        ui.colored_label(egui::Color32::YELLOW, ZONE_SECTION_REQUIRED_NOTE);
                     }
                 }
                 if let ZoneView::Unresolvable(reason) = &view {
@@ -2011,8 +2024,20 @@ impl eframe::App for SettingsApp<'_> {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.state.tab {
-                    SettingsTab::Games => self.games_section(ui),
-                    SettingsTab::Cursor => self.cursor_section(ui),
+                    SettingsTab::Games | SettingsTab::Cursor => {
+                        let enabled = zone_dependent_tabs_enabled(self.state.zone.as_ref());
+                        if !enabled {
+                            ui.colored_label(egui::Color32::YELLOW, ZONE_REQUIRED_NOTE);
+                            ui.add_space(4.0);
+                        }
+                        ui.add_enabled_ui(enabled, |ui| {
+                            if self.state.tab == SettingsTab::Games {
+                                self.games_section(ui);
+                            } else {
+                                self.cursor_section(ui);
+                            }
+                        });
+                    }
                     SettingsTab::General => self.general_section(ui),
                     SettingsTab::About => Self::about_section(ui),
                 });
@@ -2926,6 +2951,18 @@ mod tests {
         let position = centered_window_position(&monitor, [440.0, 560.0]);
 
         assert_eq!(position, [-1500.0, 440.0]);
+    }
+
+    #[test]
+    fn zone_dependent_tabs_are_disabled_without_a_zone_and_enabled_with_one() {
+        assert!(!zone_dependent_tabs_enabled(None));
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert!(zone_dependent_tabs_enabled(Some(&zone)));
     }
 
     #[test]
