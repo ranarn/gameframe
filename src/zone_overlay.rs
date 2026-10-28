@@ -59,7 +59,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// it stays usable at 100-200 %).
 const HANDLE_DRAW_PT: f32 = 28.0;
 /// Grab size of a handle, in egui points; larger than the drawn handle. Edge
-/// bands extend half of this on each side of the outline.
+/// bands extend half of this on each side of the outline, capped at a third
+/// of the Zone's width/height so a small Zone keeps a Move area.
 const HANDLE_HIT_PT: f32 = 40.0;
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
