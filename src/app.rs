@@ -33,7 +33,7 @@
 //! The taskbar is also restored automatically, with no hotkey press required:
 //! every apply-path call site above that hides the taskbar for a specific
 //! window arms [`taskbar::set_taskbar_hide_absolute_armed`]'s remembered
-//! restore for that window (see `win32::ARMED_TASKBAR_RESTORE`'s doc
+//! restore for that window (see `taskbar::ARMED_TASKBAR_RESTORE`'s doc
 //! comment). [`crate::launch_watcher`] registers a second `SetWinEventHook`
 //! scoped to `EVENT_OBJECT_DESTROY` and restores the taskbar automatically
 //! when the armed window closes; [`run`] additionally checks the same armed

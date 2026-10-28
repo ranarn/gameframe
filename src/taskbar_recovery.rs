@@ -480,7 +480,10 @@ fn currently_hidden() -> HideRecord {
 /// (e.g. the manual hotkey toggle), restore it, which also clears the marker.
 /// A marker kept by a failed startup recovery is left alone unless the retry
 /// now succeeds.
-pub fn restore_on_exit() {
+///
+/// Call `crate::taskbar::restore_all_for_exit` instead: it also restores the
+/// armed session first, which a direct call here would skip.
+pub(crate) fn restore_on_exit() {
     retry_pending_recovery();
     for restore in currently_hidden().techniques() {
         if let Err(e) = restore_marked(restore) {
@@ -503,10 +506,10 @@ pub fn restore_on_exit() {
     persist(*rec);
 }
 
-/// Restores the technique `restore` names and clears its mark. Mirrors
-/// `crate::taskbar::restore_taskbar`, which sits above this module and so
-/// cannot be called from here.
-fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
+/// Restores the technique `restore` names and clears its mark. The single
+/// marked restore: `crate::taskbar::restore_taskbar`/`show_taskbar` and the
+/// exit path all go through it.
+pub(crate) fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
     match restore {
         TaskbarHideRestore::FullyHidden => {
             // Also ends the FullyHidden session for the flags-changed log.

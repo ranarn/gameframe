@@ -964,7 +964,7 @@ pub(crate) fn show_taskbar_full(on_flags: impl FnOnce(u32)) -> Result<(), Win32E
 /// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar_full`] and the panic
 /// hook's [`restore_taskbar_raw`]: one call, no marker bookkeeping, no lock,
 /// nothing else, so it stays safe there. Returns the taskbar handle.
-pub(crate) fn show_taskbar_window() -> Result<HWND, Win32Error> {
+fn show_taskbar_window() -> Result<HWND, Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Safety: `hwnd` is a live handle just resolved above; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
