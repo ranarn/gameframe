@@ -122,6 +122,12 @@ function RegisterWindowMessage(Name: String): Longint;
   external 'RegisterWindowMessageW@user32.dll stdcall';
 function PostMessage(Wnd, Msg, WParam, LParam: Longint): Longint;
   external 'PostMessageW@user32.dll stdcall';
+function GetWindowThreadProcessId(Wnd: Longint; var ProcessId: Longint): Longint;
+  external 'GetWindowThreadProcessId@user32.dll stdcall';
+function OpenProcess(Access, InheritHandle, ProcessId: Longint): Longint;
+  external 'OpenProcess@kernel32.dll stdcall';
+function CloseHandle(Handle: Longint): Longint;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 function GameFrameRunning: Boolean;
 begin
@@ -143,7 +149,32 @@ begin
     Log('quit request: posted');
 end;
 
-procedure StopGameFrame;
+// True when the running GameFrame is one this (unelevated) setup cannot
+// terminate: it runs at a higher integrity level (#69 elevated relaunch), so
+// its quit message is blocked by UIPI and taskkill is refused. Probed by asking
+// for PROCESS_TERMINATE on the command window's owner. False when the window
+// is not found (older build) -- the taskkill outcome decides then.
+function GameFrameRunsElevated: Boolean;
+var
+  Wnd, Pid, Process: Longint;
+begin
+  Result := False;
+  Wnd := FindWindowEx(-3 { HWND_MESSAGE }, 0, '{#CommandClass}', '');
+  if Wnd = 0 then
+    Exit;
+  GetWindowThreadProcessId(Wnd, Pid);
+  if Pid = 0 then
+    Exit;
+  Process := OpenProcess(1 { PROCESS_TERMINATE }, 0, Pid);
+  if Process = 0 then
+    Result := True
+  else
+    CloseHandle(Process);
+end;
+
+// Tries to get GameFrame out of the way. False when it is still running
+// because it is elevated and setup cannot stop it.
+function StopGameFrame: Boolean;
 var
   ResultCode, Waited: Integer;
 begin
@@ -151,8 +182,15 @@ begin
   // exit through its normal path (restores the taskbar and borderless
   // windows, removes the tray icon) and wait for its single-instance mutex to
   // go; force-kill only if it does not. Nothing to do when it is not running.
+  Result := True;
   if not GameFrameRunning then
     Exit;
+  if GameFrameRunsElevated then
+  begin
+    Log('GameFrame runs elevated; setup cannot stop it');
+    Result := False;
+    Exit;
+  end;
   RequestGameFrameQuit;
   Waited := 0;
   while GameFrameRunning and (Waited < {#QuitWaitMs}) do
@@ -164,9 +202,47 @@ begin
   begin
     Log('GameFrame did not quit in time; force-killing it');
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log(Format('taskkill exit code %d', [ResultCode]));
+    Waited := 0;
+    while GameFrameRunning and (Waited < 2000) do
+    begin
+      Sleep(100);
+      Waited := Waited + 100;
+    end;
+    if GameFrameRunning then
+    begin
+      // Quit had no effect and taskkill was refused: an elevated instance
+      // whose command window could not be probed.
+      Log('GameFrame is still running after taskkill (elevated?)');
+      Result := False;
+    end;
   end
   else
     Log('GameFrame quit cleanly');
+end;
+
+// StopGameFrame, with the elevated case handed to the user: an interactive
+// run offers Retry (after quitting GameFrame from the tray) or Cancel; a
+// silent run just fails. True when GameFrame is gone.
+function EnsureGameFrameStopped(Silent: Boolean): Boolean;
+begin
+  Result := StopGameFrame;
+  while not Result do
+  begin
+    if Silent then
+    begin
+      Log('GameFrame is running as administrator and cannot be stopped; failing (silent run)');
+      Exit;
+    end;
+    if MsgBox('GameFrame is running as administrator, so setup cannot close it.'#13#10#13#10 +
+              'Quit GameFrame from its tray icon, then press Retry.',
+              mbError, MB_RETRYCANCEL) <> IDRETRY then
+    begin
+      Log('User cancelled while GameFrame was running as administrator');
+      Exit;
+    end;
+    Result := StopGameFrame;
+  end;
 end;
 
 procedure SelectStartupFromRegistry;
@@ -212,8 +288,12 @@ begin
     SelectStartupFromRegistry;
   Log(Format('startup-task: PrepareToInstall installed=%d registry=%d selected=%d applied=%d', [
     Ord(WasInstalled), Ord(InitialStartup), Ord(WizardIsTaskSelected('startup')), Ord(StartupApplied)]));
-  StopGameFrame;
-  Result := '';
+  if EnsureGameFrameStopped(WizardSilent) then
+    Result := ''
+  else
+    // Non-empty aborts before any file is touched (non-zero exit when silent).
+    Result := 'GameFrame is still running as administrator, so it was not installed. ' +
+              'Quit GameFrame from its tray icon and run setup again.';
 end;
 
 // Whether setup was started with the bare /RELAUNCH switch.
@@ -232,10 +312,20 @@ begin
   Result := (not WasInstalled) or (WizardIsTaskSelected('startup') <> InitialStartup);
 end;
 
+// Uninstall: stop GameFrame before anything is removed; False cancels the
+// uninstall untouched (non-zero exit).
+function InitializeUninstall: Boolean;
+begin
+  Result := EnsureGameFrameStopped(UninstallSilent);
+  if not Result then
+    Log('Uninstall aborted: GameFrame still running');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
+    // Backstop: GameFrame may have been started after InitializeUninstall.
     StopGameFrame;
     // Remove autostart however it was enabled -- by this installer or by
     // the app's own tray/Settings toggle.
