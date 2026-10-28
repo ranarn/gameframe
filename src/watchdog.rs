@@ -9,7 +9,7 @@
 //! ship without a PDB. The ping interval is seconds, so the idle cost is
 //! negligible. Switched by `Config::log_ui_hangs` through [`set_enabled`].
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
+    GetWindowThreadProcessId, IsHungAppWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
 };
 
 /// Time between pings.
@@ -48,9 +48,61 @@ pub struct StallTracker {
     last_logged: Option<Instant>,
     /// Consecutive unanswered pings; a stall is only reported from the second.
     misses: u32,
+    /// Last heartbeat count seen and when it was first seen at that value.
+    beat_seen: Option<(u64, Instant)>,
+}
+
+/// A reading of the heartbeat the UI code bumps (see [`beat`] and [`idle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beat {
+    /// Bumped at the start of each UI step.
+    pub count: u64,
+    /// `true` between a [`beat`] and the next [`idle`]: the main thread is
+    /// doing work, not waiting for a message. A frozen count only means
+    /// something while busy.
+    pub busy: bool,
 }
 
 impl StallTracker {
+    /// Like [`observe`](Self::observe), plus the heartbeat. A ping answered
+    /// while the thread is inside an outgoing cross-process `SendMessage` is
+    /// no proof of life (Windows lets a sender answer incoming sends), so a
+    /// busy heartbeat that has not moved for the stall threshold is a stall
+    /// even though the ping came back. It is dated from when the frozen count
+    /// was first seen, which can lag the true start by up to one ping interval.
+    pub fn observe_with_beat(
+        &mut self,
+        ping_started: Instant,
+        now: Instant,
+        answered: bool,
+        beat: Beat,
+    ) -> Option<Verdict> {
+        let changed_at = match self.beat_seen {
+            Some((count, at)) if count == beat.count => at,
+            _ => {
+                self.beat_seen = Some((beat.count, now));
+                now
+            }
+        };
+        let frozen = beat.busy && now.saturating_duration_since(changed_at) >= STALL_THRESHOLD;
+        if !(answered && frozen) {
+            return self.observe(ping_started, now, answered);
+        }
+        // Answered but frozen: no run of misses needed, the heartbeat spans time.
+        self.misses = 0;
+        let since = *self.stalled_since.get_or_insert(changed_at);
+        let due = self
+            .last_logged
+            .is_none_or(|t| now.saturating_duration_since(t) >= LOG_INTERVAL);
+        if !due {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(Verdict::Stalled {
+            stalled_for: now.saturating_duration_since(since),
+        })
+    }
+
     /// Records one ping. `ping_started` is when it was sent, `now` when it
     /// returned, `answered` whether the main thread replied in time.
     ///
@@ -114,6 +166,41 @@ impl ErrorReporter {
         }
         self.reported = true;
         Some(code)
+    }
+}
+
+/// Heartbeat count, bumped by the main thread; read by the watchdog thread.
+static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+/// Whether the main thread is working (`true`) or waiting for a message.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Heartbeat: call at the start of each UI step on the main thread (message
+/// dispatch, Settings' and the zone editor's `ui()`). Two relaxed atomic
+/// operations, never blocks.
+pub fn beat() {
+    HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+    BUSY.store(true, Ordering::Relaxed);
+}
+
+/// Marks the main thread as waiting (idle) until the next [`beat`], so a quiet
+/// window that has nothing to redraw is not mistaken for a stall.
+pub fn idle() {
+    BUSY.store(false, Ordering::Relaxed);
+}
+
+/// Calls [`idle`] on drop, so every exit from a `ui()` marks the thread idle.
+pub struct IdleOnDrop;
+
+impl Drop for IdleOnDrop {
+    fn drop(&mut self) {
+        idle();
+    }
+}
+
+fn read_beat() -> Beat {
+    Beat {
+        count: HEARTBEAT.load(Ordering::Relaxed),
+        busy: BUSY.load(Ordering::Relaxed),
     }
 }
 
@@ -226,11 +313,24 @@ pub fn set_enabled(enabled: bool) {
     });
 }
 
+/// Logs once per episode when Windows itself flags the Settings window as hung
+/// (`IsHungAppWindow`); `logged` re-arms once it is responsive again.
+fn log_if_settings_hung(logged: &mut bool) {
+    let hung = crate::instance_channel::find_settings_window()
+        // SAFETY: plain Win32 call; a stale handle only makes it return FALSE.
+        .is_some_and(|hwnd| unsafe { IsHungAppWindow(hwnd) } != 0);
+    if hung && !*logged {
+        log!("Windows reports the Settings window as not responding");
+    }
+    *logged = hung;
+}
+
 fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
     let mut tracker = StallTracker::default();
     let mut errors = ErrorReporter::default();
     let mut warned_no_window = false;
     let mut warned_wrong_thread = false;
+    let mut settings_hung_logged = false;
     loop {
         match stop.recv_timeout(PING_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -290,7 +390,8 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
             }
             (started, ok != 0)
         };
-        match tracker.observe(ping_started, Instant::now(), answered) {
+        log_if_settings_hung(&mut settings_hung_logged);
+        match tracker.observe_with_beat(ping_started, Instant::now(), answered, read_beat()) {
             Some(Verdict::Stalled { stalled_for }) => {
                 // `log!` takes the global log lock: if the main thread is stuck
                 // inside a log write, this line waits for it. Accepted.
@@ -327,6 +428,97 @@ mod tests {
     /// One ping that started at `start` and returned at `end`, unanswered.
     fn miss(t: &mut StallTracker, base: Instant, start: u64, end: u64) -> Option<Verdict> {
         t.observe(secs(base, start), secs(base, end), false)
+    }
+
+    fn busy(count: u64) -> Beat {
+        Beat { count, busy: true }
+    }
+
+    /// An answered ping at second `t`.
+    fn answered_at(t: &mut StallTracker, base: Instant, s: u64, beat: Beat) -> Option<Verdict> {
+        t.observe_with_beat(secs(base, s), secs(base, s), true, beat)
+    }
+
+    #[test]
+    fn a_frozen_busy_heartbeat_is_a_stall_even_when_the_ping_is_answered() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(answered_at(&mut t, base, 0, busy(7)), None);
+        assert_eq!(answered_at(&mut t, base, 2, busy(7)), None);
+        assert_eq!(
+            answered_at(&mut t, base, 3, busy(7)),
+            Some(Verdict::Stalled {
+                stalled_for: Duration::from_secs(3)
+            })
+        );
+    }
+
+    #[test]
+    fn a_moving_heartbeat_is_no_stall() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        for (s, count) in [(0, 1), (3, 2), (6, 3), (9, 4)] {
+            assert_eq!(answered_at(&mut t, base, s, busy(count)), None);
+        }
+    }
+
+    #[test]
+    fn a_frozen_heartbeat_while_idle_is_no_stall() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        let idle = Beat {
+            count: 5,
+            busy: false,
+        };
+        assert_eq!(answered_at(&mut t, base, 0, idle), None);
+        assert_eq!(answered_at(&mut t, base, 30, idle), None);
+    }
+
+    #[test]
+    fn a_heartbeat_stall_repeats_every_ten_seconds_then_recovers() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(answered_at(&mut t, base, 0, busy(1)), None);
+        assert!(answered_at(&mut t, base, 3, busy(1)).is_some());
+        assert_eq!(answered_at(&mut t, base, 6, busy(1)), None);
+        assert_eq!(
+            answered_at(&mut t, base, 13, busy(1)),
+            Some(Verdict::Stalled {
+                stalled_for: Duration::from_secs(13)
+            })
+        );
+        assert_eq!(
+            answered_at(&mut t, base, 16, busy(2)),
+            Some(Verdict::Recovered {
+                stalled_for: Duration::from_secs(16)
+            })
+        );
+    }
+
+    #[test]
+    fn an_unanswered_ping_still_works_through_the_heartbeat_path() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        let beat = busy(1);
+        assert_eq!(
+            t.observe_with_beat(secs(base, 0), secs(base, 3), false, beat),
+            None
+        );
+        assert!(
+            t.observe_with_beat(secs(base, 3), secs(base, 6), false, beat)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn beat_marks_busy_and_idle_clears_it() {
+        let before = read_beat().count;
+        beat();
+        let b = read_beat();
+        assert!(b.busy);
+        assert!(b.count > before);
+        idle();
+        assert!(!read_beat().busy);
     }
 
     #[test]

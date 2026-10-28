@@ -520,7 +520,7 @@ pub fn should_restore_on_end_session(wparam: usize) -> bool {
 }
 
 /// This process's Settings window, if it exists yet.
-fn find_settings_window() -> Option<HWND> {
+pub(crate) fn find_settings_window() -> Option<HWND> {
     let title = wide(SETTINGS_TITLE);
     // SAFETY: plain Win32 calls; `title` outlives them.
     unsafe {

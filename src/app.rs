@@ -308,12 +308,14 @@ fn run_event_loop(
     loop {
         // Waiting here is healthy; the label tells an idle pump from a stuck step.
         crate::watchdog::step("event loop: waiting for a message");
+        crate::watchdog::idle();
         // 0 (WM_QUIT) or -1 (error) both mean: stop pumping.
         let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if ret <= 0 {
             return;
         }
         crate::watchdog::step("event loop: dispatching a message");
+        crate::watchdog::beat();
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
