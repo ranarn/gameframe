@@ -6,7 +6,7 @@
 //! and proxy settings apply. The request is OS-facing and not exercised by the
 //! automated tests.
 
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use std::ffi::c_void;
 use std::io::Write;
 use windows_sys::Win32::Networking::WinHttp::{

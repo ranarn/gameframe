@@ -37,6 +37,7 @@
 
 use crate::profile_store::TaskbarHideMode;
 use crate::region_calc::{MonitorGeometry, Region};
+use crate::wide::encode_wide;
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
@@ -813,8 +814,30 @@ fn lock_store(store: &std::sync::Mutex<PlacedWindows>) -> std::sync::MutexGuard<
 /// Runs `f` on the process-wide [`PlacedWindows`] under its lock. Poison
 /// tolerant: the maps and sets hold no invariant a panic could break. Never
 /// call anything that pumps messages, or takes this lock, from inside `f`.
-pub(crate) fn with_placed<R>(f: impl FnOnce(&mut PlacedWindows) -> R) -> R {
+fn with_placed<R>(f: impl FnOnce(&mut PlacedWindows) -> R) -> R {
     f(&mut lock_store(&PLACED_WINDOWS))
+}
+
+/// Whether a re-check of `kind` is already pending for `hwnd`.
+pub(crate) fn recheck_pending(hwnd: HWND, kind: RecheckKind) -> bool {
+    with_placed(|p| p.has_recheck(hwnd as isize, kind))
+}
+
+/// Records `timer` as the pending re-check of `kind` for `hwnd`. Returns the
+/// timer it displaced, if a concurrent caller armed one first; the caller
+/// must kill it. The timer itself is created and killed outside the registry
+/// lock.
+pub(crate) fn store_recheck(hwnd: HWND, kind: RecheckKind, timer: usize) -> Option<usize> {
+    with_placed(|p| {
+        let displaced = p.rechecks.get(&(hwnd as isize, kind)).copied();
+        p.set_recheck(hwnd as isize, kind, timer);
+        displaced
+    })
+}
+
+/// Removes and returns the re-check whose thread timer is `timer`.
+pub(crate) fn take_recheck(timer: usize) -> Option<(HWND, RecheckKind)> {
+    with_placed(|p| p.take_recheck_by_timer(timer)).map(|(window, kind)| (window as HWND, kind))
 }
 
 /// Whether `hwnd` has a remembered pre-strip state, i.e. the next borderless
@@ -1831,12 +1854,6 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
         )));
     }
     Ok(())
-}
-
-/// Encodes a Rust string as a null-terminated UTF-16 buffer, the string
-/// format every wide (`*W`) Win32 API used here expects.
-pub(crate) fn encode_wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Per-`EnumWindows`-call userdata smuggled through `EnumWindows`'s `LPARAM`

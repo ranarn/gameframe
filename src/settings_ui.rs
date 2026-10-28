@@ -1057,10 +1057,13 @@ pub fn run_settings_window(
         match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
             SettingsExit::Saved(config, start_with_windows) => {
                 // Keep what the tray and hotkeys changed on disk while
-                // Settings was open. A failed re-read must not abort the Save.
-                // The merge and the write happen under the store's lock, so a
-                // tray upsert cannot land between the re-read and the save.
-                let saved = profile_store::update(config_dir, |on_disk| {
+                // Settings was open. The merge and the write are serialized
+                // against other `update` calls, so a tray upsert cannot land
+                // between the re-read and the save. A failure (re-read or
+                // write) is surfaced rather than retried unmerged outside
+                // that serialization: if the disk cannot be read it can
+                // hardly be written.
+                profile_store::update(config_dir, |on_disk| {
                     let tracked_games = merge_tracked_games(
                         &opened_games,
                         config.tracked_games.clone(),
@@ -1070,13 +1073,8 @@ pub fn run_settings_window(
                         tracked_games,
                         ..config.clone()
                     };
-                });
-                if let Err(e) = saved {
-                    // A failed re-read must not abort the Save: write Settings'
-                    // own snapshot unmerged.
-                    log!("could not re-read config to merge on Save: {e}");
-                    profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
-                }
+                })
+                .map_err(SettingsUiError::Config)?;
                 // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).

@@ -33,7 +33,7 @@
 
 use crate::cursor_style::{self, Bitmap, CursorSettings, CursorShape, ShakeDetector};
 use crate::profile_store::{self, Config};
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use crate::window_filter;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -525,7 +525,6 @@ fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
 fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut bm: BITMAP = unsafe { std::mem::zeroed() };
-    // Safety: valid out-pointer sized per the API contract.
     let size = std::mem::size_of::<BITMAP>() as i32;
     // SAFETY: `bm` is a valid out-pointer of the size passed.
     if unsafe { GetObjectW(bitmap as HGDIOBJ, size, (&raw mut bm).cast()) } == 0 {

@@ -466,9 +466,10 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
 static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Read-modify-write of the stored config: loads the current config, applies
-/// `change` to it and saves the result, all while holding the store's write
-/// lock, so concurrent updates (tray, hotkeys, Settings) never overwrite each
+/// `change` to it and saves the result, serialized against other `update`
+/// calls, so concurrent updates (tray, hotkeys, Settings) never overwrite each
 /// other's fields with a stale snapshot. Returns what `change` returned.
+/// (A plain [`save`] does not take that lock.)
 ///
 /// This is the way to change a few fields. [`save`] of a config loaded earlier
 /// is only right when the caller deliberately replaces the whole snapshot.

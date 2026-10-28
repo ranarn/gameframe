@@ -112,8 +112,9 @@ pub(crate) enum Outcome {
 pub(crate) trait PlacementOps {
     fn load_config(&self) -> Result<Config, String>;
     /// Persists the Tray pick: adds the game to the tracked list (a no-op for
-    /// one already there) as one read-modify-write of the stored config.
-    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<(), String>;
+    /// one already there) as one read-modify-write of the stored config, and
+    /// returns the stored entry.
+    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<TrackedGame, String>;
     /// The window's process exe path, or `None` when it cannot be read.
     fn exe_path(&self, hwnd: HWND) -> Option<PathBuf>;
     /// The eligibility filter; `Ok` carries the exe path, `Err` the refusal.
@@ -218,15 +219,19 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
             }
         };
         let display_name = ops.window_text(hwnd);
-        let index =
-            profile_store::upsert_tracked_game(&mut config.tracked_games, exe_path, display_name);
-        let game = config.tracked_games[index].clone();
-        if let Err(e) = ops.track_game(&game.exe_path, &game.display_name) {
-            log!(
-                "{label}: failed to save tracked game {}: {e}",
-                game.display_name
-            );
-        }
+        let game = match ops.track_game(&exe_path, &display_name) {
+            Ok(game) => game,
+            Err(e) => {
+                // Placement still goes ahead with an in-memory entry.
+                log!("{label}: failed to save tracked game {display_name}: {e}");
+                let index = profile_store::upsert_tracked_game(
+                    &mut config.tracked_games,
+                    exe_path,
+                    display_name,
+                );
+                config.tracked_games[index].clone()
+            }
+        };
         let Some(zone) = config.zone else {
             log!(
                 "{label}: no Zone is set; {} is tracked but nothing was applied",
@@ -397,13 +402,14 @@ impl PlacementOps for SystemOps<'_> {
         profile_store::load(self.config_dir).map_err(|e| e.to_string())
     }
 
-    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<(), String> {
+    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<TrackedGame, String> {
         profile_store::update(self.config_dir, |config| {
-            profile_store::upsert_tracked_game(
+            let index = profile_store::upsert_tracked_game(
                 &mut config.tracked_games,
                 exe_path.to_path_buf(),
                 display_name.to_string(),
             );
+            config.tracked_games[index].clone()
         })
         .map_err(|e| e.to_string())
     }

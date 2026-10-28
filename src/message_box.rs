@@ -2,7 +2,7 @@
 //! flows ([`crate::app`]), the install flow ([`crate::update_ui`]) and
 //! Settings ([`crate::settings_ui`]).
 
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW,
 };

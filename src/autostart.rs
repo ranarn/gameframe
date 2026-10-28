@@ -13,7 +13,7 @@
 //! restores the default (enabled) state. A Task-Manager-disabled entry
 //! therefore still reads as enabled here until toggled.
 
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};

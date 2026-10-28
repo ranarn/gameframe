@@ -88,14 +88,15 @@ impl PlacementOps for FakeOps {
             Err("config is corrupt".to_string())
         }
     }
-    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<(), String> {
-        self.note("save");
-        profile_store::upsert_tracked_game(
-            &mut self.config.borrow_mut().tracked_games,
+    fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<TrackedGame, String> {
+        self.note("track_game");
+        let mut config = self.config.borrow_mut();
+        let index = profile_store::upsert_tracked_game(
+            &mut config.tracked_games,
             exe_path.to_path_buf(),
             display_name.to_string(),
         );
-        Ok(())
+        Ok(config.tracked_games[index].clone())
     }
     fn exe_path(&self, _: HWND) -> Option<PathBuf> {
         self.exe_known.then(the_exe)
@@ -555,7 +556,7 @@ fn tray_apply_tracks_a_new_game_with_auto_apply_and_saves_before_placing() {
 
     assert!(matches!(outcome, Outcome::Applied));
     let calls = ops.calls();
-    let save = calls.iter().position(|c| c == "save").unwrap();
+    let save = calls.iter().position(|c| c == "track_game").unwrap();
     let place = calls.iter().position(|c| c == "place").unwrap();
     assert!(save < place);
     let saved = ops.config.borrow();
@@ -571,7 +572,7 @@ fn tray_apply_keeps_the_tracking_when_no_zone_is_set() {
     let outcome = apply_zone_with(&ops, hwnd(), Trigger::Tray);
 
     assert!(matches!(outcome, Outcome::Skipped));
-    assert_eq!(ops.calls(), ["eligibility", "save"]);
+    assert_eq!(ops.calls(), ["eligibility", "track_game"]);
     assert_eq!(ops.config.borrow().tracked_games.len(), 1);
 }
 

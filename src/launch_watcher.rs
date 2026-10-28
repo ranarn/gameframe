@@ -463,23 +463,24 @@ fn check_auto_apply(config_dir: &Path, hwnd: HWND) {
 /// timers, so neither swallows the other. The timers live in the per-window
 /// registry, which kills them when the window is forgotten.
 fn schedule_recheck(hwnd: HWND, retry_in: std::time::Duration, kind: RecheckKind) {
-    crate::win32::with_placed(|placed| {
-        if placed.has_recheck(hwnd as isize, kind) {
-            return;
+    if crate::win32::recheck_pending(hwnd, kind) {
+        return;
+    }
+    let delay_ms = u32::try_from(retry_in.as_millis())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    // SAFETY: a null window makes this a thread timer on the message-loop
+    // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`. The
+    // registry lock is not held here.
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
+    if timer == 0 {
+        log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
+    } else if let Some(displaced) = crate::win32::store_recheck(hwnd, kind, timer) {
+        // SAFETY: a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), displaced);
         }
-        let delay_ms = u32::try_from(retry_in.as_millis())
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
-        // Safety: a null window makes this a thread timer on the message-loop
-        // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
-        let timer =
-            unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
-        if timer == 0 {
-            log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
-        } else {
-            placed.set_recheck(hwnd as isize, kind, timer);
-        }
-    });
+    }
 }
 
 /// `TIMERPROC` for a deferred drift re-check: re-runs the drift decision for
@@ -489,10 +490,9 @@ unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usi
     unsafe {
         KillTimer(std::ptr::null_mut(), timer);
     }
-    let Some((window, kind)) = crate::win32::with_placed(|p| p.take_recheck_by_timer(timer)) else {
+    let Some((hwnd, kind)) = crate::win32::take_recheck(timer) else {
         return;
     };
-    let hwnd = window as HWND;
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };

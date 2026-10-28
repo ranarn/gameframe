@@ -65,7 +65,7 @@
 //! [`Command::to_wparam`]/[`Command::from_wparam`], pick its [`Channel`],
 //! decide its [`route`], and handle it in the main loop.
 
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::OnceLock;
