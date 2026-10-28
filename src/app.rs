@@ -147,13 +147,9 @@ pub fn run() -> Result<(), TrayUiError> {
     // on the taskbar) and before the process actually exits, so the desktop
     // is never left with the taskbar hidden and no running GameFrame
     // instance left to bring it back.
-    if let Some(restore) = win32::take_any_armed_taskbar_restore()
-        && let Err(e) = win32::restore_taskbar(restore)
-    {
-        log!("failed to restore taskbar on exit: {e}");
-    }
-    // Anything still hidden (e.g. the manual hotkey toggle), and the marker.
-    crate::taskbar_recovery::restore_on_exit();
+    // Then anything still hidden (e.g. the manual hotkey toggle), the exit
+    // safety net, and the marker.
+    crate::taskbar_recovery::restore_all_for_exit();
 
     if let Some(hook) = launch_watcher_hook {
         launch_watcher::unregister(hook);

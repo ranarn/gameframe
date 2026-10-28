@@ -71,7 +71,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
     DestroyWindow, FindWindowExW, GetWindowThreadProcessId, HWND_MESSAGE, IsIconic, MSGFLT_ALLOW,
     PostMessageW, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow,
-    ShowWindow, UnregisterClassW, WM_CLOSE, WNDCLASSW,
+    ShowWindow, UnregisterClassW, WM_CLOSE, WM_ENDSESSION, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 /// Window class of the hidden receiver. Same GUID as the single-instance mutex.
@@ -254,6 +254,9 @@ fn message_for(channel: Channel) -> u32 {
 /// The running instance's receiver. Dropping it destroys the window.
 pub struct Receiver {
     hwnd: HWND,
+    /// Never-shown top-level window for `WM_ENDSESSION`; null if it could not
+    /// be created.
+    session_hwnd: HWND,
 }
 
 impl Receiver {
@@ -314,7 +317,8 @@ impl Receiver {
                     "instance channel: could not allow the command message through UIPI; an elevated instance cannot be signalled by a normal launch"
                 );
             }
-            Some(Receiver { hwnd })
+            let session_hwnd = create_session_window(hinstance);
+            Some(Receiver { hwnd, session_hwnd })
         }
     }
 }
@@ -322,7 +326,12 @@ impl Receiver {
 impl Drop for Receiver {
     fn drop(&mut self) {
         // SAFETY: `hwnd` is our own window, created on this thread.
-        unsafe { DestroyWindow(self.hwnd) };
+        unsafe {
+            DestroyWindow(self.hwnd);
+            if !self.session_hwnd.is_null() {
+                DestroyWindow(self.session_hwnd);
+            }
+        }
     }
 }
 
@@ -371,6 +380,85 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     // SAFETY: forwards the exact arguments we were called with.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Window class of the never-shown top-level window that receives
+/// `WM_ENDSESSION`.
+const SESSION_CLASS_NAME: &str = "GameFrame.SessionEnd-5C28E192-0AB5-4FA5-8874-88144D010E3B";
+
+/// Window procedure of the session-end window. The system sends
+/// `WM_QUERYENDSESSION`/`WM_ENDSESSION` to top-level windows only, never to a
+/// message-only window, hence this separate window. `WM_QUERYENDSESSION` is
+/// left to `DefWindowProc` (allow the end).
+unsafe extern "system" fn session_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_ENDSESSION && should_restore_on_end_session(wparam) {
+        // The process may be ended as soon as this returns: restore now, the
+        // same way the tray's Exit item does, and clear the marker.
+        log!("session ending: restoring the taskbar");
+        crate::taskbar_recovery::restore_all_for_exit();
+        return 0;
+    }
+    // SAFETY: forwards the exact arguments we were called with.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Creates the never-shown top-level window (`WS_POPUP`, `WS_EX_TOOLWINDOW`,
+/// no `ShowWindow` ever): an unshown window has no taskbar button and is not
+/// in Alt+Tab, and the tool-window style keeps it out of both regardless.
+/// Must run on the main thread so its pump dispatches the message.
+fn create_session_window(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
+    let class = wide(SESSION_CLASS_NAME);
+    // SAFETY: plain Win32 calls with NUL-terminated strings that outlive them;
+    // `session_wndproc` has the required signature.
+    unsafe {
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(session_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+        };
+        if RegisterClassW(&wc) == 0 {
+            log!("instance channel: could not register the session-end window class");
+            return std::ptr::null_mut();
+        }
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            log!("instance channel: could not create the session-end window");
+            UnregisterClassW(class.as_ptr(), hinstance);
+        }
+        hwnd
+    }
+}
+
+/// Whether a `WM_ENDSESSION` makes the app restore the taskbar: only when the
+/// session really ends (`wParam` TRUE), not when a `WM_QUERYENDSESSION` was
+/// vetoed by another program and the end is cancelled.
+pub fn should_restore_on_end_session(wparam: usize) -> bool {
+    wparam != 0
 }
 
 /// This process's Settings window, if it exists yet.
@@ -497,6 +585,12 @@ pub fn send_within(command: Command, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_session_restores_only_when_the_session_really_ends() {
+        assert!(should_restore_on_end_session(1));
+        assert!(!should_restore_on_end_session(0));
+    }
 
     #[test]
     fn commands_round_trip_through_the_wire_encoding() {

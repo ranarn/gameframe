@@ -930,8 +930,12 @@ pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
 
 /// [`hide_taskbar_completely`] on an already-resolved taskbar handle.
 fn hide_taskbar_window(hwnd: HWND) {
+    let flags = read_appbar_flags(hwnd);
     // Marker first: a kill right after the hide is then covered.
-    let _ = taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden);
+    if taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden).is_some() {
+        // A new FullyHidden session: remember the appbar flags to compare at its end.
+        taskbar_recovery::note_session_start_flags(flags);
+    }
     // Safety: `hwnd` is a live handle just resolved by the caller; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
     unsafe {
@@ -948,14 +952,21 @@ fn hide_taskbar_window(hwnd: HWND) {
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// module docs.
 pub fn show_taskbar() -> Result<(), Win32Error> {
+    show_taskbar_full()?;
+    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
+    Ok(())
+}
+
+/// The full normal show without marker bookkeeping or the record lock: what
+/// [`show_taskbar`] does, and what startup recovery uses (#116).
+fn show_taskbar_full() -> Result<(), Win32Error> {
     let hwnd = show_taskbar_window()?;
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
     // covered or that slid away. Re-send the appbar state read just now,
     // unchanged, then raise without activating.
-    resend_appbar_state(
-        || read_appbar_flags(hwnd),
-        |lparam| send_appbar_setstate(hwnd, lparam),
-    );
+    let flags = read_appbar_flags(hwnd);
+    taskbar_recovery::finish_session_flags(flags);
+    resend_appbar_state(|| flags, |lparam| send_appbar_setstate(hwnd, lparam));
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
     // SWP_NOSIZE, and SWP_NOACTIVATE keeps focus where it is.
     unsafe {
@@ -969,7 +980,6 @@ pub fn show_taskbar() -> Result<(), Win32Error> {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
-    taskbar_recovery::mark_restored(TaskbarHideRestore::FullyHidden);
     Ok(())
 }
 
@@ -1109,9 +1119,18 @@ pub fn restore_taskbar(remembered: TaskbarHideRestore) -> Result<(), Win32Error>
 /// [`restore_taskbar`] without any marker bookkeeping or locking -- the
 /// panic hook's variant ([`crate::taskbar_recovery::install_panic_hook`]),
 /// which must not touch a lock the panicking thread may already hold.
-pub(crate) fn restore_taskbar_raw(remembered: TaskbarHideRestore) -> Result<(), Win32Error> {
+///
+/// `show` picks the `FullyHidden` show (see
+/// [`taskbar_recovery::show_kind_for`]).
+pub(crate) fn restore_taskbar_raw(
+    remembered: TaskbarHideRestore,
+    show: taskbar_recovery::ShowKind,
+) -> Result<(), Win32Error> {
     match remembered {
-        TaskbarHideRestore::FullyHidden => show_taskbar_window().map(|_| ()),
+        TaskbarHideRestore::FullyHidden => match show {
+            taskbar_recovery::ShowKind::Bare => show_taskbar_window().map(|_| ()),
+            taskbar_recovery::ShowKind::Full => show_taskbar_full(),
+        },
         TaskbarHideRestore::HoverReveal(state) => set_appbar_state(state),
     }
 }

@@ -60,6 +60,50 @@ pub enum RecoveryAction {
     SetAppbarState(TaskbarAutohideState),
 }
 
+/// Which `FullyHidden` restore a path performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowKind {
+    /// A bare `ShowWindow(SW_SHOW)`: one lock-free call, nothing else.
+    Bare,
+    /// `SW_SHOW`, the appbar state re-send and the `HWND_TOP` raise (#52).
+    Full,
+}
+
+/// The restore paths that do not go through the normal in-memory bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawRestorePath {
+    /// Startup recovery of a marker a kill or crash left behind.
+    Startup,
+    /// The panic hook, which must stay minimal (decided in #52).
+    PanicHook,
+}
+
+/// Which show a [`RawRestorePath`] uses. Startup recovery has the time and the
+/// locks for the full show (a bare `SW_SHOW` can leave an auto-hidden taskbar
+/// collapsed, #116); the panic hook must not do more than one plain call.
+pub fn show_kind_for(path: RawRestorePath) -> ShowKind {
+    match path {
+        RawRestorePath::Startup => ShowKind::Full,
+        RawRestorePath::PanicHook => ShowKind::Bare,
+    }
+}
+
+/// Whether a graceful exit must show the taskbar although the record had
+/// nothing (left) to restore: this run hid it, and it is still not visible.
+/// `visible` is `None` when the taskbar could not be observed.
+pub fn needs_exit_safety_show(hid_this_run: bool, visible: Option<bool>) -> bool {
+    hid_this_run && visible == Some(false)
+}
+
+/// The appbar flags at session start and at session end, if they differ (a
+/// user toggled Windows' auto-hide or always-on-top while GameFrame had the
+/// taskbar hidden). `None` when there was no session start or nothing changed.
+pub fn appbar_flags_change(at_start: Option<u32>, at_end: u32) -> Option<(u32, u32)> {
+    at_start
+        .filter(|&start| start != at_end)
+        .map(|start| (start, at_end))
+}
+
 /// Serializes a hide technique to the marker file's text.
 pub fn serialize_marker(restore: TaskbarHideRestore) -> String {
     match restore {
@@ -308,6 +352,34 @@ static MARKER_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// otherwise destroy the only record of a stranded hide); recovery is retried
 /// before the next hide and at exit.
 static RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set once this run has hidden the taskbar window (`FullyHidden`), so a
+/// graceful exit knows a still-hidden taskbar is its doing.
+static HID_FULLY_THIS_RUN: AtomicBool = AtomicBool::new(false);
+/// The appbar flags read when the current `FullyHidden` session started.
+static SESSION_START_FLAGS: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Remembers the appbar flags as a `FullyHidden` session starts, for
+/// [`finish_session_flags`].
+pub fn note_session_start_flags(flags: u32) {
+    *SESSION_START_FLAGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(flags);
+}
+
+/// At the end of a `FullyHidden` session: logs both values if the appbar flags
+/// differ from the session start (Windows' auto-hide was toggled meanwhile).
+/// Log only; the normal show happens regardless.
+pub fn finish_session_flags(flags_now: u32) {
+    let start = SESSION_START_FLAGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some((before, after)) = appbar_flags_change(start, flags_now) {
+        log!(
+            "taskbar appbar flags changed while hidden: {before:#x} at session start, {after:#x} at session end"
+        );
+    }
+}
 
 fn record() -> std::sync::MutexGuard<'static, HideRecord> {
     RECORD.lock().unwrap_or_else(|e| e.into_inner())
@@ -351,6 +423,9 @@ pub struct HideUndo(HideRecord);
 /// hide then fails, pass it to [`undo_hide`].
 pub fn mark_hidden(restore: TaskbarHideRestore) -> Option<HideUndo> {
     retry_pending_recovery();
+    if restore == TaskbarHideRestore::FullyHidden {
+        HID_FULLY_THIS_RUN.store(true, Ordering::SeqCst);
+    }
     let mut rec = record();
     let previous = rec.hide(restore)?;
     persist(*rec);
@@ -392,11 +467,32 @@ pub fn restore_on_exit() {
             log!("failed to restore taskbar on exit: {e}");
         }
     }
+    // The record can drift from reality (e.g. Windows' auto-hide toggled while
+    // hidden): if this run hid the taskbar and it is still not visible, show it.
+    let visible = win32::observe_taskbar().ok().map(|(visible, _)| visible);
+    if needs_exit_safety_show(HID_FULLY_THIS_RUN.load(Ordering::SeqCst), visible) {
+        log!("taskbar still hidden at exit although this run hid it; showing it");
+        if let Err(e) = win32::show_taskbar() {
+            log!("failed to show the taskbar at exit: {e}");
+        }
+    }
     // Whatever happened above, a graceful exit leaves no marker (`persist`
     // keeps one that recovery still owes).
     let mut rec = record();
     *rec = HideRecord::EMPTY;
     persist(*rec);
+}
+
+/// The whole graceful-exit restore: the armed session's hide first, then
+/// [`restore_on_exit`]. Shared by the tray Exit path and `WM_ENDSESSION`;
+/// idempotent, so running both is harmless.
+pub fn restore_all_for_exit() {
+    if let Some(restore) = win32::take_any_armed_taskbar_restore()
+        && let Err(e) = win32::restore_taskbar(restore)
+    {
+        log!("failed to restore taskbar on exit: {e}");
+    }
+    restore_on_exit();
 }
 
 /// Performs the recovery for `marker` against the real taskbar and clears the
@@ -409,12 +505,14 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
         log!("taskbar recovery: marker {input:?} -> {action:?}");
         match action {
             RecoveryAction::Nothing => {}
-            RecoveryAction::ShowTaskbar => {
-                win32::restore_taskbar_raw(TaskbarHideRestore::FullyHidden)?
-            }
-            RecoveryAction::SetAppbarState(state) => {
-                win32::restore_taskbar_raw(TaskbarHideRestore::HoverReveal(state))?
-            }
+            RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(
+                TaskbarHideRestore::FullyHidden,
+                show_kind_for(RawRestorePath::Startup),
+            )?,
+            RecoveryAction::SetAppbarState(state) => win32::restore_taskbar_raw(
+                TaskbarHideRestore::HoverReveal(state),
+                show_kind_for(RawRestorePath::Startup),
+            )?,
         }
     }
     RECOVERY_PENDING.store(false, Ordering::SeqCst);
@@ -490,7 +588,7 @@ fn restore_for_panic() {
         return;
     }
     for restore in techniques {
-        let _ = win32::restore_taskbar_raw(restore);
+        let _ = win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook));
     }
     if let Some(dir) = dir {
         let _ = clear_marker_file(dir);
@@ -511,6 +609,27 @@ mod tests {
 
     fn observed(visible: bool, autohide: TaskbarAutohideState) -> ObservedTaskbar {
         ObservedTaskbar { visible, autohide }
+    }
+
+    #[test]
+    fn startup_recovery_uses_the_full_show_and_the_panic_hook_stays_bare() {
+        assert_eq!(show_kind_for(RawRestorePath::Startup), ShowKind::Full);
+        assert_eq!(show_kind_for(RawRestorePath::PanicHook), ShowKind::Bare);
+    }
+
+    #[test]
+    fn exit_shows_a_still_hidden_taskbar_only_if_this_run_hid_it() {
+        assert!(needs_exit_safety_show(true, Some(false)));
+        assert!(!needs_exit_safety_show(false, Some(false)));
+        assert!(!needs_exit_safety_show(true, Some(true)));
+        assert!(!needs_exit_safety_show(true, None));
+    }
+
+    #[test]
+    fn appbar_flags_change_reports_both_values_only_when_they_differ() {
+        assert_eq!(appbar_flags_change(Some(0), 1), Some((0, 1)));
+        assert_eq!(appbar_flags_change(Some(1), 1), None);
+        assert_eq!(appbar_flags_change(None, 1), None);
     }
 
     #[test]
