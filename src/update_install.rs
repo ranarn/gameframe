@@ -1,5 +1,6 @@
 //! Update install: downloads the installer of an available update into a
-//! fresh temp folder, checks it against the release's SHA-256 (a file that
+//! fresh folder under `%LOCALAPPDATA%\GameFrame\updates` (never an elevated
+//! instance: it refuses, see [`ensure_unelevated`]), checks it against the release's SHA-256 (a file that
 //! fails is deleted and never run) and starts it silently and detached.
 //!
 //! The installer asks the running instance to quit before it replaces files
@@ -15,7 +16,8 @@
 
 use crate::http::HttpError;
 use crate::updater::{
-    ASSET_HOST, FlagGuard, SpawnError, UpdateError, UpdateInfo, installer_name, verify_sha256,
+    ASSET_HOST, FlagGuard, SpawnError, UpdateError, UpdateInfo, ensure_unelevated, installer_name,
+    verify_sha256,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -92,15 +94,30 @@ fn prepare_installer(
     }
 }
 
-/// Creates an empty, uniquely named update folder in the temp directory.
-fn fresh_update_dir() -> std::io::Result<PathBuf> {
+/// The folder updates download into: `%LOCALAPPDATA%\GameFrame\updates`, which
+/// inherits the user profile's ACL (the user, SYSTEM and administrators), not
+/// the shared `%TEMP%`. Not created here.
+fn updates_root() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(local).join("GameFrame").join("updates"))
+}
+
+/// Creates an empty, uniquely named update folder inside `root`.
+fn fresh_update_dir_in(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let dir =
-        std::env::temp_dir().join(format!("{UPDATE_DIR_PREFIX}{}-{nanos}", std::process::id()));
+    let dir = root.join(format!("{UPDATE_DIR_PREFIX}{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir)?;
     Ok(dir)
+}
+
+fn fresh_update_dir() -> std::io::Result<PathBuf> {
+    let root = updates_root().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "%LOCALAPPDATA% is not set")
+    })?;
+    fresh_update_dir_in(&root)
 }
 
 /// Starts the verified installer silently, as a detached process that outlives
@@ -120,6 +137,9 @@ fn launch_installer(installer: VerifiedInstaller) -> Result<(), UpdateError> {
 /// Downloads, verifies and starts the installer of `info`. On any failure the
 /// download is deleted and nothing has been run.
 fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
+    // The installer inherits this process's token and would relaunch GameFrame
+    // with it, so an elevated instance installs nothing.
+    ensure_unelevated(crate::win32::is_process_elevated())?;
     let dir = fresh_update_dir().map_err(|e| UpdateError::Download(e.to_string()))?;
     let installer = prepare_installer(info, &dir, |file| {
         crate::http::download(
@@ -210,9 +230,18 @@ pub(crate) fn clean_stale_downloads() {
     let spawned = std::thread::Builder::new()
         .name("update-cleanup".into())
         .spawn(|| {
-            let temp = std::env::temp_dir();
+            // The old temp location is swept too, for downloads made by
+            // earlier versions.
+            let roots: Vec<PathBuf> = updates_root()
+                .into_iter()
+                .chain(std::iter::once(std::env::temp_dir()))
+                .collect();
             for _ in 0..ATTEMPTS {
-                if remove_stale_update_dirs(&temp, std::process::id()) == 0 {
+                let left: usize = roots
+                    .iter()
+                    .map(|root| remove_stale_update_dirs(root, std::process::id()))
+                    .sum();
+                if left == 0 {
                     return;
                 }
                 std::thread::sleep(RETRY_AFTER);
@@ -330,6 +359,26 @@ mod tests {
 
         // The program rejects the installer switches and exits at once.
         assert_eq!(launch_installer(installer), Ok(()));
+    }
+
+    #[test]
+    fn fresh_update_dir_in_creates_a_unique_prefixed_folder_and_its_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("GameFrame").join("updates");
+
+        let first = fresh_update_dir_in(&root).unwrap();
+        let second = fresh_update_dir_in(&root).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        assert_eq!(first.parent(), Some(root.as_path()));
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(UPDATE_DIR_PREFIX)
+        );
     }
 
     #[test]

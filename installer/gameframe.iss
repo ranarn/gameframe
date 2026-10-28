@@ -527,7 +527,10 @@ begin
               'Exit GameFrame from its tray icon and run setup again.';
 end;
 
-// Whether setup was started with the bare /RELAUNCH switch.
+// Whether setup was started with the bare /RELAUNCH switch and should start
+// GameFrame. Never when setup itself runs elevated: it would hand GameFrame its
+// elevated token and make the elevation sticky (the app itself no longer starts
+// an update from an elevated instance; this covers a hand-started elevated run).
 function RelaunchRequested: Boolean;
 var
   I: Integer;
@@ -536,6 +539,8 @@ begin
   for I := 1 to ParamCount do
     if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
       Result := True;
+  if Result and IsAdmin then
+    Result := False;
 end;
 
 function StartupChoiceChanged: Boolean;

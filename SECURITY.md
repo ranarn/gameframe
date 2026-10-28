@@ -36,7 +36,7 @@ GameFrame checks about 20 seconds after it starts (and again when you choose
 "Check for Updates Now" in the tray or Settings). With the default setting
 ("Install updates automatically at startup") it then installs an available
 update without asking; with "Ask me" it adds a tray item and installs only when
-you choose it. A failed startup check is only logged. The check and the
+you choose it. (An elevated instance installs in neither mode, see below.) A failed startup check is only logged. The check and the
 download use HTTPS through Windows' own WinHTTP, so the system certificate
 store and proxy settings apply:
 
@@ -46,16 +46,28 @@ store and proxy settings apply:
   redirects by hand (at most five), and every hop must be HTTPS on `github.com`
   or `release-assets.githubusercontent.com`; any other host is refused.
 - The installer is hashed and compared with the SHA-256 digest the release API
-  reports for it. A file that does not match is deleted and never run. The
+  reports for it. This is an integrity check against a corrupted or altered
+  download, not a publisher signature: the installer is not Authenticode-signed
+  yet. A file that does not match is deleted and never run. The
   verified file is held open with a share mode that denies writing and deleting
   until its process has started, so it cannot be swapped in between. It runs
-  silently and detached from a temp folder, which the next start deletes.
+  silently and detached from a folder under `%LOCALAPPDATA%\GameFrame\updates`
+  (inheriting your profile's access rules, not the shared temp folder), which
+  the next start deletes.
+- An elevated (administrator) instance never installs an update: it reports that
+  one exists and asks you to restart GameFrame normally. Setup also does not
+  start GameFrame again when it runs elevated, so an update can't leave
+  GameFrame elevated.
+- GameFrame restricts DLL loading to System32 (`SetDefaultDllDirectories` first
+  thing in `main`, and `/DEPENDENTLOADFLAG:0x800` at link time).
 - The installer asks the running instance to quit by posting a `Quit` command to
   the instance's hidden message-only window; `gameframe.exe --quit` sends the
   same command from a second launch. `Quit` travels on a separate registered
   window message that is not let through UIPI, so a lower-integrity process
   cannot quit the instance, and a normal-integrity launch cannot quit an
-  elevated one (the installer then falls back to `taskkill` after a timeout).
+  elevated one. Setup detects an elevated instance up front and, instead of
+  using `taskkill`, asks you to exit GameFrame yourself (Retry/Cancel); a silent
+  run fails.
   Opening Settings uses a message that is let through, since that is harmless.
 
 Reports about any of these or the installer are in scope.

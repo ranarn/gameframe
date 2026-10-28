@@ -139,8 +139,24 @@ pub(crate) fn handle_update_event(
                     return;
                 }
             };
-            match crate::updater::startup_action(mode, result) {
+            let elevated = crate::win32::is_process_elevated();
+            match crate::updater::startup_action(mode, elevated, result) {
                 StartupAction::Nothing => {}
+                StartupAction::ReportElevated(info) => {
+                    log!(
+                        "startup update check: v{} is available but this instance is elevated; not installing",
+                        info.version
+                    );
+                    let text = format!(
+                        "GameFrame v{} is available.\n\n{}",
+                        info.version,
+                        crate::updater::ELEVATED_UPDATE_ADVICE
+                    );
+                    // A box blocks, and this is the event loop's thread.
+                    std::thread::spawn(move || {
+                        show_message_box(&text, MB_OK | MB_ICONINFORMATION);
+                    });
+                }
                 StartupAction::InstallNow(info) => {
                     log!("startup update check: installing v{}", info.version);
                     start_install(info, Failure::LogOnly);

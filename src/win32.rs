@@ -1856,6 +1856,49 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
     Ok(())
 }
 
+/// Restricts DLL loading to System32 for the rest of the process, so a DLL
+/// planted next to the exe or in the working directory is never picked up.
+/// Call it first thing in `main`. Returns whether the call succeeded.
+pub fn restrict_dll_search_to_system32() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // SAFETY: plain call with a documented flag; no pointers involved.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) != 0 }
+}
+
+/// Whether this process runs with an elevated (full administrator) token.
+/// A failure to read the token counts as not elevated.
+pub fn is_process_elevated() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `token` is a valid out pointer; the pseudo-handle from
+    // `GetCurrentProcess` needs no closing.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    // SAFETY: `elevation` is a writable TOKEN_ELEVATION of the size passed, and
+    // `token` is a valid handle that is closed exactly once below.
+    let ok = unsafe {
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token);
+        ok
+    };
+    ok != 0 && elevation.TokenIsElevated != 0
+}
+
 /// Per-`EnumWindows`-call userdata smuggled through `EnumWindows`'s `LPARAM`
 /// parameter: the listable windows gathered so far, plus a per-PID
 /// process-level-signal memoization cache (see

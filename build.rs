@@ -6,6 +6,12 @@
 //! see `examples/gen_icon.rs` for how `assets/icon.ico` is produced).
 
 fn main() {
+    // Static imports resolve from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32),
+    // before `main` can call SetDefaultDllDirectories. Passed per binary target
+    // so it never reaches test or build-script links; MSVC linker only.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    }
     let mut resource = winresource::WindowsResource::new();
     resource.set_icon("assets/icon.ico");
     // Shown by Task Manager, Explorer's file properties and SmartScreen;
