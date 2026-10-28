@@ -372,9 +372,8 @@ pub struct NormalizedRegion {
     pub height: f32,
 }
 
-/// The Settings window's fixed inner size, shared between the
-/// `ViewportBuilder`'s `.with_inner_size(...)` call and
-/// [`centered_window_position`] so the two never drift apart.
+/// The Settings window's preferred inner size in points; [`settings_viewport`]
+/// shrinks it to fit a small work area and centres it.
 const SETTINGS_WINDOW_SIZE: [f32; 2] = [560.0, 800.0];
 
 /// Points reserved below the window's inner size for the title bar and frame,
@@ -3108,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_viewport_shrinks_the_height_at_150_percent_on_1440p() {
+    fn settings_viewport_fits_at_150_percent_and_shrinks_at_200_percent_on_1440p() {
         // 1392 px / 1.5 = 928 pt of work area; 800 pt + chrome still fits.
         let view = settings_viewport(&work_area_1440p(), 1.5);
         assert_eq!(view.size, [560.0, 800.0]);
