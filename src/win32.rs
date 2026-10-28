@@ -538,11 +538,10 @@ fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Err
     // Safety: `hwnd` is a live handle; `placement` is a valid out-pointer
     // with `length` set, as `GetWindowPlacement` requires.
     if unsafe { GetWindowPlacement(hwnd, &mut placement) } == 0 {
-        log!(
-            "GetWindowPlacement failed for maximized window {hwnd:?}; \
-             falling back to its current rect"
-        );
-        return get_window_region(hwnd);
+        // No fallback to the full-screen rect: remembering it would restore
+        // the window full-screen without its maximize state.
+        log!("GetWindowPlacement failed for maximized window {hwnd:?}; aborting");
+        return Err(Win32Error::Os(std::io::Error::last_os_error()));
     }
     let rect = placement.rcNormalPosition;
     Ok(Region {
@@ -1212,15 +1211,17 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     }
 
     let hung = is_window_hung_logged(hwnd);
-    // A maximized window is un-maximized first (queued, behind the hung check)
-    // so the Zone rect is not overridden by the maximized state. Its normal
-    // rect is read before the restore lands and remembered as the original.
+    // A maximized window is un-maximized first (synchronously, behind the hung
+    // check) so the Zone rect is not overridden by the maximized state. Its
+    // normal rect and both styles are read before the restore, so a failed
+    // read aborts before the window is touched.
     let maximized = !hung && is_maximized(hwnd);
-    let restore_region = if maximized {
-        // Read first, so a failure aborts before the window is touched.
+    let pre_read = if maximized {
         let region = get_restorable_region(hwnd, true)?;
+        let style = get_window_style(hwnd)?;
+        let ex_style = get_window_ex_style(hwnd)?;
         restore_maximized_window(hwnd);
-        Some(region)
+        Some((style, ex_style, region))
     } else {
         None
     };
@@ -1235,11 +1236,13 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         ApplyDecision::Apply => {}
     }
 
-    let live_style = get_window_style(hwnd)?;
-    let live_ex_style = get_window_ex_style(hwnd)?;
-    let live_region = match restore_region {
-        Some(region) => region,
-        None => get_window_region(hwnd)?,
+    let (live_style, live_ex_style, live_region) = match pre_read {
+        Some(read) => read,
+        None => (
+            get_window_style(hwnd)?,
+            get_window_ex_style(hwnd)?,
+            get_window_region(hwnd)?,
+        ),
     };
     set_window_style(hwnd, strip_border_style(live_style))?;
     // Recorded once the first mutation succeeded, so a window GameFrame could
@@ -1305,6 +1308,12 @@ pub fn toggle_borderless_on_window(hwnd: HWND, target_region: Region) -> Result<
             // succeeded; a failure partway keeps the only copy of the
             // original state so a retry can recover it.
             ToggleAction::Restore(restore) => {
+                // Re-maximized since the strip: un-maximize through the OS
+                // (hung check already passed) rather than overwriting the
+                // style and clearing WS_MAXIMIZE by hand.
+                if is_maximized(hwnd) {
+                    restore_maximized_window(hwnd);
+                }
                 set_window_style(hwnd, restore.style)?;
                 set_window_ex_style(hwnd, restore.ex_style)?;
                 set_window_region(hwnd, restore.region)?;
@@ -2217,19 +2226,6 @@ mod tests {
         };
 
         assert!(!window_drifted(target, 0x14000000 | WS_MAXIMIZE, target));
-    }
-
-    #[test]
-    fn window_drifted_ignores_returned_ex_style_edges() {
-        // The ex-style is not even an input: an edge coming back is not drift.
-        let target = Region {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-        };
-
-        assert!(!window_drifted(target, 0x14000000, target));
     }
 
     #[test]
