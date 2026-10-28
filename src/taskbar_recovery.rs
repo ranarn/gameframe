@@ -296,7 +296,12 @@ fn panic_restore_target(
         Some(known) => known.techniques(),
         None => dir
             .map(read_marker_file)
-            .map(marker_techniques)
+            .map(|marker| match marker {
+                // Technique unknown: the bare show is harmless on a visible
+                // taskbar, and the hook cannot afford to observe first.
+                MarkerState::Unreadable => vec![TaskbarHideRestore::FullyHidden],
+                other => marker_techniques(other),
+            })
             .unwrap_or_default(),
     }
 }
@@ -307,7 +312,15 @@ fn marker_path(dir: &Path) -> PathBuf {
 
 fn write_record_file(dir: &Path, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    std::fs::write(marker_path(dir), text)
+    // Write a temp file next to the marker, then rename over it, so the panic
+    // hook (which reads the file without the record lock) sees the old or the
+    // new content, never a truncated one.
+    let tmp = dir.join(format!("{MARKER_FILE}.tmp"));
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, marker_path(dir)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn read_marker_file(dir: &Path) -> MarkerState {
@@ -829,11 +842,41 @@ mod tests {
     }
 
     #[test]
-    fn the_panic_hook_has_nothing_to_restore_without_a_readable_marker() {
+    fn the_panic_hook_has_nothing_to_restore_without_a_marker() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(panic_restore_target(None, Some(tmp.path())).is_empty());
         assert!(panic_restore_target(None, None).is_empty());
-        std::fs::write(marker_path(tmp.path()), "???").unwrap();
-        assert!(panic_restore_target(None, Some(tmp.path())).is_empty());
+    }
+
+    #[test]
+    fn the_panic_hook_shows_the_taskbar_for_an_unreadable_marker_like_startup_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        for content in ["???", "", "fully-hidden\n???\n"] {
+            std::fs::write(marker_path(tmp.path()), content).unwrap();
+            assert_eq!(panic_restore_target(None, Some(tmp.path())), vec![FULLY]);
+        }
+        // Startup recovery shows a hidden taskbar for the same marker.
+        assert_eq!(
+            decide_recovery(MarkerState::Unreadable, observed(false, AlwaysVisible)),
+            RecoveryAction::ShowTaskbar
+        );
+    }
+
+    #[test]
+    fn writing_the_marker_is_atomic_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_marker_file(tmp.path(), record_of(&[FULLY]));
+        write_marker_file(tmp.path(), record_of(&[HOVER_FROM_VISIBLE, FULLY]));
+        assert_eq!(
+            read_marker_file(tmp.path()),
+            MarkerState::Combined {
+                hover_prior: AlwaysVisible
+            }
+        );
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(MARKER_FILE)]);
     }
 }
