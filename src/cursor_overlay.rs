@@ -305,7 +305,7 @@ fn run_overlay_thread(shared: &Shared) {
             content = Content::Nothing;
             shake.reset();
             pulse_start = None;
-            timer.wait(poll_interval(settings.enabled, over_game, false));
+            timer.wait(poll_interval(settings.enabled, over_game));
             continue;
         };
 
@@ -375,24 +375,20 @@ fn run_overlay_thread(shared: &Shared) {
             last_topmost = Instant::now();
         }
 
-        timer.wait(poll_interval(
-            settings.enabled,
-            over_game,
-            pulse_start.is_some(),
-        ));
+        timer.wait(poll_interval(settings.enabled, over_game));
     }
 
     window.hide();
 }
 
 /// How long the overlay thread waits before its next tick. Full rate while
-/// the pointer is over a cursor-enabled game (or a pulse is playing), a
-/// slower search rate while the game cursor is on but the pointer is
-/// elsewhere, and the idle rate while it is off.
-fn poll_interval(enabled: bool, over_game: bool, pulsing: bool) -> Duration {
+/// the pointer is over a cursor-enabled game (a pulse only plays while
+/// showing, which requires that), a slower search rate while the game cursor
+/// is on but the pointer is elsewhere, and the idle rate while it is off.
+fn poll_interval(enabled: bool, over_game: bool) -> Duration {
     if !enabled {
         IDLE_INTERVAL
-    } else if over_game || pulsing {
+    } else if over_game {
         FRAME_INTERVAL
     } else {
         SEARCH_INTERVAL
@@ -898,15 +894,13 @@ mod tests {
     }
 
     #[test]
-    fn poll_interval_is_fast_over_a_game_or_while_pulsing() {
-        assert_eq!(poll_interval(true, true, false), FRAME_INTERVAL);
-        assert_eq!(poll_interval(true, false, true), FRAME_INTERVAL);
-        assert_eq!(poll_interval(true, true, true), FRAME_INTERVAL);
+    fn poll_interval_is_fast_over_a_game() {
+        assert_eq!(poll_interval(true, true), FRAME_INTERVAL);
     }
 
     #[test]
     fn poll_interval_is_slow_while_searching_for_a_game() {
-        assert_eq!(poll_interval(true, false, false), SEARCH_INTERVAL);
+        assert_eq!(poll_interval(true, false), SEARCH_INTERVAL);
         assert!(SEARCH_INTERVAL > FRAME_INTERVAL);
         assert!(SEARCH_INTERVAL < IDLE_INTERVAL);
     }
@@ -914,9 +908,7 @@ mod tests {
     #[test]
     fn poll_interval_is_idle_when_disabled() {
         for over_game in [false, true] {
-            for pulsing in [false, true] {
-                assert_eq!(poll_interval(false, over_game, pulsing), IDLE_INTERVAL);
-            }
+            assert_eq!(poll_interval(false, over_game), IDLE_INTERVAL);
         }
     }
 

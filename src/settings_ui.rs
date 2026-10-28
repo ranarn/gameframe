@@ -1300,8 +1300,11 @@ enum UpdateInstall {
     Idle,
     /// Running on a worker thread, which sends the result here.
     Running(std::sync::mpsc::Receiver<Result<(), UpdateError>>),
-    /// The installer was started; it asks GameFrame to quit.
-    Started,
+    /// The installer was started (at this time); it asks GameFrame to quit.
+    Started(std::time::Instant),
+    /// The installer was started but GameFrame wasn't quit within
+    /// [`INSTALL_QUIT_TIMEOUT`].
+    TimedOut,
     Failed(UpdateError),
     /// Not started: another install was already running.
     Busy,
@@ -1309,6 +1312,22 @@ enum UpdateInstall {
     NotStarted,
     /// The worker ended without sending a result.
     Lost,
+}
+
+/// How long Settings waits, after the installer started, for it to quit
+/// GameFrame before reporting that the installer didn't finish.
+const INSTALL_QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl UpdateInstall {
+    /// Moves `Started` to `TimedOut` once [`INSTALL_QUIT_TIMEOUT`] has passed
+    /// between its start and `now`.
+    fn expire(&mut self, now: std::time::Instant) {
+        if let Self::Started(since) = self
+            && now.saturating_duration_since(*since) >= INSTALL_QUIT_TIMEOUT
+        {
+            *self = Self::TimedOut;
+        }
+    }
 }
 
 /// The rendered game-cursor preview and variant icons, plus the settings
@@ -1709,7 +1728,7 @@ impl SettingsApp<'_> {
             // A new check while an install runs would drop the install's result.
             let installing = matches!(
                 self.update_install,
-                UpdateInstall::Running(_) | UpdateInstall::Started
+                UpdateInstall::Running(_) | UpdateInstall::Started(_)
             );
             let enabled = !installing && !matches!(self.update_check, UpdateCheck::Running(_));
             if ui
@@ -1769,9 +1788,17 @@ impl SettingsApp<'_> {
     /// success the installer quits GameFrame (closing this window) and starts
     /// it again.
     fn update_install_row(&mut self, ui: &mut egui::Ui, info: UpdateInfo) {
+        self.update_install.expire(std::time::Instant::now());
+        if matches!(self.update_install, UpdateInstall::Started(_)) {
+            // Nothing else wakes the UI if the installer never quits GameFrame.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(5));
+        }
         if let UpdateInstall::Running(receiver) = &self.update_install {
             match receiver.try_recv() {
-                Ok(Ok(())) => self.update_install = UpdateInstall::Started,
+                Ok(Ok(())) => {
+                    self.update_install = UpdateInstall::Started(std::time::Instant::now());
+                }
                 Ok(Err(e)) => self.update_install = UpdateInstall::Failed(e),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1782,7 +1809,7 @@ impl SettingsApp<'_> {
 
         let busy = matches!(
             self.update_install,
-            UpdateInstall::Running(_) | UpdateInstall::Started
+            UpdateInstall::Running(_) | UpdateInstall::Started(_)
         );
         let label = format!("Install v{}", info.version);
         if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
@@ -1808,8 +1835,14 @@ impl SettingsApp<'_> {
                 ui.spinner();
                 ui.label("Downloading the update...");
             }
-            UpdateInstall::Started => {
+            UpdateInstall::Started(_) => {
                 ui.label("Installing; GameFrame restarts in a moment.");
+            }
+            UpdateInstall::TimedOut => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "The installer didn't finish. Try installing again.",
+                );
             }
             UpdateInstall::Failed(e) => {
                 ui.colored_label(
@@ -2080,6 +2113,26 @@ mod tests {
 
     fn game(path: &str) -> TrackedGame {
         TrackedGame::new_default(std::path::PathBuf::from(path), path.to_string())
+    }
+
+    #[test]
+    fn install_started_times_out_after_the_timeout_and_not_before() {
+        let start = std::time::Instant::now();
+        let just_before = start + INSTALL_QUIT_TIMEOUT - std::time::Duration::from_millis(1);
+
+        let mut state = UpdateInstall::Started(start);
+        state.expire(just_before);
+        assert!(matches!(state, UpdateInstall::Started(_)));
+
+        state.expire(start + INSTALL_QUIT_TIMEOUT);
+        assert!(matches!(state, UpdateInstall::TimedOut));
+    }
+
+    #[test]
+    fn expire_leaves_other_install_states_alone() {
+        let mut state = UpdateInstall::Idle;
+        state.expire(std::time::Instant::now() + INSTALL_QUIT_TIMEOUT * 2);
+        assert!(matches!(state, UpdateInstall::Idle));
     }
 
     #[test]
