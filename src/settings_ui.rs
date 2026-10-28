@@ -566,7 +566,7 @@ fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
 }
 
 /// The status-line message for one live re-apply [`placement::Outcome`], if it
-/// warrants one. Pure, so it is unit tested.
+/// warrants one.
 fn live_apply_status(display_name: &str, outcome: &placement::Outcome) -> Option<String> {
     match outcome {
         placement::Outcome::Applied

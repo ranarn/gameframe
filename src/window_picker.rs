@@ -144,8 +144,9 @@ impl WindowPicker {
             .name("window-picker".into())
             .spawn(move || {
                 // Released when the closure ends -- also on a panic -- and
-                // after the send below, so a newer worker can never queue its
-                // list ahead of this one.
+                // after the send below. A worker superseded after the hang
+                // timeout can still send a late, older list after its
+                // replacement's; the next hover refreshes it again.
                 let _guard = GateGuard(gate, ticket);
                 let tracked_exes = match crate::profile_store::load(&config_dir) {
                     Ok(config) => config
