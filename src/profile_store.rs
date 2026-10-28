@@ -244,10 +244,12 @@ const PER_GAME_TASKBAR_KEY: &str = "taskbar_autohide";
 
 /// Folds per-game `taskbar_autohide` flags (present in older
 /// configs) into the global `hide_taskbar_on_apply` key: true if any game had
-/// it on, false if every game had it off. The no-games case does reach this
-/// fold but changes nothing (the value then comes from
-/// `default_hide_taskbar_on_apply`). The per-game keys are removed. A table
-/// that already carries `hide_taskbar_on_apply` keeps it.
+/// it on, false if every game had it off. A flag that is not a bool counts as
+/// on, the old per-game default, even though the global setting itself now
+/// defaults to off. The no-games case does reach this fold but changes nothing
+/// (the value then comes from `default_hide_taskbar_on_apply`). The per-game
+/// keys are removed. A table that already carries `hide_taskbar_on_apply`
+/// keeps it.
 /// Returns whether the table changed. Pure -- no filesystem access.
 fn fold_per_game_taskbar_flags(table: &mut toml::Table) -> bool {
     let mut flags = Vec::new();
@@ -258,7 +260,9 @@ fn fold_per_game_taskbar_flags(table: &mut toml::Table) -> bool {
                 && let Some(value) = entry.remove(PER_GAME_TASKBAR_KEY)
             {
                 changed = true;
-                // A malformed (non-bool) flag counts as the old default, on.
+                // A malformed (non-bool) flag counts as on, the per-game
+                // flag's default back then (the global setting now defaults
+                // to off).
                 flags.push(value.as_bool().unwrap_or(true));
             }
         }
@@ -346,7 +350,7 @@ fn load_from_disk(config_dir: &Path) -> Result<Config, ProfileStoreError> {
     match table.try_into::<Config>() {
         Ok(config) => {
             if folded && let Err(e) = save(config_dir, &config) {
-                log!("GameFrame: could not write back migrated config: {e}");
+                log!("GameFrame: could not write back folded config: {e}");
             }
             Ok(config)
         }

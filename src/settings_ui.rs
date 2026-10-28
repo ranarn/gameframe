@@ -33,6 +33,7 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 /// Title of the Settings window; `crate::instance_channel` finds the window by it.
 pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
@@ -101,35 +102,6 @@ pub struct SettingsState {
     /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
     /// [`Self::hotkey_failure`], which hides one once its binding was edited.
     hotkey_failures: Vec<BindingReport>,
-}
-
-/// The license shown in the About tab, from `Cargo.toml` (single source).
-const LICENSE: &str = env!("CARGO_PKG_LICENSE");
-
-/// The repository's funding config, embedded so the donation link has a
-/// single source of truth. This reaches outside `src/`, so it assumes a
-/// repo-only build: `cargo package`/`publish` without `.github` would break it.
-const FUNDING_YML: &str = include_str!("../.github/FUNDING.yml");
-
-/// The first `custom:` URL in a `FUNDING.yml` body, e.g.
-/// `custom: ["https://..."]`. This is an ad-hoc scraper for that single-line
-/// form only; a multi-line or unquoted list yields `None`. The test
-/// `repo_funding_config_yields_a_donation_url` guards the repo file against
-/// drifting into an unsupported form.
-fn funding_custom_url(funding_yml: &str) -> Option<String> {
-    let rest = funding_yml
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("custom:"))?;
-    let start = rest.find("http")?;
-    let url: String = rest[start..]
-        .chars()
-        .take_while(|c| !matches!(c, '"' | '\'' | ']' | ',') && !c.is_whitespace())
-        .collect();
-    Some(url)
-}
-
-fn donation_url() -> Option<String> {
-    funding_custom_url(FUNDING_YML)
 }
 
 /// The Settings window's tabs.
@@ -1301,7 +1273,7 @@ enum UpdateInstall {
     /// Running on a worker thread, which sends the result here.
     Running(std::sync::mpsc::Receiver<Result<(), UpdateError>>),
     /// The installer was started (at this time); it asks GameFrame to quit.
-    Started(std::time::Instant),
+    Started(Instant),
     /// The installer was started but GameFrame wasn't quit within
     /// [`INSTALL_QUIT_TIMEOUT`].
     TimedOut,
@@ -1316,12 +1288,12 @@ enum UpdateInstall {
 
 /// How long Settings waits, after the installer started, for it to quit
 /// GameFrame before reporting that the installer didn't finish.
-const INSTALL_QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const INSTALL_QUIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl UpdateInstall {
     /// Moves `Started` to `TimedOut` once [`INSTALL_QUIT_TIMEOUT`] has passed
     /// between its start and `now`.
-    fn expire(&mut self, now: std::time::Instant) {
+    fn expire(&mut self, now: Instant) {
         if let Self::Started(since) = self
             && now.saturating_duration_since(*since) >= INSTALL_QUIT_TIMEOUT
         {
@@ -1626,26 +1598,6 @@ impl SettingsApp<'_> {
             .on_hover_text("Leave off for games that draw their own cursor -- they hide the Windows one all the time.");
     }
 
-    /// Renders the About tab: version, license, source link and the
-    /// voluntary donation link.
-    fn about_section(ui: &mut egui::Ui) {
-        ui.heading("GameFrame");
-        ui.label(crate::version::current_label());
-        ui.label(format!("License: {LICENSE}"));
-        ui.hyperlink_to("Source code", env!("CARGO_PKG_REPOSITORY"));
-        ui.separator();
-        ui.heading("Support");
-        ui.label("GameFrame is free. Donating is entirely optional.");
-        match donation_url() {
-            Some(url) => {
-                ui.hyperlink_to("Donate via PayPal (optional)", url);
-            }
-            None => {
-                ui.label("No donation link is configured in this build.");
-            }
-        }
-    }
-
     /// Renders the "Zone, hotkeys & taskbar" tab.
     fn general_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
@@ -1788,16 +1740,15 @@ impl SettingsApp<'_> {
     /// success the installer quits GameFrame (closing this window) and starts
     /// it again.
     fn update_install_row(&mut self, ui: &mut egui::Ui, info: UpdateInfo) {
-        self.update_install.expire(std::time::Instant::now());
+        self.update_install.expire(Instant::now());
         if matches!(self.update_install, UpdateInstall::Started(_)) {
             // Nothing else wakes the UI if the installer never quits GameFrame.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(5));
+            ui.ctx().request_repaint_after(Duration::from_secs(5));
         }
         if let UpdateInstall::Running(receiver) = &self.update_install {
             match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    self.update_install = UpdateInstall::Started(std::time::Instant::now());
+                    self.update_install = UpdateInstall::Started(Instant::now());
                 }
                 Ok(Err(e)) => self.update_install = UpdateInstall::Failed(e),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1819,7 +1770,9 @@ impl SettingsApp<'_> {
                 // With the window gone nobody reads the channel; a failure is
                 // then shown in a box so it is never only in the log.
                 if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
-                    crate::app::show_warning_box(&crate::update_install::install_error_message(&e));
+                    crate::message_box::show_warning_box(
+                        &crate::update_install::install_error_message(&e),
+                    );
                 }
                 ctx.request_repaint();
             });
@@ -2101,7 +2054,7 @@ impl eframe::App for SettingsApp<'_> {
                         });
                     }
                     SettingsTab::General => self.general_section(ui),
-                    SettingsTab::About => Self::about_section(ui),
+                    SettingsTab::About => crate::about_ui::about_section(ui),
                 });
         });
     }
@@ -2117,8 +2070,8 @@ mod tests {
 
     #[test]
     fn install_started_times_out_after_the_timeout_and_not_before() {
-        let start = std::time::Instant::now();
-        let just_before = start + INSTALL_QUIT_TIMEOUT - std::time::Duration::from_millis(1);
+        let start = Instant::now();
+        let just_before = start + INSTALL_QUIT_TIMEOUT - Duration::from_millis(1);
 
         let mut state = UpdateInstall::Started(start);
         state.expire(just_before);
@@ -2131,7 +2084,7 @@ mod tests {
     #[test]
     fn expire_leaves_other_install_states_alone() {
         let mut state = UpdateInstall::Idle;
-        state.expire(std::time::Instant::now() + INSTALL_QUIT_TIMEOUT * 2);
+        state.expire(Instant::now() + INSTALL_QUIT_TIMEOUT * 2);
         assert!(matches!(state, UpdateInstall::Idle));
     }
 
@@ -2201,24 +2154,6 @@ mod tests {
         state.apply_external_cursor_enabled(true);
 
         assert_eq!(state.cursor.size, size);
-    }
-
-    #[test]
-    fn funding_custom_url_is_read_from_the_yaml() {
-        assert_eq!(
-            funding_custom_url("custom: [\"https://example.com/d?x=1\"]\n").as_deref(),
-            Some("https://example.com/d?x=1")
-        );
-        assert_eq!(funding_custom_url("github: someone\n"), None);
-    }
-
-    #[test]
-    fn repo_funding_config_yields_a_donation_url() {
-        assert!(
-            donation_url()
-                .unwrap()
-                .starts_with("https://www.paypal.com/")
-        );
     }
 
     #[test]

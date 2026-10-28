@@ -4,6 +4,7 @@
 #[macro_use]
 mod logging;
 
+mod about_ui;
 mod app;
 mod autostart;
 mod cursor_overlay;
@@ -13,6 +14,7 @@ mod http;
 mod instance_channel;
 mod keyboard_hook;
 mod launch_watcher;
+mod message_box;
 mod profile_store;
 mod region_calc;
 mod settings_ui;

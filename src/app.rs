@@ -51,6 +51,7 @@ use crate::cursor_overlay::CursorOverlay;
 use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction, Hotkeys};
 use crate::instance_channel;
 use crate::launch_watcher;
+use crate::message_box::show_message_box;
 use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
 use crate::settings_ui::{self, TickContext, primary_monitor_geometry};
@@ -70,8 +71,8 @@ use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
-    MB_SETFOREGROUND, MB_YESNO, MSG, MessageBoxW, TranslateMessage,
+    DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
+    TranslateMessage,
 };
 
 pub fn run() -> Result<(), TrayUiError> {
@@ -1079,22 +1080,6 @@ pub(crate) fn handle_applied_window_drift(
 static UPDATE_RESULT_BOX_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Shows a message box titled "GameFrame" and returns the button pressed.
-/// Blocks, so call it from a worker thread.
-pub(crate) fn show_message_box(text: &str, style: u32) -> i32 {
-    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-    let text = wide(text);
-    let title = wide("GameFrame");
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            style | MB_SETFOREGROUND,
-        )
-    }
-}
-
 /// Runs an update check on a worker thread (the event loop never waits on the
 /// network) and shows the result in a message box from that thread; an
 /// available update is offered for installation. Ignored while a message box
@@ -1135,11 +1120,6 @@ fn check_for_updates_from_tray() {
             show_message_box(why_not, MB_OK | MB_ICONINFORMATION);
         });
     }
-}
-
-/// Shows `text` in a warning box and waits for it to be dismissed.
-pub(crate) fn show_warning_box(text: &str) {
-    show_message_box(text, MB_OK | MB_ICONWARNING);
 }
 
 /// Asks whether to install the available update `info` and, on yes, installs
