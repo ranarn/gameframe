@@ -77,6 +77,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub fn run() -> Result<(), TrayUiError> {
     let config_dir = config_dir();
     crate::logging::init(&config_dir);
+    // `run` is only reached by the process that owns the single-instance mutex.
+    crate::logging::claim_rotation();
     log!("GameFrame {} started", env!("CARGO_PKG_VERSION"));
 
     // The installer of an update cannot delete its own download.
