@@ -102,9 +102,33 @@ enum Repeat {
 #[derive(Default)]
 struct RepeatFilter {
     seen: HashMap<String, (Instant, u32)>,
+    /// Counts of records dropped from `seen` while still pending, waiting to
+    /// be written (see [`RepeatFilter::take_pending`]).
+    evicted: Vec<(String, u32)>,
+}
+
+/// The line reporting `n` suppressed repeats of `key`.
+fn repeated_line(key: &str, n: u32) -> String {
+    format!("{key} (repeated {n} more times)")
 }
 
 impl RepeatFilter {
+    /// Every pending count line: those of records evicted since the last call
+    /// and those still tracked. Resets the tracked counts to zero.
+    fn take_pending(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = std::mem::take(&mut self.evicted)
+            .into_iter()
+            .map(|(key, n)| repeated_line(&key, n))
+            .collect();
+        for (key, (_, n)) in self.seen.iter_mut() {
+            if *n > 0 {
+                lines.push(repeated_line(key, *n));
+                *n = 0;
+            }
+        }
+        lines
+    }
+
     fn check(&mut self, key: &str, now: Instant) -> Repeat {
         if let Some((last, suppressed)) = self.seen.get_mut(key) {
             if now.duration_since(*last) < REPEAT_WINDOW {
@@ -117,7 +141,12 @@ impl RepeatFilter {
             return Repeat::Log(n);
         }
         if self.seen.len() >= MAX_TRACKED {
-            self.seen.clear();
+            self.evicted.extend(
+                self.seen
+                    .drain()
+                    .filter(|(_, (_, n))| *n > 0)
+                    .map(|(k, (_, n))| (k, n)),
+            );
         }
         self.seen.insert(key.to_string(), (now, 0));
         Repeat::Log(0)
@@ -139,19 +168,40 @@ impl log::Log for LogBridge {
             return;
         }
         let line = format!("{} {}: {}", record.level(), record.target(), record.args());
-        let decision = REPEATS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(RepeatFilter::default)
-            .check(&line, Instant::now());
+        let (decision, evicted) = {
+            let mut guard = REPEATS.lock().unwrap_or_else(|e| e.into_inner());
+            let filter = guard.get_or_insert_with(RepeatFilter::default);
+            let decision = filter.check(&line, Instant::now());
+            (decision, std::mem::take(&mut filter.evicted))
+        };
+        for (key, n) in evicted {
+            write(format_args!("{}", repeated_line(&key, n)));
+        }
         match decision {
             Repeat::Suppress => {}
             Repeat::Log(0) => write(format_args!("{line}")),
-            Repeat::Log(n) => write(format_args!("{line} (repeated {n} more times)")),
+            Repeat::Log(n) => write(format_args!("{}", repeated_line(&line, n))),
         }
     }
 
-    fn flush(&self) {}
+    /// Writes every pending "(repeated N more times)" line.
+    fn flush(&self) {
+        let lines = REPEATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(RepeatFilter::take_pending)
+            .unwrap_or_default();
+        for line in lines {
+            write(format_args!("{line}"));
+        }
+    }
+}
+
+/// Writes the pending repeat counts of the `log` crate bridge; call once on
+/// graceful exit.
+pub fn flush() {
+    log::Log::flush(&LogBridge);
 }
 
 /// Installs [`LogBridge`] as the global `log` logger.
@@ -204,6 +254,17 @@ struct LogFile {
     /// because the owner holds the file open and the rename would fail.
     owner: bool,
     rotate_failure_noted: bool,
+    /// When the last rotation attempt failed; see [`rotation_due`].
+    last_failed_rotation: Option<Instant>,
+}
+
+/// After a failed rotation, the rename is retried at most this often.
+const ROTATE_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether a rotation may be attempted now: always, unless the last attempt
+/// failed less than [`ROTATE_RETRY`] ago.
+fn rotation_due(last_failure: Option<Instant>, now: Instant) -> bool {
+    last_failure.is_none_or(|t| now.duration_since(t) >= ROTATE_RETRY)
 }
 
 impl LogFile {
@@ -221,6 +282,7 @@ impl LogFile {
             size,
             owner: false,
             rotate_failure_noted: false,
+            last_failed_rotation: None,
         })
     }
 
@@ -228,7 +290,11 @@ impl LogFile {
     /// would pass the cap. A failed write is dropped: there is nowhere left to
     /// report it.
     fn append(&mut self, line: &str) {
-        if self.owner && self.size > 0 && self.size + line.len() as u64 > self.max_bytes {
+        if self.owner
+            && self.size > 0
+            && self.size + line.len() as u64 > self.max_bytes
+            && rotation_due(self.last_failed_rotation, Instant::now())
+        {
             self.rotate();
         }
         if self.file.write_all(line.as_bytes()).is_ok() {
@@ -242,6 +308,7 @@ impl LogFile {
     fn rotate(&mut self) {
         let current = self.dir.join(LOG_FILE);
         if let Err(e) = std::fs::rename(&current, self.dir.join(OLD_LOG_FILE)) {
+            self.last_failed_rotation = Some(Instant::now());
             if !self.rotate_failure_noted {
                 self.rotate_failure_noted = true;
                 let note = format!(
@@ -255,6 +322,7 @@ impl LogFile {
             }
             return;
         }
+        self.last_failed_rotation = None;
         if let Ok(file) = OpenOptions::new()
             .create(true)
             .write(true)
@@ -271,8 +339,12 @@ impl LogFile {
 mod tests {
     use super::*;
 
+    /// Serialises tests that touch the global [`LOG`].
+    static GLOBAL_LOG_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn init_is_idempotent() {
+        let _serial = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Releases the file (so the temp dir can be removed) even if an
         // assert below panics.
         struct ResetLog;
@@ -401,6 +473,84 @@ mod tests {
             f.check(&i.to_string(), t0);
         }
         assert!(f.seen.len() <= MAX_TRACKED);
+    }
+
+    #[test]
+    fn evicting_a_record_with_suppressed_repeats_yields_its_count() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        f.check("noisy", t0);
+        f.check("noisy", t0);
+        f.check("noisy", t0);
+        for i in 0..MAX_TRACKED {
+            f.check(&i.to_string(), t0);
+        }
+        assert_eq!(f.evicted, vec![("noisy".to_string(), 2)]);
+        assert_eq!(f.take_pending(), vec!["noisy (repeated 2 more times)"]);
+        assert!(f.take_pending().is_empty());
+    }
+
+    #[test]
+    fn take_pending_yields_every_pending_count_and_clears_them() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            f.check("a", t0);
+        }
+        f.check("b", t0);
+        for _ in 0..2 {
+            f.check("c", t0);
+        }
+        let mut lines = f.take_pending();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec!["a (repeated 2 more times)", "c (repeated 1 more times)"]
+        );
+        assert!(f.take_pending().is_empty());
+        // The cleared count does not come back on the next window.
+        assert_eq!(f.check("a", t0 + REPEAT_WINDOW), Repeat::Log(0));
+    }
+
+    #[test]
+    fn a_failed_rotation_is_retried_only_after_the_retry_interval() {
+        let t0 = Instant::now();
+        assert!(rotation_due(None, t0));
+        assert!(!rotation_due(Some(t0), t0 + Duration::from_secs(1)));
+        assert!(!rotation_due(
+            Some(t0),
+            t0 + ROTATE_RETRY - Duration::from_millis(1)
+        ));
+        assert!(rotation_due(Some(t0), t0 + ROTATE_RETRY));
+    }
+
+    #[test]
+    fn claim_rotation_marks_an_open_log_and_does_nothing_before_init() {
+        let _serial = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        claim_rotation(); // before init: no file to mark, no panic
+        assert!(LOG.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(LogFile::open(tmp.path(), 1024).unwrap());
+        assert!(
+            !LOG.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .owner
+        );
+        claim_rotation();
+        let owner = LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .unwrap()
+            .owner;
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert!(owner);
     }
 
     #[test]

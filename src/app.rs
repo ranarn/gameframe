@@ -165,6 +165,9 @@ pub fn run() -> Result<(), TrayUiError> {
         launch_watcher::unregister(hook);
     }
 
+    // Last, so repeat counts from the shutdown above are included.
+    crate::logging::flush();
+
     Ok(())
 }
 
