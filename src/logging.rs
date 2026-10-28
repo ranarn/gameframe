@@ -240,14 +240,22 @@ mod tests {
 
     #[test]
     fn init_is_idempotent() {
+        // Releases the file (so the temp dir can be removed) even if an
+        // assert below panics.
+        struct ResetLog;
+        impl Drop for ResetLog {
+            fn drop(&mut self) {
+                *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
+        // Declared after the temp dirs so it drops (and closes the file) first.
+        let _reset = ResetLog;
         init(first.path());
         init(second.path());
         assert!(first.path().join(LOG_FILE).exists());
         assert!(!second.path().join(LOG_FILE).exists());
-        // Release the file so the temp dir can be removed.
-        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]

@@ -13,7 +13,6 @@
 //! [`ELEVATED_RELAUNCH_FLAG`] polls for the mutex for a few seconds instead
 //! of giving up on the first attempt.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -85,17 +84,47 @@ where
     args.into_iter().skip(1).any(|a| a.as_ref() == QUIT_FLAG)
 }
 
-/// Returns `true` if this process is the only running GameFrame, `false` if
-/// another instance holds the mutex. With `wait`, keeps polling for up to
-/// that long (an elevated relaunch waiting for the old process to exit); a
-/// timeout is logged. If the mutex can't be created at all, returns `true` --
-/// failing open beats refusing to start.
-pub fn acquire(wait: Option<Duration>) -> bool {
+/// An unusual `CreateMutexW` outcome worth a log line. `acquire` hands the
+/// first one back to `main` instead of logging it, because the log may not be
+/// open yet when the mutex is taken (and a non-owning process shouldn't open
+/// the shared log early).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Note {
+    /// An existing mutex can't be opened; treated as held.
+    AccessDenied,
+    /// The call failed for another reason; treated as not held (fail open).
+    CreateFailed(u32),
+}
+
+impl std::fmt::Display for Note {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Note::AccessDenied => f.write_str(
+                "single-instance mutex exists but cannot be opened (access denied); treating it as held by another instance",
+            ),
+            Note::CreateFailed(code) => write!(
+                f,
+                "single-instance mutex could not be created (error {code}); starting anyway"
+            ),
+        }
+    }
+}
+
+/// Returns whether this process is the only running GameFrame (`false` if
+/// another instance holds the mutex), plus the first unusual outcome seen, for
+/// the caller to log. With `wait`, keeps polling for up to that long (an
+/// elevated relaunch waiting for the old process to exit); a timeout is
+/// logged. If the mutex can't be created at all, returns `true` -- failing
+/// open beats refusing to start.
+pub fn acquire(wait: Option<Duration>) -> (bool, Option<Note>) {
     let start = Instant::now();
+    let mut note = None;
     loop {
-        let owned = try_acquire(MUTEX_NAME);
+        let (owned, attempt_note) = try_acquire(MUTEX_NAME);
+        // Keep only the first: an elevated relaunch polls for seconds.
+        note = note.or(attempt_note);
         match decide(owned, start.elapsed(), wait) {
-            Decision::Proceed => return true,
+            Decision::Proceed => return (true, note),
             Decision::Retry => std::thread::sleep(POLL_INTERVAL),
             Decision::GiveUp => {
                 if let Some(limit) = wait {
@@ -103,7 +132,7 @@ pub fn acquire(wait: Option<Duration>) -> bool {
                         "elevated relaunch: previous instance still held the single-instance mutex after {limit:?}; exiting"
                     );
                 }
-                return false;
+                return (false, note);
             }
         }
     }
@@ -111,7 +140,7 @@ pub fn acquire(wait: Option<Duration>) -> bool {
 
 /// One attempt. On success the handle is intentionally kept open for the
 /// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
-fn try_acquire(mutex_name: &str) -> bool {
+fn try_acquire(mutex_name: &str) -> (bool, Option<Note>) {
     let name: Vec<u16> = mutex_name
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -123,23 +152,15 @@ fn try_acquire(mutex_name: &str) -> bool {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         (handle, GetLastError())
     };
-    let held = mutex_held(handle.is_null(), last_error);
-    if held && !handle.is_null() {
+    let failed = handle.is_null();
+    let held = mutex_held(failed, last_error);
+    if held && !failed {
         // SAFETY: `handle` is a valid mutex handle we just received and
         // haven't closed; this drops our reference to the existing mutex.
         unsafe { CloseHandle(handle) };
     }
-    if held && handle.is_null() && !ACCESS_DENIED_LOGGED.swap(true, Ordering::Relaxed) {
-        // Logged once: an elevated relaunch polls for seconds.
-        log!(
-            "single-instance mutex exists but cannot be opened (access denied); treating it as held by another instance"
-        );
-    }
-    !held
+    (!held, note_for(failed, last_error))
 }
-
-/// Set once the access-denied case has been logged.
-static ACCESS_DENIED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Pure mapping of a `CreateMutexW` result to "another instance holds the
 /// mutex". `handle_is_null` is whether the call failed; `last_error` is
@@ -151,6 +172,15 @@ fn mutex_held(handle_is_null: bool, last_error: u32) -> bool {
         last_error == ERROR_ACCESS_DENIED
     } else {
         last_error == ERROR_ALREADY_EXISTS
+    }
+}
+
+/// Pure: the diagnostic for a failed `CreateMutexW` (`None` when it worked).
+fn note_for(handle_is_null: bool, last_error: u32) -> Option<Note> {
+    match (handle_is_null, last_error) {
+        (false, _) => None,
+        (true, ERROR_ACCESS_DENIED) => Some(Note::AccessDenied),
+        (true, code) => Some(Note::CreateFailed(code)),
     }
 }
 
@@ -203,10 +233,22 @@ mod tests {
     fn a_held_mutex_makes_further_attempts_fail() {
         // Own name, so a running GameFrame can't interfere.
         let name = format!("Local\\GameFrame-test-{}", std::process::id());
-        assert!(try_acquire(&name));
+        assert!(try_acquire(&name).0);
         for _ in 0..3 {
-            assert!(!try_acquire(&name));
+            assert!(!try_acquire(&name).0);
         }
+    }
+
+    #[test]
+    fn failed_calls_produce_a_note_and_successful_ones_none() {
+        assert_eq!(
+            note_for(true, ERROR_ACCESS_DENIED),
+            Some(Note::AccessDenied)
+        );
+        assert_eq!(note_for(true, 8), Some(Note::CreateFailed(8)));
+        assert_eq!(note_for(false, ERROR_ALREADY_EXISTS), None);
+        assert_eq!(note_for(false, 0), None);
+        assert!(Note::CreateFailed(8).to_string().contains("error 8"));
     }
 
     #[test]
