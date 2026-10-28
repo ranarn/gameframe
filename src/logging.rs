@@ -40,11 +40,17 @@ pub const MAX_LOG_BYTES: u64 = 1024 * 1024;
 static LOG: Mutex<Option<LogFile>> = Mutex::new(None);
 
 /// Opens (appending to) the log file in `dir`. Failing to open it only
-/// costs the file output; logging to stderr keeps working.
+/// costs the file output; logging to stderr keeps working. Idempotent: once a
+/// file is open, later calls do nothing (an elevated relaunch initialises
+/// early in `main` and again in `app::run`).
 pub fn init(dir: &Path) {
     install_log_bridge();
+    let mut slot = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return;
+    }
     match LogFile::open(dir, MAX_LOG_BYTES) {
-        Ok(file) => *LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(file),
+        Ok(file) => *slot = Some(file),
         Err(e) => eprintln!("could not open the log file in {}: {e}", dir.display()),
     }
 }
@@ -231,6 +237,18 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_is_idempotent() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        init(first.path());
+        init(second.path());
+        assert!(first.path().join(LOG_FILE).exists());
+        assert!(!second.path().join(LOG_FILE).exists());
+        // Release the file so the temp dir can be removed.
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 
     #[test]
     fn append_adds_lines_to_the_existing_file() {

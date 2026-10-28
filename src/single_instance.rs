@@ -13,9 +13,12 @@
 //! [`ELEVATED_RELAUNCH_FLAG`] polls for the mutex for a few seconds instead
 //! of giving up on the first attempt.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError,
+};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 /// Same GUID as the installer's `AppId`, so the name can't collide with
@@ -23,21 +26,21 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 pub(crate) const MUTEX_NAME: &str = "Local\\GameFrame-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
 /// Command-line flag passed to the elevated child by `relaunch_elevated`.
-pub const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
+pub(crate) const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
 
 /// Command-line flag that asks the running instance to quit, see
 /// [`is_quit_request`].
 pub const QUIT_FLAG: &str = "--quit";
 
 /// How long an elevated relaunch waits for the old instance to exit.
-pub const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
 
 /// Polling interval while waiting for the old instance to release the mutex.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What to do after one attempt at taking the mutex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
     /// This process owns the instance; start up.
     Proceed,
     /// Another instance still holds it; try again after a short sleep.
@@ -49,7 +52,7 @@ pub enum Decision {
 /// Pure retry decision. `owned` is the attempt result, `elapsed` the time
 /// since the first attempt, `wait` the allowed total (`None` = single attempt,
 /// the normal launch).
-pub fn decide(owned: bool, elapsed: Duration, wait: Option<Duration>) -> Decision {
+fn decide(owned: bool, elapsed: Duration, wait: Option<Duration>) -> Decision {
     if owned {
         return Decision::Proceed;
     }
@@ -120,16 +123,35 @@ fn try_acquire(mutex_name: &str) -> bool {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         (handle, GetLastError())
     };
-    if handle.is_null() {
-        return true;
-    }
-    if last_error == ERROR_ALREADY_EXISTS {
+    let held = mutex_held(handle.is_null(), last_error);
+    if held && !handle.is_null() {
         // SAFETY: `handle` is a valid mutex handle we just received and
         // haven't closed; this drops our reference to the existing mutex.
         unsafe { CloseHandle(handle) };
-        return false;
     }
-    true
+    if held && handle.is_null() && !ACCESS_DENIED_LOGGED.swap(true, Ordering::Relaxed) {
+        // Logged once: an elevated relaunch polls for seconds.
+        log!(
+            "single-instance mutex exists but cannot be opened (access denied); treating it as held by another instance"
+        );
+    }
+    !held
+}
+
+/// Set once the access-denied case has been logged.
+static ACCESS_DENIED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Pure mapping of a `CreateMutexW` result to "another instance holds the
+/// mutex". `handle_is_null` is whether the call failed; `last_error` is
+/// `GetLastError` right after it. `ERROR_ACCESS_DENIED` (an existing mutex we
+/// may not open, e.g. the other instance runs elevated with other
+/// credentials) means held; any other failure is not held (fail open).
+fn mutex_held(handle_is_null: bool, last_error: u32) -> bool {
+    if handle_is_null {
+        last_error == ERROR_ACCESS_DENIED
+    } else {
+        last_error == ERROR_ALREADY_EXISTS
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +189,14 @@ mod tests {
             decide(false, Duration::from_secs(6), WAIT),
             Decision::GiveUp
         );
+    }
+
+    #[test]
+    fn mutex_held_mapping() {
+        assert!(mutex_held(true, ERROR_ACCESS_DENIED));
+        assert!(mutex_held(false, ERROR_ALREADY_EXISTS));
+        assert!(!mutex_held(false, 0));
+        assert!(!mutex_held(true, 8)); // other failure: fail open
     }
 
     #[test]
