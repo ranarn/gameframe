@@ -649,7 +649,10 @@ fn toggle_with_store<E>(
     }
 }
 
-static APPLIED_WINDOWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+/// Windows GameFrame applied the Zone to, as `(window handle, owning process
+/// id)`. The pid is captured at registration because a destroyed window can no
+/// longer be asked for it.
+static APPLIED_WINDOWS: std::sync::Mutex<Vec<(isize, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether the user restored `hwnd` with the borderless hotkey, so auto-apply
 /// and drift re-apply must leave it alone until it is destroyed or stripped
@@ -672,10 +675,18 @@ pub fn allow_auto_apply(hwnd: HWND) {
 /// location-change watcher can cheaply (one mutex lock + scan) ignore every
 /// other window's move events.
 pub fn remember_applied_window(hwnd: HWND) {
-    let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
-    if !windows.contains(&(hwnd as isize)) {
-        windows.push(hwnd as isize);
+    let mut pid: u32 = 0;
+    // Safety: `&mut pid` is a valid out-pointer; a stale handle just yields 0.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
     }
+    {
+        let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+        if !windows.iter().any(|(h, _)| *h == hwnd as isize) {
+            windows.push((hwnd as isize, pid));
+        }
+    }
+    crate::launch_watcher::sync_drift_hooks();
 }
 
 /// Whether `hwnd` was previously registered via [`remember_applied_window`].
@@ -683,7 +694,19 @@ pub fn is_applied_window(hwnd: HWND) -> bool {
     APPLIED_WINDOWS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .contains(&(hwnd as isize))
+        .iter()
+        .any(|(h, _)| *h == hwnd as isize)
+}
+
+/// Process ids owning at least one applied window (never 0).
+pub fn applied_window_pids() -> std::collections::BTreeSet<u32> {
+    APPLIED_WINDOWS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(_, pid)| *pid)
+        .filter(|pid| *pid != 0)
+        .collect()
 }
 
 /// Minimum time between two drift re-apply attempts on one window. A game that
@@ -794,7 +817,8 @@ fn unmark_applied_window(hwnd: HWND) {
     APPLIED_WINDOWS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retain(|h| *h != hwnd as isize);
+        .retain(|(h, _)| *h != hwnd as isize);
+    crate::launch_watcher::sync_drift_hooks();
 }
 
 /// Reads `hwnd`'s live bounds/style and reports [`window_drifted`] against
