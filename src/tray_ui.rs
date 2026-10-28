@@ -188,6 +188,8 @@ pub struct Tray {
     update_item: std::cell::RefCell<Option<MenuItem>>,
     ids: TrayMenuIds,
     apply_to_window_menu: Submenu,
+    /// Builds the "Apply to Window" list on a worker thread.
+    picker: crate::window_picker::WindowPicker,
     start_with_windows_item: CheckMenuItem,
 }
 
@@ -215,7 +217,8 @@ impl Tray {
 
         let apply_to_window_menu =
             Submenu::with_id(ids.apply_to_window.clone(), "Apply to Window", true);
-        rebuild_apply_to_window_items(&apply_to_window_menu);
+        // Starts empty: the window list is built on a worker thread
+        // (`crate::window_picker`), never on this one.
         menu.append(&apply_to_window_menu)
             .map_err(TrayUiError::Menu)?;
 
@@ -255,6 +258,7 @@ impl Tray {
             update_item: std::cell::RefCell::new(None),
             ids,
             apply_to_window_menu,
+            picker: crate::window_picker::WindowPicker::new(),
             start_with_windows_item,
         })
     }
@@ -265,46 +269,36 @@ impl Tray {
         &self.ids
     }
 
-    /// Rebuilds the "Apply to Window" submenu's item list from the
-    /// currently-visible top-level windows ([`crate::win32::list_visible_windows`]),
-    /// discarding whatever was listed before.
+    /// Asks for a fresh "Apply to Window" window list. The list is built on a
+    /// worker thread ([`crate::window_picker`]); the submenu keeps showing the
+    /// previous list until [`Self::apply_finished_window_refresh`] swaps the
+    /// new one in. Never blocks the UI thread.
     ///
-    /// Live-refresh mechanism: `muda`/`tray-icon` (as vendored -- see
-    /// `Cargo.toml`) expose no "menu about to show"/`WM_INITMENUPOPUP`-style
-    /// event to hook a just-in-time rebuild to (confirmed by inspecting the
-    /// vendored crate sources; there's no such event in either crate's
-    /// public API, nor any `WM_INITMENUPOPUP` handling in `muda`'s Windows
-    /// backend). Instead, [`crate::app::run_event_loop`] calls this method
-    /// when it observes a [`tray_icon::TrayIconEvent::Enter`] or
-    /// [`tray_icon::TrayIconEvent::Click`] event on
-    /// [`tray_icon::TrayIconEvent::receiver`] -- i.e. right before the user
-    /// is actually about to see the menu, since (per `tray-icon`'s Windows
-    /// backend) the mouse must hover onto the tray icon (`Enter`) before a
-    /// click on it (`Click`) can open the context menu. It is deliberately not
-    /// called before every pumped message: `tray-icon` sets a 15ms `WM_TIMER`
-    /// while the mouse merely rests near the icon, which would drive a full
-    /// `EnumWindows` + per-window `GetWindowTextW` + submenu rebuild (real
-    /// Win32 syscalls) up to ~66 times/second just from the cursor resting
-    /// nearby -- needlessly expensive on this process's one and only message
-    /// loop. A secondary, less certain consideration also favors keeping the
-    /// refresh off the hot path: per the documented
-    /// `GetWindowText`/`GetWindowTextW` contract, a *same-process* target
-    /// window causes a `WM_GETTEXT` to be sent via `SendMessage` (which can
-    /// block if that window's own message handling is stuck), whereas a
-    /// *cross-process* target -- the common case when enumerating the whole
-    /// desktop -- is documented to read the window's cached caption text
-    /// directly instead, specifically so callers don't hang on an
-    /// unresponsive foreign process. So the SendMessage-hang risk this
-    /// refresh could hit is narrower than "any hung window anywhere on the
-    /// desktop" -- it's closer to "one of GameFrame's own top-level windows
-    /// (e.g. an open Settings window) getting stuck", which is a real but
-    /// much smaller surface. Gating on `Enter`/`Click` avoids that residual
-    /// risk too, at effectively no cost.
+    /// `muda`/`tray-icon` (as vendored) expose no "menu about to show"
+    /// event, so [`crate::app::run_event_loop`] calls this on a
+    /// [`tray_icon::TrayIconEvent::Enter`] or
+    /// [`tray_icon::TrayIconEvent::Click`] -- the hover that precedes a click.
+    /// It is not called before every pumped message: `tray-icon` sets a 15ms
+    /// `WM_TIMER` while the cursor rests near the icon. At most one refresh
+    /// runs at a time.
     ///
-    /// OS-facing: enumerates real windows and mutates a real `muda` submenu.
-    /// Not exercised by this crate's automated tests -- see module docs.
-    pub fn refresh_apply_to_window_menu(&self) {
-        rebuild_apply_to_window_items(&self.apply_to_window_menu);
+    /// Known limit: the tray popup's modal menu loop does not run the event
+    /// loop, so a menu that is already open keeps the previous list; the
+    /// hover normally started the refresh early enough for the next open.
+    ///
+    /// OS-facing; not exercised by this crate's automated tests -- see module
+    /// docs.
+    pub fn refresh_apply_to_window_menu(&self, config_dir: &std::path::Path) {
+        self.picker.request(config_dir.to_path_buf());
+    }
+
+    /// Rebuilds the "Apply to Window" submenu if a background refresh
+    /// ([`Self::refresh_apply_to_window_menu`]) has finished since the last
+    /// call. Cheap; the event loop calls it on every pass.
+    pub fn apply_finished_window_refresh(&self) {
+        if let Some(entries) = self.picker.take_latest() {
+            rebuild_apply_to_window_items(&self.apply_to_window_menu, &entries);
+        }
     }
 
     /// Adds (or relabels) the "Update to v<version>" item above "Check for
@@ -361,17 +355,17 @@ impl Tray {
 }
 
 /// Clears `submenu`'s current items and re-populates it with one
-/// [`MenuItem`] per currently-visible top-level window
-/// ([`crate::win32::list_visible_windows`]), labeled with the window's title
+/// [`MenuItem`] per picker entry (built off-thread by
+/// [`crate::window_picker`]), labeled with the window's title
 /// and carrying an id encoding its `HWND` ([`encode_window_item_id`]) for
 /// [`crate::app`]'s dispatch to recover on click.
-fn rebuild_apply_to_window_items(submenu: &Submenu) {
+fn rebuild_apply_to_window_items(submenu: &Submenu, entries: &[crate::window_picker::PickerEntry]) {
     while submenu.remove_at(0).is_some() {}
 
-    for (hwnd, title) in crate::win32::list_visible_windows() {
+    for (hwnd, title) in entries {
         let item = MenuItem::with_id(
-            encode_window_item_id(hwnd),
-            escape_menu_ampersand(&title),
+            encode_window_item_id(*hwnd as HWND),
+            escape_menu_ampersand(title),
             true,
             None,
         );

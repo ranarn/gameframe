@@ -1462,12 +1462,20 @@ pub(crate) fn encode_wide(value: &str) -> Vec<u16> {
 struct EnumWindowsState {
     windows: Vec<(HWND, String, WindowRank)>,
     rank_cache: std::collections::HashMap<u32, window_filter::ProcessRankSignals>,
+    /// Executable paths of the tracked games; their processes are never
+    /// module-snapshotted.
+    tracked_exes: Vec<std::path::PathBuf>,
 }
 
-pub fn list_visible_windows() -> Vec<(HWND, String)> {
+/// Lists the pickable top-level windows, likely games first. Blocking and
+/// slow (window walk, exe paths, module snapshots, Steam scan): call it from
+/// a worker thread, never the UI thread. `tracked_exes` are the tracked games'
+/// executable paths.
+pub fn list_visible_windows(tracked_exes: Vec<std::path::PathBuf>) -> Vec<(HWND, String)> {
     let mut state = EnumWindowsState {
         windows: Vec::new(),
         rank_cache: std::collections::HashMap::new(),
+        tracked_exes,
     };
     // Safety: `state` outlives this call (it's a local that isn't dropped
     // until after `EnumWindows` returns); it's cast to a raw pointer solely
@@ -1500,12 +1508,22 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i3
     // synchronously invoking this callback.
     let state = unsafe { &mut *(lparam as *mut EnumWindowsState) };
 
+    // A hung window can't be applied to anyway, and querying it may block.
+    if is_window_hung_logged(hwnd) {
+        return 1;
+    }
+
     // An untitled window isn't something a user could sensibly pick by name.
     let title = window_text(hwnd);
     if window_filter::is_listable_title(&title)
         && let Ok(exe_path) = window_filter::eligibility_for_hwnd(hwnd)
     {
-        let rank = window_filter::rank_window_for_hwnd(hwnd, &exe_path, &mut state.rank_cache);
+        let rank = window_filter::rank_window_for_hwnd(
+            hwnd,
+            &exe_path,
+            &state.tracked_exes,
+            &mut state.rank_cache,
+        );
         state.windows.push((hwnd, title, rank));
     }
     1 // TRUE: keep enumerating.

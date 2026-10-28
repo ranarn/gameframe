@@ -29,6 +29,7 @@ mod version;
 mod watchdog;
 mod win32;
 mod window_filter;
+mod window_picker;
 mod zone_editor;
 mod zone_overlay;
 mod zone_taskbar;
