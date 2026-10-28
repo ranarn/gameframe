@@ -262,7 +262,8 @@ pub fn enter_settings() -> SettingsGuard {
 impl Drop for SettingsGuard {
     fn drop(&mut self) {
         SETTINGS_OPEN.store(false, Ordering::SeqCst);
-        // Same thread as the window procedure, so nothing can queue in between.
+        // The queue lock is held for the discard, so it is atomic with respect
+        // to the window procedure's enqueue.
         discard_open_settings(&mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
@@ -804,15 +805,38 @@ mod tests {
         let mut opened = 0;
         let quit = dispatch_commands(take, || {
             opened += 1;
-            // Queued while Settings is open; the guard's drop then discards
-            // the OpenSettings but not the Quit.
+            // Queued while Settings is open and still queued when it returns.
             let mut q = queue.borrow_mut();
-            enqueue(&mut q, Command::OpenSettings);
             enqueue(&mut q, Command::Quit);
-            discard_open_settings(&mut q);
         });
         assert!(quit);
         assert_eq!(opened, 1);
+    }
+
+    #[test]
+    fn dropping_the_settings_guard_discards_open_settings_but_keeps_quit() {
+        // Serializes tests that touch the global queue, and resets it after.
+        static LOCK: Mutex<()> = Mutex::new(());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                SETTINGS_OPEN.store(false, Ordering::SeqCst);
+            }
+        }
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reset = Reset;
+
+        let guard = enter_settings();
+        {
+            let mut q = QUEUE.lock().unwrap();
+            enqueue(&mut q, Command::OpenSettings);
+            enqueue(&mut q, Command::Quit);
+        }
+        drop(guard);
+
+        assert!(!SETTINGS_OPEN.load(Ordering::SeqCst));
+        assert_eq!(drain(), vec![Command::Quit]);
     }
 
     #[test]
