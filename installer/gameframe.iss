@@ -26,8 +26,14 @@
 #define QuitWParam "2"
 ; How long to wait for GameFrame to exit after the quit request before killing it.
 #define QuitWaitMs "10000"
+; Quit wait when no command window was found (build older than the command
+; channel, so the request cannot be acted on): just long enough for the startup
+; race where the window appears slightly after the mutex.
+#define NoWindowWaitMs "2000"
 ; How long to wait for the process to disappear after a successful force-kill.
 #define KillWaitMs "5000"
+; After the mutex is gone, how long to wait for gameframe.exe to become writable.
+#define ExitWaitMs "5000"
 #define StartupApprovedKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 [Setup]
@@ -116,6 +122,18 @@ var
   // the user's own tick/untick survives going Back and Next.
   StartupApplied: Boolean;
 
+// MSG for the message pump below (32-bit layout: setup is a 32-bit process).
+type
+  TMsg = record
+    Wnd: Longint;
+    Message: Longint;
+    WParam: Longint;
+    LParam: Longint;
+    Time: Longint;
+    PtX: Longint;
+    PtY: Longint;
+  end;
+
 // Win32 calls for the quit request. Setup is a 32-bit process, so window
 // handles fit a Longint.
 function FindWindowEx(Parent, ChildAfter: Longint; ClassName, WindowName: String): Longint;
@@ -130,32 +148,87 @@ function OpenProcess(Access, InheritHandle, ProcessId: Longint): Longint;
   external 'OpenProcess@kernel32.dll stdcall';
 function CloseHandle(Handle: Longint): Longint;
   external 'CloseHandle@kernel32.dll stdcall';
+function PeekMessage(var Msg: TMsg; Wnd, MsgFilterMin, MsgFilterMax, RemoveMsg: Longint): Longint;
+  external 'PeekMessageW@user32.dll stdcall';
+procedure PostQuitMessage(ExitCode: Longint);
+  external 'PostQuitMessage@user32.dll stdcall';
+function TranslateMessage(var Msg: TMsg): Longint;
+  external 'TranslateMessage@user32.dll stdcall';
+function DispatchMessage(var Msg: TMsg): Longint;
+  external 'DispatchMessageW@user32.dll stdcall';
+function CreateFile(FileName: String; Access, ShareMode, Security, Disposition, Flags, Template: Longint): Longint;
+  external 'CreateFileW@kernel32.dll stdcall';
 
 function GameFrameRunning: Boolean;
 begin
   Result := CheckForMutexes('{#MutexName}');
 end;
 
+// Dispatches everything waiting in this thread's queue (Pascal Script has no
+// Application.ProcessMessages), so the wizard repaints and the window stays
+// responsive. Wizard buttons stay clickable meanwhile (no IsDialogMessage, so
+// no Tab/Enter/Esc handling); the wait is short, and a Cancel click is handled
+// by Inno's own confirmation, re-entrantly but modally.
+procedure PumpMessages;
+var
+  Msg: TMsg;
+begin
+  while PeekMessage(Msg, 0, 0, 0, 1 { PM_REMOVE }) <> 0 do
+  begin
+    if Msg.Message = $0012 { WM_QUIT } then
+    begin
+      // Not ours to swallow: hand it back for the outer message loop.
+      PostQuitMessage(Msg.WParam);
+      Exit;
+    end;
+    TranslateMessage(Msg);
+    DispatchMessage(Msg);
+  end;
+end;
+
+// Sleeps for the given time in short slices, pumping the message queue between
+// them so the wizard keeps repainting and answering the user.
+procedure PumpSleep(Ms: Integer);
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while Waited < Ms do
+  begin
+    PumpMessages;
+    Sleep(50);
+    Waited := Waited + 50;
+  end;
+  PumpMessages;
+end;
+
 // Posts GameFrame's restricted Quit command (see src/instance_channel.rs) to
-// its message-only window. A no-op for a build without that window.
-procedure RequestGameFrameQuit;
+// its message-only window. False when the window is not there (a build older
+// than the command channel) or the post failed -- nothing will act on the request.
+function RequestGameFrameQuit: Boolean;
 var
   Wnd: Longint;
 begin
+  Result := False;
   Wnd := FindWindowEx(-3 { HWND_MESSAGE }, 0, '{#CommandClass}', '');
   if Wnd = 0 then
     Log('quit request: no GameFrame command window found')
   else if PostMessage(Wnd, RegisterWindowMessage('{#QuitMessage}'), {#QuitWParam}, 0) = 0 then
     Log('quit request: could not post the quit message')
   else
+  begin
     Log('quit request: posted');
+    Result := True;
+  end;
 end;
 
 // True when the running GameFrame is one this (unelevated) setup cannot
 // terminate: it runs at a higher integrity level (#69 elevated relaunch), so
 // its quit message is blocked by UIPI and taskkill is refused. Probed by asking
-// for PROCESS_TERMINATE on the command window's owner. False when the window
-// is not found (older build) -- the taskkill outcome decides then.
+// for PROCESS_TERMINATE on the command window's owner; only ERROR_ACCESS_DENIED
+// counts (any other failure, e.g. the process just exited, is not elevation).
+// False when the window is not found (older build) -- the taskkill outcome
+// decides then.
 function GameFrameRunsElevated: Boolean;
 var
   Wnd, Pid, Process: Longint;
@@ -169,16 +242,60 @@ begin
     Exit;
   Process := OpenProcess(1 { PROCESS_TERMINATE }, 0, Pid);
   if Process = 0 then
-    Result := True
+    // Inno stores GetLastError after every external call.
+    Result := DLLGetLastError = 5 { ERROR_ACCESS_DENIED }
   else
     CloseHandle(Process);
 end;
 
-// Tries to get GameFrame out of the way. False when it is still running
-// because it is elevated and setup cannot stop it.
+// True while something still holds gameframe.exe open without write sharing,
+// i.e. the process image is still mapped. The mutex disappears while the
+// process is still shutting down, so it does not prove the file is replaceable.
+// Only a sharing violation counts as locked; any other failure (missing file on
+// a fresh install, access denied on a read-only or ACL-protected exe) is
+// treated as unlocked on purpose -- waiting would not help, and the wait is
+// only an optimisation before Inno's own copy retry.
+function ExeLocked: Boolean;
+var
+  Handle: Longint;
+begin
+  Handle := CreateFile(ExpandConstant('{app}\{#AppExe}'), $40000000 { GENERIC_WRITE },
+                       0 { no sharing }, 0, 3 { OPEN_EXISTING }, 0, 0);
+  if Handle = -1 { INVALID_HANDLE_VALUE } then
+    Result := DLLGetLastError = 32 { ERROR_SHARING_VIOLATION }
+  else
+  begin
+    Result := False;
+    CloseHandle(Handle);
+  end;
+end;
+
+// Waits (capped) until gameframe.exe can be written, so the file copy / removal
+// that follows does not hit the lock of a process that is still exiting.
+procedure WaitForExeUnlocked;
+var
+  Waited: Integer;
+  Locked: Boolean;
+begin
+  Waited := 0;
+  Locked := ExeLocked;
+  while Locked and (Waited < {#ExitWaitMs}) do
+  begin
+    PumpSleep(100);
+    Waited := Waited + 100;
+    Locked := ExeLocked;
+  end;
+  if Locked then
+    Log('gameframe.exe is still locked; continuing (the file copy retries)')
+  else
+    Log(Format('gameframe.exe is writable after %d ms', [Waited]));
+end;
+
+// Tries to get GameFrame out of the way. False when it is still running and
+// setup cannot stop it (typically because it is elevated).
 function StopGameFrame: Boolean;
 var
-  ResultCode, Waited: Integer;
+  ResultCode, Waited, QuitWait: Integer;
 begin
   // A running gameframe.exe locks the file being replaced/removed. Ask it to
   // exit through its normal path (restores the taskbar and borderless
@@ -186,18 +303,28 @@ begin
   // go; force-kill only if it does not. Nothing to do when it is not running.
   Result := True;
   if not GameFrameRunning then
+  begin
+    // The mutex goes before the process has fully exited (e.g. a retry after
+    // quitting from the tray), so the exe can still be locked.
+    WaitForExeUnlocked;
     Exit;
+  end;
   if GameFrameRunsElevated then
   begin
     Log('GameFrame runs elevated; setup cannot stop it');
     Result := False;
     Exit;
   end;
-  RequestGameFrameQuit;
+  if RequestGameFrameQuit then
+    QuitWait := {#QuitWaitMs}
+  else
+    // Older build: nothing will act on the request, so only allow for the
+    // startup race where the window appears just after the mutex.
+    QuitWait := {#NoWindowWaitMs};
   Waited := 0;
-  while GameFrameRunning and (Waited < {#QuitWaitMs}) do
+  while GameFrameRunning and (Waited < QuitWait) do
   begin
-    Sleep(100);
+    PumpSleep(100);
     Waited := Waited + 100;
   end;
   if GameFrameRunning then
@@ -207,9 +334,10 @@ begin
     Log(Format('taskkill exit code %d', [ResultCode]));
     if (ResultCode <> 0) and GameFrameRunning then
     begin
-      // taskkill was refused (access denied, exit 1): an elevated instance
-      // whose command window could not be probed.
-      Log('taskkill was refused and GameFrame is still running (elevated?)');
+      // taskkill was refused (access denied, exit 1) or failed for another
+      // reason (other session, policy); an elevated instance whose command
+      // window could not be probed is the usual cause.
+      Log('taskkill failed and GameFrame is still running');
       Result := False;
       Exit;
     end;
@@ -217,7 +345,7 @@ begin
     Waited := 0;
     while GameFrameRunning and (Waited < {#KillWaitMs}) do
     begin
-      Sleep(100);
+      PumpSleep(100);
       Waited := Waited + 100;
     end;
     if GameFrameRunning then
@@ -225,11 +353,12 @@ begin
   end
   else
     Log('GameFrame quit cleanly');
+  WaitForExeUnlocked;
 end;
 
-// StopGameFrame, with the elevated case handed to the user: an interactive
-// run offers Retry (after quitting GameFrame from the tray) or Cancel; a
-// silent run just fails. True when GameFrame is gone.
+// StopGameFrame, with the "cannot stop it" case handed to the user: an
+// interactive run offers Retry (after quitting GameFrame from the tray) or
+// Cancel; a silent run just fails. True when GameFrame is gone.
 function EnsureGameFrameStopped(Silent: Boolean): Boolean;
 begin
   Result := StopGameFrame;
@@ -237,14 +366,15 @@ begin
   begin
     if Silent then
     begin
-      Log('GameFrame is running as administrator and cannot be stopped; failing (silent run)');
+      Log('GameFrame is still running and cannot be stopped; failing (silent run)');
       Exit;
     end;
-    if MsgBox('GameFrame is running as administrator, so setup cannot close it.'#13#10#13#10 +
+    if MsgBox('GameFrame is still running and setup cannot close it. It may be running as ' +
+              'administrator or in another session.'#13#10#13#10 +
               'Quit GameFrame from its tray icon, then press Retry.',
               mbError, MB_RETRYCANCEL) <> IDRETRY then
     begin
-      Log('User cancelled while GameFrame was running as administrator');
+      Log('User cancelled while GameFrame could not be stopped');
       Exit;
     end;
     Result := StopGameFrame;
@@ -298,7 +428,7 @@ begin
     Result := ''
   else
     // Non-empty aborts before any file is touched (non-zero exit when silent).
-    Result := 'GameFrame is still running as administrator, so it was not installed. ' +
+    Result := 'GameFrame is still running and could not be closed, so it was not installed. ' +
               'Quit GameFrame from its tray icon and run setup again.';
 end;
 
@@ -332,8 +462,23 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     // Backstop: GameFrame may have been started after InitializeUninstall.
+    // Source: jrsoftware/issrc Projects/Src/Setup.Uninstall.pas calls
+    // CurUninstallStepChanged(usUninstall, HandleException=False) immediately
+    // before UninstLog.PerformUninstall (the file removal); with False the
+    // script's exception is re-raised ("fatal"), so Abort (EAbort) ends the
+    // uninstall before any file is removed. It takes the same exit path as
+    // InitializeUninstall returning False (that also calls Abort); the exact
+    // exit code is not documented and not run here (it would need a throwaway
+    // machine).
     if not StopGameFrame then
-      Log('Uninstall backstop: an elevated GameFrame is running; its exe may be locked');
+    begin
+      Log('Uninstall aborted by the backstop: GameFrame is running and cannot be stopped');
+      if not UninstallSilent then
+        MsgBox('GameFrame was started again and setup cannot close it. It may be running as ' +
+               'administrator or in another session.'#13#10#13#10 +
+               'Quit GameFrame from its tray icon and run the uninstall again.', mbError, MB_OK);
+      Abort;
+    end;
     // Remove autostart however it was enabled -- by this installer or by
     // the app's own tray/Settings toggle.
     RegDeleteValue(HKEY_CURRENT_USER, '{#RunKey}', '{#AppName}');
