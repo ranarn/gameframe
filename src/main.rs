@@ -77,7 +77,8 @@ fn main() {
         logging::flush();
         return;
     }
-    // Flushed whatever `run` returns, so no exit path loses pending repeat counts.
+    // Flushed whatever `run` returns, so no exit of the running instance loses
+    // pending repeat counts (a `--quit` request logs nothing that repeats).
     let result = app::run();
     logging::flush();
     if let Err(e) = result {

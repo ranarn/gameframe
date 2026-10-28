@@ -127,6 +127,8 @@ impl RepeatFilter {
                 *n = 0;
             }
         }
+        // Deterministic order regardless of the map's iteration order.
+        lines.sort();
         lines
     }
 
