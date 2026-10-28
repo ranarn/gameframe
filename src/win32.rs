@@ -1531,16 +1531,21 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &TaskbarJudgement) -> boo
     }
 }
 
-/// Whether the real taskbar is hidden right now under `mode` (see
-/// [`is_taskbar_hidden`]); `false` when the taskbar cannot be found. For the
-/// zone editor, which starts its toggle button from the real state.
+/// Whether the taskbar is hidden by the plain flag for `mode`, for the zone
+/// editor's one read at open: `FullyHidden` looks only at `WS_VISIBLE` (the
+/// "covered"/"off monitor" judgement of [`is_taskbar_hidden`] can be tripped
+/// by the editor's own always-on-top overlay); `HoverReveal` reads the appbar
+/// auto-hide flag. `false` when the taskbar cannot be found.
 ///
 /// OS-facing; not exercised by this crate's automated tests -- see module docs.
-pub fn taskbar_hidden_now(mode: TaskbarHideMode) -> bool {
+pub fn taskbar_hidden_flag(mode: TaskbarHideMode) -> bool {
     find_taskbar_window()
         .ok()
         .map(gather_taskbar_judgement)
-        .is_some_and(|j| is_taskbar_hidden(mode, &j))
+        .is_some_and(|j| match mode {
+            TaskbarHideMode::FullyHidden => !j.visible,
+            TaskbarHideMode::HoverReveal => is_taskbar_hidden(mode, &j),
+        })
 }
 
 /// Toggles the taskbar's hidden/visible state on/off -- the manual global

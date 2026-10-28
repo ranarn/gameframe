@@ -16,9 +16,10 @@
 //! Drives [`crate::zone_editor::AppState`] from real pointer input. The
 //! taskbar is left as found when the editor opens; a control-box toggle hides
 //! it via [`crate::win32::hide_taskbar`] (mode-aware -- see
-//! [`crate::profile_store::TaskbarHideMode`]) and shows it again. When the
+//! [`crate::profile_store::TaskbarHideMode`]) and shows it again; the toggle
+//! is disabled when the taskbar was already hidden at open. When the
 //! session ends -- Save, Cancel, or the window being closed any other way --
-//! the taskbar is returned to its state at open (see [`crate::zone_taskbar`];
+//! a hide made by the editor is undone (see [`crate::zone_taskbar`];
 //! an RAII guard, [`TaskbarRestoreGuard`], does it on drop, covering
 //! early returns). A panic is covered separately: the release profile is
 //! `panic = "abort"`, so the guard's `Drop` does NOT run then; instead the
@@ -95,7 +96,7 @@ impl std::error::Error for ZoneOverlayError {
 ///
 /// Leaves the taskbar as it is on open. The control box has a toggle that
 /// hides/shows it using whichever technique `mode` selects (see module
-/// docs); the taskbar is returned to its state at open before returning --
+/// docs); a hide the editor made is undone before returning --
 /// whether the window ran cleanly, failed to run, or returned early -- via
 /// the [`TaskbarRestoreGuard`] RAII guard held across the call. A panic
 /// mid-session is handled by the panic hook, not the guard (see the module
@@ -110,10 +111,11 @@ pub fn run_zone_editor_overlay(
         height: monitor_geometry.height,
     };
 
-    // The toggle starts from the taskbar's real state: a Zone-apply path may
-    // have it hidden already.
+    // The taskbar's state is read once, here. Hidden already (a Zone-apply
+    // path, the hotkey, Windows auto-hide): the toggle is locked and the
+    // editor never touches it.
     let taskbar = Rc::new(RefCell::new(TaskbarSession::new(
-        win32::taskbar_hidden_now(mode),
+        win32::taskbar_hidden_flag(mode),
     )));
 
     // RAII guard, not a manual "call restore after run_native" step, so
@@ -122,7 +124,7 @@ pub fn run_zone_editor_overlay(
     // build (`panic = "abort"`); the panic hook installed at startup
     // (`crate::taskbar_recovery`) restores the taskbar in that case, e.g.
     // after a wgpu device-lost panic on sleep/resume or a monitor unplug.
-    let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar), mode);
+    let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar));
 
     let state = match initial {
         Some(zone) => AppState::new_with_zone(monitor, zone),
@@ -536,7 +538,10 @@ impl OverlayApp {
                                 *self.outcome.borrow_mut() = Some(outcome);
                             }
                         });
-                        let hidden = self.taskbar.borrow().is_hidden();
+                        let (hidden, locked) = {
+                            let taskbar = self.taskbar.borrow();
+                            (taskbar.is_hidden(), taskbar.is_locked())
+                        };
                         let toggle_text = if hidden {
                             "Show taskbar"
                         } else {
@@ -544,10 +549,17 @@ impl OverlayApp {
                         };
                         ui.vertical_centered(|ui| {
                             let toggle = control_button(toggle_text, egui::Color32::from_gray(70));
-                            if ui.add(toggle).clicked() {
+                            if ui.add_enabled(!locked, toggle).clicked() {
                                 self.taskbar.borrow_mut().toggle(self.taskbar_mode);
                             }
-                            if let Some(error) = &self.taskbar.borrow().error {
+                            if locked {
+                                ui.label(
+                                    egui::RichText::new("The taskbar is already hidden")
+                                        .color(egui::Color32::LIGHT_GRAY)
+                                        .size(16.0),
+                                );
+                            }
+                            if let Some(error) = self.taskbar.borrow().error() {
                                 ui.label(
                                     egui::RichText::new(error)
                                         .color(egui::Color32::from_rgb(255, 120, 100))
