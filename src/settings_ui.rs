@@ -20,12 +20,12 @@ use crate::autostart::{self, AutostartError};
 use crate::cursor_style::{self, CursorShape};
 use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::keyboard_hook;
+use crate::placement;
 use crate::profile_store::{
     self, Config, CursorSettings, HotkeyBindings, ProfileStoreError, TaskbarHideMode, TrackedGame,
     UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
-use crate::taskbar;
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
 use crate::zone_editor::pixels_to_points;
@@ -75,8 +75,8 @@ pub struct SettingsState {
     pub duplicate_hotkey_error: Option<String>,
     /// The tracked-games list, editable in place by the Settings "Games"
     /// section (auto-apply per row, and immediate
-    /// no-confirmation removal) -- see [`crate::app`]'s apply paths for how
-    /// entries are added.
+    /// no-confirmation removal) -- entries are added by
+    /// [`crate::placement::apply_zone`]'s `Trigger::Tray` branch.
     pub tracked_games: Vec<TrackedGame>,
     /// Which technique GameFrame uses to hide the taskbar whenever any call
     /// site hides it -- `FullyHidden` (the default, no hover-reveal) or
@@ -439,7 +439,7 @@ fn primary_work_area() -> MonitorGeometry {
         unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) };
     if ok == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
         log!("settings: SPI_GETWORKAREA failed; using the full monitor");
-        return primary_monitor_geometry();
+        return crate::win32::primary_monitor_geometry();
     }
     MonitorGeometry {
         x: rect.left,
@@ -540,86 +540,38 @@ pub(crate) fn persist_zone(
     Ok(updated)
 }
 
-/// Attempts the live re-apply for a single tracked game, via
-/// [`win32::resolve_running_window`] + [`taskbar::live_reapply_running_window`].
-/// Returns `Some(message)` only when an attempt was actually made and failed
-/// (the game was running, but repositioning it hit an OS-level error) -- a
-/// game that isn't currently running is silently skipped (`None`) *before*
-/// the Zone's region is even resolved: its setting still saved normally and
-/// will apply on its next launch/hotkey/tray-apply. This ordering matters --
-/// a not-running game must never surface a region-resolution error as a
-/// live-apply failure.
+/// Live re-applies the Zone on disk to every running tracked game in `games`
+/// through [`placement::apply_zone`] (the Zone is shared, so a new one affects
+/// all of them). Returns one status-line message per game whose re-apply
+/// failed -- an empty list if every game either isn't running, was skipped
+/// (e.g. refused by the eligibility filter; logged) or was repositioned.
 ///
-/// OS-facing (delegates to [`win32::resolve_running_window`]/
-/// [`taskbar::live_reapply_running_window`], which perform the real toolhelp
-/// snapshot/window enumeration/repositioning) -- not exercised by this
-/// crate's automated tests, per this crate's established convention;
-/// [`live_apply_failure_message`] above is the pure decision this delegates
-/// to for its one testable piece (the message text).
-fn live_reapply_tracked_game(
-    game: &TrackedGame,
-    zone: &Zone,
-    monitor: &MonitorGeometry,
-    hide_taskbar_on_apply: bool,
-    taskbar_hide_mode: TaskbarHideMode,
-) -> Option<String> {
-    // Not-running must always short-circuit before region resolution is even
-    // attempted: a saved Zone that no longer fits the current monitor would
-    // otherwise surface a spurious failure message for a game that was
-    // never actually running.
-    let hwnd = win32::resolve_running_window(&game.exe_path)?;
-
-    let region = match resolve_region(zone, monitor) {
-        Ok(region) => region,
-        Err(e) => {
-            log!(
-                "live re-apply: failed to resolve the Zone for {}: {e}",
-                game.display_name
-            );
-            return Some(live_apply_failure_message(&game.display_name));
-        }
-    };
-
-    match taskbar::live_reapply_running_window(
-        hwnd,
-        &game.display_name,
-        hide_taskbar_on_apply,
-        taskbar_hide_mode,
-        region,
-    ) {
-        win32::LiveApplyOutcome::Applied => None,
-        win32::LiveApplyOutcome::Failed(e) => {
-            log!("live re-apply failed for {}: {e}", game.display_name);
-            Some(live_apply_failure_message(&game.display_name))
-        }
-    }
-}
-
-/// Live re-applies a newly-saved `zone` to every tracked game in `games`
-/// (the Zone is shared, so a new one affects all of them). Returns one
-/// status-line message per game whose live re-apply attempt failed -- an
-/// empty list if every game either isn't running or was repositioned
-/// successfully.
+/// A game that isn't running is skipped *before* any Zone resolution, so a
+/// saved Zone that no longer fits the monitor never surfaces as a failure for a
+/// game that was never running; its setting still applies on its next
+/// launch/hotkey/tray-apply.
 ///
-/// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs.
-fn live_reapply_all(
-    games: &[TrackedGame],
-    zone: &Zone,
-    monitor: &MonitorGeometry,
-    hide_taskbar_on_apply: bool,
-    taskbar_hide_mode: TaskbarHideMode,
-) -> Vec<String> {
+/// OS-facing -- not exercised by this crate's automated tests; the
+/// orchestration is tested in `placement`, and
+/// [`live_apply_failure_message`] is the pure message text.
+fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
     games
         .iter()
         .filter_map(|game| {
-            live_reapply_tracked_game(
-                game,
-                zone,
-                monitor,
-                hide_taskbar_on_apply,
-                taskbar_hide_mode,
-            )
+            let hwnd = win32::resolve_running_window(&game.exe_path)?;
+            match placement::apply_zone(config_dir, hwnd, placement::Trigger::LiveReapply) {
+                placement::Outcome::Applied
+                | placement::Outcome::Skipped
+                | placement::Outcome::RetryIn(_)
+                // Refused by the eligibility filter: it would be refused on
+                // the next launch too, so the "used next launch" message
+                // would be wrong; skipped silently (logged by placement).
+                | placement::Outcome::Refused => None,
+                placement::Outcome::RegionFailed
+                | placement::Outcome::Failed(_) => {
+                    Some(live_apply_failure_message(&game.display_name))
+                }
+            }
         })
         .collect()
 }
@@ -944,28 +896,6 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
-/// Queries the primary monitor's geometry via a minimal Win32 call.
-///
-/// OS-facing -- not exercised by this crate's automated tests, for the same
-/// reason as [`crate::tray_ui::Tray::new`]. Only the primary monitor is
-/// supported (see `region_calc` module docs); there is no monitor-enumeration
-/// module.
-pub fn primary_monitor_geometry() -> MonitorGeometry {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-
-    // Safety: `GetSystemMetrics` is a simple, side-effect-free Win32 query
-    // that takes a plain integer index and returns a plain integer; no
-    // pointers or lifetimes are involved.
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    MonitorGeometry {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
 /// Reasons opening the Settings window or persisting its result can fail.
 #[derive(Debug)]
 pub enum SettingsUiError {
@@ -1104,7 +1034,7 @@ pub fn run_settings_window(
     state.set_hotkey_reports(hotkey_reports);
     let started_with_windows = autostart::is_enabled();
     state.start_with_windows = started_with_windows;
-    let monitor = primary_monitor_geometry();
+    let monitor = crate::win32::primary_monitor_geometry();
     let mut status_messages: Vec<String> = Vec::new();
 
     loop {
@@ -1164,15 +1094,8 @@ pub fn run_settings_window(
                         match persist_zone(config_dir, Some(zone)) {
                             Ok(saved) => {
                                 latest_state.set_zone(zone);
-                                // The on-disk taskbar settings, not the
-                                // unsaved Settings state.
-                                status_messages = live_reapply_all(
-                                    &saved.tracked_games,
-                                    &zone,
-                                    &monitor,
-                                    saved.hide_taskbar_on_apply,
-                                    saved.taskbar_hide_mode,
-                                );
+                                status_messages =
+                                    live_reapply_all(config_dir, &saved.tracked_games);
                             }
                             Err(e) => {
                                 log!("failed to save the zone: {e}");

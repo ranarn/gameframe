@@ -12,12 +12,11 @@
 //! Any new code path that hides the taskbar must go through this module.
 
 use crate::profile_store::TaskbarHideMode;
-use crate::region_calc::Region;
 use crate::taskbar_recovery;
 use crate::win32::{
-    self, LiveApplyOutcome, TaskbarAutohideState, TaskbarHideRestore, Win32Error,
-    find_taskbar_window, gather_taskbar_judgement, plan_taskbar_hide, read_appbar_flags,
-    should_rehide_on_join, state_from_flags, taskbar_autohide_state_from_bool, write_appbar_state,
+    self, TaskbarAutohideState, TaskbarHideRestore, Win32Error, find_taskbar_window,
+    gather_taskbar_judgement, plan_taskbar_hide, read_appbar_flags, should_rehide_on_join,
+    state_from_flags, taskbar_autohide_state_from_bool, write_appbar_state,
 };
 use windows_sys::Win32::Foundation::HWND;
 
@@ -519,7 +518,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement)
 /// visible hides via
 /// [`set_taskbar_hide_absolute`]; currently hidden shows via the same.
 ///
-/// Fully independent of [`crate::win32::toggle_borderless_on_window`]'s
+/// Fully independent of [`crate::win32::restore_window`]'s
 /// `RestoreState`, and of [`set_taskbar_hide_absolute_armed`]'s
 /// `ARMED_TASKBAR_RESTORE` bookkeeping -- this reads only the taskbar's real
 /// OS-level visibility, never any tracked-game config or armed-window state,
@@ -565,68 +564,6 @@ fn taskbar_debug_state() -> String {
         Ok(taskbar) => describe_taskbar(&gather_taskbar_judgement(taskbar)),
         Err(_) => "Shell_TrayWnd not found".to_string(),
     }
-}
-
-/// Re-applies a tracked game's border/taskbar settings to its already-running
-/// window, for the live-apply-on-commit feature: this is the fourth
-/// call site of the "apply borderless, then gate taskbar-set on border-apply
-/// success" pattern already used by the borderless-toggle hotkey path, the
-/// tray "Apply to Window" path, and the launch-watcher path (see
-/// `crate::app::handle_toggle_borderless`/`handle_apply_to_window`/
-/// `handle_auto_apply_launch`) -- getting it right here means simply
-/// mirroring the same early-return-on-border-failure shape those three
-/// already use, not re-deriving it.
-///
-/// Deliberately takes an already-resolved `hwnd` rather than an `exe_path`:
-/// resolving the running window (via [`crate::win32::resolve_running_window`]) is the
-/// caller's (`crate::settings_ui`) responsibility, and must happen *before*
-/// the caller resolves `target_region` -- a not-running game must never reach
-/// this function at all, and must never cause a region-resolution error to be
-/// reported as a live-apply failure.
-///
-/// `mode` selects which taskbar-hide technique the taskbar-set call below
-/// uses (`FullyHidden` via `ShowWindow`, or `HoverReveal` via the native
-/// appbar auto-hide mechanism) -- it's threaded straight through to
-/// [`set_taskbar_hide_absolute_armed`], same as every other apply path, so
-/// closing `hwnd` later can auto-restore the taskbar.
-///
-/// A taskbar-set failure (after a successful border-apply) is only logged,
-/// never escalated to [`LiveApplyOutcome::Failed`] -- the window was already
-/// successfully repositioned, so treating the whole attempt as failed (and
-/// showing "will apply on next launch" for it) would be misleading.
-///
-/// Deliberately never calls [`crate::win32::relaunch_elevated`] on an access-denied
-/// failure, unlike the hotkey path: this runs synchronously inside the
-/// Settings window's own commit handlers, and `relaunch_elevated` restarts
-/// the whole app -- doing so here would destroy the in-progress Settings
-/// session out from under the user for a comparatively minor, easily
-/// retried-later failure. Reactive elevation stays scoped to the hotkey path
-/// only.
-///
-/// OS-facing: not exercised by this crate's automated tests -- see the
-/// `win32` module docs.
-pub(crate) fn live_reapply_running_window(
-    hwnd: HWND,
-    display_name: &str,
-    hide_taskbar: bool,
-    mode: TaskbarHideMode,
-    target_region: Region,
-) -> LiveApplyOutcome {
-    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region) {
-        return LiveApplyOutcome::Failed(e);
-    }
-
-    // An explicit placement, like the tray picker: lift any hotkey-restore
-    // opt-out so auto-apply and drift re-apply cover the window again.
-    win32::allow_auto_apply(hwnd);
-
-    if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode)
-        && !e.is_window_hung()
-    {
-        log!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
-    }
-
-    LiveApplyOutcome::Applied
 }
 
 /// [`taskbar_debug_state`] for an already-gathered judgement, plus the armed
