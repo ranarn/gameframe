@@ -55,6 +55,14 @@ pub fn init(dir: &Path) {
     }
 }
 
+/// Marks this process as the single-instance owner, which lets it rotate the
+/// log. Until called, a process only appends. Call after [`init`].
+pub fn claim_rotation() {
+    if let Some(file) = LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        file.owner = true;
+    }
+}
+
 /// Crates whose `info` records are forwarded (see [`should_forward`]).
 const INFO_TARGET_PREFIXES: [&str; 3] = ["egui_wgpu", "wgpu_core", "wgpu_hal"];
 
@@ -190,6 +198,11 @@ struct LogFile {
     max_bytes: u64,
     file: File,
     size: u64,
+    /// Only the process owning the single-instance mutex rotates; any other
+    /// (a second launch, an elevated relaunch still waiting) only appends,
+    /// because the owner holds the file open and the rename would fail.
+    owner: bool,
+    rotate_failure_noted: bool,
 }
 
 impl LogFile {
@@ -205,13 +218,16 @@ impl LogFile {
             max_bytes,
             file,
             size,
+            owner: false,
+            rotate_failure_noted: false,
         })
     }
 
-    /// Appends `line`, rotating first if it would pass the cap. A failed
-    /// write is dropped: there is nowhere left to report it.
+    /// Appends `line`, rotating first if this process owns the log and the line
+    /// would pass the cap. A failed write is dropped: there is nowhere left to
+    /// report it.
     fn append(&mut self, line: &str) {
-        if self.size > 0 && self.size + line.len() as u64 > self.max_bytes {
+        if self.owner && self.size > 0 && self.size + line.len() as u64 > self.max_bytes {
             self.rotate();
         }
         if self.file.write_all(line.as_bytes()).is_ok() {
@@ -219,9 +235,25 @@ impl LogFile {
         }
     }
 
+    /// Moves the current file aside and starts a new one. If the rename fails
+    /// (another process may hold the file) nothing is truncated: the file keeps
+    /// growing and the failure is noted once.
     fn rotate(&mut self) {
         let current = self.dir.join(LOG_FILE);
-        let _ = std::fs::rename(&current, self.dir.join(OLD_LOG_FILE));
+        if let Err(e) = std::fs::rename(&current, self.dir.join(OLD_LOG_FILE)) {
+            if !self.rotate_failure_noted {
+                self.rotate_failure_noted = true;
+                let note = format!(
+                    "{} [{}] log rotation failed, continuing in the current file: {e}\n",
+                    timestamp(),
+                    thread_name()
+                );
+                if self.file.write_all(note.as_bytes()).is_ok() {
+                    self.size += note.len() as u64;
+                }
+            }
+            return;
+        }
         if let Ok(file) = OpenOptions::new()
             .create(true)
             .write(true)
@@ -275,6 +307,7 @@ mod tests {
     fn passing_the_cap_moves_the_file_aside_and_starts_a_new_one() {
         let tmp = tempfile::tempdir().unwrap();
         let mut log = LogFile::open(tmp.path(), 10).unwrap();
+        log.owner = true;
 
         log.append("12345678\n");
         log.append("abc\n");
@@ -283,6 +316,41 @@ mod tests {
         let old = std::fs::read_to_string(tmp.path().join(OLD_LOG_FILE)).unwrap();
         assert_eq!(current, "abc\n");
         assert_eq!(old, "12345678\n");
+    }
+
+    #[test]
+    fn a_non_owner_past_the_cap_appends_without_rotating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = LogFile::open(tmp.path(), 10).unwrap();
+
+        log.append("12345678\n");
+        log.append("abc\n");
+
+        let current = std::fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        assert_eq!(current, "12345678\nabc\n");
+        assert!(!tmp.path().join(OLD_LOG_FILE).exists());
+    }
+
+    #[test]
+    fn a_failed_rotation_still_writes_the_line_and_notes_the_failure_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory at the target makes the rename fail.
+        std::fs::create_dir(tmp.path().join(OLD_LOG_FILE)).unwrap();
+        let mut log = LogFile::open(tmp.path(), 10).unwrap();
+        log.owner = true;
+
+        log.append("12345678\n");
+        log.append("abc\n");
+        log.append("def\n");
+
+        let current = std::fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        assert!(current.starts_with("12345678\n"), "{current}");
+        assert!(current.contains("abc\n") && current.contains("def\n"));
+        assert_eq!(
+            current.matches("log rotation failed").count(),
+            1,
+            "{current}"
+        );
     }
 
     #[test]
