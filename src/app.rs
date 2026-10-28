@@ -192,10 +192,18 @@ Yes: set up the Zone now (draw it on screen).\n\
 No: skip for now (set it up later in Settings; Settings stays limited until then).\n\n\
 Set up the Zone now?";
 
+/// Shown after the first-run Zone is saved: what to do next and where the
+/// tray icon is (Windows 11 may hide a new icon in the overflow area).
+const ZONE_SAVED_NEXT_STEPS: &str = "Zone saved.\n\n\
+Next: start your game in windowed or borderless-windowed mode. Then either track it in \
+Settings > Games, or right-click the GameFrame tray icon and choose Apply to Window > your game.\n\n\
+The tray icon may be hidden under the ^ arrow in the taskbar. Launching GameFrame again \
+also opens Settings.";
+
 /// When the loaded config has no Zone (see
 /// [`profile_store::should_prompt_for_zone`]), explains what a Zone is and
 /// asks whether to set it up now or skip. "Set up now" opens the zone editor
-/// blank, persisting the Zone on Save exactly like Settings' "Draw zone" does.
+/// blank, persisting the Zone on Save exactly like Settings' "Draw Zone" does.
 /// Skip, Cancel, a close, or any failure leaves the Zone unset and startup
 /// simply continues -- there is no re-prompt this session. No window is
 /// placed and the taskbar is never touched here.
@@ -225,11 +233,12 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
 
     // No tray or hotkeys exist yet at first run, so there is nothing to tick.
     match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode, &mut || {}) {
-        Ok(Some(zone)) => {
-            if let Err(e) = settings_ui::persist_zone(config_dir, Some(zone)) {
-                log!("failed to save the zone: {e}");
+        Ok(Some(zone)) => match settings_ui::persist_zone(config_dir, Some(zone)) {
+            Ok(_) => {
+                show_message_box(ZONE_SAVED_NEXT_STEPS, MB_OK | MB_ICONINFORMATION);
             }
-        }
+            Err(e) => log!("failed to save the zone: {e}"),
+        },
         Ok(None) => {}
         Err(e) => log!("failed to open the zone editor overlay: {e}"),
     }

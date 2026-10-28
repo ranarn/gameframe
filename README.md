@@ -18,12 +18,17 @@ Uninstall from Settings > Apps.
 
 ## Getting started
 
-1. Right-click the GameFrame icon in the system tray and choose **Show Settings**.
-2. Under **Zone, hotkeys & taskbar**, click **Draw zone** and drag out the area your games should
+1. Right-click the GameFrame icon in the system tray and choose **Show Settings**. On Windows 11
+   the icon may be hidden under the **^** arrow in the taskbar; launching GameFrame again from the
+   Start menu also opens Settings.
+2. Under **Zone, hotkeys & taskbar**, click **Draw Zone** and drag out the area your games should
    fill. Edges snap to the screen border. Click **Save**.
 3. Start a game, then pick its window under **Apply to Window** in the tray menu. The game is now
    a *tracked game*: its border is removed and it is placed in the Zone, now and every time it
    launches.
+
+The game must run in windowed or borderless-windowed mode; exclusive fullscreen can't be placed.
+The **Toggle borderless** hotkey only works on tracked games.
 
 ## Features
 

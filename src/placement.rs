@@ -294,6 +294,7 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
                     &mut config.tracked_games,
                     exe_path,
                     display_name,
+                    config.cursor.enabled,
                 );
                 config.tracked_games[index].clone()
             }
@@ -479,6 +480,7 @@ impl PlacementOps for SystemOps<'_> {
                 &mut config.tracked_games,
                 exe_path.to_path_buf(),
                 display_name.to_string(),
+                config.cursor.enabled,
             );
             config.tracked_games[index].clone()
         })

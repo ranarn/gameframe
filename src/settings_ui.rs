@@ -95,7 +95,7 @@ pub struct SettingsState {
     /// The Log UI hangs (diagnostics) checkbox.
     pub log_ui_hangs: bool,
     /// The open tab. UI-only (never persisted), but kept here rather than on
-    /// [`SettingsApp`] so it survives the "Edit zone" close-and-reopen.
+    /// [`SettingsApp`] so it survives the "Edit Zone" close-and-reopen.
     pub tab: SettingsTab,
     /// Bindings that failed to register when GameFrame last registered its
     /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
@@ -113,6 +113,18 @@ pub enum SettingsTab {
     General,
     /// Version, license, repository and the optional donation link.
     About,
+}
+
+impl SettingsTab {
+    /// The tab Settings opens on: without a Zone the Games and Cursor tabs
+    /// are greyed out, so open on the one that lets the user draw it.
+    pub fn initial(zone: Option<Zone>) -> Self {
+        if zone.is_none() {
+            Self::General
+        } else {
+            Self::default()
+        }
+    }
 }
 
 /// Which of GameFrame's three hotkey fields a press-to-bind capture applies
@@ -162,7 +174,7 @@ impl SettingsState {
             start_with_windows: false,
             update_mode: config.update_mode,
             log_ui_hangs: config.log_ui_hangs,
-            tab: SettingsTab::default(),
+            tab: SettingsTab::initial(config.zone),
             hotkey_failures: Vec::new(),
         }
     }
@@ -460,7 +472,7 @@ fn normalize_region(region: &Region, monitor: &MonitorGeometry) -> NormalizedReg
 /// current monitor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZoneView {
-    /// No Zone is set: the section shows "No zone set" and a "Draw zone"
+    /// No Zone is set: the section shows "No Zone set" and a "Draw Zone"
     /// button.
     NotSet,
     /// The Zone resolves on this monitor: draw it, normalized, on the
@@ -480,9 +492,9 @@ pub fn zone_dependent_tabs_enabled(zone: Option<&Zone>) -> bool {
 }
 
 /// Shown on the greyed-out tabs while no Zone exists.
-const ZONE_REQUIRED_NOTE: &str = "A Zone must be configured first. Open the \"Zone, hotkeys & taskbar\" tab and click \"Draw zone\".";
+const ZONE_REQUIRED_NOTE: &str = "A Zone must be configured first. Open the \"Zone, hotkeys & taskbar\" tab and click \"Draw Zone\".";
 /// Shown in the Zone section itself while no Zone exists.
-const ZONE_SECTION_REQUIRED_NOTE: &str = "A Zone must be configured first: click \"Draw zone\" to set the screen area games are placed into.";
+const ZONE_SECTION_REQUIRED_NOTE: &str = "A Zone must be configured first: click \"Draw Zone\" to set the screen area games are placed into.";
 
 /// Decides what the Zone section shows for `zone` against `monitor` -- the
 /// pure data behind the thumbnail painter and the red unresolvable reason.
@@ -508,7 +520,7 @@ pub fn zone_view(zone: Option<&Zone>, monitor: &MonitorGeometry) -> ZoneView {
 /// show it.
 fn live_apply_failure_message(display_name: &str) -> String {
     format!(
-        "couldn't reposition {display_name} live -- the saved zone will be used the next time it launches or you apply it"
+        "couldn't reposition {display_name} live -- the saved Zone will be used the next time it launches or you apply it"
     )
 }
 
@@ -589,7 +601,7 @@ fn live_apply_status(display_name: &str, outcome: &placement::Outcome) -> Option
 /// re-apply (already logged once where the hang was found).
 fn live_apply_hung_message(display_name: &str) -> String {
     format!(
-        "{display_name} is not responding -- the saved zone will be used the next time it launches or you apply it"
+        "{display_name} is not responding -- the saved Zone will be used the next time it launches or you apply it"
     )
 }
 
@@ -976,7 +988,7 @@ enum SettingsExit {
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`])
     /// -- so a message surfaced by a Zone commit made
-    /// just before "Edit zone" was clicked isn't lost when this
+    /// just before "Edit Zone" was clicked isn't lost when this
     /// session's `SettingsApp` is torn down; [`run_settings_window`] carries
     /// it forward as the next session's initial status messages.
     EditZone(SettingsState, Vec<String>),
@@ -1033,7 +1045,7 @@ pub enum TickContext {
 /// persists it immediately, so the disk and the windows it was live-applied
 /// to never disagree.
 ///
-/// Clicking "Draw zone"/"Edit zone" opens the zone-editor overlay
+/// Clicking "Draw Zone"/"Edit Zone" opens the zone-editor overlay
 /// ([`zone_overlay::run_zone_editor_overlay`]) *sequentially* rather than
 /// nesting it inside the Settings window's own event loop -- egui/winit
 /// don't support one native event loop starting another while it's still
@@ -1050,7 +1062,7 @@ pub enum TickContext {
 /// or a fresh set if the overlay's save triggered a live re-apply), and is
 /// handed to the next [`run_settings_frame`]
 /// call as its `initial_status_messages` -- so a status line surfaced right
-/// before "Edit zone" was clicked survives the round trip through
+/// before "Edit Zone" was clicked survives the round trip through
 /// the overlay instead of vanishing with the torn-down `SettingsApp`.
 ///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
@@ -1138,7 +1150,7 @@ pub fn run_settings_window(
                             }
                             Err(e) => {
                                 log!("failed to save the zone: {e}");
-                                status_messages = vec![format!("couldn't save the zone: {e}")];
+                                status_messages = vec![format!("couldn't save the Zone: {e}")];
                             }
                         }
                     }
@@ -1165,7 +1177,7 @@ pub fn run_settings_window(
 /// [`SettingsApp::pending_status_messages`] -- carried over from
 /// the previous session's [`SettingsExit::EditZone`], or empty on the
 /// very first call from [`run_settings_window`]. Any close other than an
-/// explicit Save, Cancel, or "Draw zone"/"Edit zone" click -- concretely, the
+/// explicit Save, Cancel, or "Draw Zone"/"Edit Zone" click -- concretely, the
 /// window's own close button -- is treated as [`SettingsExit::Cancelled`]:
 /// this function's documented "discards the edits" contract for any
 /// non-Save close.
@@ -1634,7 +1646,7 @@ impl SettingsApp<'_> {
         self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
         self.hotkey_row(
             ui,
-            "Toggle taskbar autohide:",
+            "Toggle taskbar auto-hide:",
             HotkeyField::ToggleTaskbarAutohide,
         );
         self.hotkey_row(ui, "Toggle game cursor:", HotkeyField::ToggleGameCursor);
@@ -1849,9 +1861,9 @@ impl SettingsApp<'_> {
     }
 
     /// Renders the Zone section: a monitor-outline thumbnail with the Zone
-    /// drawn on it (or "No zone set"), a red reason when the Zone can't be
+    /// drawn on it (or "No Zone set"), a red reason when the Zone can't be
     /// resolved on the current monitor (see [`zone_view`]), and a
-    /// "Draw zone"/"Edit zone" button that closes Settings to open the
+    /// "Draw Zone"/"Edit Zone" button that closes Settings to open the
     /// zone-editor overlay (blank or pre-filled).
     fn zone_section(&mut self, ui: &mut egui::Ui) {
         const THUMBNAIL_SIZE: egui::Vec2 = egui::Vec2::new(128.0, 72.0);
@@ -1904,7 +1916,7 @@ impl SettingsApp<'_> {
                         ));
                     }
                     None => {
-                        ui.label("No zone set");
+                        ui.label("No Zone set");
                         ui.colored_label(ui.visuals().warn_fg_color, ZONE_SECTION_REQUIRED_NOTE);
                     }
                 }
@@ -1913,13 +1925,13 @@ impl SettingsApp<'_> {
                         ui.visuals().error_fg_color,
                         format!("Unavailable: {reason}"),
                     )
-                    .on_hover_text("The zone doesn't fit the current monitor. Edit it to fix.");
+                    .on_hover_text("The Zone doesn't fit the current monitor. Edit it to fix.");
                 }
                 ui.horizontal(|ui| {
                     let label = if self.state.zone.is_some() {
-                        "Edit zone"
+                        "Edit Zone"
                     } else {
-                        "Draw zone"
+                        "Draw Zone"
                     };
                     if ui.button(label).clicked() {
                         *self.exit.borrow_mut() = Some(SettingsExit::EditZone(
@@ -1936,7 +1948,7 @@ impl SettingsApp<'_> {
                             Err(e) => {
                                 log!("failed to clear the zone: {e}");
                                 self.pending_status_messages =
-                                    vec![format!("couldn't clear the zone: {e}")];
+                                    vec![format!("couldn't clear the Zone: {e}")];
                             }
                         }
                     }
@@ -2265,7 +2277,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "couldn't reposition Thing live -- the saved zone will be used the next time it launches or you apply it"
+            "couldn't reposition Thing live -- the saved Zone will be used the next time it launches or you apply it"
         );
     }
 
@@ -2625,6 +2637,30 @@ mod tests {
             config.hotkeys.toggle_taskbar_autohide,
             Some("Ctrl+Alt+D".to_string())
         );
+    }
+
+    #[test]
+    fn settings_opens_on_the_zone_tab_when_no_zone_exists() {
+        let state = SettingsState::from_config(&Config::default());
+
+        assert_eq!(state.tab, SettingsTab::General);
+    }
+
+    #[test]
+    fn settings_opens_on_the_games_tab_when_a_zone_exists() {
+        let config = Config {
+            zone: Some(Zone {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            ..Config::default()
+        };
+
+        let state = SettingsState::from_config(&config);
+
+        assert_eq!(state.tab, SettingsTab::Games);
     }
 
     #[test]

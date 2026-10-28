@@ -67,10 +67,25 @@ impl TrackedGame {
             game_cursor: true,
         }
     }
+
+    /// Like [`Self::new_default`], but the "Game cursor" box starts ticked
+    /// only while the global game cursor feature (`cursor.enabled`) is on, so
+    /// a new game doesn't silently opt in to a feature that is off.
+    pub fn new_for_cursor_setting(
+        exe_path: PathBuf,
+        display_name: String,
+        cursor_enabled: bool,
+    ) -> Self {
+        TrackedGame {
+            game_cursor: cursor_enabled,
+            ..Self::new_default(exe_path, display_name)
+        }
+    }
 }
 
 /// Finds a tracked game whose `exe_path` matches, or appends a fresh
-/// default-configured one ([`TrackedGame::new_default`]) if none matched --
+/// default-configured one ([`TrackedGame::new_for_cursor_setting`], with
+/// `cursor_enabled` the global cursor feature's state) if none matched --
 /// the identity/dedupe rule behind the "Apply to Window" add flow (a game is
 /// identified solely by its executable path; picking an already-tracked game
 /// again must not create a duplicate entry, nor reset its existing settings,
@@ -91,11 +106,16 @@ pub fn upsert_tracked_game(
     games: &mut Vec<TrackedGame>,
     exe_path: PathBuf,
     display_name: String,
+    cursor_enabled: bool,
 ) -> usize {
     if let Some(pos) = games.iter().position(|g| g.exe_path == exe_path) {
         return pos;
     }
-    games.push(TrackedGame::new_default(exe_path, display_name));
+    games.push(TrackedGame::new_for_cursor_setting(
+        exe_path,
+        display_name,
+        cursor_enabled,
+    ));
     games.len() - 1
 }
 
@@ -562,6 +582,7 @@ mod tests {
                             &mut config.tracked_games,
                             PathBuf::from(format!("C:\\Games\\game{n}.exe")),
                             format!("Game {n}"),
+                            config.cursor.enabled,
                         );
                     })
                     .unwrap();
@@ -1115,12 +1136,41 @@ mod tests {
             &mut games,
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            true,
         );
 
         assert_eq!(index, 0);
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].display_name, "Thing");
         assert!(games[0].auto_apply);
+    }
+
+    #[test]
+    fn a_new_game_starts_with_game_cursor_off_while_the_cursor_feature_is_off() {
+        let mut games: Vec<TrackedGame> = Vec::new();
+
+        upsert_tracked_game(
+            &mut games,
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            false,
+        );
+
+        assert!(!games[0].game_cursor);
+    }
+
+    #[test]
+    fn a_new_game_starts_with_game_cursor_on_while_the_cursor_feature_is_on() {
+        let mut games: Vec<TrackedGame> = Vec::new();
+
+        upsert_tracked_game(
+            &mut games,
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            true,
+        );
+
+        assert!(games[0].game_cursor);
     }
 
     #[test]
@@ -1135,6 +1185,7 @@ mod tests {
             &mut games,
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing (different window title)".to_string(),
+            true,
         );
 
         assert_eq!(index, 0);

@@ -91,10 +91,12 @@ impl PlacementOps for FakeOps {
     fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<TrackedGame, String> {
         self.note("track_game");
         let mut config = self.config.borrow_mut();
+        let config = &mut *config;
         let index = profile_store::upsert_tracked_game(
             &mut config.tracked_games,
             exe_path.to_path_buf(),
             display_name.to_string(),
+            config.cursor.enabled,
         );
         Ok(config.tracked_games[index].clone())
     }
