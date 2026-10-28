@@ -938,18 +938,17 @@ pub(crate) fn hide_taskbar_window(hwnd: HWND) {
 /// re-sending it unchanged (per this module's `FullyHidden`/`HoverReveal`
 /// split -- see [`TaskbarHideRestore`]'s doc comment).
 ///
-/// `on_flags` receives the appbar flags read just after the show, before the
-/// state re-send: the caller ends its `FullyHidden` session bookkeeping there.
+/// Returns the appbar flags read just after the show, before the state
+/// re-send: the session-end caller compares them with the session start.
 ///
 /// # Unmarked: call through `crate::taskbar`
 /// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
-pub(crate) fn show_taskbar_full(on_flags: impl FnOnce(u32)) -> Result<(), Win32Error> {
+pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
     let hwnd = show_taskbar_window()?;
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
     // covered or that slid away. Re-send the appbar state read just now,
     // unchanged, then raise without activating.
     let flags = read_appbar_flags(hwnd);
-    on_flags(flags);
     resend_appbar_state(|| flags, |lparam| send_appbar_setstate(hwnd, lparam));
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
     // SWP_NOSIZE, and SWP_NOACTIVATE keeps focus where it is.
@@ -964,7 +963,7 @@ pub(crate) fn show_taskbar_full(on_flags: impl FnOnce(u32)) -> Result<(), Win32E
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
-    Ok(())
+    Ok(flags)
 }
 
 /// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar_full`] and the panic
@@ -1059,17 +1058,15 @@ pub enum ShowKind {
 /// and startup recovery's variant ([`crate::taskbar_recovery`]), which must
 /// not touch a lock the panicking thread may already hold.
 ///
-/// `show` picks the `FullyHidden` show; `on_flags` is handed to
-/// [`show_taskbar_full`] (never called for [`ShowKind::Bare`]).
+/// `show` picks the `FullyHidden` show.
 pub(crate) fn restore_taskbar_raw(
     remembered: TaskbarHideRestore,
     show: ShowKind,
-    on_flags: impl FnOnce(u32),
 ) -> Result<(), Win32Error> {
     match remembered {
         TaskbarHideRestore::FullyHidden => match show {
             ShowKind::Bare => show_taskbar_window().map(|_| ()),
-            ShowKind::Full => show_taskbar_full(on_flags),
+            ShowKind::Full => show_taskbar_full().map(|_| ()),
         },
         TaskbarHideRestore::HoverReveal(state) => set_appbar_state(state),
     }
