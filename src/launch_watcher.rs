@@ -284,9 +284,9 @@ static DRIFT_WATCHER_ENABLED: std::sync::atomic::AtomicBool =
 ///
 /// The mutex is held across `SetWinEventHook`/`UnhookWinEvent`. That is safe
 /// because every caller runs on the message-loop thread (asserted in
-/// [`sync_drift_hooks`]) and out-of-context hook callbacks are only delivered
-/// by that thread's `DispatchMessageW`, never re-entrantly from inside those
-/// calls, so no callback can try to take the lock while it is held.
+/// [`sync_drift_hooks`]), the drift callback never takes this lock, and
+/// out-of-context hook callbacks are only delivered by that thread's
+/// `DispatchMessageW`, never re-entrantly from inside those calls.
 static DRIFT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<u32, isize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -311,9 +311,17 @@ pub fn enable_drift_watcher() {
     sync_drift_hooks();
 }
 
-/// Disarms the watcher and unhooks everything. Call on the message-loop thread.
+/// Disarms the watcher, cancels a pending hook-sync retry and unhooks
+/// everything. Call on the message-loop thread.
 pub fn disable_drift_watcher() {
     DRIFT_WATCHER_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let timer = DRIFT_SYNC_TIMER.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if timer != 0 {
+        // Safety: `timer` is a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
     sync_drift_hooks();
 }
 
