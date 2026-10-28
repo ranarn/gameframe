@@ -49,7 +49,7 @@
 use crate::autostart;
 use crate::cursor_overlay::CursorOverlay;
 use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction, Hotkeys};
-use crate::instance_channel::{self, Command};
+use crate::instance_channel;
 use crate::launch_watcher;
 use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
@@ -319,24 +319,13 @@ fn run_event_loop(
         crate::watchdog::step("event loop: second-launch commands");
         // Commands from a second launch (see crate::instance_channel); the
         // channel's window is dispatched by this pump, so they are queued by now.
-        let commands = instance_channel::drain();
-        if instance_channel::wants_quit(&commands) {
-            // Same clean-shutdown path as the tray's Exit item below.
+        // Keeps draining until the queue is empty, so a Quit that arrived
+        // while Settings was open is handled as soon as it closes. Quit exits
+        // through the same clean-shutdown path as the tray's Exit item below.
+        if instance_channel::dispatch_commands(instance_channel::drain, || {
+            show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
+        }) {
             return;
-        }
-        for command in commands {
-            match command {
-                Command::OpenSettings => {
-                    show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
-                    // A Quit that arrived while Settings was open closed it
-                    // and is waiting in the queue.
-                    if instance_channel::quit_pending() {
-                        return;
-                    }
-                }
-                // Handled above.
-                Command::Quit => return,
-            }
         }
 
         // Tray, hotkey and update events. Settings drains the same events while
