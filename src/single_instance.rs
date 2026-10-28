@@ -15,7 +15,9 @@
 
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError,
+};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 /// Same GUID as the installer's `AppId`, so the name can't collide with
@@ -23,21 +25,21 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 pub(crate) const MUTEX_NAME: &str = "Local\\GameFrame-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
 /// Command-line flag passed to the elevated child by `relaunch_elevated`.
-pub const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
+pub(crate) const ELEVATED_RELAUNCH_FLAG: &str = "--elevated-relaunch";
 
 /// Command-line flag that asks the running instance to quit, see
 /// [`is_quit_request`].
 pub const QUIT_FLAG: &str = "--quit";
 
 /// How long an elevated relaunch waits for the old instance to exit.
-pub const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const RELAUNCH_WAIT: Duration = Duration::from_secs(5);
 
 /// Polling interval while waiting for the old instance to release the mutex.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What to do after one attempt at taking the mutex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
     /// This process owns the instance; start up.
     Proceed,
     /// Another instance still holds it; try again after a short sleep.
@@ -49,7 +51,7 @@ pub enum Decision {
 /// Pure retry decision. `owned` is the attempt result, `elapsed` the time
 /// since the first attempt, `wait` the allowed total (`None` = single attempt,
 /// the normal launch).
-pub fn decide(owned: bool, elapsed: Duration, wait: Option<Duration>) -> Decision {
+fn decide(owned: bool, elapsed: Duration, wait: Option<Duration>) -> Decision {
     if owned {
         return Decision::Proceed;
     }
@@ -82,17 +84,47 @@ where
     args.into_iter().skip(1).any(|a| a.as_ref() == QUIT_FLAG)
 }
 
-/// Returns `true` if this process is the only running GameFrame, `false` if
-/// another instance holds the mutex. With `wait`, keeps polling for up to
-/// that long (an elevated relaunch waiting for the old process to exit); a
-/// timeout is logged. If the mutex can't be created at all, returns `true` --
-/// failing open beats refusing to start.
-pub fn acquire(wait: Option<Duration>) -> bool {
+/// An unusual `CreateMutexW` outcome worth a log line. `acquire` hands the
+/// first one back to `main` instead of logging it, because the log may not be
+/// open yet when the mutex is taken; `main` opens the log only when there is
+/// a note (or later, as usual), then writes it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Note {
+    /// An existing mutex can't be opened; treated as held.
+    AccessDenied,
+    /// The call failed for another reason; treated as not held (fail open).
+    CreateFailed(u32),
+}
+
+impl std::fmt::Display for Note {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Note::AccessDenied => f.write_str(
+                "single-instance mutex exists but cannot be opened (access denied); treating it as held by another instance",
+            ),
+            Note::CreateFailed(code) => write!(
+                f,
+                "single-instance mutex could not be created (error {code}); starting anyway"
+            ),
+        }
+    }
+}
+
+/// Returns whether this process is the only running GameFrame (`false` if
+/// another instance holds the mutex), plus the first unusual outcome seen, for
+/// the caller to log. With `wait`, keeps polling for up to that long (an
+/// elevated relaunch waiting for the old process to exit); a timeout is
+/// logged. If the mutex can't be created at all, returns `true` -- failing
+/// open beats refusing to start.
+pub fn acquire(wait: Option<Duration>) -> (bool, Option<Note>) {
     let start = Instant::now();
+    let mut note = None;
     loop {
-        let owned = try_acquire(MUTEX_NAME);
+        let (owned, attempt_note) = try_acquire(MUTEX_NAME);
+        // Keep only the first: an elevated relaunch polls for seconds.
+        note = note.or(attempt_note);
         match decide(owned, start.elapsed(), wait) {
-            Decision::Proceed => return true,
+            Decision::Proceed => return (true, note),
             Decision::Retry => std::thread::sleep(POLL_INTERVAL),
             Decision::GiveUp => {
                 if let Some(limit) = wait {
@@ -100,7 +132,7 @@ pub fn acquire(wait: Option<Duration>) -> bool {
                         "elevated relaunch: previous instance still held the single-instance mutex after {limit:?}; exiting"
                     );
                 }
-                return false;
+                return (false, note);
             }
         }
     }
@@ -108,7 +140,7 @@ pub fn acquire(wait: Option<Duration>) -> bool {
 
 /// One attempt. On success the handle is intentionally kept open for the
 /// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
-fn try_acquire(mutex_name: &str) -> bool {
+fn try_acquire(mutex_name: &str) -> (bool, Option<Note>) {
     let name: Vec<u16> = mutex_name
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -120,16 +152,36 @@ fn try_acquire(mutex_name: &str) -> bool {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         (handle, GetLastError())
     };
-    if handle.is_null() {
-        return true;
-    }
-    if last_error == ERROR_ALREADY_EXISTS {
+    let failed = handle.is_null();
+    let held = mutex_held(failed, last_error);
+    if held && !failed {
         // SAFETY: `handle` is a valid mutex handle we just received and
         // haven't closed; this drops our reference to the existing mutex.
         unsafe { CloseHandle(handle) };
-        return false;
     }
-    true
+    (!held, note_for(failed, last_error))
+}
+
+/// Pure mapping of a `CreateMutexW` result to "another instance holds the
+/// mutex". `handle_is_null` is whether the call failed; `last_error` is
+/// `GetLastError` right after it. `ERROR_ACCESS_DENIED` (an existing mutex we
+/// may not open, e.g. the other instance runs elevated with other
+/// credentials) means held; any other failure is not held (fail open).
+fn mutex_held(handle_is_null: bool, last_error: u32) -> bool {
+    if handle_is_null {
+        last_error == ERROR_ACCESS_DENIED
+    } else {
+        last_error == ERROR_ALREADY_EXISTS
+    }
+}
+
+/// Pure: the diagnostic for a failed `CreateMutexW` (`None` when it worked).
+fn note_for(handle_is_null: bool, last_error: u32) -> Option<Note> {
+    match (handle_is_null, last_error) {
+        (false, _) => None,
+        (true, ERROR_ACCESS_DENIED) => Some(Note::AccessDenied),
+        (true, code) => Some(Note::CreateFailed(code)),
+    }
 }
 
 #[cfg(test)]
@@ -170,13 +222,33 @@ mod tests {
     }
 
     #[test]
+    fn mutex_held_mapping() {
+        assert!(mutex_held(true, ERROR_ACCESS_DENIED));
+        assert!(mutex_held(false, ERROR_ALREADY_EXISTS));
+        assert!(!mutex_held(false, 0));
+        assert!(!mutex_held(true, 8)); // other failure: fail open
+    }
+
+    #[test]
     fn a_held_mutex_makes_further_attempts_fail() {
         // Own name, so a running GameFrame can't interfere.
         let name = format!("Local\\GameFrame-test-{}", std::process::id());
-        assert!(try_acquire(&name));
+        assert!(try_acquire(&name).0);
         for _ in 0..3 {
-            assert!(!try_acquire(&name));
+            assert!(!try_acquire(&name).0);
         }
+    }
+
+    #[test]
+    fn failed_calls_produce_a_note_and_successful_ones_none() {
+        assert_eq!(
+            note_for(true, ERROR_ACCESS_DENIED),
+            Some(Note::AccessDenied)
+        );
+        assert_eq!(note_for(true, 8), Some(Note::CreateFailed(8)));
+        assert_eq!(note_for(false, ERROR_ALREADY_EXISTS), None);
+        assert_eq!(note_for(false, 0), None);
+        assert!(Note::CreateFailed(8).to_string().contains("error 8"));
     }
 
     #[test]

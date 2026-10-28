@@ -53,7 +53,15 @@ fn main() {
         // its handoff, below.)
         logging::init(&app::config_dir());
     }
-    if !single_instance::acquire(wait) {
+    let (owned, note) = single_instance::acquire(wait);
+    if let Some(note) = note {
+        // Logged here, not in `acquire`: a normal launch hasn't opened the log
+        // yet at that point. `init` is idempotent, so the paths below and
+        // `app::run` can call it again.
+        logging::init(&app::config_dir());
+        log!("{note}");
+    }
+    if !owned {
         // A normal second launch hands off to the running instance; an elevated
         // relaunch that timed out has nobody to talk to.
         if wait.is_none() {
