@@ -16,12 +16,10 @@
 //! Drives [`crate::zone_editor::AppState`] from real pointer input. The
 //! taskbar is left as found when the editor opens; a control-box toggle hides
 //! it via [`crate::win32::hide_taskbar`] (mode-aware -- see
-//! [`crate::profile_store::TaskbarHideMode`]) and shows it again, and
-//! whatever the session still has hidden is restored via
-//! [`crate::win32::restore_taskbar`] once the session ends -- Save, Cancel,
-//! or the window being closed any other way (an RAII guard,
-//! [`TaskbarRestoreGuard`], holds the remembered
-//! [`crate::win32::TaskbarHideRestore`] and restores it on drop, covering
+//! [`crate::profile_store::TaskbarHideMode`]) and shows it again. When the
+//! session ends -- Save, Cancel, or the window being closed any other way --
+//! the taskbar is returned to its state at open (see [`crate::zone_taskbar`];
+//! an RAII guard, [`TaskbarRestoreGuard`], does it on drop, covering
 //! early returns). A panic is covered separately: the release profile is
 //! `panic = "abort"`, so the guard's `Drop` does NOT run then; instead the
 //! panic hook ([`crate::taskbar_recovery::install_panic_hook`]) restores the
@@ -43,6 +41,7 @@ use crate::zone_editor::{
     Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome, Target, hit_test,
     pixels_to_points, point_from_points, points_to_pixels, scale_from_dpi,
 };
+use crate::zone_taskbar::{TaskbarRestoreGuard, TaskbarSession};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
@@ -96,7 +95,7 @@ impl std::error::Error for ZoneOverlayError {
 ///
 /// Leaves the taskbar as it is on open. The control box has a toggle that
 /// hides/shows it using whichever technique `mode` selects (see module
-/// docs); whatever the session hid is restored exactly before returning --
+/// docs); the taskbar is returned to its state at open before returning --
 /// whether the window ran cleanly, failed to run, or returned early -- via
 /// the [`TaskbarRestoreGuard`] RAII guard held across the call. A panic
 /// mid-session is handled by the panic hook, not the guard (see the module
@@ -123,7 +122,7 @@ pub fn run_zone_editor_overlay(
     // build (`panic = "abort"`); the panic hook installed at startup
     // (`crate::taskbar_recovery`) restores the taskbar in that case, e.g.
     // after a wgpu device-lost panic on sleep/resume or a monitor unplug.
-    let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar));
+    let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar), mode);
 
     let state = match initial {
         Some(zone) => AppState::new_with_zone(monitor, zone),
@@ -179,164 +178,6 @@ pub fn run_zone_editor_overlay(
     match outcome.borrow_mut().take() {
         Some(SessionOutcome::Saved(zone)) => Ok(Some(zone)),
         Some(SessionOutcome::Cancelled) | None => Ok(None),
-    }
-}
-
-/// The taskbar as the editing session sees it. `hidden` holds the remembered
-/// state (see [`win32::TaskbarHideRestore`]) only while the session itself
-/// has the taskbar hidden -- the only thing closing restores. `hidden_at_open`
-/// is a taskbar that was already hidden when the editor opened (e.g. by a
-/// Zone-apply path): the toggle label starts from it and its first click
-/// shows the taskbar, but closing never hides or restores it on its own.
-/// Opening the editor leaves the taskbar alone, so closing restores nothing
-/// unless the toggle hid it. `error` is the last toggle failure, for the
-/// control box.
-#[derive(Debug, Default)]
-struct TaskbarSession {
-    hidden: Option<win32::TaskbarHideRestore>,
-    hidden_at_open: bool,
-    error: Option<String>,
-}
-
-/// What the toggle button must do next.
-#[derive(Debug, PartialEq, Eq)]
-enum TaskbarToggle {
-    /// The taskbar is visible: hide it.
-    Hide,
-    /// The session hid the taskbar: restore this state.
-    Show(win32::TaskbarHideRestore),
-    /// The taskbar was hidden before the editor opened: show it.
-    ShowPreHidden,
-}
-
-/// What closing the editor did about the taskbar.
-#[derive(Debug, PartialEq, Eq)]
-enum CloseOutcome {
-    /// The session had hidden nothing (or had shown it again).
-    NothingToRestore,
-    Restored,
-    /// The session state was borrowed elsewhere, so nothing was restored.
-    Busy,
-    Failed(String),
-}
-
-impl TaskbarSession {
-    /// A session over a taskbar that is `hidden_at_open` when the editor
-    /// opens.
-    fn new(hidden_at_open: bool) -> Self {
-        Self {
-            hidden_at_open,
-            ..Self::default()
-        }
-    }
-
-    /// Whether the taskbar is hidden as far as the session knows: the toggle
-    /// button's label follows this.
-    fn is_hidden(&self) -> bool {
-        self.hidden.is_some() || self.hidden_at_open
-    }
-
-    /// Pure decision for the toggle button.
-    fn toggle_action(&self) -> TaskbarToggle {
-        match self.hidden {
-            Some(remembered) => TaskbarToggle::Show(remembered),
-            None if self.hidden_at_open => TaskbarToggle::ShowPreHidden,
-            None => TaskbarToggle::Hide,
-        }
-    }
-
-    /// Takes what must be restored when the session ends: the state to undo,
-    /// or `None` when the session never hid the taskbar (or already showed it
-    /// again) so the pre-editor state is left alone.
-    fn take_restore_on_close(&mut self) -> Option<win32::TaskbarHideRestore> {
-        self.hidden.take()
-    }
-
-    /// Performs the toggle with the given OS actions. A failure leaves the
-    /// bookkeeping unchanged and is kept in `error` so the control box can
-    /// show it; a success clears `error`.
-    fn toggle_with<E: std::fmt::Display>(
-        &mut self,
-        hide: impl FnOnce() -> Result<win32::TaskbarHideRestore, E>,
-        show: impl FnOnce(win32::TaskbarHideRestore) -> Result<(), E>,
-        show_pre_hidden: impl FnOnce() -> Result<(), E>,
-    ) {
-        let result = match self.toggle_action() {
-            TaskbarToggle::Hide => hide()
-                .map(|remembered| self.hidden = Some(remembered))
-                .map_err(|e| format!("could not hide the taskbar: {e}")),
-            TaskbarToggle::Show(remembered) => show(remembered)
-                .map(|()| self.hidden = None)
-                .map_err(|e| format!("could not show the taskbar: {e}")),
-            TaskbarToggle::ShowPreHidden => show_pre_hidden()
-                .map(|()| self.hidden_at_open = false)
-                .map_err(|e| format!("could not show the taskbar: {e}")),
-        };
-        self.error = result.err();
-    }
-
-    /// Performs the toggle with `mode` against the real taskbar, logging a
-    /// failure.
-    fn toggle(&mut self, mode: TaskbarHideMode) {
-        self.toggle_with(
-            || win32::hide_taskbar(mode),
-            win32::restore_taskbar,
-            || win32::set_taskbar_hide_absolute(false, mode),
-        );
-        if let Some(error) = &self.error {
-            log!("zone editor: {error}");
-        }
-    }
-}
-
-/// Ends the session's hold on the taskbar: restores what it hid, through
-/// `restore`. Never panics (it runs from a destructor), so a busy `session`
-/// is reported rather than unwrapped.
-fn restore_on_close<E: std::fmt::Display>(
-    session: &RefCell<TaskbarSession>,
-    restore: impl FnOnce(win32::TaskbarHideRestore) -> Result<(), E>,
-) -> CloseOutcome {
-    // `try_borrow_mut`: never panic in a destructor.
-    let Ok(mut session) = session.try_borrow_mut() else {
-        return CloseOutcome::Busy;
-    };
-    match session.take_restore_on_close() {
-        None => CloseOutcome::NothingToRestore,
-        Some(remembered) => match restore(remembered) {
-            Ok(()) => CloseOutcome::Restored,
-            Err(e) => CloseOutcome::Failed(e.to_string()),
-        },
-    }
-}
-
-/// RAII guard that restores whatever the session hid (see
-/// [`TaskbarSession`]) when dropped, whether that happens via normal return
-/// or early `?` propagation. It does not cover a panic in the release build
-/// (`panic = "abort"` skips destructors); the panic hook in
-/// `crate::taskbar_recovery` does.
-///
-/// `restore_taskbar`'s own error is logged rather than propagated or
-/// unwrapped -- a `Drop` impl must not panic (it could run during a debug
-/// build's unwind, where a second panic aborts).
-struct TaskbarRestoreGuard {
-    session: Rc<RefCell<TaskbarSession>>,
-}
-
-impl TaskbarRestoreGuard {
-    fn new(session: Rc<RefCell<TaskbarSession>>) -> Self {
-        Self { session }
-    }
-}
-
-impl Drop for TaskbarRestoreGuard {
-    fn drop(&mut self) {
-        match restore_on_close(&self.session, win32::restore_taskbar) {
-            CloseOutcome::NothingToRestore | CloseOutcome::Restored => {}
-            CloseOutcome::Busy => log!("zone editor: taskbar state busy at close; not restored"),
-            CloseOutcome::Failed(e) => {
-                log!("zone editor: failed to restore taskbar state: {e}")
-            }
-        }
     }
 }
 
@@ -822,7 +663,6 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
 #[cfg(test)]
 mod editor_ui_tests {
     use super::*;
-    use crate::win32::TaskbarHideRestore;
 
     #[test]
     fn readout_shows_the_zone_in_physical_pixels() {
@@ -858,170 +698,6 @@ mod editor_ui_tests {
             panic!("save failed");
         };
         assert_eq!(live, format_zone_readout(Some(saved)));
-    }
-
-    #[test]
-    fn toggle_shows_a_taskbar_that_was_hidden_before_the_editor_opened() {
-        let session = TaskbarSession::new(true);
-        assert!(session.is_hidden());
-        assert_eq!(session.toggle_action(), TaskbarToggle::ShowPreHidden);
-    }
-
-    #[test]
-    fn showing_a_pre_hidden_taskbar_is_not_undone_on_close() {
-        let mut session = TaskbarSession::new(true);
-        session.toggle_with::<String>(
-            || panic!("must not hide"),
-            |_| panic!("must not restore"),
-            || Ok(()),
-        );
-        assert!(!session.is_hidden());
-        assert_eq!(session.error, None);
-        assert_eq!(session.take_restore_on_close(), None);
-    }
-
-    #[test]
-    fn a_pre_hidden_taskbar_is_left_alone_on_close_when_not_toggled() {
-        let mut session = TaskbarSession::new(true);
-        assert_eq!(session.take_restore_on_close(), None);
-    }
-
-    #[test]
-    fn hiding_remembers_the_state_and_clears_a_previous_error() {
-        let mut session = TaskbarSession {
-            error: Some("old".into()),
-            ..TaskbarSession::default()
-        };
-        session.toggle_with::<String>(
-            || Ok(TaskbarHideRestore::FullyHidden),
-            |_| panic!("must not restore"),
-            || panic!("must not show"),
-        );
-        assert_eq!(session.hidden, Some(TaskbarHideRestore::FullyHidden));
-        assert!(session.is_hidden());
-        assert_eq!(session.error, None);
-    }
-
-    #[test]
-    fn a_failed_hide_keeps_the_bookkeeping_and_reports_the_error() {
-        let mut session = TaskbarSession::default();
-        session.toggle_with(
-            || Err("boom"),
-            |_| panic!("must not restore"),
-            || panic!("must not show"),
-        );
-        assert!(!session.is_hidden());
-        let error = session.error.as_deref().unwrap();
-        assert!(error.contains("hide") && error.contains("boom"), "{error}");
-    }
-
-    #[test]
-    fn a_failed_show_keeps_what_the_session_hid_and_reports_the_error() {
-        let mut session = TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        };
-        session.toggle_with(
-            || panic!("must not hide"),
-            |_| Err("boom"),
-            || panic!("must not show"),
-        );
-        assert_eq!(session.hidden, Some(TaskbarHideRestore::FullyHidden));
-        let error = session.error.as_deref().unwrap();
-        assert!(error.contains("show") && error.contains("boom"), "{error}");
-    }
-
-    #[test]
-    fn a_failed_show_of_a_pre_hidden_taskbar_keeps_it_hidden() {
-        let mut session = TaskbarSession::new(true);
-        session.toggle_with(
-            || panic!("must not hide"),
-            |_| panic!("must not restore"),
-            || Err("boom"),
-        );
-        assert!(session.is_hidden());
-        assert!(session.error.is_some());
-    }
-
-    #[test]
-    fn close_restores_what_the_session_hid() {
-        let session = RefCell::new(TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        });
-        let mut restored = None;
-        let outcome = restore_on_close::<String>(&session, |r| {
-            restored = Some(r);
-            Ok(())
-        });
-        assert_eq!(outcome, CloseOutcome::Restored);
-        assert_eq!(restored, Some(TaskbarHideRestore::FullyHidden));
-    }
-
-    #[test]
-    fn close_restores_nothing_for_an_untouched_taskbar() {
-        let session = RefCell::new(TaskbarSession::new(true));
-        let outcome = restore_on_close::<String>(&session, |_| panic!("must not restore"));
-        assert_eq!(outcome, CloseOutcome::NothingToRestore);
-    }
-
-    #[test]
-    fn close_reports_a_failed_restore() {
-        let session = RefCell::new(TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        });
-        let outcome = restore_on_close(&session, |_| Err("boom"));
-        assert_eq!(outcome, CloseOutcome::Failed("boom".into()));
-    }
-
-    #[test]
-    fn close_does_not_panic_or_restore_when_the_session_is_busy() {
-        let session = RefCell::new(TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        });
-        let _held = session.borrow_mut();
-        let outcome = restore_on_close::<String>(&session, |_| panic!("must not restore"));
-        assert_eq!(outcome, CloseOutcome::Busy);
-    }
-
-    #[test]
-    fn toggle_hides_when_the_session_has_not_hidden_the_taskbar() {
-        assert_eq!(
-            TaskbarSession::default().toggle_action(),
-            TaskbarToggle::Hide
-        );
-    }
-
-    #[test]
-    fn toggle_shows_the_remembered_state_when_the_session_hid_the_taskbar() {
-        let session = TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        };
-        assert_eq!(
-            session.toggle_action(),
-            TaskbarToggle::Show(TaskbarHideRestore::FullyHidden)
-        );
-    }
-
-    #[test]
-    fn close_restores_nothing_when_the_taskbar_was_never_hidden() {
-        assert_eq!(TaskbarSession::default().take_restore_on_close(), None);
-    }
-
-    #[test]
-    fn close_restores_what_the_session_hid_exactly_once() {
-        let mut session = TaskbarSession {
-            hidden: Some(TaskbarHideRestore::FullyHidden),
-            ..Default::default()
-        };
-        assert_eq!(
-            session.take_restore_on_close(),
-            Some(TaskbarHideRestore::FullyHidden)
-        );
-        assert_eq!(session.take_restore_on_close(), None);
     }
 
     #[test]

@@ -140,7 +140,7 @@ fn taskbar_autohide_state_from_bool(auto_hide: bool) -> TaskbarAutohideState {
 /// state: recording *which technique* hid the taskbar
 /// (not just an appbar flag value) so a later restore always undoes exactly
 /// that, even if [`crate::profile_store::TaskbarHideMode`] changes in
-/// between (e.g. the zone editor forces the taskbar hidden in `FullyHidden`
+/// between (e.g. the zone editor's taskbar toggle hides it in `FullyHidden`
 /// mode, the user flips the setting to `HoverReveal` mid-session, then
 /// closes the editor -- restoring must still call [`show_taskbar`], not
 /// write an appbar state that would do nothing to a `ShowWindow`-hidden
@@ -1066,7 +1066,7 @@ fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
 /// Hides the taskbar using whichever technique `mode` selects, remembering
 /// which one was used so it can be undone later -- called by the
 /// taskbar-autohide hotkey's "on" direction (via [`toggle_taskbar_hide`]),
-/// the zone-editor overlay's force-on session, and every
+/// the zone-editor overlay's taskbar toggle, and every
 /// apply-path call site that hides the taskbar for a specific window (via
 /// [`set_taskbar_hide_absolute_armed`]) -- all callers that need a "hide
 /// now, restore exactly this later" round trip rather than a bare absolute

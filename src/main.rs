@@ -28,6 +28,7 @@ mod win32;
 mod window_filter;
 mod zone_editor;
 mod zone_overlay;
+mod zone_taskbar;
 
 fn main() {
     if single_instance::is_quit_request(std::env::args()) {
