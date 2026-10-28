@@ -56,6 +56,15 @@ impl Handle {
     ];
 }
 
+/// What a pointer position over a placed Zone grabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// A corner handle or an edge (handle or the edge's band): resizes.
+    Resize(Handle),
+    /// The Zone's interior: moves the whole Zone.
+    Move,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorState {
     /// No zone exists yet -- nothing drawn.
@@ -70,6 +79,13 @@ pub enum EditorState {
     Resizing {
         original: Zone,
         handle: Handle,
+        live: Zone,
+    },
+    /// The whole Zone is being dragged; `grab` is where the pointer pressed,
+    /// so the Zone follows the pointer's offset from it.
+    Moving {
+        original: Zone,
+        grab: Point,
         live: Zone,
     },
 }
@@ -88,6 +104,8 @@ pub enum Action {
     /// Finish the current drag or resize, committing it to `Placed`.
     Commit,
     Grab(Handle),
+    /// Start moving the whole Zone, pressed at this pointer position.
+    GrabMove(Point),
     Save,
     /// Discard any in-progress edit and close the editing session.
     Cancel,
@@ -153,6 +171,14 @@ impl AppState {
                         *live = apply_handle_drag(*original, *handle, p, self.monitor);
                         self.last_message = "live resize updated".to_string();
                     }
+                    EditorState::Moving {
+                        original,
+                        grab,
+                        live,
+                    } => {
+                        *live = move_zone(*original, *grab, p, self.monitor);
+                        self.last_message = "live move updated".to_string();
+                    }
                     _ => self.reject("`drag` needs an active draw or resize"),
                 }
                 None
@@ -168,6 +194,10 @@ impl AppState {
                         self.editor = EditorState::Placed { zone: *live };
                         self.last_message = "resize committed".to_string();
                     }
+                    EditorState::Moving { live, .. } => {
+                        self.editor = EditorState::Placed { zone: *live };
+                        self.last_message = "move committed".to_string();
+                    }
                     _ => self.reject("nothing to commit"),
                 }
                 None
@@ -181,6 +211,20 @@ impl AppState {
                             live: *zone,
                         };
                         self.last_message = format!("resizing via {handle:?}");
+                    }
+                    _ => self.reject("`grab` needs a placed zone"),
+                }
+                None
+            }
+            Action::GrabMove(p) => {
+                match &self.editor {
+                    EditorState::Placed { zone } => {
+                        self.editor = EditorState::Moving {
+                            original: *zone,
+                            grab: p,
+                            live: *zone,
+                        };
+                        self.last_message = "moving zone".to_string();
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -275,6 +319,79 @@ fn normalize(anchor: Point, current: Point, monitor: Monitor) -> Zone {
         y: y0,
         width: (x1 - x0).max(1),
         height: (y1 - y0).max(1),
+    }
+}
+
+/// Which [`Target`] `pointer` grabs on `zone`, or `None` outside it.
+///
+/// `grab_px` is the hit size of a handle in pixels: corners and edges are
+/// grabbable within `grab_px / 2` of the Zone's outline (straddling it), so
+/// the grab area covers the drawn handle. Corners win over edges, and the
+/// closer edge wins on a Zone thinner than the grab band; everything else
+/// inside the Zone is [`Target::Move`].
+pub fn hit_test(zone: &Zone, pointer: Point, grab_px: i32) -> Option<Target> {
+    let half = grab_px / 2;
+    let (left, top) = (zone.x, zone.y);
+    let (right, bottom) = (zone.x + zone.width, zone.y + zone.height);
+
+    let corners = [
+        (Handle::Nw, left, top),
+        (Handle::Ne, right, top),
+        (Handle::Sw, left, bottom),
+        (Handle::Se, right, bottom),
+    ];
+    let corner = corners
+        .iter()
+        .filter(|(_, cx, cy)| (pointer.x - cx).abs() <= half && (pointer.y - cy).abs() <= half)
+        .min_by_key(|(_, cx, cy)| (pointer.x - cx).pow(2) + (pointer.y - cy).pow(2));
+    if let Some((handle, _, _)) = corner {
+        return Some(Target::Resize(*handle));
+    }
+
+    let within_x = pointer.x >= left && pointer.x <= right;
+    let within_y = pointer.y >= top && pointer.y <= bottom;
+    let edges = [
+        (Handle::N, within_x, (pointer.y - top).abs()),
+        (Handle::S, within_x, (pointer.y - bottom).abs()),
+        (Handle::W, within_y, (pointer.x - left).abs()),
+        (Handle::E, within_y, (pointer.x - right).abs()),
+    ];
+    let edge = edges
+        .iter()
+        .filter(|(_, along, dist)| *along && *dist <= half)
+        .min_by_key(|(_, _, dist)| *dist);
+    if let Some((handle, _, _)) = edge {
+        return Some(Target::Resize(*handle));
+    }
+
+    (within_x && within_y).then_some(Target::Move)
+}
+
+/// Moves `original` by the pointer's offset from `grab` without resizing it.
+/// The Zone stays within the monitor (clamped), and snaps flush to a monitor
+/// edge when a side lands within [`EDGE_SNAP_PX`] of it.
+fn move_zone(original: Zone, grab: Point, pointer: Point, monitor: Monitor) -> Zone {
+    let max_x = (monitor.width - original.width).max(0);
+    let max_y = (monitor.height - original.height).max(0);
+    let x = (original.x + pointer.x - grab.x).clamp(0, max_x);
+    let y = (original.y + pointer.y - grab.y).clamp(0, max_y);
+    Zone {
+        x: snap_axis(x, original.width, monitor.width),
+        y: snap_axis(y, original.height, monitor.height),
+        width: original.width,
+        height: original.height,
+    }
+}
+
+/// Snaps a moved span's start so its near side or far side lands flush on
+/// the monitor boundary when within [`EDGE_SNAP_PX`].
+fn snap_axis(start: i32, len: i32, extent: i32) -> i32 {
+    if snap_to_edge(start, 0) == 0 {
+        0
+    } else if snap_to_edge(start + len, extent) == extent {
+        (extent - len).max(0)
+    } else {
+        start
     }
 }
 
@@ -793,6 +910,213 @@ mod tests {
         };
         let mut state = placed(zone);
         state.apply(Action::Grab(Handle::E));
+        assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
+    }
+
+    fn big_zone() -> Zone {
+        Zone {
+            x: 500,
+            y: 300,
+            width: 400,
+            height: 300,
+        }
+    }
+
+    fn at(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+
+    #[test]
+    fn hit_test_finds_each_corner() {
+        let z = big_zone();
+        assert_eq!(
+            hit_test(&z, at(500, 300), 40),
+            Some(Target::Resize(Handle::Nw))
+        );
+        assert_eq!(
+            hit_test(&z, at(900, 300), 40),
+            Some(Target::Resize(Handle::Ne))
+        );
+        assert_eq!(
+            hit_test(&z, at(500, 600), 40),
+            Some(Target::Resize(Handle::Sw))
+        );
+        assert_eq!(
+            hit_test(&z, at(900, 600), 40),
+            Some(Target::Resize(Handle::Se))
+        );
+    }
+
+    #[test]
+    fn hit_test_corner_grab_area_straddles_the_outline() {
+        let z = big_zone();
+        // 20 px (half of 40) outside and inside both hit; 21 px does not.
+        assert_eq!(
+            hit_test(&z, at(480, 280), 40),
+            Some(Target::Resize(Handle::Nw))
+        );
+        assert_eq!(
+            hit_test(&z, at(520, 320), 40),
+            Some(Target::Resize(Handle::Nw))
+        );
+        assert_eq!(hit_test(&z, at(479, 280), 40), None);
+    }
+
+    #[test]
+    fn hit_test_finds_edges_anywhere_along_them() {
+        let z = big_zone();
+        assert_eq!(
+            hit_test(&z, at(700, 300), 40),
+            Some(Target::Resize(Handle::N))
+        );
+        assert_eq!(
+            hit_test(&z, at(600, 610), 40),
+            Some(Target::Resize(Handle::S))
+        );
+        assert_eq!(
+            hit_test(&z, at(495, 450), 40),
+            Some(Target::Resize(Handle::W))
+        );
+        assert_eq!(
+            hit_test(&z, at(910, 350), 40),
+            Some(Target::Resize(Handle::E))
+        );
+    }
+
+    #[test]
+    fn hit_test_interior_moves_the_zone() {
+        let z = big_zone();
+        assert_eq!(hit_test(&z, at(700, 450), 40), Some(Target::Move));
+        assert_eq!(hit_test(&z, at(530, 330), 40), Some(Target::Move));
+    }
+
+    #[test]
+    fn hit_test_outside_the_zone_hits_nothing() {
+        let z = big_zone();
+        assert_eq!(hit_test(&z, at(100, 100), 40), None);
+        assert_eq!(hit_test(&z, at(700, 200), 40), None);
+        assert_eq!(hit_test(&z, at(1000, 450), 40), None);
+    }
+
+    #[test]
+    fn hit_test_on_a_thin_zone_picks_the_nearer_edge() {
+        let z = Zone {
+            x: 500,
+            y: 300,
+            width: 400,
+            height: 10,
+        };
+        assert_eq!(
+            hit_test(&z, at(700, 302), 40),
+            Some(Target::Resize(Handle::N))
+        );
+        assert_eq!(
+            hit_test(&z, at(700, 308), 40),
+            Some(Target::Resize(Handle::S))
+        );
+    }
+
+    #[test]
+    fn grab_move_then_drag_moves_the_zone_by_the_pointer_offset_keeping_its_size() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+        state.apply(Action::Drag(at(760, 400)));
+
+        assert_eq!(
+            state.editor,
+            EditorState::Moving {
+                original: big_zone(),
+                grab: at(700, 450),
+                live: Zone {
+                    x: 560,
+                    y: 250,
+                    width: 400,
+                    height: 300
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn commit_from_moving_places_the_moved_zone() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+        state.apply(Action::Drag(at(760, 400)));
+
+        assert_eq!(state.apply(Action::Commit), None);
+
+        assert_eq!(
+            state.editor,
+            EditorState::Placed {
+                zone: Zone {
+                    x: 560,
+                    y: 250,
+                    width: 400,
+                    height: 300
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn moving_clamps_the_zone_to_the_monitor() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+
+        state.apply(Action::Drag(at(-5000, -5000)));
+        let EditorState::Moving { live, .. } = state.editor.clone() else {
+            panic!("expected Moving");
+        };
+        assert_eq!((live.x, live.y), (0, 0));
+
+        state.apply(Action::Drag(at(9000, 9000)));
+        let EditorState::Moving { live, .. } = state.editor.clone() else {
+            panic!("expected Moving");
+        };
+        assert_eq!((live.x, live.y), (1920 - 400, 1080 - 300));
+        assert_eq!((live.width, live.height), (400, 300));
+    }
+
+    #[test]
+    fn moving_snaps_a_side_within_threshold_flush_to_the_monitor_edge() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+
+        // Left side lands at x=10, top at y=1080-300-15=765 (bottom 15 px short).
+        state.apply(Action::Drag(at(700 - 490, 450 + 465)));
+
+        let EditorState::Moving { live, .. } = state.editor else {
+            panic!("expected Moving");
+        };
+        assert_eq!((live.x, live.y), (0, 780));
+    }
+
+    #[test]
+    fn moving_does_not_snap_just_outside_the_threshold() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+
+        // Left side lands at x=21.
+        state.apply(Action::Drag(at(700 - 479, 450)));
+
+        let EditorState::Moving { live, .. } = state.editor else {
+            panic!("expected Moving");
+        };
+        assert_eq!(live.x, 21);
+    }
+
+    #[test]
+    fn grab_move_is_illegal_from_empty() {
+        let mut state = AppState::new(monitor());
+        assert_eq!(state.apply(Action::GrabMove(at(1, 1))), None);
+        assert_eq!(state.editor, EditorState::Empty);
+    }
+
+    #[test]
+    fn cancel_is_legal_from_moving_and_save_is_not() {
+        let mut state = placed(big_zone());
+        state.apply(Action::GrabMove(at(700, 450)));
+        assert_eq!(state.apply(Action::Save), None);
         assert_eq!(state.apply(Action::Cancel), Some(SessionOutcome::Cancelled));
     }
 
