@@ -559,21 +559,38 @@ fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
         .iter()
         .filter_map(|game| {
             let hwnd = win32::resolve_running_window(&game.exe_path)?;
-            match placement::apply_zone(config_dir, hwnd, placement::Trigger::LiveReapply) {
-                placement::Outcome::Applied
-                | placement::Outcome::Skipped
-                | placement::Outcome::RetryIn(_)
-                // Refused by the eligibility filter: it would be refused on
-                // the next launch too, so the "used next launch" message
-                // would be wrong; skipped silently (logged by placement).
-                | placement::Outcome::Refused => None,
-                placement::Outcome::RegionFailed
-                | placement::Outcome::Failed(_) => {
-                    Some(live_apply_failure_message(&game.display_name))
-                }
-            }
+            let outcome = placement::apply_zone(config_dir, hwnd, placement::Trigger::LiveReapply);
+            live_apply_status(&game.display_name, &outcome)
         })
         .collect()
+}
+
+/// The status-line message for one live re-apply [`placement::Outcome`], if it
+/// warrants one. Pure, so it is unit tested.
+fn live_apply_status(display_name: &str, outcome: &placement::Outcome) -> Option<String> {
+    match outcome {
+        placement::Outcome::Applied
+        | placement::Outcome::Skipped
+        | placement::Outcome::RetryIn(_)
+        // Refused by the eligibility filter: it would be refused on the next
+        // launch too, so the "used next launch" message would be wrong;
+        // skipped silently (logged by placement).
+        | placement::Outcome::Refused => None,
+        placement::Outcome::Failed(e) if e.is_window_hung() => {
+            Some(live_apply_hung_message(display_name))
+        }
+        placement::Outcome::RegionFailed | placement::Outcome::Failed(_) => {
+            Some(live_apply_failure_message(display_name))
+        }
+    }
+}
+
+/// The status-line message for a game that was not responding at the live
+/// re-apply (already logged once where the hang was found).
+fn live_apply_hung_message(display_name: &str) -> String {
+    format!(
+        "{display_name} is not responding -- the saved zone will be used the next time it launches or you apply it"
+    )
 }
 
 /// `true` for egui's eight physical modifier-key variants (Shift/Control/Alt/
@@ -2181,6 +2198,25 @@ mod tests {
         state.apply_external_cursor_enabled(true);
 
         assert_eq!(state.cursor.size, size);
+    }
+
+    #[test]
+    fn a_hung_game_gets_the_not_responding_message_not_the_generic_one() {
+        use crate::win32::Win32Error;
+        let hung = placement::Outcome::Failed(Win32Error::WindowHung);
+        let other = placement::Outcome::Failed(Win32Error::WindowMinimized);
+
+        let hung_message = live_apply_status("Thing", &hung).unwrap();
+
+        assert!(hung_message.contains("Thing is not responding"));
+        assert_eq!(
+            live_apply_status("Thing", &other),
+            Some(live_apply_failure_message("Thing"))
+        );
+        assert_eq!(
+            live_apply_status("Thing", &placement::Outcome::Applied),
+            None
+        );
     }
 
     #[test]

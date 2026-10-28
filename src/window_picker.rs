@@ -11,39 +11,83 @@
 //! previous list; the next open shows the new one.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, PostThreadMessageW, WM_NULL};
 
 /// One picker entry: the window handle (as `isize`, so it is `Send`) and its
 /// title.
 pub(crate) type PickerEntry = (isize, String);
 
-/// Lets at most one refresh run at a time; a request that arrives meanwhile is
-/// dropped, because the running refresh is about to deliver a fresh list.
+/// How long a refresh may hold the gate before a new request starts its own
+/// worker: a worker that hangs (a stalled drive) must not block the picker
+/// forever.
+const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Identifies one refresh that holds the gate.
+type Ticket = u64;
+
 #[derive(Default)]
-struct RefreshGate(AtomicBool);
+struct GateState {
+    /// The refresh in flight and when it started.
+    holder: Option<(Ticket, Instant)>,
+    next_ticket: Ticket,
+}
+
+/// Lets at most one refresh run at a time; a request that arrives meanwhile is
+/// dropped, because the running refresh is about to deliver a fresh list. A
+/// refresh older than [`GATE_TIMEOUT`] is presumed hung and is superseded.
+#[derive(Default)]
+struct RefreshGate(Mutex<GateState>);
 
 impl RefreshGate {
-    /// `true` if the caller now owns the refresh and must call [`finish`].
-    fn try_begin(&self) -> bool {
-        !self.0.swap(true, Ordering::AcqRel)
+    /// The ticket the caller must hand to [`finish`] if it now owns the
+    /// refresh, `None` if a younger refresh is running.
+    fn try_begin(&self, now: Instant) -> Option<Ticket> {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, started)) = state.holder
+            && now.saturating_duration_since(started) < GATE_TIMEOUT
+        {
+            return None;
+        }
+        state.next_ticket += 1;
+        let ticket = state.next_ticket;
+        state.holder = Some((ticket, now));
+        Some(ticket)
     }
 
-    fn finish(&self) {
-        self.0.store(false, Ordering::Release);
+    /// Releases the gate, unless a newer refresh superseded `ticket` (a late
+    /// finish of a hung worker must not free the gate under its replacement).
+    fn finish(&self, ticket: Ticket) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.holder.is_some_and(|(held, _)| held == ticket) {
+            state.holder = None;
+        }
     }
 }
 
 /// Releases the gate when dropped, so a worker that panics cannot leave the
 /// picker refusing every later request.
-struct GateGuard(Arc<RefreshGate>);
+struct GateGuard(Arc<RefreshGate>, Ticket);
 
 impl Drop for GateGuard {
     fn drop(&mut self) {
-        self.0.finish();
+        self.0.finish(self.1);
     }
+}
+
+/// Where [`wake_loop`] posts its no-op message.
+#[derive(Debug, PartialEq, Eq)]
+enum WakeTarget {
+    Window(HWND),
+    Thread,
+}
+
+/// The command window when it exists, else the loop thread.
+fn wake_target(command_window: Option<HWND>) -> WakeTarget {
+    command_window.map_or(WakeTarget::Thread, WakeTarget::Window)
 }
 
 /// Wakes the event loop so it picks up the finished list. Posts to the
@@ -54,11 +98,11 @@ fn wake_loop(loop_thread: u32) {
     // Safety: plain integer/handle arguments; a failed post only delays the
     // menu rebuild to the next message.
     unsafe {
-        match crate::instance_channel::command_window() {
-            Some(hwnd) => {
+        match wake_target(crate::instance_channel::command_window()) {
+            WakeTarget::Window(hwnd) => {
                 PostMessageW(hwnd, WM_NULL, 0, 0);
             }
-            None => {
+            WakeTarget::Thread => {
                 PostThreadMessageW(loop_thread, WM_NULL, 0, 0);
             }
         }
@@ -90,9 +134,9 @@ impl WindowPicker {
     /// blocks: the config read, the window walk and the Steam scan all happen
     /// on the worker.
     pub(crate) fn request(&self, config_dir: PathBuf) {
-        if !self.gate.try_begin() {
+        let Some(ticket) = self.gate.try_begin(Instant::now()) else {
             return;
-        }
+        };
         let gate = Arc::clone(&self.gate);
         let sender = self.sender.clone();
         let loop_thread = self.loop_thread;
@@ -102,7 +146,7 @@ impl WindowPicker {
                 // Released when the closure ends -- also on a panic -- and
                 // after the send below, so a newer worker can never queue its
                 // list ahead of this one.
-                let _guard = GateGuard(gate);
+                let _guard = GateGuard(gate, ticket);
                 let tracked_exes = match crate::profile_store::load(&config_dir) {
                     Ok(config) => config
                         .tracked_games
@@ -141,28 +185,74 @@ mod tests {
     #[test]
     fn a_second_request_while_one_runs_is_dropped() {
         let gate = RefreshGate::default();
-        assert!(gate.try_begin());
-        assert!(!gate.try_begin());
+        let t0 = Instant::now();
+        assert!(gate.try_begin(t0).is_some());
+        assert!(gate.try_begin(t0).is_none());
     }
 
     #[test]
     fn a_request_after_the_refresh_finished_is_accepted() {
         let gate = RefreshGate::default();
-        assert!(gate.try_begin());
-        gate.finish();
-        assert!(gate.try_begin());
+        let t0 = Instant::now();
+        let ticket = gate.try_begin(t0).unwrap();
+        gate.finish(ticket);
+        assert!(gate.try_begin(t0).is_some());
     }
 
     #[test]
     fn a_panicking_worker_still_releases_the_gate() {
         let gate = Arc::new(RefreshGate::default());
-        assert!(gate.try_begin());
+        let ticket = gate.try_begin(Instant::now()).unwrap();
         let worker_gate = Arc::clone(&gate);
         let worker = std::thread::spawn(move || {
-            let _guard = GateGuard(worker_gate);
+            let _guard = GateGuard(worker_gate, ticket);
             panic!("worker failed");
         });
         assert!(worker.join().is_err());
-        assert!(gate.try_begin());
+        assert!(gate.try_begin(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn a_hung_refresh_is_superseded_after_the_timeout() {
+        let gate = RefreshGate::default();
+        let t0 = Instant::now();
+        gate.try_begin(t0).unwrap();
+
+        let almost = t0 + GATE_TIMEOUT - Duration::from_secs(1);
+        assert!(gate.try_begin(almost).is_none(), "still within the timeout");
+        assert!(gate.try_begin(t0 + GATE_TIMEOUT).is_some());
+    }
+
+    #[test]
+    fn a_superseded_worker_finishing_late_does_not_free_the_new_one() {
+        let gate = RefreshGate::default();
+        let t0 = Instant::now();
+        let hung = gate.try_begin(t0).unwrap();
+        let later = t0 + GATE_TIMEOUT;
+        gate.try_begin(later).unwrap();
+
+        gate.finish(hung);
+
+        assert!(
+            gate.try_begin(later).is_none(),
+            "the replacement still holds it"
+        );
+    }
+
+    #[test]
+    fn take_latest_returns_the_newest_list_then_nothing() {
+        let picker = WindowPicker::new();
+        picker.sender.send(vec![(1, "old".into())]).unwrap();
+        picker.sender.send(vec![(2, "new".into())]).unwrap();
+
+        assert_eq!(picker.take_latest(), Some(vec![(2, "new".to_string())]));
+        assert_eq!(picker.take_latest(), None);
+    }
+
+    #[test]
+    fn the_loop_is_woken_through_the_command_window_when_it_exists() {
+        let hwnd = 5usize as HWND;
+        assert_eq!(wake_target(Some(hwnd)), WakeTarget::Window(hwnd));
+        assert_eq!(wake_target(None), WakeTarget::Thread);
     }
 }

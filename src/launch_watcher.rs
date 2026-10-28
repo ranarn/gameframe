@@ -440,17 +440,41 @@ unsafe extern "system" fn drift_callback(
     check_applied_window_drift(config_dir, hwnd);
 }
 
-/// Window handle -> thread timer id of the one pending deferred drift re-check.
-static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, usize>> =
+/// What a deferred re-check re-runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckKind {
+    /// The drift handler, for a window GameFrame placed.
+    Drift,
+    /// Auto-apply, for a tracked game that was hung when it took the
+    /// foreground and so was never placed.
+    AutoApply,
+}
+
+/// Window handle -> (thread timer id, kind) of the one pending deferred
+/// re-check.
+static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, (usize, RecheckKind)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Runs the drift handler for `hwnd`; if it was only rate-limited or the
 /// window is hung, schedules one re-check for when the limit expires or after
 /// the hung re-check interval (at most one pending per window).
 fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
-    let Some(retry_in) = crate::placement::handle_applied_window_drift(config_dir, hwnd) else {
-        return;
-    };
+    if let Some(retry_in) = crate::placement::handle_applied_window_drift(config_dir, hwnd) {
+        schedule_recheck(hwnd, retry_in, RecheckKind::Drift);
+    }
+}
+
+/// Runs auto-apply for `hwnd`; a hung game is retried after the hung re-check
+/// interval, reusing the drift re-check timer (until it responds or is
+/// destroyed -- a hung game produces no further foreground events).
+fn check_auto_apply(config_dir: &Path, hwnd: HWND) {
+    if let Some(retry_in) = crate::placement::handle_auto_apply_launch(config_dir, hwnd) {
+        schedule_recheck(hwnd, retry_in, RecheckKind::AutoApply);
+    }
+}
+
+/// Arms the one pending re-check of `hwnd`, if none is armed yet.
+fn schedule_recheck(hwnd: HWND, retry_in: std::time::Duration, kind: RecheckKind) {
     let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
     if pending.contains_key(&(hwnd as isize)) {
         return;
@@ -464,7 +488,7 @@ fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
     if timer == 0 {
         log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
     } else {
-        pending.insert(hwnd as isize, timer);
+        pending.insert(hwnd as isize, (timer, kind));
     }
 }
 
@@ -474,7 +498,7 @@ fn cancel_drift_recheck(hwnd: HWND) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(&(hwnd as isize));
-    if let Some(timer) = timer {
+    if let Some((timer, _)) = timer {
         // Safety: `timer` is a thread timer id this module created.
         unsafe {
             KillTimer(std::ptr::null_mut(), timer);
@@ -489,25 +513,32 @@ unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usi
     unsafe {
         KillTimer(std::ptr::null_mut(), timer);
     }
-    let hwnd = {
+    let (hwnd, kind) = {
         let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(window) = pending
+        let Some((window, kind)) = pending
             .iter()
-            .find_map(|(window, id)| (*id == timer).then_some(*window))
+            .find_map(|(window, (id, kind))| (*id == timer).then_some((*window, *kind)))
         else {
             return;
         };
         pending.remove(&window);
-        window as HWND
+        (window as HWND, kind)
     };
-    let _crumb = crate::watchdog::scoped("drift timer: re-check");
-    if !crate::win32::is_applied_window(hwnd) {
-        return;
-    }
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };
-    check_applied_window_drift(config_dir, hwnd);
+    match kind {
+        RecheckKind::Drift => {
+            let _crumb = crate::watchdog::scoped("drift timer: re-check");
+            if crate::win32::is_applied_window(hwnd) {
+                check_applied_window_drift(config_dir, hwnd);
+            }
+        }
+        RecheckKind::AutoApply => {
+            let _crumb = crate::watchdog::scoped("drift timer: auto-apply retry");
+            check_auto_apply(config_dir, hwnd);
+        }
+    }
 }
 
 /// The real `WINEVENTPROC` Windows calls on every `EVENT_SYSTEM_FOREGROUND`
@@ -543,7 +574,7 @@ unsafe extern "system" fn win_event_callback(
     };
 
     let _crumb = crate::watchdog::scoped("foreground hook: auto-apply");
-    crate::placement::handle_auto_apply_launch(config_dir, hwnd);
+    check_auto_apply(config_dir, hwnd);
 }
 
 #[cfg(test)]
