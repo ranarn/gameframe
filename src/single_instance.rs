@@ -141,10 +141,7 @@ pub fn acquire(wait: Option<Duration>) -> (bool, Option<Note>) {
 /// One attempt. On success the handle is intentionally kept open for the
 /// process lifetime; on `ERROR_ALREADY_EXISTS` it is closed.
 fn try_acquire(mutex_name: &str) -> (bool, Option<Note>) {
-    let name: Vec<u16> = mutex_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let name = crate::win32::encode_wide(mutex_name);
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
     // call; null security attributes are valid. GetLastError is read
     // immediately after, before any other API call can overwrite it.

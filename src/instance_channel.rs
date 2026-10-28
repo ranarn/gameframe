@@ -65,13 +65,13 @@
 //! [`Command::to_wparam`]/[`Command::from_wparam`], pick its [`Channel`],
 //! decide its [`route`], and handle it in the main loop.
 
+use crate::win32::encode_wide;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::settings_ui::SETTINGS_TITLE;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -81,6 +81,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow,
     ShowWindow, UnregisterClassW, WM_CLOSE, WM_ENDSESSION, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+
+/// Title of the Settings window (`crate::settings_ui` creates it with this
+/// title); [`find_settings_window`] finds the window by it.
+pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
 
 /// Window class of the hidden receiver. Same GUID as the single-instance mutex.
 const CLASS_NAME: &str = "GameFrame.CommandChannel-5C28E192-0AB5-4FA5-8874-88144D010E3B";
@@ -268,10 +272,6 @@ impl Drop for SettingsGuard {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 fn command_message() -> u32 {
     static MESSAGE: OnceLock<u32> = OnceLock::new();
     *MESSAGE.get_or_init(|| register_message(MESSAGE_NAME))
@@ -283,7 +283,7 @@ fn restricted_message() -> u32 {
 }
 
 fn register_message(name: &str) -> u32 {
-    let name = wide(name);
+    let name = encode_wide(name);
     // SAFETY: `name` is NUL-terminated and outlives the call.
     unsafe { RegisterWindowMessageW(name.as_ptr()) }
 }
@@ -309,7 +309,7 @@ impl Receiver {
     /// window could not be created; the instance then simply cannot be
     /// signalled.
     pub fn create() -> Option<Receiver> {
-        let class = wide(CLASS_NAME);
+        let class = encode_wide(CLASS_NAME);
         // SAFETY: plain Win32 calls with NUL-terminated strings that outlive
         // them; `wndproc` has the required signature and 'static lifetime.
         unsafe {
@@ -374,7 +374,7 @@ impl Drop for Receiver {
             DestroyWindow(self.hwnd);
             if !self.session_hwnd.is_null() {
                 DestroyWindow(self.session_hwnd);
-                let class = wide(SESSION_CLASS_NAME);
+                let class = encode_wide(SESSION_CLASS_NAME);
                 UnregisterClassW(class.as_ptr(), GetModuleHandleW(std::ptr::null()));
             }
         }
@@ -470,7 +470,7 @@ fn end_session_restore() {
 /// no `ShowWindow` ever): an unshown window has no taskbar button and is not
 /// in Alt+Tab. Must run on the main thread so its pump dispatches the message.
 fn create_session_window(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
-    let class = wide(SESSION_CLASS_NAME);
+    let class = encode_wide(SESSION_CLASS_NAME);
     // SAFETY: plain Win32 calls with NUL-terminated strings that outlive them;
     // `session_wndproc` has the required signature.
     unsafe {
@@ -521,7 +521,7 @@ pub fn should_restore_on_end_session(wparam: usize) -> bool {
 
 /// This process's Settings window, if it exists yet.
 pub(crate) fn find_settings_window() -> Option<HWND> {
-    let title = wide(SETTINGS_TITLE);
+    let title = encode_wide(SETTINGS_TITLE);
     // SAFETY: plain Win32 calls; `title` outlives them.
     unsafe {
         let pid = GetCurrentProcessId();
@@ -561,7 +561,7 @@ pub fn focus_settings_window() -> bool {
 /// Windows of another GameFrame process (an elevated relaunch overlapping the
 /// old instance) share the class name and are skipped.
 pub fn command_window() -> Option<HWND> {
-    let class = wide(CLASS_NAME);
+    let class = encode_wide(CLASS_NAME);
     // SAFETY: plain Win32 calls; `class` outlives them.
     unsafe {
         let pid = GetCurrentProcessId();
@@ -613,7 +613,7 @@ pub fn send(command: Command) -> bool {
 /// (`Duration::ZERO` = one attempt, for callers where "not running" is the
 /// normal case and must not stall).
 pub fn send_within(command: Command, timeout: Duration) -> bool {
-    let class = wide(CLASS_NAME);
+    let class = encode_wide(CLASS_NAME);
     let message = message_for(command.channel());
     let start = Instant::now();
     loop {
@@ -657,7 +657,7 @@ mod tests {
             // SAFETY: our own window, created on this thread.
             unsafe {
                 DestroyWindow(self.0);
-                let class = wide(SESSION_CLASS_NAME);
+                let class = encode_wide(SESSION_CLASS_NAME);
                 UnregisterClassW(class.as_ptr(), GetModuleHandleW(std::ptr::null()));
             }
         }

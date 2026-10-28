@@ -58,6 +58,7 @@ impl UpdateNotifier {
     /// next tray hover). That is harmless for a startup check.
     fn notify(&self, event: UpdateEvent) {
         if self.sender.send(event).is_ok() {
+            // SAFETY: plain post to the stored thread id; fails harmlessly if it is gone.
             unsafe { PostThreadMessageW(self.loop_thread, WM_NULL, 0, 0) };
         }
     }
@@ -79,6 +80,7 @@ pub(crate) struct UpdateEvents {
 impl UpdateEvents {
     pub(crate) fn new() -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
+        // SAFETY: no arguments or preconditions.
         let loop_thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         let notifier = UpdateNotifier {
             sender,

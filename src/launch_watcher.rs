@@ -87,6 +87,7 @@
 //! no-op: a mutex lock plus one pointer comparison, no OS call at all,
 //! unless a restore is actually due).
 
+use crate::win32::RecheckKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HWND;
@@ -232,8 +233,7 @@ unsafe extern "system" fn window_destroy_callback(
     }
 
     let _crumb = crate::watchdog::scoped("destroy hook");
-    crate::win32::forget_applied_window(hwnd);
-    cancel_drift_recheck(hwnd);
+    crate::win32::forget_window(hwnd);
 
     if let Some(restore) = crate::taskbar::take_armed_taskbar_restore_for_window(hwnd) {
         log!("taskbar auto-restore: armed window {hwnd:?} closed, restoring {restore:?}");
@@ -440,21 +440,6 @@ unsafe extern "system" fn drift_callback(
     check_applied_window_drift(config_dir, hwnd);
 }
 
-/// What a deferred re-check re-runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecheckKind {
-    /// The drift handler, for a window GameFrame placed.
-    Drift,
-    /// Auto-apply, for a tracked game that was hung when it took the
-    /// foreground and so was never placed.
-    AutoApply,
-}
-
-/// Window handle -> (thread timer id, kind) of the one pending deferred
-/// re-check.
-static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, (usize, RecheckKind)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
 /// Runs the drift handler for `hwnd`; if it was only rate-limited or the
 /// window is hung, schedules one re-check for when the limit expires or after
 /// the hung re-check interval (at most one pending per window).
@@ -473,37 +458,28 @@ fn check_auto_apply(config_dir: &Path, hwnd: HWND) {
     }
 }
 
-/// Arms the one pending re-check of `hwnd`, if none is armed yet.
+/// Arms the one pending re-check of `kind` for `hwnd`, if none is armed yet.
+/// A drift re-check and an auto-apply retry of the same window are separate
+/// timers, so neither swallows the other. The timers live in the per-window
+/// registry, which kills them when the window is forgotten.
 fn schedule_recheck(hwnd: HWND, retry_in: std::time::Duration, kind: RecheckKind) {
-    let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
-    if pending.contains_key(&(hwnd as isize)) {
-        return;
-    }
-    let delay_ms = u32::try_from(retry_in.as_millis())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
-    // Safety: a null window makes this a thread timer on the message-loop
-    // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
-    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
-    if timer == 0 {
-        log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
-    } else {
-        pending.insert(hwnd as isize, (timer, kind));
-    }
-}
-
-/// Drops `hwnd`'s pending deferred drift re-check, if any.
-fn cancel_drift_recheck(hwnd: HWND) {
-    let timer = DRIFT_RECHECKS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&(hwnd as isize));
-    if let Some((timer, _)) = timer {
-        // Safety: `timer` is a thread timer id this module created.
-        unsafe {
-            KillTimer(std::ptr::null_mut(), timer);
+    crate::win32::with_placed(|placed| {
+        if placed.has_recheck(hwnd as isize, kind) {
+            return;
         }
-    }
+        let delay_ms = u32::try_from(retry_in.as_millis())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        // Safety: a null window makes this a thread timer on the message-loop
+        // thread, delivered to `drift_recheck_timer` by `DispatchMessageW`.
+        let timer =
+            unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_recheck_timer)) };
+        if timer == 0 {
+            log!("drift re-check: SetTimer failed; the drift is corrected on its next event");
+        } else {
+            placed.set_recheck(hwnd as isize, kind, timer);
+        }
+    });
 }
 
 /// `TIMERPROC` for a deferred drift re-check: re-runs the drift decision for
@@ -513,17 +489,10 @@ unsafe extern "system" fn drift_recheck_timer(_hwnd: HWND, _msg: u32, timer: usi
     unsafe {
         KillTimer(std::ptr::null_mut(), timer);
     }
-    let (hwnd, kind) = {
-        let mut pending = DRIFT_RECHECKS.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((window, kind)) = pending
-            .iter()
-            .find_map(|(window, (id, kind))| (*id == timer).then_some((*window, *kind)))
-        else {
-            return;
-        };
-        pending.remove(&window);
-        (window as HWND, kind)
+    let Some((window, kind)) = crate::win32::with_placed(|p| p.take_recheck_by_timer(timer)) else {
+        return;
     };
+    let hwnd = window as HWND;
     let Some(config_dir) = WATCHED_CONFIG_DIR.get() else {
         return;
     };

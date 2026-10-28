@@ -851,6 +851,7 @@ mod window_frame_tests {
     }
 
     fn sizes(hwnd: HWND) -> ((i32, i32), (i32, i32)) {
+        // SAFETY: all-zero bytes are a valid value of this plain C struct.
         let (mut window, mut client) = (unsafe { std::mem::zeroed::<RECT>() }, unsafe {
             std::mem::zeroed::<RECT>()
         });

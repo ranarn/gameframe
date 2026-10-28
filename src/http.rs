@@ -6,6 +6,7 @@
 //! and proxy settings apply. The request is OS-facing and not exercised by the
 //! automated tests.
 
+use crate::win32::encode_wide;
 use std::ffi::c_void;
 use std::io::Write;
 use windows_sys::Win32::Networking::WinHttp::{
@@ -45,15 +46,13 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is a handle this guard owns and closes exactly once.
         unsafe { WinHttpCloseHandle(self.0) };
     }
 }
 
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 fn failed(what: &str) -> HttpError {
+    // SAFETY: GetLastError has no arguments or preconditions.
     HttpError::Failed(format!("{what} failed (Windows error {})", unsafe {
         windows_sys::Win32::Foundation::GetLastError()
     }))
@@ -89,7 +88,8 @@ fn request(
     follow_redirects: bool,
     sink: Sink,
 ) -> Result<Reply, HttpError> {
-    let agent = wide(USER_AGENT);
+    let agent = encode_wide(USER_AGENT);
+    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
     let session = Handle::new(unsafe {
         WinHttpOpen(
             agent.as_ptr(),
@@ -100,21 +100,24 @@ fn request(
         )
     })
     .ok_or_else(|| failed("WinHttpOpen"))?;
+    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
     if unsafe { WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS) } == 0
     {
         return Err(failed("WinHttpSetTimeouts"));
     }
 
-    let host = wide(host);
+    let host = encode_wide(host);
+    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
     let connection = Handle::new(unsafe {
         WinHttpConnect(session.0, host.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT, 0)
     })
     .ok_or_else(|| failed("WinHttpConnect"))?;
 
-    let verb = wide("GET");
-    let path = wide(path);
-    let accept_type = wide(accept);
+    let verb = encode_wide("GET");
+    let path = encode_wide(path);
+    let accept_type = encode_wide(accept);
     let accept_types = [accept_type.as_ptr(), std::ptr::null()];
+    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
     let request = Handle::new(unsafe {
         WinHttpOpenRequest(
             connection.0,
@@ -130,6 +133,7 @@ fn request(
 
     if !follow_redirects {
         let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
         if unsafe {
             WinHttpSetOption(
                 request.0,
@@ -143,16 +147,19 @@ fn request(
         }
     }
 
+    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
     if unsafe { WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) } == 0
     {
         return Err(failed("sending the request"));
     }
+    // SAFETY: `request.0` is an open request handle owned by its guard.
     if unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) } == 0 {
         return Err(failed("receiving the response"));
     }
 
     let mut status: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
+    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
     if unsafe {
         WinHttpQueryHeaders(
             request.0,
@@ -169,6 +176,7 @@ fn request(
     if !follow_redirects && matches!(status, 301 | 302 | 303 | 307 | 308) {
         let mut location = vec![0u16; LOCATION_CAPACITY];
         let mut location_len = (location.len() * 2) as u32;
+        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
         if unsafe {
             WinHttpQueryHeaders(
                 request.0,
@@ -193,6 +201,7 @@ fn request(
     let mut chunk = [0u8; 16 * 1024];
     loop {
         let mut read: u32 = 0;
+        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
         if unsafe {
             WinHttpReadData(
                 request.0,

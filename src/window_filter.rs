@@ -593,6 +593,7 @@ fn loaded_module_names(pid: u32) -> Vec<String> {
     }
 
     let mut names = Vec::new();
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
 
