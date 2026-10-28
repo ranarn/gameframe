@@ -1531,6 +1531,18 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &TaskbarJudgement) -> boo
     }
 }
 
+/// Whether the real taskbar is hidden right now under `mode` (see
+/// [`is_taskbar_hidden`]); `false` when the taskbar cannot be found. For the
+/// zone editor, which starts its toggle button from the real state.
+///
+/// OS-facing; not exercised by this crate's automated tests -- see module docs.
+pub fn taskbar_hidden_now(mode: TaskbarHideMode) -> bool {
+    find_taskbar_window()
+        .ok()
+        .map(gather_taskbar_judgement)
+        .is_some_and(|j| is_taskbar_hidden(mode, &j))
+}
+
 /// Toggles the taskbar's hidden/visible state on/off -- the manual global
 /// taskbar-autohide hotkey's own independent on/off toggle, grounded in the
 /// taskbar's real current state ([`is_taskbar_hidden`]) rather than a

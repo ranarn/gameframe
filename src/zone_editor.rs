@@ -267,6 +267,20 @@ impl AppState {
     fn reject(&mut self, reason: &str) {
         self.last_message = format!("reject: {reason}");
     }
+
+    /// The Zone as it currently stands, in physical pixels: the placed Zone,
+    /// the one being moved/resized, or the normalized live drag -- exactly
+    /// what `Save` would store from it. `None` while nothing is drawn.
+    pub fn live_zone(&self) -> Option<Zone> {
+        match &self.editor {
+            EditorState::Empty => None,
+            EditorState::Dragging { anchor, current } => {
+                Some(normalize(*anchor, *current, self.monitor))
+            }
+            EditorState::Placed { zone } => Some(*zone),
+            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => Some(*live),
+        }
+    }
 }
 
 /// A drawn/resized edge within this many pixels of a monitor boundary snaps
@@ -551,6 +565,70 @@ mod tests {
         };
         let state = AppState::new_with_zone(monitor(), zone);
         assert_eq!(state.editor, EditorState::Placed { zone });
+    }
+
+    #[test]
+    fn live_zone_is_none_before_anything_is_drawn() {
+        assert_eq!(AppState::new(monitor()).live_zone(), None);
+    }
+
+    #[test]
+    fn live_zone_of_a_drag_equals_the_zone_commit_stores() {
+        let mut state = AppState::new(monitor());
+        state.apply(Action::Start(Point { x: 300, y: 250 }));
+        state.apply(Action::Drag(Point { x: 100, y: 50 }));
+        let live = state.live_zone();
+        assert_eq!(
+            live,
+            Some(Zone {
+                x: 100,
+                y: 50,
+                width: 200,
+                height: 200
+            })
+        );
+        state.apply(Action::Commit);
+        assert_eq!(state.live_zone(), live);
+    }
+
+    #[test]
+    fn live_zone_of_a_drag_is_clamped_and_snapped_like_the_saved_zone() {
+        let m = monitor();
+        let mut state = AppState::new(m);
+        state.apply(Action::Start(Point { x: 5, y: 5 }));
+        state.apply(Action::Drag(Point {
+            x: m.width + 500,
+            y: m.height - 3,
+        }));
+        let live = state.live_zone();
+        state.apply(Action::Commit);
+        assert_eq!(state.live_zone(), live);
+        let zone = live.unwrap();
+        assert_eq!((zone.x, zone.y), (0, 0));
+        assert_eq!((zone.width, zone.height), (m.width, m.height));
+    }
+
+    #[test]
+    fn live_zone_follows_a_placed_zone_and_its_live_resize() {
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let mut state = placed(zone);
+        assert_eq!(state.live_zone(), Some(zone));
+        state.apply(Action::GrabMove(Point { x: 200, y: 200 }));
+        state.apply(Action::Drag(Point { x: 210, y: 220 }));
+        assert_eq!(
+            state.live_zone(),
+            Some(Zone {
+                x: 110,
+                y: 120,
+                width: 400,
+                height: 300
+            })
+        );
     }
 
     #[test]

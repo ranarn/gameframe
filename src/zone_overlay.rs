@@ -111,7 +111,11 @@ pub fn run_zone_editor_overlay(
         height: monitor_geometry.height,
     };
 
-    let taskbar = Rc::new(RefCell::new(TaskbarSession::default()));
+    // The toggle starts from the taskbar's real state: a Zone-apply path may
+    // have it hidden already.
+    let taskbar = Rc::new(RefCell::new(TaskbarSession::new(
+        win32::taskbar_hidden_now(mode),
+    )));
 
     // RAII guard, not a manual "call restore after run_native" step, so
     // every non-panic exit path -- normal return and early `?` propagation
@@ -178,30 +182,66 @@ pub fn run_zone_editor_overlay(
     }
 }
 
-/// What the editing session has done to the taskbar: `hidden` holds the
-/// remembered state (see [`win32::TaskbarHideRestore`]) only while the
-/// session itself has the taskbar hidden. Opening the editor leaves the
-/// taskbar alone, so closing restores nothing unless the toggle was used.
+/// The taskbar as the editing session sees it. `hidden` holds the remembered
+/// state (see [`win32::TaskbarHideRestore`]) only while the session itself
+/// has the taskbar hidden -- the only thing closing restores. `hidden_at_open`
+/// is a taskbar that was already hidden when the editor opened (e.g. by a
+/// Zone-apply path): the toggle label starts from it and its first click
+/// shows the taskbar, but closing never hides or restores it on its own.
+/// Opening the editor leaves the taskbar alone, so closing restores nothing
+/// unless the toggle hid it. `error` is the last toggle failure, for the
+/// control box.
 #[derive(Debug, Default)]
 struct TaskbarSession {
     hidden: Option<win32::TaskbarHideRestore>,
+    hidden_at_open: bool,
+    error: Option<String>,
 }
 
 /// What the toggle button must do next.
 #[derive(Debug, PartialEq, Eq)]
 enum TaskbarToggle {
-    /// The session has not hidden the taskbar: hide it.
+    /// The taskbar is visible: hide it.
     Hide,
     /// The session hid the taskbar: restore this state.
     Show(win32::TaskbarHideRestore),
+    /// The taskbar was hidden before the editor opened: show it.
+    ShowPreHidden,
+}
+
+/// What closing the editor did about the taskbar.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseOutcome {
+    /// The session had hidden nothing (or had shown it again).
+    NothingToRestore,
+    Restored,
+    /// The session state was borrowed elsewhere, so nothing was restored.
+    Busy,
+    Failed(String),
 }
 
 impl TaskbarSession {
+    /// A session over a taskbar that is `hidden_at_open` when the editor
+    /// opens.
+    fn new(hidden_at_open: bool) -> Self {
+        Self {
+            hidden_at_open,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the taskbar is hidden as far as the session knows: the toggle
+    /// button's label follows this.
+    fn is_hidden(&self) -> bool {
+        self.hidden.is_some() || self.hidden_at_open
+    }
+
     /// Pure decision for the toggle button.
     fn toggle_action(&self) -> TaskbarToggle {
         match self.hidden {
-            None => TaskbarToggle::Hide,
             Some(remembered) => TaskbarToggle::Show(remembered),
+            None if self.hidden_at_open => TaskbarToggle::ShowPreHidden,
+            None => TaskbarToggle::Hide,
         }
     }
 
@@ -212,19 +252,60 @@ impl TaskbarSession {
         self.hidden.take()
     }
 
-    /// Performs the toggle with `mode`. A failure is logged and leaves the
-    /// bookkeeping unchanged.
+    /// Performs the toggle with the given OS actions. A failure leaves the
+    /// bookkeeping unchanged and is kept in `error` so the control box can
+    /// show it; a success clears `error`.
+    fn toggle_with<E: std::fmt::Display>(
+        &mut self,
+        hide: impl FnOnce() -> Result<win32::TaskbarHideRestore, E>,
+        show: impl FnOnce(win32::TaskbarHideRestore) -> Result<(), E>,
+        show_pre_hidden: impl FnOnce() -> Result<(), E>,
+    ) {
+        let result = match self.toggle_action() {
+            TaskbarToggle::Hide => hide()
+                .map(|remembered| self.hidden = Some(remembered))
+                .map_err(|e| format!("could not hide the taskbar: {e}")),
+            TaskbarToggle::Show(remembered) => show(remembered)
+                .map(|()| self.hidden = None)
+                .map_err(|e| format!("could not show the taskbar: {e}")),
+            TaskbarToggle::ShowPreHidden => show_pre_hidden()
+                .map(|()| self.hidden_at_open = false)
+                .map_err(|e| format!("could not show the taskbar: {e}")),
+        };
+        self.error = result.err();
+    }
+
+    /// Performs the toggle with `mode` against the real taskbar, logging a
+    /// failure.
     fn toggle(&mut self, mode: TaskbarHideMode) {
-        match self.toggle_action() {
-            TaskbarToggle::Hide => match win32::hide_taskbar(mode) {
-                Ok(remembered) => self.hidden = Some(remembered),
-                Err(e) => log!("zone editor: failed to hide the taskbar: {e}"),
-            },
-            TaskbarToggle::Show(remembered) => match win32::restore_taskbar(remembered) {
-                Ok(()) => self.hidden = None,
-                Err(e) => log!("zone editor: failed to show the taskbar: {e}"),
-            },
+        self.toggle_with(
+            || win32::hide_taskbar(mode),
+            win32::restore_taskbar,
+            || win32::set_taskbar_hide_absolute(false, mode),
+        );
+        if let Some(error) = &self.error {
+            log!("zone editor: {error}");
         }
+    }
+}
+
+/// Ends the session's hold on the taskbar: restores what it hid, through
+/// `restore`. Never panics (it runs from a destructor), so a busy `session`
+/// is reported rather than unwrapped.
+fn restore_on_close<E: std::fmt::Display>(
+    session: &RefCell<TaskbarSession>,
+    restore: impl FnOnce(win32::TaskbarHideRestore) -> Result<(), E>,
+) -> CloseOutcome {
+    // `try_borrow_mut`: never panic in a destructor.
+    let Ok(mut session) = session.try_borrow_mut() else {
+        return CloseOutcome::Busy;
+    };
+    match session.take_restore_on_close() {
+        None => CloseOutcome::NothingToRestore,
+        Some(remembered) => match restore(remembered) {
+            Ok(()) => CloseOutcome::Restored,
+            Err(e) => CloseOutcome::Failed(e.to_string()),
+        },
     }
 }
 
@@ -249,15 +330,12 @@ impl TaskbarRestoreGuard {
 
 impl Drop for TaskbarRestoreGuard {
     fn drop(&mut self) {
-        // `try_borrow_mut`: never panic in a destructor.
-        let Ok(mut session) = self.session.try_borrow_mut() else {
-            log!("zone editor: taskbar state busy at close; not restored");
-            return;
-        };
-        if let Some(remembered) = session.take_restore_on_close()
-            && let Err(e) = win32::restore_taskbar(remembered)
-        {
-            log!("zone editor: failed to restore taskbar state: {e}");
+        match restore_on_close(&self.session, win32::restore_taskbar) {
+            CloseOutcome::NothingToRestore | CloseOutcome::Restored => {}
+            CloseOutcome::Busy => log!("zone editor: taskbar state busy at close; not restored"),
+            CloseOutcome::Failed(e) => {
+                log!("zone editor: failed to restore taskbar state: {e}")
+            }
         }
     }
 }
@@ -488,16 +566,9 @@ impl OverlayApp {
     /// The Zone as currently drawn (in points), if any: the live drag, the
     /// placed Zone, or the Zone being moved/resized.
     fn live_rect(&self, scale: f32) -> Option<egui::Rect> {
-        match &self.state.editor {
-            EditorState::Empty => None,
-            EditorState::Dragging { anchor, current } => {
-                Some(rect_from_points(*anchor, *current, scale))
-            }
-            EditorState::Placed { zone, .. } => Some(rect_from_zone(zone, scale)),
-            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => {
-                Some(rect_from_zone(live, scale))
-            }
-        }
+        self.state
+            .live_zone()
+            .map(|zone| rect_from_zone(&zone, scale))
     }
 
     /// Whole-screen drag capture for the initial corner-to-corner draw
@@ -624,7 +695,7 @@ impl OverlayApp {
                                 *self.outcome.borrow_mut() = Some(outcome);
                             }
                         });
-                        let hidden = self.taskbar.borrow().hidden.is_some();
+                        let hidden = self.taskbar.borrow().is_hidden();
                         let toggle_text = if hidden {
                             "Show taskbar"
                         } else {
@@ -635,15 +706,18 @@ impl OverlayApp {
                             if ui.add(toggle).clicked() {
                                 self.taskbar.borrow_mut().toggle(self.taskbar_mode);
                             }
-                            let scale = scale_of(ctx);
+                            if let Some(error) = &self.taskbar.borrow().error {
+                                ui.label(
+                                    egui::RichText::new(error)
+                                        .color(egui::Color32::from_rgb(255, 120, 100))
+                                        .size(16.0),
+                                );
+                            }
                             ui.label(
-                                egui::RichText::new(format_zone_readout(
-                                    self.live_rect(scale),
-                                    scale,
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .monospace()
-                                .size(18.0),
+                                egui::RichText::new(format_zone_readout(self.state.live_zone()))
+                                    .color(egui::Color32::WHITE)
+                                    .monospace()
+                                    .size(18.0),
                             );
                             ui.label(
                                 egui::RichText::new(&self.state.last_message)
@@ -666,15 +740,6 @@ fn control_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     )
     .fill(fill)
     .min_size(egui::vec2(140.0, 56.0))
-}
-
-/// The helpers below convert pixel-space editor state to the egui points the
-/// overlay draws in (see [`crate::zone_editor::pixels_to_points`]).
-fn rect_from_points(a: Point, b: Point, scale: f32) -> egui::Rect {
-    egui::Rect::from_two_pos(
-        egui::pos2(pixels_to_points(a.x, scale), pixels_to_points(a.y, scale)),
-        egui::pos2(pixels_to_points(b.x, scale), pixels_to_points(b.y, scale)),
-    )
 }
 
 fn rect_from_zone(zone: &Zone, scale: f32) -> egui::Rect {
@@ -712,18 +777,15 @@ fn press_action(zone: &Zone, press: Point, grab_px: i32) -> Option<Action> {
 }
 
 /// The control box's readout of the Zone being edited: x, y, width and height
-/// in physical pixels (the unit the Zone is saved in), converted from the
-/// drawn `rect` (points) at `scale`. A placeholder when no Zone exists yet.
-fn format_zone_readout(rect: Option<egui::Rect>, scale: f32) -> String {
-    let Some(rect) = rect else {
+/// in physical pixels (the unit the Zone is saved in), taken from the very
+/// Zone `Save` would store. A placeholder when no Zone exists yet.
+fn format_zone_readout(zone: Option<Zone>) -> String {
+    let Some(zone) = zone else {
         return "x \u{2014}  y \u{2014}  w \u{2014}  h \u{2014}  px".to_string();
     };
     format!(
         "x {}  y {}  w {}  h {}  px",
-        points_to_pixels(rect.min.x, scale),
-        points_to_pixels(rect.min.y, scale),
-        points_to_pixels(rect.width(), scale),
-        points_to_pixels(rect.height(), scale),
+        zone.x, zone.y, zone.width, zone.height
     )
 }
 
@@ -763,25 +825,165 @@ mod editor_ui_tests {
     use crate::win32::TaskbarHideRestore;
 
     #[test]
-    fn readout_shows_pixels_for_a_rect_drawn_in_points() {
-        // 100 % scale: points are pixels.
-        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+    fn readout_shows_the_zone_in_physical_pixels() {
+        let zone = Zone {
+            x: 15,
+            y: 30,
+            width: 450,
+            height: 300,
+        };
         assert_eq!(
-            format_zone_readout(Some(rect), 1.0),
-            "x 10  y 20  w 300  h 200  px"
-        );
-        // 150 %: the same Zone in points is 1.5x in physical pixels.
-        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
-        assert_eq!(
-            format_zone_readout(Some(rect), 1.5),
+            format_zone_readout(Some(zone)),
             "x 15  y 30  w 450  h 300  px"
         );
     }
 
     #[test]
     fn readout_shows_a_placeholder_without_a_zone() {
-        let text = format_zone_readout(None, 1.0);
+        let text = format_zone_readout(None);
         assert_eq!(text, "x \u{2014}  y \u{2014}  w \u{2014}  h \u{2014}  px");
+    }
+
+    #[test]
+    fn readout_of_a_live_drag_matches_the_zone_save_stores() {
+        let mut state = AppState::new(Monitor {
+            width: 1920,
+            height: 1080,
+        });
+        state.apply(Action::Start(Point { x: 303, y: 251 }));
+        state.apply(Action::Drag(Point { x: 101, y: 49 }));
+        let live = format_zone_readout(state.live_zone());
+        state.apply(Action::Commit);
+        let Some(SessionOutcome::Saved(saved)) = state.apply(Action::Save) else {
+            panic!("save failed");
+        };
+        assert_eq!(live, format_zone_readout(Some(saved)));
+    }
+
+    #[test]
+    fn toggle_shows_a_taskbar_that_was_hidden_before_the_editor_opened() {
+        let session = TaskbarSession::new(true);
+        assert!(session.is_hidden());
+        assert_eq!(session.toggle_action(), TaskbarToggle::ShowPreHidden);
+    }
+
+    #[test]
+    fn showing_a_pre_hidden_taskbar_is_not_undone_on_close() {
+        let mut session = TaskbarSession::new(true);
+        session.toggle_with::<String>(
+            || panic!("must not hide"),
+            |_| panic!("must not restore"),
+            || Ok(()),
+        );
+        assert!(!session.is_hidden());
+        assert_eq!(session.error, None);
+        assert_eq!(session.take_restore_on_close(), None);
+    }
+
+    #[test]
+    fn a_pre_hidden_taskbar_is_left_alone_on_close_when_not_toggled() {
+        let mut session = TaskbarSession::new(true);
+        assert_eq!(session.take_restore_on_close(), None);
+    }
+
+    #[test]
+    fn hiding_remembers_the_state_and_clears_a_previous_error() {
+        let mut session = TaskbarSession {
+            error: Some("old".into()),
+            ..TaskbarSession::default()
+        };
+        session.toggle_with::<String>(
+            || Ok(TaskbarHideRestore::FullyHidden),
+            |_| panic!("must not restore"),
+            || panic!("must not show"),
+        );
+        assert_eq!(session.hidden, Some(TaskbarHideRestore::FullyHidden));
+        assert!(session.is_hidden());
+        assert_eq!(session.error, None);
+    }
+
+    #[test]
+    fn a_failed_hide_keeps_the_bookkeeping_and_reports_the_error() {
+        let mut session = TaskbarSession::default();
+        session.toggle_with(
+            || Err("boom"),
+            |_| panic!("must not restore"),
+            || panic!("must not show"),
+        );
+        assert!(!session.is_hidden());
+        let error = session.error.as_deref().unwrap();
+        assert!(error.contains("hide") && error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_show_keeps_what_the_session_hid_and_reports_the_error() {
+        let mut session = TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
+        };
+        session.toggle_with(
+            || panic!("must not hide"),
+            |_| Err("boom"),
+            || panic!("must not show"),
+        );
+        assert_eq!(session.hidden, Some(TaskbarHideRestore::FullyHidden));
+        let error = session.error.as_deref().unwrap();
+        assert!(error.contains("show") && error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_show_of_a_pre_hidden_taskbar_keeps_it_hidden() {
+        let mut session = TaskbarSession::new(true);
+        session.toggle_with(
+            || panic!("must not hide"),
+            |_| panic!("must not restore"),
+            || Err("boom"),
+        );
+        assert!(session.is_hidden());
+        assert!(session.error.is_some());
+    }
+
+    #[test]
+    fn close_restores_what_the_session_hid() {
+        let session = RefCell::new(TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
+        });
+        let mut restored = None;
+        let outcome = restore_on_close::<String>(&session, |r| {
+            restored = Some(r);
+            Ok(())
+        });
+        assert_eq!(outcome, CloseOutcome::Restored);
+        assert_eq!(restored, Some(TaskbarHideRestore::FullyHidden));
+    }
+
+    #[test]
+    fn close_restores_nothing_for_an_untouched_taskbar() {
+        let session = RefCell::new(TaskbarSession::new(true));
+        let outcome = restore_on_close::<String>(&session, |_| panic!("must not restore"));
+        assert_eq!(outcome, CloseOutcome::NothingToRestore);
+    }
+
+    #[test]
+    fn close_reports_a_failed_restore() {
+        let session = RefCell::new(TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
+        });
+        let outcome = restore_on_close(&session, |_| Err("boom"));
+        assert_eq!(outcome, CloseOutcome::Failed("boom".into()));
+    }
+
+    #[test]
+    fn close_does_not_panic_or_restore_when_the_session_is_busy() {
+        let session = RefCell::new(TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
+        });
+        let _held = session.borrow_mut();
+        let outcome = restore_on_close::<String>(&session, |_| panic!("must not restore"));
+        assert_eq!(outcome, CloseOutcome::Busy);
     }
 
     #[test]
@@ -796,6 +998,7 @@ mod editor_ui_tests {
     fn toggle_shows_the_remembered_state_when_the_session_hid_the_taskbar() {
         let session = TaskbarSession {
             hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
         };
         assert_eq!(
             session.toggle_action(),
@@ -812,6 +1015,7 @@ mod editor_ui_tests {
     fn close_restores_what_the_session_hid_exactly_once() {
         let mut session = TaskbarSession {
             hidden: Some(TaskbarHideRestore::FullyHidden),
+            ..Default::default()
         };
         assert_eq!(
             session.take_restore_on_close(),
