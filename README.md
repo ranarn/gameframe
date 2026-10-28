@@ -71,8 +71,8 @@ The release build is a single self-contained executable; the C runtime is static
 To build the installer, install [Inno Setup 7](https://jrsoftware.org/isinfo.php)
 (`winget install JRSoftware.InnoSetup.7`) and
 [cargo-about](https://github.com/EmbarkStudios/cargo-about)
-(`cargo install cargo-about --locked --features cli --version 0.9.2`, generates the third-party license
-notices), then run `.\installer\build.ps1`. The result is
+(generates the third-party license notices; `build.ps1` checks the installed version against the one pinned in
+`.github/actions/install-cargo-about/action.yml` and prints the exact `cargo install` command if it differs), then run `.\installer\build.ps1`. The result is
 `target\installer\GameFrame-Setup-<version>.exe`.
 
 ## Support

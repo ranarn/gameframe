@@ -10,7 +10,8 @@ unmaintained = "none"
 yanked = "deny"
 
 [licenses]
-# Keep identical to `accepted` in about.toml (cargo-about notices); nothing checks that.
+# Keep identical to `accepted` in about.toml (cargo-about notices); installer/build.ps1 checks that
+# (in the release build and the PR `third-party-notices` job) and fails naming any difference.
 # Licenses that can be combined with GameFrame's GPL-3.0-or-later. OFL-1.1 and
 # Ubuntu-font-1.0 cover the fonts egui embeds.
 allow = [

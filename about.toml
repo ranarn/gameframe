@@ -1,9 +1,9 @@
 # cargo-about: generates the third-party notices shipped with the installer
 # (see installer/build.ps1). Keep `accepted` identical to [licenses].allow in
-# deny.toml (which points back here). Nothing checks that; edit both together.
+# deny.toml (which points back here). installer/build.ps1 checks they match (in the
+# release build and the PR `third-party-notices` job); edit both together.
 # The 0.9 confidence threshold deny.toml uses is a CLI flag in cargo-about
-# (--threshold); see installer/build.ps1 and the cargo-about job in
-# .github/workflows/pull-request.yml.
+# (--threshold); see installer/build.ps1.
 
 accepted = [
     "0BSD",

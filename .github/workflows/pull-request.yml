@@ -81,11 +81,7 @@ jobs:
       - uses: $/.github/actions/install-cargo-about
       - name: Generate notices
         shell: pwsh
-        run: |
-          # Same flags as installer/build.ps1.
-          cargo about generate --locked --fail --threshold 0.9 -o "$env:RUNNER_TEMP/notices.txt" installer/third-party-notices.hbs
-          if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed ($LASTEXITCODE)" }
-          if ((Get-Item "$env:RUNNER_TEMP/notices.txt").Length -eq 0) { throw 'empty notices file' }
+        run: ./installer/build.ps1 -NoticesOnly -NoticesPath "$env:RUNNER_TEMP/notices.txt"
 
   # Blocks a PR that adds a dependency with a known vulnerability.
   dependency-review:
