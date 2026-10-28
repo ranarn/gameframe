@@ -115,7 +115,7 @@ pub fn run_zone_editor_overlay(
     // path, the hotkey, Windows auto-hide): the toggle is locked and the
     // editor never touches it.
     let taskbar = Rc::new(RefCell::new(TaskbarSession::new(
-        win32::taskbar_hidden_flag(mode),
+        win32::taskbar_hidden_flag(),
     )));
 
     // RAII guard, not a manual "call restore after run_native" step, so
