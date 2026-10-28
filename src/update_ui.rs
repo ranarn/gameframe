@@ -6,10 +6,10 @@
 //! OS-facing glue, checked manually (the decisions it makes are tested in
 //! [`crate::updater`]).
 
-use crate::app::{show_message_box, show_warning_box};
+use crate::message_box::{show_message_box, show_warning_box};
 use crate::profile_store;
 use crate::tray_ui::Tray;
-use crate::updater::{CheckOutcome, SpawnError, StartupAction, UpdateError, UpdateInfo};
+use crate::updater::{CheckOutcome, SpawnError, StartupAction, UpdateError, UpdateInfo, Version};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -35,9 +35,9 @@ pub(crate) enum UpdateEvent {
     /// A manual check found no newer release.
     UpToDate,
     /// An install started: it downloads this version.
-    InstallStarted(String),
+    InstallStarted(Version),
     /// The installer of this version was started; it should quit GameFrame.
-    InstallerLaunched(String),
+    InstallerLaunched(Version),
     /// An install failed, or the installer never quit this instance.
     InstallFailed,
 }
@@ -222,11 +222,10 @@ pub(crate) fn spawn_install(
     info: UpdateInfo,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), SpawnError> {
-    let version = info.version.to_string();
-    let started_version = version.clone();
+    let version = info.version;
     crate::update_install::spawn_install(
         info,
-        move || notify(UpdateEvent::InstallStarted(started_version)),
+        move || notify(UpdateEvent::InstallStarted(version)),
         move |result| match result {
             Ok(()) => {
                 on_done(Ok(()));
