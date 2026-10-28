@@ -76,6 +76,40 @@ pub struct BindingReport {
     pub outcome: BindingOutcome,
 }
 
+/// The notice for bindings that fail in `now` but did not fail the same way in
+/// `previous` (the registration before Settings was opened): the ones the user
+/// just saved. A failure that was already there is not repeated on every visit
+/// to Settings. `None` when there is nothing new.
+pub(crate) fn new_failure_notice(
+    previous: &[BindingReport],
+    now: &[BindingReport],
+) -> Option<String> {
+    let mut fresh = now.iter().filter_map(|report| {
+        let BindingOutcome::Failed(reason) = &report.outcome else {
+            return None;
+        };
+        let known = previous.iter().any(|p| {
+            p.action == report.action
+                && p.binding == report.binding
+                && matches!(p.outcome, BindingOutcome::Failed(_))
+        });
+        (!known).then_some((report, reason))
+    });
+    let (first, reason) = fresh.next()?;
+    let more = fresh.count();
+    // One balloon holds ~255 characters: name the first failure, put its
+    // reason before anything else, and only count the rest.
+    let others = match more {
+        0 => String::new(),
+        n => format!(" (+{n} more failed)"),
+    };
+    Some(format!(
+        "Couldn't register {} ({}): {reason}{others}. Change it in Settings.",
+        first.binding,
+        first.action.label()
+    ))
+}
+
 /// Human-readable reason an OS registration failed.
 fn registration_failure_reason(error: &global_hotkey::Error) -> String {
     match error {
@@ -431,6 +465,61 @@ mod tests {
 
         assert!(registered.is_empty());
         assert!(reports.is_empty());
+    }
+
+    fn a_report(binding: &str, outcome: BindingOutcome) -> BindingReport {
+        BindingReport {
+            action: HotkeyAction::ToggleBorderless,
+            binding: binding.to_string(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn a_newly_failing_binding_is_announced_with_its_reason() {
+        let now = [a_report(
+            "Ctrl+F4",
+            BindingOutcome::Failed("already in use by another program".to_string()),
+        )];
+
+        let notice = new_failure_notice(&[], &now).unwrap();
+
+        assert!(notice.contains("Ctrl+F4"));
+        assert!(notice.contains("toggle borderless"));
+        assert!(notice.contains("already in use by another program"));
+    }
+
+    #[test]
+    fn a_failure_that_was_already_reported_is_not_announced_again() {
+        let failed = a_report("Ctrl+F4", BindingOutcome::Failed("x".to_string()));
+
+        assert_eq!(
+            new_failure_notice(std::slice::from_ref(&failed), std::slice::from_ref(&failed)),
+            None
+        );
+        // A different combination failing for the same action is new.
+        let rebound = a_report("Ctrl+F5", BindingOutcome::Failed("x".to_string()));
+        assert!(new_failure_notice(&[failed], &[rebound]).is_some());
+    }
+
+    #[test]
+    fn several_new_failures_name_the_first_and_count_the_rest() {
+        let failed = |b: &str| a_report(b, BindingOutcome::Failed("in use".to_string()));
+        let now = [failed("Ctrl+F4"), failed("Ctrl+F5"), failed("Ctrl+F6")];
+
+        let notice = new_failure_notice(&[], &now).unwrap();
+
+        assert!(notice.contains("Ctrl+F4"));
+        assert!(!notice.contains("Ctrl+F5"));
+        assert!(notice.contains("+2 more"));
+        assert!(notice.encode_utf16().count() < 255);
+    }
+
+    #[test]
+    fn registered_bindings_produce_no_failure_notice() {
+        let ok = a_report("Ctrl+F4", BindingOutcome::Registered);
+
+        assert_eq!(new_failure_notice(&[], &[ok]), None);
     }
 
     #[test]

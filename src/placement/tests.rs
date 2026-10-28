@@ -210,7 +210,10 @@ fn a_window_whose_exe_path_cannot_be_read_is_skipped_without_placing() {
 
     let outcome = apply_zone_with(&ops, hwnd(), Trigger::Hotkey);
 
-    assert!(matches!(outcome, Outcome::Skipped));
+    assert!(matches!(
+        outcome,
+        Outcome::Declined(Declined::ProcessUnreadable)
+    ));
     assert!(ops.calls().is_empty());
 }
 
@@ -526,10 +529,14 @@ fn an_untracked_window_is_skipped_by_every_non_tray_trigger() {
             ..Config::default()
         });
 
-        assert!(matches!(
-            apply_zone_with(&ops, hwnd(), trigger),
-            Outcome::Skipped
-        ));
+        let outcome = apply_zone_with(&ops, hwnd(), trigger);
+
+        // Automatic triggers stay quiet; the user's own say why.
+        if trigger.is_automatic() {
+            assert!(matches!(outcome, Outcome::Skipped));
+        } else {
+            assert!(matches!(outcome, Outcome::Declined(Declined::NotTracked)));
+        }
         assert!(ops.calls().is_empty());
     }
 }
@@ -540,9 +547,72 @@ fn no_zone_skips_the_placement() {
 
     assert!(matches!(
         apply_zone_with(&ops, hwnd(), Trigger::Hotkey),
-        Outcome::Skipped
+        Outcome::Declined(Declined::NoZone)
     ));
     assert!(ops.calls().is_empty());
+}
+
+#[test]
+fn an_unreadable_config_is_declined_by_a_user_trigger_and_skipped_by_an_automatic_one() {
+    let mut ops = tracked_ops(true);
+    ops.config_ok = false;
+
+    assert!(matches!(
+        apply_zone_with(&ops, hwnd(), Trigger::Hotkey),
+        Outcome::Declined(Declined::ConfigUnreadable)
+    ));
+    assert!(matches!(
+        apply_zone_with(&ops, hwnd(), Trigger::AutoApply),
+        Outcome::Skipped
+    ));
+}
+
+#[test]
+fn every_failure_a_user_can_hit_has_a_notice_and_successes_have_none() {
+    let failures = [
+        Outcome::Declined(Declined::NoZone),
+        Outcome::Declined(Declined::NotTracked),
+        Outcome::Declined(Declined::ProcessUnreadable),
+        Outcome::Declined(Declined::ConfigUnreadable),
+        Outcome::Refused,
+        Outcome::RegionFailed,
+        Outcome::Failed(Win32Error::WindowHung),
+        Outcome::Failed(Win32Error::WindowMinimized),
+    ];
+    for trigger in [Trigger::Tray, Trigger::Hotkey] {
+        for outcome in &failures {
+            let notice = failure_notice(trigger, outcome);
+            assert!(
+                notice.as_deref().is_some_and(|n| !n.is_empty()),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(failure_notice(trigger, &Outcome::Applied), None);
+        assert_eq!(failure_notice(trigger, &Outcome::Skipped), None);
+    }
+}
+
+#[test]
+fn the_notices_tell_the_reasons_apart() {
+    let no_zone = failure_notice(Trigger::Hotkey, &Outcome::Declined(Declined::NoZone)).unwrap();
+    let untracked =
+        failure_notice(Trigger::Hotkey, &Outcome::Declined(Declined::NotTracked)).unwrap();
+    let hung = failure_notice(Trigger::Hotkey, &Outcome::Failed(Win32Error::WindowHung)).unwrap();
+
+    assert!(no_zone.contains("No Zone"));
+    assert!(untracked.contains("tracked game"));
+    assert!(hung.contains("isn't responding"));
+}
+
+#[test]
+fn the_untracked_notice_only_points_to_the_tray_menu_for_the_hotkey() {
+    let outcome = Outcome::Declined(Declined::NotTracked);
+
+    let hotkey = failure_notice(Trigger::Hotkey, &outcome).unwrap();
+    let tray = failure_notice(Trigger::Tray, &outcome).unwrap();
+
+    assert!(hotkey.contains("tray menu"));
+    assert!(!tray.contains("tray menu"));
 }
 
 #[test]
@@ -571,7 +641,7 @@ fn tray_apply_keeps_the_tracking_when_no_zone_is_set() {
 
     let outcome = apply_zone_with(&ops, hwnd(), Trigger::Tray);
 
-    assert!(matches!(outcome, Outcome::Skipped));
+    assert!(matches!(outcome, Outcome::Declined(Declined::NoZone)));
     assert_eq!(ops.calls(), ["eligibility", "track_game"]);
     assert_eq!(ops.config.borrow().tracked_games.len(), 1);
 }
