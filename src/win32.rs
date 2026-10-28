@@ -1186,7 +1186,8 @@ pub(crate) fn is_window_hung_logged(hwnd: HWND) -> bool {
 /// foreground window at all). Reads `hwnd`'s current style itself, so callers
 /// only need a target `HWND` and region.
 ///
-/// Once the style change succeeds, records the window's pre-strip
+/// After the first mutation that took effect (the un-maximize for a maximized
+/// window, otherwise the style change), records the window's pre-strip
 /// style/region as its [`RestoreState`] unless it already has one, so the
 /// borderless hotkey can later restore a window placed by any path (tray
 /// picker, auto-apply, drift re-apply) to its original look. A window that
@@ -1253,8 +1254,9 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         ),
     };
     set_window_style(hwnd, strip_border_style(live_style))?;
-    // Recorded once the first mutation succeeded, so a window GameFrame could
-    // not change (e.g. an elevated game) never gets a restore entry; the
+    // Recorded once the style change succeeded (a no-op for a maximized
+    // window, already recorded at its un-maximize), so a window GameFrame
+    // could not change (e.g. an elevated game) never gets a restore entry; the
     // remaining calls below can still fail with the original already safe.
     lock_store(&RESTORE_STATES).record_if_absent(
         hwnd as isize,
