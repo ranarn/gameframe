@@ -39,8 +39,8 @@ use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
 use crate::win32;
 use crate::zone_editor::{
-    Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome, pixels_to_points,
-    point_from_points, scale_from_dpi,
+    Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome, Target, hit_test,
+    pixels_to_points, point_from_points, points_to_pixels, scale_from_dpi,
 };
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -54,6 +54,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
     WS_SYSMENU, WS_THICKFRAME,
 };
+
+/// Drawn size of a resize handle square, in egui points (scales with DPI, so
+/// it stays usable at 100-200 %).
+const HANDLE_DRAW_PT: f32 = 28.0;
+/// Grab size of a handle, in egui points; larger than the drawn handle. Edge
+/// bands extend half of this on each side of the outline, capped at a third
+/// of the Zone's width/height so a small Zone keeps a Move area.
+const HANDLE_HIT_PT: f32 = 40.0;
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
 /// afterward) can fail.
@@ -346,12 +354,7 @@ impl eframe::App for OverlayApp {
         self.strip_frame();
         self.draw_dim_and_zone(ui);
         self.handle_draw_interaction(ui);
-        if matches!(
-            self.state.editor,
-            EditorState::Placed { .. } | EditorState::Resizing { .. }
-        ) {
-            self.handle_resize_interaction(ui);
-        }
+        self.handle_placed_interaction(ui);
 
         let ctx = ui.ctx().clone();
         self.control_panel(&ctx);
@@ -382,8 +385,8 @@ impl OverlayApp {
     }
 
     /// Dims the whole desktop, then draws the current/live zone as a
-    /// brighter cutout with an outline, plus one small colored square per
-    /// resize handle. Deliberately plain: no hover cursors or other styling.
+    /// brighter cutout with an outline, plus one colored square per resize
+    /// handle. Deliberately plain styling.
     fn draw_dim_and_zone(&self, ui: &egui::Ui) {
         let painter = ui.painter();
         let screen = ui.max_rect();
@@ -396,7 +399,9 @@ impl OverlayApp {
                 Some(rect_from_points(*anchor, *current, scale))
             }
             EditorState::Placed { zone, .. } => Some(rect_from_zone(zone, scale)),
-            EditorState::Resizing { live, .. } => Some(rect_from_zone(live, scale)),
+            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => {
+                Some(rect_from_zone(live, scale))
+            }
         };
 
         if let Some(rect) = live_rect {
@@ -413,14 +418,18 @@ impl OverlayApp {
             );
         }
 
-        if let EditorState::Placed { zone } | EditorState::Resizing { live: zone, .. } =
-            &self.state.editor
+        if let EditorState::Placed { zone }
+        | EditorState::Resizing { live: zone, .. }
+        | EditorState::Moving { live: zone, .. } = &self.state.editor
         {
             for handle in Handle::ALL {
                 let center = handle_center(zone, handle, scale);
                 let color = egui::Color32::from_rgb(80, 200, 255);
                 painter.rect_filled(
-                    egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0)),
+                    egui::Rect::from_center_size(
+                        center,
+                        egui::vec2(HANDLE_DRAW_PT, HANDLE_DRAW_PT),
+                    ),
                     2.0,
                     color,
                 );
@@ -456,36 +465,72 @@ impl OverlayApp {
         }
     }
 
-    /// One drag-sense rect per resize handle, for `Placed`/
-    /// `Resizing` states.
-    fn handle_resize_interaction(&mut self, ui: &egui::Ui) {
+    /// Whole-screen drag capture for a placed Zone: what a press grabs (a
+    /// handle, an edge, or the interior) is decided by
+    /// [`crate::zone_editor::hit_test`], which also picks the hover cursor.
+    fn handle_placed_interaction(&mut self, ui: &egui::Ui) {
         let zone = match &self.state.editor {
             EditorState::Placed { zone } => *zone,
-            EditorState::Resizing { live, .. } => *live,
+            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => *live,
             _ => return,
         };
 
-        let scale = scale_of(ui.ctx());
-        for handle in Handle::ALL {
-            let center = handle_center(&zone, handle, scale);
-            let rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
-            let response = ui.interact(
-                rect,
-                ui.scope_id().with(("handle", format!("{handle:?}"))),
-                egui::Sense::drag(),
-            );
-            let Some(pos) = response.interact_pointer_pos() else {
-                continue;
-            };
-            let point = point_from_points(pos.x, pos.y, scale);
+        let ctx = ui.ctx();
+        let scale = scale_of(ctx);
+        let grab_px = points_to_pixels(HANDLE_HIT_PT, scale);
+        let response = ui.interact(
+            ui.max_rect(),
+            ui.scope_id().with("placed-area"),
+            egui::Sense::drag(),
+        );
 
-            if response.drag_started() {
-                self.state.apply(Action::Grab(handle));
-            } else if response.dragged() {
-                self.state.apply(Action::Drag(point));
-            } else if response.drag_stopped() {
-                self.state.apply(Action::Commit);
+        // The cursor follows the active drag, else whatever is hovered.
+        let target = match &self.state.editor {
+            EditorState::Resizing { handle, .. } => Some(Target::Resize(*handle)),
+            EditorState::Moving { .. } => Some(Target::Move),
+            _ => response
+                .hover_pos()
+                .and_then(|pos| hit_test(&zone, point_from_points(pos.x, pos.y, scale), grab_px)),
+        };
+        if let Some(target) = target {
+            ctx.set_cursor_icon(cursor_for(target));
+        }
+
+        if response.drag_started() {
+            // The press position, not the position after egui's drag
+            // threshold, decides what was grabbed.
+            let press = ctx
+                .input(|i| i.pointer.press_origin())
+                .or(response.interact_pointer_pos());
+            let Some(press) = press else { return };
+            let press = point_from_points(press.x, press.y, scale);
+            match hit_test(&zone, press, grab_px) {
+                Some(Target::Resize(handle)) => {
+                    self.state.apply(Action::Grab(handle, press));
+                }
+                Some(Target::Move) => {
+                    self.state.apply(Action::GrabMove(press));
+                }
+                // A press outside the Zone is ignored: a new Zone can't be
+                // drawn from the Placed state (same as before moving existed).
+                None => {}
             }
+        }
+
+        let active = matches!(
+            self.state.editor,
+            EditorState::Resizing { .. } | EditorState::Moving { .. }
+        );
+        if !active {
+            return;
+        }
+        if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                self.state
+                    .apply(Action::Drag(point_from_points(pos.x, pos.y, scale)));
+            }
+        } else if response.drag_stopped() {
+            self.state.apply(Action::Commit);
         }
     }
 
@@ -570,6 +615,17 @@ fn rect_from_zone(zone: &Zone, scale: f32) -> egui::Rect {
     )
 }
 
+/// The mouse cursor shown over (or while dragging) a grab target.
+fn cursor_for(target: Target) -> egui::CursorIcon {
+    match target {
+        Target::Resize(Handle::N | Handle::S) => egui::CursorIcon::ResizeVertical,
+        Target::Resize(Handle::E | Handle::W) => egui::CursorIcon::ResizeHorizontal,
+        Target::Resize(Handle::Nw | Handle::Se) => egui::CursorIcon::ResizeNwSe,
+        Target::Resize(Handle::Ne | Handle::Sw) => egui::CursorIcon::ResizeNeSw,
+        Target::Move => egui::CursorIcon::Move,
+    }
+}
+
 fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
     let (x, y, w, h) = (
         pixels_to_points(zone.x, scale),
@@ -586,6 +642,30 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
         Handle::Nw => egui::pos2(x, y),
         Handle::Se => egui::pos2(x + w, y + h),
         Handle::Sw => egui::pos2(x, y + h),
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_matches_the_grab_target() {
+        use egui::CursorIcon::*;
+        let cases = [
+            (Handle::N, ResizeVertical),
+            (Handle::S, ResizeVertical),
+            (Handle::E, ResizeHorizontal),
+            (Handle::W, ResizeHorizontal),
+            (Handle::Nw, ResizeNwSe),
+            (Handle::Se, ResizeNwSe),
+            (Handle::Ne, ResizeNeSw),
+            (Handle::Sw, ResizeNeSw),
+        ];
+        for (handle, icon) in cases {
+            assert_eq!(cursor_for(Target::Resize(handle)), icon, "{handle:?}");
+        }
+        assert_eq!(cursor_for(Target::Move), Move);
     }
 }
 
