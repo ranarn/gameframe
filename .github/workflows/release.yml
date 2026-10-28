@@ -71,21 +71,36 @@ jobs:
           echo "Next version: $VERSION"
 
       # Computed here from the versions themselves, independent of how
-      # Release Pilot treats breaking changes below 1.0.
+      # Release Pilot treats breaking changes below 1.0. The previous version
+      # is Release Pilot's own previous-version output: it bases the bump on
+      # the highest semver tag with the prefix, not the nearest reachable one
+      # (findLatestTag in src/release/tags.ts, ranarn/release-pilot v1.1.0),
+      # so this guard compares against exactly what it bumped from.
       - name: Guard against an accidental major bump
         env:
           VERSION: ${{ steps.next.outputs.version }}
+          PREV_TAG: ${{ steps.next.outputs.previous-tag }}
+          PREV_VERSION: ${{ steps.next.outputs.previous-version }}
           ALLOW_MAJOR: ${{ inputs.allow-major }}
         run: |
-          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
-          prev=${prev_tag#v}
-          prev=${prev:-0.0.0}
+          # Release Pilot reports no previous tag as an empty value. Only then
+          # is 0.0.0 the right baseline; a tag without a version means the
+          # output is missing or renamed, so fail closed rather than treat
+          # every run as coming from 0.0.0.
+          if [ -z "$PREV_TAG" ]; then
+            prev=0.0.0
+          elif [ -z "$PREV_VERSION" ]; then
+            echo "::error::Release Pilot reported previous tag '$PREV_TAG' but no previous-version output; refusing to guess the baseline."
+            exit 1
+          else
+            prev=$PREV_VERSION
+          fi
           prev_major=${prev%%.*}
           next_major=${VERSION%%.*}
           # Fail closed: a non-numeric major would make the comparison below
           # error out inside `if` and silently fall through to "allowed".
           if ! [[ "$prev_major" =~ ^[0-9]+$ && "$next_major" =~ ^[0-9]+$ ]]; then
-            echo "::error::Cannot compare versions: previous '$prev' (tag '$prev_tag'), next '$VERSION'. Both must start with a numeric major."
+            echo "::error::Cannot compare versions: previous '$prev' (tag '$PREV_TAG'), next '$VERSION'. Both must start with a numeric major."
             exit 1
           fi
           if [ "$next_major" -gt "$prev_major" ] && [ "$prev_major" -lt 1 ]; then
@@ -171,17 +186,26 @@ jobs:
           REUSED: ${{ steps.existing.outputs.exists }}
         run: |
           if [ "$REUSED" = "true" ]; then
-            # Only a genuine "not found" may create a draft; any other
-            # failure (network, auth, rate limit) must fail the job rather
+            # Find an existing release (draft or published, either counts on a
+            # re-run) by listing, which includes drafts, so this existence
+            # check does not depend on gh's tag-to-draft fallback (the upload
+            # below still finds the draft by tag, and fails loudly if it
+            # can't, rather than creating a duplicate). Any lookup failure
+            # (network, auth, rate limit, bad JSON) must fail the job rather
             # than risk a duplicate draft.
-            if err=$(gh release view "$PLANNED" 2>&1 >/dev/null); then
+            if ! releases=$(gh release list --limit 1000 --json tagName); then
+              echo "::error::Could not list releases"
+              exit 1
+            fi
+            if ! count=$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | length' <<<"$releases") || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not parse the release list"
+              exit 1
+            fi
+            if [ "$count" -gt 0 ]; then
               echo "Found the existing release for $PLANNED"
-            elif grep -qi 'release not found' <<<"$err"; then
+            else
               echo "::warning::No release exists for $PLANNED; creating a draft with generated notes. Review the notes before publishing."
               gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --generate-notes
-            else
-              echo "::error::Could not look up the release for $PLANNED: $err"
-              exit 1
             fi
           elif [ "$TAG" != "$PLANNED" ]; then
             echo "::error::Release Pilot tagged $TAG, but the installer was built as $PLANNED"
