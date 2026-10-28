@@ -19,7 +19,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowThreadProcessId, IsHungAppWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
+    GUI_INMENUMODE, GUI_INMOVESIZE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO,
+    GetGUIThreadInfo, GetWindowThreadProcessId, IsHungAppWindow, SMTO_ABORTIFHUNG,
+    SendMessageTimeoutW, WM_NULL,
 };
 
 /// Time between pings.
@@ -70,15 +72,20 @@ impl StallTracker {
     /// busy heartbeat that has not moved for the stall threshold is a stall
     /// even though the ping came back. It is dated from when the frozen count
     /// was first seen, which can lag the true start by up to one ping interval.
+    ///
+    /// `user_modal` says the thread sits in a system modal loop the user holds
+    /// open (menu, window drag/resize): those pump and answer pings while the
+    /// heartbeat is frozen, so the stall timer is reset instead.
     pub fn observe_with_beat(
         &mut self,
         ping_started: Instant,
         now: Instant,
         answered: bool,
         beat: Beat,
+        user_modal: bool,
     ) -> Option<Verdict> {
         let changed_at = match self.beat_seen {
-            Some((count, at)) if count == beat.count => at,
+            Some((count, at)) if count == beat.count && !user_modal => at,
             _ => {
                 self.beat_seen = Some((beat.count, now));
                 now
@@ -251,6 +258,22 @@ impl Drop for IdleOnDrop {
 
 fn read_beat() -> Beat {
     HEARTBEAT.read()
+}
+
+/// Whether `flags` (`GUITHREADINFO::flags`) show a menu or a move/size loop.
+fn is_user_modal(flags: u32) -> bool {
+    flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE | GUI_INMOVESIZE) != 0
+}
+
+/// Whether the watched thread is in a menu or move/size modal loop (tray
+/// menu, system menu, dragging the window). False if the query fails.
+fn thread_in_user_modal(thread: u32) -> bool {
+    // SAFETY: GUITHREADINFO is plain data; cbSize is set before the call.
+    unsafe {
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        GetGUIThreadInfo(thread, &mut info) != 0 && is_user_modal(info.flags)
+    }
 }
 
 /// Last breadcrumb: label and when it was entered.
@@ -448,7 +471,14 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
             (started, ok != 0)
         };
         log_if_settings_hung(&mut settings_hung_logged);
-        match tracker.observe_with_beat(ping_started, Instant::now(), answered, read_beat()) {
+        let user_modal = thread_in_user_modal(main_thread);
+        match tracker.observe_with_beat(
+            ping_started,
+            Instant::now(),
+            answered,
+            read_beat(),
+            user_modal,
+        ) {
             Some(Verdict::Stalled { stalled_for }) => {
                 // `log!` takes the global log lock: if the main thread is stuck
                 // inside a log write, this line waits for it. Accepted.
@@ -493,7 +523,31 @@ mod tests {
 
     /// An answered ping at second `t`.
     fn answered_at(t: &mut StallTracker, base: Instant, s: u64, beat: Beat) -> Option<Verdict> {
-        t.observe_with_beat(secs(base, s), secs(base, s), true, beat)
+        t.observe_with_beat(secs(base, s), secs(base, s), true, beat, false)
+    }
+
+    #[test]
+    fn a_frozen_heartbeat_inside_a_user_modal_loop_is_no_stall() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        for s in [0, 3, 6, 30] {
+            assert_eq!(
+                t.observe_with_beat(secs(base, s), secs(base, s), true, busy(7), true),
+                None
+            );
+        }
+        // The menu closes: the timer restarts, so no instant stall.
+        assert_eq!(answered_at(&mut t, base, 31, busy(7)), None);
+        assert!(answered_at(&mut t, base, 34, busy(7)).is_some());
+    }
+
+    #[test]
+    fn menu_and_move_size_flags_count_as_user_modal() {
+        assert!(is_user_modal(GUI_INMENUMODE));
+        assert!(is_user_modal(GUI_POPUPMENUMODE));
+        assert!(is_user_modal(GUI_SYSTEMMENUMODE));
+        assert!(is_user_modal(GUI_INMOVESIZE));
+        assert!(!is_user_modal(0));
     }
 
     #[test]
@@ -558,11 +612,11 @@ mod tests {
         let mut t = StallTracker::default();
         let beat = busy(1);
         assert_eq!(
-            t.observe_with_beat(secs(base, 0), secs(base, 3), false, beat),
+            t.observe_with_beat(secs(base, 0), secs(base, 3), false, beat, false),
             None
         );
         assert!(
-            t.observe_with_beat(secs(base, 3), secs(base, 6), false, beat)
+            t.observe_with_beat(secs(base, 3), secs(base, 6), false, beat, false)
                 .is_some()
         );
     }
