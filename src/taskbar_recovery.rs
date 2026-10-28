@@ -314,13 +314,26 @@ fn write_record_file(dir: &Path, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     // Write a temp file next to the marker, then rename over it, so the panic
     // hook (which reads the file without the record lock) sees the old or the
-    // new content, never a truncated one.
-    let tmp = dir.join(format!("{MARKER_FILE}.tmp"));
-    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, marker_path(dir)));
+    // new content, never a truncated one. The fixed temp name is safe because
+    // every writer holds the `RECORD` lock. `sync_all` before the rename keeps
+    // a power loss from leaving a renamed-but-empty marker.
+    let tmp = tmp_marker_path(dir);
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, marker_path(dir))
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// The temp file [`write_record_file`] renames over the marker.
+fn tmp_marker_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(format!("{MARKER_FILE}.tmp"))
 }
 
 fn read_marker_file(dir: &Path) -> MarkerState {
@@ -347,6 +360,8 @@ fn read_marker_file(dir: &Path) -> MarkerState {
 }
 
 fn clear_marker_file(dir: &Path) -> std::io::Result<()> {
+    // A temp file left by a kill between write and rename is stale too.
+    let _ = std::fs::remove_file(tmp_marker_path(dir));
     match std::fs::remove_file(marker_path(dir)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
