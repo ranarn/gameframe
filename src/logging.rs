@@ -9,16 +9,22 @@
 //! worth is ever kept.
 //!
 //! [`init`] also installs a `log` crate backend ([`LogBridge`]) so records
-//! from dependencies (egui-wgpu, wgpu, winit, ...) land in the same file:
-//! `warn`/`error` from every crate, plus `info` from the GPU crates, whose
-//! adapter/backend/alpha-mode lines show what the zone-editor overlay got.
+//! from dependencies (egui-wgpu, wgpu, ...) land in the same file:
+//! `warn`/`error` from every crate, plus `info` from the GPU crates. Repeated
+//! identical records (egui-wgpu warns on every dropped frame) are logged once
+//! per [`REPEAT_WINDOW`], followed by a count of the suppressed ones. winit
+//! 0.30 logs through `tracing`, which this bridge does not see. The GPU crates
+//! log little at `info`, so the zone-editor overlay logs the adapter it got
+//! itself.
 //!
 //! Before [`init`] runs (and in tests) lines go to stderr only.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Writes one timestamped line to the log file, `format!`-style.
 macro_rules! log {
@@ -47,9 +53,8 @@ pub fn init(dir: &Path) {
 const INFO_TARGET_PREFIXES: [&str; 3] = ["egui_wgpu", "wgpu_core", "wgpu_hal"];
 
 /// Whether a `log` crate record is written to the log file: `warn` and
-/// `error` from every crate, `info` only from the GPU crates (adapter name,
-/// backend, chosen alpha mode); `debug`/`trace` never, so there is no
-/// per-frame noise. A target matches a prefix as a whole path segment
+/// `error` from every crate, `info` only from the GPU crates;
+/// `debug`/`trace` never, so there is no per-frame noise. A target matches a prefix as a whole path segment
 /// (`wgpu_hal::dx12` yes, `wgpu_hal_extra` no).
 fn should_forward(level: log::Level, target: &str) -> bool {
     match level {
@@ -64,6 +69,48 @@ fn should_forward(level: log::Level, target: &str) -> bool {
     }
 }
 
+/// How long an identical forwarded record is suppressed after being logged.
+const REPEAT_WINDOW: Duration = Duration::from_secs(60);
+/// Distinct records remembered at once; the memory is cleared when exceeded.
+const MAX_TRACKED: usize = 64;
+
+/// What to do with a forwarded record.
+#[derive(Debug, PartialEq, Eq)]
+enum Repeat {
+    /// Log it, after `n` identical records were suppressed since the last one.
+    Log(u32),
+    Suppress,
+}
+
+/// Rate-limits identical records: first one passes, repeats within
+/// [`REPEAT_WINDOW`] are counted, and the next one after it reports the count.
+#[derive(Default)]
+struct RepeatFilter {
+    seen: HashMap<String, (Instant, u32)>,
+}
+
+impl RepeatFilter {
+    fn check(&mut self, key: &str, now: Instant) -> Repeat {
+        if let Some((last, suppressed)) = self.seen.get_mut(key) {
+            if now.duration_since(*last) < REPEAT_WINDOW {
+                *suppressed += 1;
+                return Repeat::Suppress;
+            }
+            let n = *suppressed;
+            *last = now;
+            *suppressed = 0;
+            return Repeat::Log(n);
+        }
+        if self.seen.len() >= MAX_TRACKED {
+            self.seen.clear();
+        }
+        self.seen.insert(key.to_string(), (now, 0));
+        Repeat::Log(0)
+    }
+}
+
+static REPEATS: Mutex<Option<RepeatFilter>> = Mutex::new(None);
+
 /// `log::Log` implementation that writes through [`write`].
 struct LogBridge;
 
@@ -73,19 +120,24 @@ impl log::Log for LogBridge {
     }
 
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            write(format_args!(
-                "{} {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            ));
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let line = format!("{} {}: {}", record.level(), record.target(), record.args());
+        let decision = REPEATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(RepeatFilter::default)
+            .check(&line, Instant::now());
+        match decision {
+            Repeat::Suppress => {}
+            Repeat::Log(0) => write(format_args!("{line}")),
+            Repeat::Log(n) => write(format_args!("{line} (repeated {n} more times)")),
         }
     }
 
     fn flush(&self) {}
 }
-
 fn install_log_bridge() {
     // A second `init` (or another logger) makes this fail, which is fine.
     if log::set_logger(&LogBridge).is_ok() {
@@ -230,6 +282,28 @@ mod tests {
             assert!(!should_forward(level, "wgpu_hal::dx12"));
             assert!(!should_forward(level, "egui_wgpu"));
         }
+    }
+
+    #[test]
+    fn repeats_within_the_window_are_suppressed_then_counted() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        assert_eq!(f.check("a", t0), Repeat::Log(0));
+        assert_eq!(f.check("a", t0 + Duration::from_secs(1)), Repeat::Suppress);
+        assert_eq!(f.check("a", t0 + Duration::from_secs(59)), Repeat::Suppress);
+        assert_eq!(f.check("b", t0 + Duration::from_secs(30)), Repeat::Log(0));
+        assert_eq!(f.check("a", t0 + REPEAT_WINDOW), Repeat::Log(2));
+        assert_eq!(f.check("a", t0 + REPEAT_WINDOW), Repeat::Suppress);
+    }
+
+    #[test]
+    fn the_repeat_memory_is_bounded() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        for i in 0..=MAX_TRACKED {
+            f.check(&i.to_string(), t0);
+        }
+        assert!(f.seen.len() <= MAX_TRACKED);
     }
 
     #[test]
