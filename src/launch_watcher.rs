@@ -94,7 +94,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    KillTimer, OBJID_WINDOW, SetTimer, WINEVENT_OUTOFCONTEXT,
+    KillTimer, OBJID_WINDOW, SetTimer, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// The config directory the callback reads the config from on every
@@ -244,24 +244,175 @@ unsafe extern "system" fn window_destroy_callback(
     }
 }
 
-/// Registers an `EVENT_OBJECT_LOCATIONCHANGE` hook so a game that moves,
-/// resizes or re-adds its border itself after GameFrame applied the Zone
-/// (e.g. Last Epoch after an in-game settings change) is put back. Same
-/// thread/message-loop requirements as [`register`]. OS-facing.
-pub fn register_drift_watcher() -> Option<HWINEVENTHOOK> {
-    // Safety: `drift_callback` matches the `WINEVENTPROC` signature.
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            std::ptr::null_mut(),
-            Some(drift_callback),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT,
-        )
+/// What [`sync_drift_hooks`] must do to turn the hooks that exist into the
+/// ones wanted: one location hook per applied game process, none otherwise.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DriftHookPlan {
+    register: Vec<u32>,
+    unregister: Vec<u32>,
+}
+
+/// Pure registration decision. `applied` are the pids owning applied windows,
+/// `hooked` the pids that currently have a hook. GameFrame's own pid never
+/// gets one (its windows are never applied, and the hook skips it anyway).
+fn plan_drift_hooks(
+    applied: &std::collections::BTreeSet<u32>,
+    hooked: &std::collections::BTreeSet<u32>,
+    own_pid: u32,
+) -> DriftHookPlan {
+    DriftHookPlan {
+        register: applied
+            .iter()
+            .copied()
+            .filter(|pid| *pid != own_pid && !hooked.contains(pid))
+            .collect(),
+        unregister: hooked
+            .iter()
+            .copied()
+            .filter(|pid| *pid == own_pid || !applied.contains(pid))
+            .collect(),
+    }
+}
+
+/// Whether the drift watcher is armed (set by [`enable_drift_watcher`] on the
+/// message-loop thread); keeps registry changes from hooking anything before
+/// the pump exists or after teardown.
+static DRIFT_WATCHER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Game process id -> its `EVENT_OBJECT_LOCATIONCHANGE` hook handle.
+///
+/// The mutex is held across `SetWinEventHook`/`UnhookWinEvent`. That is safe
+/// because every caller runs on the message-loop thread (asserted in
+/// [`sync_drift_hooks`]), the drift callback never takes this lock, and
+/// out-of-context hook callbacks are only delivered by that thread's
+/// `DispatchMessageW`, never re-entrantly from inside those calls.
+static DRIFT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<u32, isize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Id of the message-loop thread, recorded by [`enable_drift_watcher`].
+static DRIFT_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How long a failed hook registration or an unreadable pid waits before
+/// [`sync_drift_hooks`] tries again.
+const DRIFT_SYNC_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Thread timer id of the pending [`sync_drift_hooks`] retry, 0 if none.
+static DRIFT_SYNC_TIMER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Arms the drift watcher. Hooks are then registered per applied game process
+/// by [`sync_drift_hooks`], which must run on this same (message-loop) thread;
+/// no hook exists while nothing is applied. OS-facing.
+pub fn enable_drift_watcher() {
+    // Safety: no arguments or preconditions.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    DRIFT_THREAD_ID.store(thread, std::sync::atomic::Ordering::SeqCst);
+    DRIFT_WATCHER_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    sync_drift_hooks();
+}
+
+/// Disarms the watcher, cancels a pending hook-sync retry and unhooks
+/// everything. Call on the message-loop thread.
+pub fn disable_drift_watcher() {
+    DRIFT_WATCHER_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let timer = DRIFT_SYNC_TIMER.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if timer != 0 {
+        // Safety: `timer` is a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
+    sync_drift_hooks();
+}
+
+/// Reconciles the location-change hooks with the applied-window registry so a
+/// game that moves, resizes or re-adds its border after GameFrame applied the
+/// Zone (e.g. Last Epoch after an in-game settings change) is put back, while
+/// the rest of the desktop's move events never reach this process. Each hook is
+/// scoped to one game pid with `WINEVENT_SKIPOWNPROCESS`. Same
+/// thread/message-loop requirements as [`register`]. If a registration fails or
+/// a window's pid can't be read, a timer re-runs this after
+/// [`DRIFT_SYNC_RETRY`]. OS-facing.
+pub fn sync_drift_hooks() {
+    let enabled = DRIFT_WATCHER_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
+    if enabled {
+        // Safety: no arguments or preconditions.
+        let here = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        debug_assert_eq!(
+            here,
+            DRIFT_THREAD_ID.load(std::sync::atomic::Ordering::SeqCst),
+            "sync_drift_hooks must run on the message-loop thread"
+        );
+    }
+    let (applied, mut needs_retry) = if enabled {
+        crate::win32::refresh_applied_window_pids()
+    } else {
+        (std::collections::BTreeSet::new(), false)
     };
-    if hook.is_null() { None } else { Some(hook) }
+    let mut hooks = DRIFT_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+    let hooked = hooks.keys().copied().collect();
+    let plan = plan_drift_hooks(&applied, &hooked, std::process::id());
+    for pid in plan.unregister {
+        if let Some(hook) = hooks.remove(&pid) {
+            // Safety: a handle this module obtained from `SetWinEventHook`.
+            unsafe {
+                UnhookWinEvent(hook as HWINEVENTHOOK);
+            }
+        }
+    }
+    for pid in plan.register {
+        // Safety: `drift_callback` matches the `WINEVENTPROC` signature; the
+        // hook is scoped to game `pid` (all its threads) and skips this process.
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                std::ptr::null_mut(),
+                Some(drift_callback),
+                pid,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if hook.is_null() {
+            log!("drift watcher: SetWinEventHook failed for pid {pid}; retrying shortly");
+            needs_retry = true;
+        } else {
+            hooks.insert(pid, hook as isize);
+        }
+    }
+    drop(hooks);
+    if needs_retry {
+        schedule_drift_sync_retry();
+    }
+}
+
+/// Arms the one pending [`sync_drift_hooks`] retry timer, if not armed yet.
+fn schedule_drift_sync_retry() {
+    use std::sync::atomic::Ordering;
+    if DRIFT_SYNC_TIMER.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let delay_ms = u32::try_from(DRIFT_SYNC_RETRY.as_millis()).unwrap_or(u32::MAX);
+    // Safety: a null window makes this a thread timer on the message-loop
+    // thread, delivered to `drift_sync_timer` by `DispatchMessageW`.
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_sync_timer)) };
+    if timer == 0 {
+        log!("drift watcher: SetTimer failed; hooks are retried on the next window change");
+    } else {
+        DRIFT_SYNC_TIMER.store(timer, Ordering::SeqCst);
+    }
+}
+
+/// `TIMERPROC` for the [`sync_drift_hooks`] retry. OS-facing; not unit tested.
+unsafe extern "system" fn drift_sync_timer(_hwnd: HWND, _msg: u32, timer: usize, _time: u32) {
+    // Safety: `timer` is a thread timer id this module created.
+    unsafe {
+        KillTimer(std::ptr::null_mut(), timer);
+    }
+    DRIFT_SYNC_TIMER.store(0, std::sync::atomic::Ordering::SeqCst);
+    let _crumb = crate::watchdog::scoped("drift timer: hook sync");
+    sync_drift_hooks();
 }
 
 /// `EVENT_OBJECT_LOCATIONCHANGE` fires very often system-wide, so this
@@ -394,4 +545,57 @@ unsafe extern "system" fn win_event_callback(
 
     let _crumb = crate::watchdog::scoped("foreground hook: auto-apply");
     crate::app::handle_auto_apply_launch(config_dir, hwnd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn set(pids: &[u32]) -> BTreeSet<u32> {
+        pids.iter().copied().collect()
+    }
+
+    #[test]
+    fn no_applied_window_means_no_hook() {
+        assert_eq!(
+            plan_drift_hooks(&set(&[]), &set(&[]), 1),
+            DriftHookPlan::default()
+        );
+    }
+
+    #[test]
+    fn first_applied_process_gets_a_hook() {
+        let plan = plan_drift_hooks(&set(&[42]), &set(&[]), 1);
+        assert_eq!(plan.register, vec![42]);
+        assert!(plan.unregister.is_empty());
+    }
+
+    #[test]
+    fn unchanged_set_does_nothing() {
+        assert_eq!(
+            plan_drift_hooks(&set(&[42, 43]), &set(&[42, 43]), 1),
+            DriftHookPlan::default()
+        );
+    }
+
+    #[test]
+    fn set_change_registers_new_and_drops_gone_processes() {
+        let plan = plan_drift_hooks(&set(&[43, 44]), &set(&[42, 43]), 1);
+        assert_eq!(plan.register, vec![44]);
+        assert_eq!(plan.unregister, vec![42]);
+    }
+
+    #[test]
+    fn last_window_gone_drops_every_hook() {
+        let plan = plan_drift_hooks(&set(&[]), &set(&[42, 43]), 1);
+        assert!(plan.register.is_empty());
+        assert_eq!(plan.unregister, vec![42, 43]);
+    }
+
+    #[test]
+    fn own_process_is_never_hooked() {
+        let plan = plan_drift_hooks(&set(&[1, 42]), &set(&[]), 1);
+        assert_eq!(plan.register, vec![42]);
+    }
 }

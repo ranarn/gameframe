@@ -118,7 +118,8 @@ pub fn run() -> Result<(), TrayUiError> {
 
     // Re-applies the Zone to a tracked game if the game itself resizes/restyles
     // its window afterwards (e.g. after an in-game settings change).
-    let drift_watcher_hook = launch_watcher::register_drift_watcher();
+    // No hook exists until a window is applied; then one per game process.
+    launch_watcher::enable_drift_watcher();
 
     // The game cursor runs on its own thread so it keeps following the
     // mouse while this thread is blocked in Settings or the zone editor.
@@ -161,9 +162,7 @@ pub fn run() -> Result<(), TrayUiError> {
     if let Some(hook) = taskbar_restore_watcher_hook {
         launch_watcher::unregister(hook);
     }
-    if let Some(hook) = drift_watcher_hook {
-        launch_watcher::unregister(hook);
-    }
+    launch_watcher::disable_drift_watcher();
 
     // The log bridge's pending repeat counts are flushed by `main`, after this
     // returns, so every exit path (including errors) is covered.
