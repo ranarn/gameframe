@@ -29,7 +29,7 @@ use windows_sys::Win32::Foundation::HWND;
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// the `win32` module docs.
-pub fn hide_taskbar_completely() -> Result<(), Win32Error> {
+fn hide_taskbar_completely() -> Result<(), Win32Error> {
     hide_taskbar_window(find_taskbar_window()?);
     Ok(())
 }
@@ -52,7 +52,7 @@ fn hide_taskbar_window(hwnd: HWND) {
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow` call. Not exercised by this crate's automated tests.
-pub fn show_taskbar() -> Result<(), Win32Error> {
+fn show_taskbar() -> Result<(), Win32Error> {
     taskbar_recovery::restore_marked(TaskbarHideRestore::FullyHidden)
 }
 
@@ -73,7 +73,7 @@ pub fn show_taskbar() -> Result<(), Win32Error> {
 /// OS-facing: for `HoverReveal`, resolves the taskbar window and reads its
 /// flags once, reusing both for the write below rather than a separate
 /// query-then-set round trip. Not exercised by this crate's automated tests
-/// -- see module docs. The decision of what to remember is pure and tested
+/// -- see the `win32` module docs. The decision of what to remember is pure and tested
 /// separately via [`plan_taskbar_hide`].
 pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Error> {
     match mode {
@@ -329,7 +329,7 @@ pub(crate) fn take_any_armed_taskbar_restore() -> Option<TaskbarHideRestore> {
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow`/`SHAppBarMessage` call depending on `mode`. Not exercised by
-/// this crate's automated tests -- see module docs; the `bool` ->
+/// this crate's automated tests -- see the `win32` module docs; the `bool` ->
 /// [`TaskbarAutohideState`] interpretation itself is pure and unit tested via
 /// [`taskbar_autohide_state_from_bool`].
 pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<(), Win32Error> {
@@ -399,7 +399,7 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 /// already known to have failed would only compound the failure.
 ///
 /// OS-facing (delegates to [`hide_taskbar`]/[`set_taskbar_hide_absolute`]).
-/// Not exercised by this crate's automated tests -- see module docs.
+/// Not exercised by this crate's automated tests -- see the `win32` module docs.
 pub fn set_taskbar_hide_absolute_armed(
     hwnd: HWND,
     hide: bool,
@@ -475,7 +475,7 @@ pub fn set_taskbar_hide_absolute_armed(
 ///
 /// OS-facing: `judgement` is the just-gathered state of the real taskbar
 /// (`HoverReveal` additionally reads its appbar flags). Not exercised by this
-/// crate's automated tests -- see module docs.
+/// crate's automated tests -- see the `win32` module docs.
 fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement) -> bool {
     match mode {
         TaskbarHideMode::FullyHidden => judgement.verdict.is_some(),
@@ -501,7 +501,7 @@ fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement)
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow`/`SHAppBarMessage` call. Not exercised by this crate's
-/// automated tests -- see module docs.
+/// automated tests -- see the `win32` module docs.
 pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
     // The hotkey can appear to do nothing after long uptime. Log what it saw
     // and what it left behind so a report comes with evidence.
@@ -531,7 +531,7 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
 /// `WS_VISIBLE`, the appbar flags, its rect, whether it is actually the
 /// topmost window at its own center (it can be `WS_VISIBLE` yet covered),
 /// the foreground window, and the armed hide session.
-pub fn taskbar_debug_state() -> String {
+fn taskbar_debug_state() -> String {
     match find_taskbar_window() {
         Ok(taskbar) => describe_taskbar(&gather_taskbar_judgement(taskbar)),
         Err(_) => "Shell_TrayWnd not found".to_string(),
@@ -574,8 +574,8 @@ pub fn taskbar_debug_state() -> String {
 /// retried-later failure. Reactive elevation stays scoped to the hotkey path
 /// only.
 ///
-/// OS-facing: not exercised by this crate's automated tests -- see module
-/// docs.
+/// OS-facing: not exercised by this crate's automated tests -- see the
+/// `win32` module docs.
 pub(crate) fn live_reapply_running_window(
     hwnd: HWND,
     display_name: &str,

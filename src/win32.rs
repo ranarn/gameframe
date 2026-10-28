@@ -921,6 +921,9 @@ pub fn foreground_window() -> Option<HWND> {
 ///
 /// OS-facing: sends a real `ShowWindow` call. Not exercised by this crate's
 /// automated tests -- see module docs.
+///
+/// # Unmarked: call through `crate::taskbar`
+/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn hide_taskbar_window(hwnd: HWND) {
     // Safety: `hwnd` is a live handle just resolved by the caller; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
@@ -937,6 +940,9 @@ pub(crate) fn hide_taskbar_window(hwnd: HWND) {
 ///
 /// `on_flags` receives the appbar flags read just after the show, before the
 /// state re-send: the caller ends its `FullyHidden` session bookkeeping there.
+///
+/// # Unmarked: call through `crate::taskbar`
+/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn show_taskbar_full(on_flags: impl FnOnce(u32)) -> Result<(), Win32Error> {
     let hwnd = show_taskbar_window()?;
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
@@ -1144,6 +1150,9 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
 /// handle to query/set its auto-hide/always-on-top state directly. For
 /// `ABM_GETSTATE`, the current state is returned as `SHAppBarMessage`'s
 /// return value itself (not written into `APPBARDATA.lParam`).
+///
+/// # Unmarked: call through `crate::taskbar`
+/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
     let current_flags = read_appbar_flags(hwnd);
@@ -1157,6 +1166,9 @@ pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32E
 /// already have both in hand (e.g. `crate::taskbar::hide_taskbar`'s `HoverReveal` arm, which reads
 /// them once to derive the state to force) don't have to pay for a redundant
 /// [`find_taskbar_window`] + [`read_appbar_flags`] round trip just to write.
+///
+/// # Unmarked: call through `crate::taskbar`
+/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn write_appbar_state(hwnd: HWND, current_flags: u32, state: TaskbarAutohideState) {
     send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize);
 }

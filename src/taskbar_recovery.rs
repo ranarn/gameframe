@@ -465,7 +465,7 @@ pub fn undo_hide(undo: HideUndo) {
 /// clearing that part of the record; the marker is removed once no technique
 /// remains. (A restore to the user's own auto-hide state clears it too: the
 /// taskbar is then back in a state GameFrame is not responsible for.)
-pub fn mark_restored(restore: TaskbarHideRestore) {
+fn mark_restored(restore: TaskbarHideRestore) {
     let mut rec = record();
     rec.restore(restore);
     persist(*rec);
@@ -510,14 +510,29 @@ pub(crate) fn restore_on_exit() {
 /// marked restore: `crate::taskbar::restore_taskbar`/`show_taskbar` and the
 /// exit path all go through it.
 pub(crate) fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
+    restore_marked_with(
+        restore,
+        // Also ends the FullyHidden session for the flags-changed log.
+        || win32::show_taskbar_full(finish_session_flags),
+        win32::set_appbar_state,
+        mark_restored,
+    )
+}
+
+/// Core of [`restore_marked`] with the OS steps and the marker bookkeeping
+/// injected, so the dispatch-then-clear contract is testable: pick the OS step
+/// for `restore`, and only if it succeeds, clear that technique's mark.
+fn restore_marked_with<E>(
+    restore: TaskbarHideRestore,
+    show_full: impl FnOnce() -> Result<(), E>,
+    set_appbar: impl FnOnce(TaskbarAutohideState) -> Result<(), E>,
+    mark: impl FnOnce(TaskbarHideRestore),
+) -> Result<(), E> {
     match restore {
-        TaskbarHideRestore::FullyHidden => {
-            // Also ends the FullyHidden session for the flags-changed log.
-            win32::show_taskbar_full(finish_session_flags)?;
-        }
-        TaskbarHideRestore::HoverReveal(state) => win32::set_appbar_state(state)?,
+        TaskbarHideRestore::FullyHidden => show_full()?,
+        TaskbarHideRestore::HoverReveal(state) => set_appbar(state)?,
     }
-    mark_restored(restore);
+    mark(restore);
     Ok(())
 }
 
@@ -640,6 +655,62 @@ mod tests {
 
     fn observed(visible: bool, autohide: TaskbarAutohideState) -> ObservedTaskbar {
         ObservedTaskbar { visible, autohide }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        ShowFull,
+        SetAppbar(TaskbarAutohideState),
+        Marked(TaskbarHideRestore),
+    }
+
+    /// Runs `restore_marked_with` with recording fakes; the OS steps fail when
+    /// `os_fails`. Returns the result and the ordered steps taken.
+    fn run_restore(
+        restore: TaskbarHideRestore,
+        os_fails: bool,
+    ) -> (Result<(), &'static str>, Vec<Step>) {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let outcome = |step: Step| {
+            steps.borrow_mut().push(step);
+            if os_fails { Err("os") } else { Ok(()) }
+        };
+        let result = restore_marked_with(
+            restore,
+            || outcome(Step::ShowFull),
+            |s| outcome(Step::SetAppbar(s)),
+            |r| steps.borrow_mut().push(Step::Marked(r)),
+        );
+        (result, steps.into_inner())
+    }
+
+    #[test]
+    fn restoring_fully_hidden_shows_fully_then_clears_only_that_mark() {
+        let (result, steps) = run_restore(FULLY, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(steps, vec![Step::ShowFull, Step::Marked(FULLY)]);
+    }
+
+    #[test]
+    fn restoring_hover_reveal_sets_the_prior_state_then_clears_only_that_mark() {
+        let (result, steps) = run_restore(HOVER_FROM_AUTO, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            steps,
+            vec![Step::SetAppbar(AutoHidden), Step::Marked(HOVER_FROM_AUTO)]
+        );
+    }
+
+    #[test]
+    fn a_failed_os_restore_leaves_the_mark_in_place() {
+        for restore in [FULLY, HOVER_FROM_VISIBLE] {
+            let (result, steps) = run_restore(restore, true);
+            assert_eq!(result, Err("os"));
+            assert!(
+                !steps.iter().any(|s| matches!(s, Step::Marked(_))),
+                "{steps:?}"
+            );
+        }
     }
 
     #[test]
