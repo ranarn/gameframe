@@ -27,13 +27,13 @@
 //! taskbar before the abort, and a kill is covered by the marker file
 //! restored at the next start (see [`crate::taskbar_recovery`]).
 //!
-//! OS/GPU-facing: not exercised by this crate's automated tests, for the
-//! same reason [`crate::settings_ui::run_settings_window`] isn't -- a
-//! headless/CI sandbox cannot provide a real GPU-backed window to render
-//! into or a real taskbar to hide. The pure interaction logic it drives
-//! ([`crate::zone_editor`]) and the pure taskbar hide/remember decision
-//! ([`crate::win32::plan_taskbar_hide`]) are both fully unit tested
-//! instead.
+//! OS/GPU-facing: the overlay itself is not exercised by this crate's
+//! automated tests, for the same reason [`crate::settings_ui::run_settings_window`]
+//! isn't -- a headless/CI sandbox cannot provide a real GPU-backed window to
+//! render into or a real taskbar to hide. The pure interaction logic it
+//! drives ([`crate::zone_editor`]) and the pure taskbar hide/remember
+//! decision ([`crate::win32::plan_taskbar_hide`]) are fully unit tested
+//! instead, and [`strip_window_frame`] is tested on a plain Win32 window.
 
 use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
@@ -43,11 +43,17 @@ use crate::zone_editor::{
     point_from_points, scale_from_dpi,
 };
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Foundation::{HWND, POINT, SetLastError};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_SYSMENU, WS_THICKFRAME,
+};
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
 /// afterward) can fail.
@@ -125,11 +131,36 @@ pub fn run_zone_editor_overlay(
     let run_result = eframe::run_native(
         "GameFrame zone editor",
         native_options,
-        Box::new(move |_cc| {
-            Ok(Box::new(OverlayApp {
+        Box::new(move |cc| {
+            // The GPU path the overlay got, for tester logs. egui-wgpu logs
+            // the chosen adapter only at `debug`, and the surface's alpha mode
+            // is not exposed by egui-wgpu at all.
+            match cc.wgpu_render_state.as_ref() {
+                Some(rs) => log!(
+                    "zone editor: wgpu adapter {:?}, target format {:?}",
+                    rs.adapter.get_info(),
+                    rs.target_format
+                ),
+                None => log!("zone editor: no wgpu render state"),
+            }
+            // WORKAROUND for egui #8750: strip the window frame so it can't
+            // show through the transparent pixels, see `strip_window_frame`.
+            // winit re-applies the frame when the window is first shown, so
+            // `OverlayApp::ui` strips it again every frame.
+            let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as HWND),
+                other => {
+                    log!("zone editor: no Win32 window handle ({other:?}); window frame kept");
+                    None
+                }
+            };
+            let app = OverlayApp {
                 state,
                 outcome: outcome_for_app,
-            }))
+                hwnd,
+            };
+            app.strip_frame();
+            Ok(Box::new(app))
         }),
     );
 
@@ -169,6 +200,61 @@ impl Drop for TaskbarRestoreGuard {
     }
 }
 
+/// Window-style bits that give a window a non-client frame: caption (title
+/// bar plus border), sizing border, system menu and the min/max buttons.
+const FRAME_STYLE_BITS: u32 =
+    WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+
+/// Strips the frame style bits from the overlay's own window, so the DWM has
+/// no frame (and drop shadow) to draw behind the transparent pixels. Returns
+/// whether anything had to be changed.
+///
+/// WORKAROUND for egui #8750 (https://github.com/emilk/egui/issues/8750):
+/// egui-winit requests winit's "undecorated shadow" on every undecorated,
+/// non-fullscreen window. winit 0.30 implements an "undecorated" window by
+/// keeping `WS_CAPTION | WS_BORDER | WS_SYSMENU` and shrinking the non-client
+/// area in `WM_NCCALCSIZE` (plus a 1 px top offset for the shadow), so the DWM
+/// still sees a captioned window. On a transparent DX12 + DirectComposition
+/// window that frame then shows through every transparent pixel as solid
+/// light grey (seen on an NVIDIA machine). Remove this, [`OverlayApp`]'s
+/// per-frame call to it and the call in [`run_zone_editor_overlay`] once an
+/// egui release fixes it.
+///
+/// winit re-applies its full style set (caption included) whenever one of its
+/// window flags changes -- notably when eframe shows the window after the
+/// first frame -- so this has to be repeated; it is a cheap style read when
+/// there is nothing to strip.
+fn strip_window_frame(hwnd: HWND) -> Result<bool, win32::Win32Error> {
+    // Safety: `hwnd` is a live window handle; these calls only read and write
+    // the window's own style and re-evaluate its frame.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if style & FRAME_STYLE_BITS == 0 {
+            return Ok(false);
+        }
+        SetLastError(0);
+        let previous = SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !FRAME_STYLE_BITS) as isize);
+        if previous == 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(0) {
+                return Err(win32::Win32Error::Os(e));
+            }
+        }
+        if SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) == 0
+        {
+            return Err(win32::Win32Error::Os(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(true)
+}
 /// The primary monitor's live DPI as a points-to-pixels factor, for placing
 /// the viewport before a window (and so a `Context`) exists. Winit derives
 /// the window's scale factor, and so egui's `pixels_per_point`, from the same
@@ -244,6 +330,8 @@ fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOption
 struct OverlayApp {
     state: AppState,
     outcome: Rc<RefCell<Option<SessionOutcome>>>,
+    /// The overlay's window, for [`strip_window_frame`] (egui #8750).
+    hwnd: Option<HWND>,
 }
 
 impl eframe::App for OverlayApp {
@@ -255,6 +343,7 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.strip_frame();
         self.draw_dim_and_zone(ui);
         self.handle_draw_interaction(ui);
         if matches!(
@@ -281,6 +370,17 @@ impl eframe::App for OverlayApp {
 }
 
 impl OverlayApp {
+    /// Keeps the window frame stripped (egui #8750). Logs each strip, and
+    /// each failing frame's error.
+    fn strip_frame(&self) {
+        let Some(hwnd) = self.hwnd else { return };
+        match strip_window_frame(hwnd) {
+            Ok(true) => log!("zone editor: window frame stripped"),
+            Ok(false) => {}
+            Err(e) => log!("zone editor: could not strip the window frame: {e}"),
+        }
+    }
+
     /// Dims the whole desktop, then draws the current/live zone as a
     /// brighter cutout with an outline, plus one small colored square per
     /// resize handle. Deliberately plain: no hover cursors or other styling.
@@ -486,5 +586,99 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
         Handle::Nw => egui::pos2(x, y),
         Handle::Se => egui::pos2(x + w, y + h),
         Handle::Sw => egui::pos2(x, y + h),
+    }
+}
+
+#[cfg(test)]
+mod window_frame_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetClientRect, GetWindowRect, WS_POPUP,
+    };
+
+    /// Destroys the window even when an assertion panics.
+    struct TestWindow(HWND);
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            // Safety: the window was created by this thread and not yet destroyed.
+            unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    fn create_window(style: u32) -> TestWindow {
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        // Safety: built-in STATIC class, no parent; destroyed by `TestWindow`.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                style,
+                0,
+                0,
+                200,
+                100,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        TestWindow(hwnd)
+    }
+
+    fn style_of(hwnd: HWND) -> u32 {
+        // Safety: `hwnd` is live.
+        unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 }
+    }
+
+    fn sizes(hwnd: HWND) -> ((i32, i32), (i32, i32)) {
+        let (mut window, mut client) = (unsafe { std::mem::zeroed::<RECT>() }, unsafe {
+            std::mem::zeroed::<RECT>()
+        });
+        // Safety: valid out-buffers, live window.
+        unsafe {
+            GetWindowRect(hwnd, &mut window);
+            GetClientRect(hwnd, &mut client);
+        }
+        (
+            (window.right - window.left, window.bottom - window.top),
+            (client.right - client.left, client.bottom - client.top),
+        )
+    }
+
+    #[test]
+    fn strip_window_frame_removes_the_frame_and_keeps_popup() {
+        let w = create_window(WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+        let (window, client) = sizes(w.0);
+        assert_ne!(window, client, "a captioned window has a non-client area");
+
+        assert!(strip_window_frame(w.0).unwrap());
+
+        let style = style_of(w.0);
+        assert_eq!(style & FRAME_STYLE_BITS, 0);
+        assert_ne!(style & WS_POPUP, 0);
+        let (window, client) = sizes(w.0);
+        assert_eq!(window, client, "no non-client area is left");
+    }
+
+    #[test]
+    fn strip_window_frame_is_a_no_op_on_a_frameless_window() {
+        let w = create_window(WS_POPUP);
+        let before = style_of(w.0);
+        assert!(!strip_window_frame(w.0).unwrap());
+        assert_eq!(style_of(w.0), before);
+    }
+
+    #[test]
+    fn strip_window_frame_strips_again_after_the_style_is_reapplied() {
+        let w = create_window(WS_POPUP);
+        // Safety: live window; mimics winit re-applying its style set.
+        unsafe { SetWindowLongPtrW(w.0, GWL_STYLE, (WS_POPUP | WS_CAPTION) as isize) };
+        assert!(strip_window_frame(w.0).unwrap());
+        assert_eq!(style_of(w.0) & FRAME_STYLE_BITS, 0);
     }
 }
