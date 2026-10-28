@@ -485,8 +485,8 @@ begin
 end;
 
 // Upgrade, first application, and the caller made no explicit task choice:
-//  - /TASKS (any value, including an explicit empty "/TASKS=" meaning "no
-//    tasks") is honoured as given;
+//  - /TASKS= with any value, including an empty "/TASKS=" meaning "no
+//    tasks", is honoured as given (a bare /TASKS without "=" is not a choice);
 //  - /MERGETASKS naming startup ("startup" or "!startup") wins over the
 //    registry, so a silent upgrade can force the task either way.
 // Only the HKCU Uninstall key is looked up (see InitializeWizard).
