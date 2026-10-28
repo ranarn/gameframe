@@ -43,20 +43,20 @@ use crate::region_calc::Region;
 /// resizable sizing border, and `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX`/`WS_SYSMENU`
 /// the title-bar buttons/system menu that have no purpose once the title bar
 /// is gone.
-/// `WS_MAXIMIZE` is the window's *state* rather than a border bit, but a
-/// stripped window must not stay maximized (the Zone rect would be overridden),
-/// so it is cleared with them.
+/// `WS_MAXIMIZE` is deliberately *not* in the mask: it is window state owned by
+/// `SW_RESTORE` ([`restore_maximized_window`]), and clearing it by hand on a
+/// still-maximized window would leave the OS state inconsistent.
 const BORDERLESS_STYLE_MASK: u32 =
-    WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_MAXIMIZE;
+    WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
 
 /// The extended-style edge bits removed to strip a window: the sunken client
 /// edge, the raised window edge and the dialog frame all draw a border that
 /// survives removing `WS_CAPTION`/`WS_THICKFRAME`.
 const BORDERLESS_EX_STYLE_MASK: u32 = WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME;
 
-/// Removes the border/title-bar style bits (and `WS_MAXIMIZE`) from a raw
-/// `GWL_STYLE` value, leaving every other bit (e.g. `WS_VISIBLE`,
-/// `WS_POPUP`, `WS_CHILD`) untouched. Pure bit manipulation -- no `HWND`
+/// Removes the border/title-bar style bits from a raw `GWL_STYLE` value,
+/// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`,
+/// `WS_MAXIMIZE`) untouched. Pure bit manipulation -- no `HWND`
 /// involved.
 pub fn strip_border_style(style: u32) -> u32 {
     style & !BORDERLESS_STYLE_MASK
@@ -448,6 +448,9 @@ fn get_window_ex_style(hwnd: HWND) -> Result<u32, Win32Error> {
     get_window_long(hwnd, GWL_EXSTYLE)
 }
 
+/// Reads a window long (`GWL_STYLE` or `GWL_EXSTYLE`) with the
+/// `SetLastError(0)` / zero-return protocol described on [`get_window_style`].
+/// The `isize` result is truncated to `u32`; all style bits live in the low 32.
 fn get_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> Result<u32, Win32Error> {
     // Safety: `hwnd` is a live handle; `GetWindowLongPtrW` performs no writes
     // and takes no pointers besides `hwnd` itself.
@@ -485,6 +488,8 @@ fn set_window_ex_style(hwnd: HWND, ex_style: u32) -> Result<(), Win32Error> {
     set_window_long(hwnd, GWL_EXSTYLE, ex_style)
 }
 
+/// Writes a window long (`GWL_STYLE` or `GWL_EXSTYLE`) with the
+/// `SetLastError(0)` / zero-return protocol described on [`set_window_style`].
 fn set_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: u32) -> Result<(), Win32Error> {
     // Safety: `hwnd` is a live handle; `SetWindowLongPtrW` performs no reads
     // besides `hwnd`/`style` and takes no pointers.
@@ -533,6 +538,10 @@ fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Err
     // Safety: `hwnd` is a live handle; `placement` is a valid out-pointer
     // with `length` set, as `GetWindowPlacement` requires.
     if unsafe { GetWindowPlacement(hwnd, &mut placement) } == 0 {
+        log!(
+            "GetWindowPlacement failed for maximized window {hwnd:?}; \
+             falling back to its current rect"
+        );
         return get_window_region(hwnd);
     }
     let rect = placement.rcNormalPosition;
@@ -544,13 +553,13 @@ fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Err
     })
 }
 
-/// Un-maximizes `hwnd` without blocking on its thread (`ShowWindowAsync`
-/// queues `SW_RESTORE` to the owning thread). The caller has already passed
-/// the hung check.
+/// Un-maximizes `hwnd` synchronously, so the style/rect writes that follow
+/// never race a still-queued restore. The caller has already passed the hung
+/// check (`is_window_hung_logged`), so this cannot block on a hung window.
 fn restore_maximized_window(hwnd: HWND) {
-    // Safety: `hwnd` is a live handle; `ShowWindowAsync` takes plain integers.
+    // Safety: `hwnd` is a live handle; `ShowWindow` takes plain integers.
     unsafe {
-        ShowWindowAsync(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_RESTORE);
     }
 }
 
@@ -638,15 +647,14 @@ fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
 /// Used by the in-game-resize watcher so it only re-applies when the game
 /// actually changed the window -- which also keeps GameFrame's own
 /// `SetWindowPos` (which fires another location-change event) from looping.
-pub fn window_drifted(
-    current_region: Region,
-    current_style: u32,
-    current_ex_style: u32,
-    target: Region,
-) -> bool {
-    current_region != target
-        || strip_border_style(current_style) != current_style
-        || strip_border_ex_style(current_ex_style) != current_ex_style
+///
+/// `WS_MAXIMIZE` and the leftover extended-style edges
+/// ([`strip_border_ex_style`]) are deliberately not drift: a game that
+/// maximizes itself or re-adds an edge would otherwise be re-applied on every
+/// location event (a maximized window already differs by bounds). They are
+/// still handled whenever an apply does run.
+pub fn window_drifted(current_region: Region, current_style: u32, target: Region) -> bool {
+    current_region != target || strip_border_style(current_style) != current_style
 }
 
 /// The pre-strip [`RestoreState`] of every window GameFrame has stripped,
@@ -1084,7 +1092,6 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
     Ok(window_drifted(
         get_window_region(hwnd)?,
         get_window_style(hwnd)?,
-        get_window_ex_style(hwnd)?,
         target,
     ))
 }
@@ -1210,7 +1217,8 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     // rect is read before the restore lands and remembered as the original.
     let maximized = !hung && is_maximized(hwnd);
     let restore_region = if maximized {
-        let region = get_restorable_region(hwnd, true);
+        // Read first, so a failure aborts before the window is touched.
+        let region = get_restorable_region(hwnd, true)?;
         restore_maximized_window(hwnd);
         Some(region)
     } else {
@@ -1230,7 +1238,7 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     let live_style = get_window_style(hwnd)?;
     let live_ex_style = get_window_ex_style(hwnd)?;
     let live_region = match restore_region {
-        Some(region) => region?,
+        Some(region) => region,
         None => get_window_region(hwnd)?,
     };
     set_window_style(hwnd, strip_border_style(live_style))?;
@@ -2154,7 +2162,7 @@ mod tests {
             height: 1479,
         };
 
-        assert!(window_drifted(drifted, 0x14CF0000, 0, target));
+        assert!(window_drifted(drifted, 0x14CF0000, target));
     }
 
     #[test]
@@ -2166,7 +2174,7 @@ mod tests {
             height: 100,
         };
 
-        assert!(window_drifted(target, 0x14CF0000, 0, target));
+        assert!(window_drifted(target, 0x14CF0000, target));
     }
 
     #[test]
@@ -2178,7 +2186,7 @@ mod tests {
             height: 1440,
         };
 
-        assert!(!window_drifted(target, 0x14000000, 0, target));
+        assert!(!window_drifted(target, 0x14000000, target));
     }
 
     #[test]
@@ -2190,17 +2198,17 @@ mod tests {
     }
 
     #[test]
-    fn strip_border_style_clears_the_maximized_state() {
+    fn strip_border_style_leaves_the_maximized_state_to_sw_restore() {
         const WS_VISIBLE: u32 = 0x10000000;
 
         assert_eq!(
             strip_border_style(WS_MAXIMIZE | WS_CAPTION | WS_VISIBLE),
-            WS_VISIBLE
+            WS_MAXIMIZE | WS_VISIBLE
         );
     }
 
     #[test]
-    fn window_drifted_detects_a_maximized_window_even_when_bounds_match() {
+    fn window_drifted_ignores_a_maximized_flag_when_bounds_match() {
         let target = Region {
             x: 0,
             y: 0,
@@ -2208,11 +2216,12 @@ mod tests {
             height: 100,
         };
 
-        assert!(window_drifted(target, 0x14000000 | WS_MAXIMIZE, 0, target));
+        assert!(!window_drifted(target, 0x14000000 | WS_MAXIMIZE, target));
     }
 
     #[test]
-    fn window_drifted_detects_a_returned_edge_even_when_bounds_match() {
+    fn window_drifted_ignores_returned_ex_style_edges() {
+        // The ex-style is not even an input: an edge coming back is not drift.
         let target = Region {
             x: 0,
             y: 0,
@@ -2220,7 +2229,7 @@ mod tests {
             height: 100,
         };
 
-        assert!(window_drifted(target, 0x14000000, WS_EX_CLIENTEDGE, target));
+        assert!(!window_drifted(target, 0x14000000, target));
     }
 
     #[test]
