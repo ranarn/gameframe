@@ -437,8 +437,10 @@ pub fn zone_dependent_tabs_enabled(zone: Option<&Zone>) -> bool {
     zone.is_some()
 }
 
-/// Shown on the greyed-out tabs and in the Zone section while no Zone exists.
+/// Shown on the greyed-out tabs while no Zone exists.
 const ZONE_REQUIRED_NOTE: &str = "A Zone must be configured first. Open the \"Zone, hotkeys & taskbar\" tab and click \"Draw zone\".";
+/// Shown in the Zone section itself while no Zone exists.
+const ZONE_SECTION_REQUIRED_NOTE: &str = "A Zone must be configured first: click \"Draw zone\" to set the screen area games are placed into.";
 
 /// Decides what the Zone section shows for `zone` against `monitor` -- the
 /// pure data behind the thumbnail painter and the red unresolvable reason.
@@ -1870,7 +1872,7 @@ impl SettingsApp<'_> {
                     }
                     None => {
                         ui.label("No zone set");
-                        ui.colored_label(egui::Color32::YELLOW, ZONE_REQUIRED_NOTE);
+                        ui.colored_label(egui::Color32::YELLOW, ZONE_SECTION_REQUIRED_NOTE);
                     }
                 }
                 if let ZoneView::Unresolvable(reason) = &view {
