@@ -138,6 +138,8 @@ impl log::Log for LogBridge {
 
     fn flush(&self) {}
 }
+
+/// Installs [`LogBridge`] as the global `log` logger.
 fn install_log_bridge() {
     // A second `init` (or another logger) makes this fail, which is fine.
     if log::set_logger(&LogBridge).is_ok() {

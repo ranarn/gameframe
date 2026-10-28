@@ -27,13 +27,13 @@
 //! taskbar before the abort, and a kill is covered by the marker file
 //! restored at the next start (see [`crate::taskbar_recovery`]).
 //!
-//! OS/GPU-facing: not exercised by this crate's automated tests, for the
-//! same reason [`crate::settings_ui::run_settings_window`] isn't -- a
-//! headless/CI sandbox cannot provide a real GPU-backed window to render
-//! into or a real taskbar to hide. The pure interaction logic it drives
-//! ([`crate::zone_editor`]) and the pure taskbar hide/remember decision
-//! ([`crate::win32::plan_taskbar_hide`]) are both fully unit tested
-//! instead.
+//! OS/GPU-facing: the overlay itself is not exercised by this crate's
+//! automated tests, for the same reason [`crate::settings_ui::run_settings_window`]
+//! isn't -- a headless/CI sandbox cannot provide a real GPU-backed window to
+//! render into or a real taskbar to hide. The pure interaction logic it
+//! drives ([`crate::zone_editor`]) and the pure taskbar hide/remember
+//! decision ([`crate::win32::plan_taskbar_hide`]) are fully unit tested
+//! instead, and [`strip_window_frame`] is tested on a plain Win32 window.
 
 use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
@@ -47,7 +47,6 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, POINT, SetLastError};
-
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -331,7 +330,7 @@ fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOption
 struct OverlayApp {
     state: AppState,
     outcome: Rc<RefCell<Option<SessionOutcome>>>,
-    /// The overlay's window, for [strip_window_frame] (egui #8750).
+    /// The overlay's window, for [`strip_window_frame`] (egui #8750).
     hwnd: Option<HWND>,
 }
 
@@ -371,7 +370,8 @@ impl eframe::App for OverlayApp {
 }
 
 impl OverlayApp {
-    /// Keeps the window frame stripped (egui #8750); logs a failure once.
+    /// Keeps the window frame stripped (egui #8750). Logs each strip, and
+    /// each failing frame's error.
     fn strip_frame(&self) {
         let Some(hwnd) = self.hwnd else { return };
         match strip_window_frame(hwnd) {
