@@ -86,8 +86,8 @@ where
 
 /// An unusual `CreateMutexW` outcome worth a log line. `acquire` hands the
 /// first one back to `main` instead of logging it, because the log may not be
-/// open yet when the mutex is taken (and a non-owning process shouldn't open
-/// the shared log early).
+/// open yet when the mutex is taken; `main` opens the log only when there is
+/// a note (or later, as usual), then writes it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Note {
     /// An existing mutex can't be opened; treated as held.
