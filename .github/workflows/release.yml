@@ -187,8 +187,10 @@ jobs:
         run: |
           if [ "$REUSED" = "true" ]; then
             # Find an existing release (draft or published, either counts on a
-            # re-run) by listing, which includes drafts, so the lookup does
-            # not depend on gh's tag-to-draft fallback. Any lookup failure
+            # re-run) by listing, which includes drafts, so this existence
+            # check does not depend on gh's tag-to-draft fallback (the upload
+            # below still finds the draft by tag, and fails loudly if it
+            # can't, rather than creating a duplicate). Any lookup failure
             # (network, auth, rate limit, bad JSON) must fail the job rather
             # than risk a duplicate draft.
             if ! releases=$(gh release list --limit 1000 --json tagName); then
