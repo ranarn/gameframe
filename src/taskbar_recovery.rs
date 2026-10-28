@@ -504,10 +504,10 @@ pub(crate) fn restore_on_exit() {
             log!("failed to show the taskbar at exit: {e}");
         }
     }
-    // Whatever happened above, a graceful exit leaves no marker (`persist`
-    // keeps one that recovery still owes).
-    let mut rec = record();
-    *rec = HideRecord::EMPTY;
+    // Successful restores cleared their marks above; a technique whose
+    // restore failed (e.g. Explorer hung) keeps its mark so the next start
+    // can still recover it. `persist` also keeps one that recovery owes.
+    let rec = record();
     persist(*rec);
 }
 
@@ -693,10 +693,16 @@ fn restore_for_panic() {
     if techniques.is_empty() {
         return;
     }
+    let mut all_restored = true;
     for restore in techniques {
         // The panic hook shows bare, which never calls back (and must not
         // touch the session lock).
-        let _ = win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook));
+        all_restored &=
+            win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook)).is_ok();
+    }
+    // A failed restore (e.g. Explorer hung) keeps the marker for the next start.
+    if !all_restored {
+        return;
     }
     if let Some(dir) = dir {
         let _ = clear_marker_file(dir);

@@ -1093,10 +1093,11 @@ pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
     Ok(flags)
 }
 
-/// Whether the taskbar's thread has stopped pumping messages.
+/// Whether the taskbar's thread has stopped pumping messages, logged once per
+/// hung episode (callers rely on that and don't log `WindowHung` again). Not
+/// used on the panic hook's bare show, which must take no lock.
 fn taskbar_is_hung(hwnd: HWND) -> bool {
-    // Safety: `IsHungAppWindow` only reads window state.
-    unsafe { IsHungAppWindow(hwnd) != 0 }
+    is_window_hung_logged(hwnd)
 }
 
 /// The bare `ShowWindow(SW_SHOW)` behind [`show_taskbar_full`] and the panic
