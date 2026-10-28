@@ -459,21 +459,11 @@ unsafe extern "system" fn session_wndproc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// The restore a session end performs.
-#[cfg(not(test))]
+/// The restore a session end performs. Tests run it for real: the
+/// OS-facing steps underneath are faked out in `taskbar_recovery`.
 fn end_session_restore() {
     log!("session ending: restoring the taskbar");
     crate::taskbar::restore_all_for_exit();
-}
-
-/// Tests count the calls instead of touching the real taskbar.
-#[cfg(test)]
-static END_SESSION_RESTORES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn end_session_restore() {
-    END_SESSION_RESTORES.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Creates the never-shown top-level window (`WS_POPUP`, `WS_EX_TOOLWINDOW`,
@@ -675,17 +665,36 @@ mod tests {
 
     #[test]
     fn session_window_restores_on_a_real_end_session_only() {
+        use crate::taskbar_recovery::{MARKER_FILE, init, mark_hidden};
+        use crate::win32::TaskbarHideRestore;
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        struct RemoveDir(std::path::PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("gameframe-endsession-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = RemoveDir(dir.clone());
+        // `taskbar_recovery::init` sets a process-wide OnceLock (first call
+        // wins, never reset). This is the only test that calls it; a second
+        // one must share this directory (e.g. via a helper) or it will write
+        // its marker here.
+        init(&dir);
+        let marker = dir.join(MARKER_FILE);
+        let _ = mark_hidden(TaskbarHideRestore::FullyHidden);
+        assert!(marker.exists(), "hiding must write the recovery marker");
         // SAFETY: plain Win32 calls on a window created and destroyed here.
         unsafe {
             let hwnd = create_session_window(GetModuleHandleW(std::ptr::null()));
             assert!(!hwnd.is_null(), "session window must be creatable");
             let _guard = SessionWindow(hwnd);
-            let before = END_SESSION_RESTORES.load(Ordering::SeqCst);
+            // A cancelled end (wParam FALSE) leaves the marker alone.
             SendMessageW(hwnd, WM_ENDSESSION, 0, 0);
-            assert_eq!(END_SESSION_RESTORES.load(Ordering::SeqCst), before);
+            assert!(marker.exists(), "a cancelled end must not restore");
             SendMessageW(hwnd, WM_ENDSESSION, 1, 0);
-            assert_eq!(END_SESSION_RESTORES.load(Ordering::SeqCst), before + 1);
+            assert!(!marker.exists(), "a real end must clear the marker");
         }
     }
 

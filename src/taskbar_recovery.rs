@@ -386,9 +386,12 @@ pub fn note_session_start_flags(flags: u32) {
         .unwrap_or_else(|e| e.into_inner()) = Some(flags);
 }
 
-/// At the end of a `FullyHidden` session: logs both values if the appbar flags
-/// differ from the session start (Windows' auto-hide was toggled meanwhile).
+/// When a marked `FullyHidden` hide is undone through `restore_marked` (the
+/// hotkey show, a session end or exit -- never startup recovery or the panic
+/// hook): logs both values if the appbar flags differ from the session start
+/// (Windows' auto-hide was toggled meanwhile).
 /// Log only; the normal show happens regardless.
+#[cfg_attr(test, allow(dead_code))] // tests fake the OS show that calls it
 pub fn finish_session_flags(flags_now: u32) {
     let start = SESSION_START_FLAGS
         .lock()
@@ -492,7 +495,7 @@ pub(crate) fn restore_on_exit() {
     }
     // The record can drift from reality (e.g. Windows' auto-hide toggled while
     // hidden): if this run hid the taskbar and it is still not visible, show it.
-    let visible = win32::observe_taskbar().ok().map(|(visible, _)| visible);
+    let visible = os_taskbar_visible();
     if needs_exit_safety_show(HID_FULLY_THIS_RUN.load(Ordering::SeqCst), visible) {
         log!("taskbar still hidden at exit although this run hid it; showing it");
         if let Err(e) = restore_marked(TaskbarHideRestore::FullyHidden) {
@@ -510,13 +513,43 @@ pub(crate) fn restore_on_exit() {
 /// marked restore: `crate::taskbar::restore_taskbar`/`show_taskbar` and the
 /// exit path all go through it.
 pub(crate) fn restore_marked(restore: TaskbarHideRestore) -> Result<(), win32::Win32Error> {
-    restore_marked_with(
-        restore,
-        // Also ends the FullyHidden session for the flags-changed log.
-        || win32::show_taskbar_full(finish_session_flags),
-        win32::set_appbar_state,
-        mark_restored,
-    )
+    restore_marked_with(restore, os_show_full, os_set_appbar, mark_restored)
+}
+
+/// The full show that ends a `FullyHidden` session: this caller, not
+/// `show_taskbar_full`, ends the session for the flags-changed log, so a
+/// startup-recovery show can never consume the session-start flags.
+#[cfg(not(test))]
+fn os_show_full() -> Result<(), win32::Win32Error> {
+    win32::show_taskbar_full().map(finish_session_flags)
+}
+
+#[cfg(not(test))]
+fn os_set_appbar(state: TaskbarAutohideState) -> Result<(), win32::Win32Error> {
+    win32::set_appbar_state(state)
+}
+
+/// The visibility the exit safety net sees; `None` when unobservable.
+#[cfg(not(test))]
+fn os_taskbar_visible() -> Option<bool> {
+    win32::observe_taskbar().ok().map(|(visible, _)| visible)
+}
+
+// Tests never touch the real taskbar: the OS-facing steps are no-ops, so the
+// real exit path (`restore_on_exit`) can run against a temp marker directory.
+#[cfg(test)]
+fn os_show_full() -> Result<(), win32::Win32Error> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn os_set_appbar(_: TaskbarAutohideState) -> Result<(), win32::Win32Error> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn os_taskbar_visible() -> Option<bool> {
+    None
 }
 
 /// Core of [`restore_marked`] with the OS steps and the marker bookkeeping
@@ -549,12 +582,10 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
             RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(
                 TaskbarHideRestore::FullyHidden,
                 show_kind_for(RawRestorePath::Startup),
-                finish_session_flags,
             )?,
             RecoveryAction::SetAppbarState(state) => win32::restore_taskbar_raw(
                 TaskbarHideRestore::HoverReveal(state),
                 show_kind_for(RawRestorePath::Startup),
-                finish_session_flags,
             )?,
         }
     }
@@ -633,8 +664,7 @@ fn restore_for_panic() {
     for restore in techniques {
         // The panic hook shows bare, which never calls back (and must not
         // touch the session lock).
-        let _ =
-            win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook), |_| {});
+        let _ = win32::restore_taskbar_raw(restore, show_kind_for(RawRestorePath::PanicHook));
     }
     if let Some(dir) = dir {
         let _ = clear_marker_file(dir);

@@ -36,11 +36,11 @@ fn hide_taskbar_completely() -> Result<(), Win32Error> {
 
 /// [`hide_taskbar_completely`] on an already-resolved taskbar handle.
 fn mark_and_hide_taskbar_window(hwnd: HWND) {
-    let flags = read_appbar_flags(hwnd);
     // Marker first: a kill right after the hide is then covered.
     if taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden).is_some() {
-        // A new FullyHidden session: remember the appbar flags to compare at its end.
-        taskbar_recovery::note_session_start_flags(flags);
+        // A new FullyHidden session (not a join): read and remember the appbar
+        // flags, before the hide, to compare at its end.
+        taskbar_recovery::note_session_start_flags(read_appbar_flags(hwnd));
     }
     win32::hide_taskbar_window(hwnd);
 }
