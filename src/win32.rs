@@ -1618,8 +1618,8 @@ pub(crate) fn resolve_running_window(exe_path: &Path) -> Option<HWND> {
 /// decide what -- if anything -- to surface in its non-blocking status line.
 ///
 /// Deliberately has no `NotRunning` variant: whether the game is currently
-/// running is decided by the caller *before* this function (or a region) is
-/// ever invoked -- via [`resolve_running_window`] -- so that a not-running
+/// running is decided by the caller *before* the live re-apply
+/// (`crate::taskbar::live_reapply_running_window`) or a region is ever invoked -- via [`resolve_running_window`] -- so that a not-running
 /// game always short-circuits ahead of any region-resolution error and is
 /// never routed through this type at all (region resolution must never run,
 /// let alone be reported as a failure, for a game that was never actually

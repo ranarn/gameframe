@@ -134,7 +134,7 @@ fn armed_taskbar_windows_take_all_returns_none_when_nothing_is_armed() {
 /// inspection, but the underlying `ShowWindow` state change *is*
 /// directly observable via `IsWindowVisible`). Ignored by default (not part
 /// of the automated suite, same OS-facing convention as the rest of this
-/// module) -- run explicitly with `cargo test --lib taskbar::tests::hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility -- --ignored`
+/// module) -- run explicitly with `cargo test --bin gameframe taskbar::tests::hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_window_visibility -- --ignored`
 /// on a real desktop session. Mutates the real Shell_TrayWnd on this
 /// machine for the duration of the test, restoring it in every case
 /// (including a failed assertion, via a drop guard) so a test failure
@@ -149,6 +149,8 @@ fn hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_wi
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let hwnd = find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
 
@@ -197,6 +199,8 @@ fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_re
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let taskbar_hwnd =
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
@@ -238,6 +242,8 @@ fn take_armed_taskbar_restore_for_window_leaves_an_unrelated_windows_hide_untouc
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let taskbar_hwnd =
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
@@ -285,6 +291,8 @@ fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let taskbar_hwnd =
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
@@ -340,6 +348,8 @@ fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let taskbar_hwnd =
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
@@ -383,6 +393,8 @@ fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
         }
     }
     let _restore = RestoreOnDrop;
+    // The real taskbar is hidden here, so restores must use the real OS show.
+    crate::taskbar_recovery::REAL_OS_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let taskbar_hwnd =
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
