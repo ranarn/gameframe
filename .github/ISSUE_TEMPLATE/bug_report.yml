@@ -36,6 +36,6 @@ body:
       description: >
         Relevant lines from `%APPDATA%\GameFrame\gameframe.log` (and
         `gameframe.old.log`, the rotated log, if the problem is older). They
-        contain window titles and executable paths, so remove anything you'd rather
-        not share.
+        contain window titles and executable paths, so remove anything you'd
+        rather not share.
       render: text
