@@ -17,6 +17,10 @@ on:
         description: Deliberately release a new major version (e.g. 1.0.0); without it a major bump below 1.0 is refused
         type: boolean
         default: false
+      minor-pre-major:
+        description: Below 1.0, release a breaking change as a minor bump (e.g. 0.5.0 -> 0.6.0) instead of 1.0.0
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -59,6 +63,7 @@ jobs:
         with:
           dry-run: true
           default-bump: none
+          bump-minor-pre-major: ${{ inputs.minor-pre-major }}
 
       - name: Require something to release
         env:
@@ -172,6 +177,7 @@ jobs:
         uses: ranarn/release-pilot@3ea1793e95926ed237bd8e9e1633987c05763b1b # v1.1.0
         with:
           default-bump: none
+          bump-minor-pre-major: ${{ inputs.minor-pre-major }}
           commit-sha: ${{ github.sha }}
           create-release: true
           release-draft: true

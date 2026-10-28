@@ -14,7 +14,7 @@ a large, easy-to-see cursor over your games.
 Requires 64-bit Windows 10 or 11. To upgrade, run a newer installer; your settings are kept.
 Uninstall from Settings > Apps.
 
-**Upgrading to 1.0:** configs from the pre-Zone preset era (the ones with a `[presets]` table) are no longer migrated and are reset to defaults on first start; the old file is kept as a backup next to the config (`config.toml.bak`, or `config.toml.bak.N` if one already exists). Configs from 0.x releases that already use the Zone are unaffected.
+**Upgrading to 0.6 or later:** configs from the pre-Zone preset era (the ones with a `[presets]` table) are no longer migrated and are reset to defaults on first start; the old file is kept as a backup next to the config (`config.toml.bak`, or `config.toml.bak.N` if one already exists). Configs from 0.x releases that already use the Zone are unaffected.
 
 ## Getting started
 
