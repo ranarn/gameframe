@@ -334,7 +334,7 @@ fn run_event_loop(
         // Tray, hotkey and update events. Settings drains the same events while
         // it is open (see `show_settings`), so nothing waits for it to close.
         loop {
-            let drained = drain_events(&ctx, &hotkeys, &mut offered_update, SettingsMode::Closed);
+            let drained = drain_events(&ctx, &hotkeys, &mut offered_update, None);
             if drained.exit {
                 return;
             }
@@ -360,41 +360,20 @@ struct Shared<'a> {
     updates: &'a UpdateEvents,
 }
 
-/// Which window, if any, is blocking the main loop while [`drain_events`] runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsMode {
-    Closed,
-    Open,
-    /// Open and waiting for the next key to bind; hotkey presses are dropped.
-    Capturing,
-    /// The zone-editor overlay is open (Settings is closed meanwhile).
-    ZoneEditor,
-}
-
-impl From<TickContext> for SettingsMode {
-    fn from(context: TickContext) -> Self {
-        match context {
-            TickContext::Settings => Self::Open,
-            TickContext::SettingsCapturing => Self::Capturing,
-            TickContext::ZoneEditor => Self::ZoneEditor,
-        }
-    }
-}
-
-/// Whether a hotkey action may run while `mode` is blocking the main loop.
+/// Whether a hotkey action may run while `context` (the window blocking the
+/// main loop, `None` when none is) is running [`drain_events`].
 ///
 /// The zone editor owns the taskbar (its session caches the state and its
 /// guard restores on close), so the taskbar hotkey would desync it; the
 /// borderless hotkey would only target the always-on-top overlay itself.
 /// Everything else, the game-cursor hotkey included, runs as usual.
-fn hotkey_allowed(mode: SettingsMode, action: HotkeyAction) -> bool {
-    match mode {
-        SettingsMode::Capturing => false,
-        SettingsMode::ZoneEditor => matches!(action, HotkeyAction::ToggleGameCursor),
-        SettingsMode::Closed | SettingsMode::Open => true,
+fn hotkey_allowed(context: Option<TickContext>, action: HotkeyAction) -> bool {
+    match context {
+        Some(TickContext::SettingsCapturing) => false,
+        Some(TickContext::ZoneEditor) => matches!(action, HotkeyAction::ToggleGameCursor),
+        Some(TickContext::Settings) | None => true,
     }
 }
-
 /// What one pass of [`drain_events`] asks its caller to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
@@ -421,7 +400,7 @@ fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
     offered_update: &mut Option<UpdateInfo>,
-    settings: SettingsMode,
+    settings: Option<TickContext>,
 ) -> Drained {
     let Shared {
         tray,
@@ -429,7 +408,10 @@ fn drain_events(
         cursor_overlay,
         updates,
     } = *ctx;
-    let settings_open = settings != SettingsMode::Closed;
+    let settings_open = settings.is_some();
+    // Set by the hotkey loop; every return reports it, so a toggle that was
+    // already persisted never goes unreported.
+    let mut cursor_enabled = None;
     crate::watchdog::step("drain_events: update events");
     // Results of the startup update check and of installs started from
     // the tray (posted by worker threads, which wake this pump).
@@ -501,6 +483,7 @@ fn drain_events(
                 // the entire clean-shutdown path for the tray UI.
                 return Drained {
                     exit: true,
+                    cursor_enabled,
                     ..Drained::default()
                 };
             }
@@ -510,6 +493,7 @@ fn drain_events(
                 } else {
                     return Drained {
                         show_settings: true,
+                        cursor_enabled,
                         ..Drained::default()
                     };
                 }
@@ -535,7 +519,6 @@ fn drain_events(
     }
 
     crate::watchdog::step("drain_events: hotkey events");
-    let mut cursor_enabled = None;
     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
         // Only act on the key-down edge; the crate also emits a
         // `Released` event on key-up (see `global_hotkey`'s Windows
@@ -545,7 +528,7 @@ fn drain_events(
         }
         // Settings is capturing a new binding: pressing a bound combo must
         // not also run its action.
-        if settings == SettingsMode::Capturing {
+        if settings == Some(TickContext::SettingsCapturing) {
             continue;
         }
 
@@ -568,6 +551,7 @@ fn drain_events(
                     // this (unelevated) instance's job is done.
                     return Drained {
                         exit: true,
+                        cursor_enabled,
                         ..Drained::default()
                     };
                 }
@@ -1222,7 +1206,7 @@ fn show_settings(
     let mut on_tick = {
         let hotkeys = &*hotkeys;
         move |context: TickContext| -> Option<bool> {
-            let mode = SettingsMode::from(context);
+            let mode = Some(context);
             let drained = drain_events(ctx, hotkeys, offered_update, mode);
             if drained.exit {
                 // Settings closes on a queued Quit and the main loop exits.
@@ -1306,21 +1290,30 @@ mod tests {
     #[test]
     fn zone_editor_tick_allows_only_the_cursor_hotkey() {
         use HotkeyAction::*;
-        assert!(hotkey_allowed(SettingsMode::ZoneEditor, ToggleGameCursor));
+        assert!(hotkey_allowed(
+            Some(TickContext::ZoneEditor),
+            ToggleGameCursor
+        ));
         assert!(!hotkey_allowed(
-            SettingsMode::ZoneEditor,
+            Some(TickContext::ZoneEditor),
             ToggleTaskbarAutohide
         ));
-        assert!(!hotkey_allowed(SettingsMode::ZoneEditor, ToggleBorderless));
+        assert!(!hotkey_allowed(
+            Some(TickContext::ZoneEditor),
+            ToggleBorderless
+        ));
     }
 
     #[test]
     fn settings_ticks_allow_every_hotkey_except_while_capturing() {
         use HotkeyAction::*;
         for action in [ToggleBorderless, ToggleTaskbarAutohide, ToggleGameCursor] {
-            assert!(hotkey_allowed(SettingsMode::Closed, action));
-            assert!(hotkey_allowed(SettingsMode::Open, action));
-            assert!(!hotkey_allowed(SettingsMode::Capturing, action));
+            assert!(hotkey_allowed(None, action));
+            assert!(hotkey_allowed(Some(TickContext::Settings), action));
+            assert!(!hotkey_allowed(
+                Some(TickContext::SettingsCapturing),
+                action
+            ));
         }
     }
 

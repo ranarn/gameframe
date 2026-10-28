@@ -1961,6 +1961,24 @@ impl SettingsApp<'_> {
     }
 }
 
+/// Builds the Save result. Ticks once more first, so a game-cursor hotkey
+/// toggle that landed after this frame's tick (but before the click was
+/// handled) is adopted and not overwritten by the stale checkbox value.
+fn save_exit(
+    state: &mut SettingsState,
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
+) -> SettingsExit {
+    let context = if state.capturing.is_some() {
+        TickContext::SettingsCapturing
+    } else {
+        TickContext::Settings
+    };
+    if let Some(enabled) = on_tick(context) {
+        state.apply_external_cursor_enabled(enabled);
+    }
+    SettingsExit::Saved(state.to_config(), state.start_with_windows)
+}
+
 impl eframe::App for SettingsApp<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sync_keyboard_hook();
@@ -1991,10 +2009,7 @@ impl eframe::App for SettingsApp<'_> {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::Saved(
-                        self.state.to_config(),
-                        self.state.start_with_windows,
-                    ));
+                    *self.exit.borrow_mut() = Some(save_exit(&mut self.state, self.on_tick));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {
@@ -2127,6 +2142,33 @@ mod tests {
         let merged = merge_tracked_games(&[], vec![game("b.exe")], &[game("b.exe")]);
 
         assert_eq!(merged, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn save_adopts_a_cursor_toggle_reported_by_the_final_tick() {
+        let mut state = SettingsState::from_config(&Config::default());
+        assert!(!state.cursor.enabled);
+
+        let mut contexts = Vec::new();
+        let mut on_tick = |context| {
+            contexts.push(context);
+            Some(true)
+        };
+        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut on_tick) else {
+            panic!("save_exit must produce Saved");
+        };
+        assert!(config.cursor.enabled);
+        assert_eq!(contexts.len(), 1);
+    }
+
+    #[test]
+    fn save_keeps_the_checkbox_when_the_final_tick_reports_nothing() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.cursor.enabled = true;
+        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut |_| None) else {
+            panic!("save_exit must produce Saved");
+        };
+        assert!(config.cursor.enabled);
     }
 
     #[test]
