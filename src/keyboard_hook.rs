@@ -196,8 +196,7 @@ mod tests {
         assert!(!should_suppress(0x42, true));
     }
 
-    // One test, not two: both cases share the global flag, and parallel tests
-    // racing on it made the "true once" case flaky.
+    // Both cases share the global flag, so they run sequentially in one test.
     #[test]
     fn take_suppressed_ctrl_escape_is_false_until_set_then_true_once() {
         CTRL_ESCAPE_SUPPRESSED.store(false, Ordering::SeqCst);

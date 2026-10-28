@@ -27,15 +27,27 @@ use windows_sys::Win32::Foundation::HWND;
 /// near the screen edge.
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
-/// `ShowWindow` call. Not exercised by this crate's automated tests -- see
-/// the `win32` module docs.
+/// `ShowWindow` call, unless Explorer is hung. Not exercised by this crate's
+/// automated tests -- see the `win32` module docs.
 fn hide_taskbar_completely() -> Result<(), Win32Error> {
-    mark_and_hide_taskbar_window(find_taskbar_window()?);
-    Ok(())
+    mark_and_hide_taskbar_window(find_taskbar_window()?)
+}
+
+/// Every call into Explorer for a hide goes through this check: a hung
+/// Explorer fails with [`Win32Error::WindowHung`] (logged once) before anything
+/// is marked or sent, so no hide is ever queued behind a later show.
+fn ensure_taskbar_responsive(hwnd: HWND) -> Result<(), Win32Error> {
+    if win32::is_window_hung_logged(hwnd) {
+        Err(Win32Error::WindowHung)
+    } else {
+        Ok(())
+    }
 }
 
 /// [`hide_taskbar_completely`] on an already-resolved taskbar handle.
-fn mark_and_hide_taskbar_window(hwnd: HWND) {
+fn mark_and_hide_taskbar_window(hwnd: HWND) -> Result<(), Win32Error> {
+    // Not marked when skipped: no hide happens.
+    ensure_taskbar_responsive(hwnd)?;
     // Marker first: a kill right after the hide is then covered.
     if taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden).is_some() {
         // A new FullyHidden session (not a join): read and remember the appbar
@@ -43,6 +55,7 @@ fn mark_and_hide_taskbar_window(hwnd: HWND) {
         taskbar_recovery::note_session_start_flags(read_appbar_flags(hwnd));
     }
     win32::hide_taskbar_window(hwnd);
+    Ok(())
 }
 
 /// Shows the real taskbar via `ShowWindow(Shell_TrayWnd, SW_SHOW)` -- undoes
@@ -83,6 +96,7 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
         }
         TaskbarHideMode::HoverReveal => {
             let hwnd = find_taskbar_window()?;
+            ensure_taskbar_responsive(hwnd)?;
             let current_flags = read_appbar_flags(hwnd);
             let current = state_from_flags(current_flags);
             let restore = plan_taskbar_hide(mode, current);
@@ -349,6 +363,7 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
             }
             // Marker first, recording the state to go back to.
             let hwnd = find_taskbar_window()?;
+            ensure_taskbar_responsive(hwnd)?;
             let prior = state_from_flags(read_appbar_flags(hwnd));
             let undo = taskbar_recovery::mark_hidden(TaskbarHideRestore::HoverReveal(prior));
             if let Err(e) = win32::set_appbar_state(target) {
@@ -427,15 +442,16 @@ pub fn set_taskbar_hide_absolute_armed(
             // Join first: the re-hide is best-effort and must not leave
             // `hwnd` out of the armed set.
             join_taskbar_hide_session(hwnd);
+            // Best-effort: a hung Explorer skips the re-hide.
             if rehide && let Some(j) = judgement {
-                mark_and_hide_taskbar_window(j.taskbar);
+                let _ = mark_and_hide_taskbar_window(j.taskbar);
             }
             Ok(())
         } else {
             let restore = hide_taskbar(mode)?;
             start_taskbar_hide_session(hwnd, restore);
             log!(
-                "taskbar hide for {hwnd:?}: started a session ({mode:?}); {} (a FullyHidden hide is posted, so visibility may lag)",
+                "taskbar hide for {hwnd:?}: started a session ({mode:?}); {}",
                 taskbar_debug_state()
             );
             Ok(())

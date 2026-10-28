@@ -1061,15 +1061,19 @@ pub(crate) fn handle_applied_window_drift(
         );
         return None;
     }
-    if let Err(e) = win32::apply_borderless_to_window(hwnd, target_region)
-        && !e.is_window_hung()
-    {
-        log!(
-            "drift re-apply: failed for {}: {e}",
-            tracked_game.display_name
-        );
+    match win32::apply_borderless_to_window(hwnd, target_region) {
+        // Already logged once by the hung check. A hung window produces no
+        // location-change events, so poll it until it responds.
+        Err(e) if e.is_window_hung() => Some(win32::HUNG_RECHECK_INTERVAL),
+        Err(e) => {
+            log!(
+                "drift re-apply: failed for {}: {e}",
+                tracked_game.display_name
+            );
+            None
+        }
+        Ok(()) => None,
     }
-    None
 }
 
 /// Whether one of the tray's update message boxes is open.
