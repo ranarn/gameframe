@@ -562,9 +562,12 @@ fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
             match placement::apply_zone(config_dir, hwnd, placement::Trigger::LiveReapply) {
                 placement::Outcome::Applied
                 | placement::Outcome::Skipped
-                | placement::Outcome::RetryIn(_) => None,
-                placement::Outcome::Refused
-                | placement::Outcome::RegionFailed
+                | placement::Outcome::RetryIn(_)
+                // Refused by the eligibility filter: it would be refused on
+                // the next launch too, so the "used next launch" message
+                // would be wrong; skipped silently (logged by placement).
+                | placement::Outcome::Refused => None,
+                placement::Outcome::RegionFailed
                 | placement::Outcome::Failed(_) => {
                     Some(live_apply_failure_message(&game.display_name))
                 }

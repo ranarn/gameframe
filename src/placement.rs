@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_and_live_reapply_are_remembered_for_drift_correction() {
+    fn hotkey_live_reapply_and_tray_placements_are_remembered_for_drift_correction() {
         for trigger in [Trigger::Hotkey, Trigger::LiveReapply, Trigger::Tray] {
             let ops = tracked_ops(false);
 
