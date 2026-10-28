@@ -294,8 +294,9 @@ unsafe extern "system" fn drift_callback(
 static DRIFT_RECHECKS: std::sync::Mutex<std::collections::BTreeMap<isize, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Runs the drift handler for `hwnd`; if it was only rate-limited, schedules
-/// one re-check for when the limit expires (at most one pending per window).
+/// Runs the drift handler for `hwnd`; if it was only rate-limited or the
+/// window is hung, schedules one re-check for when the limit expires or after
+/// the hung re-check interval (at most one pending per window).
 fn check_applied_window_drift(config_dir: &Path, hwnd: HWND) {
     let Some(retry_in) = crate::app::handle_applied_window_drift(config_dir, hwnd) else {
         return;

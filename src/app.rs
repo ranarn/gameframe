@@ -793,6 +793,8 @@ fn handle_toggle_borderless(config_dir: &Path) -> bool {
             config.hide_taskbar_on_apply,
             config.taskbar_hide_mode,
         )
+        // A hung Explorer was already logged once where it was found.
+        && !e.is_window_hung()
     {
         log!(
             "borderless toggle: failed to set the taskbar for {}: {e}",
@@ -904,7 +906,8 @@ fn handle_apply_to_window(config_dir: &Path, target_hwnd: HWND) {
         target_hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
-    ) {
+    ) && !e.is_window_hung()
+    {
         log!(
             "apply to window: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
@@ -1011,7 +1014,8 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
         hwnd,
         config.hide_taskbar_on_apply,
         config.taskbar_hide_mode,
-    ) {
+    ) && !e.is_window_hung()
+    {
         log!(
             "launch detection: failed to set the taskbar for {}: {e}",
             tracked_game.display_name
@@ -1028,8 +1032,9 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 ///
 /// Minimized windows are skipped and re-applies are rate-limited per window.
 /// Returns how long to wait before re-checking when the event was skipped only
-/// because of the rate limit, so a drift that lands inside the limit is still
-/// corrected.
+/// because of the rate limit (so a drift that lands inside the limit is still
+/// corrected) or because the window is hung (HUNG_RECHECK_INTERVAL, so it is
+/// retried once it responds again).
 ///
 /// OS-facing; the drift decisions are [`win32::window_drifted`] and the
 /// re-apply decision behind `win32::decide_drift_for_window`, unit tested.
@@ -1161,7 +1166,9 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
         }
     };
 
-    if let Err(e) = taskbar::toggle_taskbar_hide(mode) {
+    if let Err(e) = taskbar::toggle_taskbar_hide(mode)
+        && !e.is_window_hung()
+    {
         log!("taskbar auto-hide toggle failed: {e}");
     }
 }

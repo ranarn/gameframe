@@ -46,8 +46,9 @@ pub enum MarkerState {
 pub struct ObservedTaskbar {
     /// `IsWindowVisible(Shell_TrayWnd)`.
     pub visible: bool,
-    /// The appbar auto-hide state.
-    pub autohide: TaskbarAutohideState,
+    /// The appbar auto-hide state; None when it could not be read (a hung
+    /// Explorer), which is not the same as AlwaysVisible.
+    pub autohide: Option<TaskbarAutohideState>,
 }
 
 /// What startup should do about a possibly stranded hidden taskbar.
@@ -58,6 +59,9 @@ pub enum RecoveryAction {
     ShowTaskbar,
     /// Write this appbar auto-hide state back.
     SetAppbarState(TaskbarAutohideState),
+    /// The taskbar's state needed for the decision is unknown (Explorer is
+    /// hung): neither act nor clear the marker, recover later.
+    Undecidable,
 }
 
 /// The restore paths that do not go through the normal in-memory bookkeeping.
@@ -132,6 +136,7 @@ pub fn parse_marker(text: &str) -> Option<TaskbarHideRestore> {
 ///   the meantime, or it was auto-hide to begin with, leave it).
 /// - `Combined`: callers split it into its techniques first (see
 ///   `recovery_inputs`); decided here as `Nothing`.
+/// - HoverReveal(prior) with an unknown auto-hide state: Undecidable.
 /// - Unreadable marker: if the taskbar window is hidden, show it (the
 ///   technique is unknown, so the only safe guess is the visible state); a
 ///   visible taskbar is left alone, since its auto-hide may be the user's own.
@@ -146,15 +151,13 @@ pub fn decide_recovery(marker: MarkerState, observed: ObservedTaskbar) -> Recove
             }
         }
         MarkerState::Combined { .. } => RecoveryAction::Nothing,
-        MarkerState::Technique(TaskbarHideRestore::HoverReveal(prior)) => {
-            if observed.autohide == TaskbarAutohideState::AutoHidden
-                && prior != TaskbarAutohideState::AutoHidden
-            {
+        MarkerState::Technique(TaskbarHideRestore::HoverReveal(prior)) => match observed.autohide {
+            None => RecoveryAction::Undecidable,
+            Some(TaskbarAutohideState::AutoHidden) if prior != TaskbarAutohideState::AutoHidden => {
                 RecoveryAction::SetAppbarState(prior)
-            } else {
-                RecoveryAction::Nothing
             }
-        }
+            Some(_) => RecoveryAction::Nothing,
+        },
     }
 }
 
@@ -596,11 +599,13 @@ fn restore_marked_with<E>(
 fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Error> {
     let (visible, autohide) = win32::observe_taskbar()?;
     let observed = ObservedTaskbar { visible, autohide };
+    let mut undecidable = false;
     for input in recovery_inputs(marker) {
         let action = decide_recovery(input, observed);
         log!("taskbar recovery: marker {input:?} -> {action:?}");
         match action {
             RecoveryAction::Nothing => {}
+            RecoveryAction::Undecidable => undecidable = true,
             RecoveryAction::ShowTaskbar => win32::restore_taskbar_raw(
                 TaskbarHideRestore::FullyHidden,
                 show_kind_for(RawRestorePath::Startup),
@@ -610,6 +615,11 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
                 show_kind_for(RawRestorePath::Startup),
             )?,
         }
+    }
+    if undecidable {
+        // Keep the marker: the state to decide on is unknown until Explorer
+        // answers again.
+        return Err(win32::Win32Error::WindowHung);
     }
     RECOVERY_PENDING.store(false, Ordering::SeqCst);
     if let Err(e) = clear_marker_file(dir) {
@@ -706,7 +716,40 @@ mod tests {
     const HOVER_FROM_AUTO: TaskbarHideRestore = TaskbarHideRestore::HoverReveal(AutoHidden);
 
     fn observed(visible: bool, autohide: TaskbarAutohideState) -> ObservedTaskbar {
-        ObservedTaskbar { visible, autohide }
+        ObservedTaskbar {
+            visible,
+            autohide: Some(autohide),
+        }
+    }
+
+    /// The taskbar visible or not, but its appbar state unreadable (hung Explorer).
+    fn observed_unknown(visible: bool) -> ObservedTaskbar {
+        ObservedTaskbar {
+            visible,
+            autohide: None,
+        }
+    }
+
+    #[test]
+    fn a_hover_reveal_marker_with_an_unknown_appbar_state_cannot_be_decided() {
+        for prior in [HOVER_FROM_VISIBLE, HOVER_FROM_AUTO] {
+            assert_eq!(
+                decide_recovery(MarkerState::Technique(prior), observed_unknown(true)),
+                RecoveryAction::Undecidable
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_appbar_state_does_not_affect_the_fully_hidden_decision() {
+        assert_eq!(
+            decide_recovery(MarkerState::Technique(FULLY), observed_unknown(false)),
+            RecoveryAction::ShowTaskbar
+        );
+        assert_eq!(
+            decide_recovery(MarkerState::Technique(FULLY), observed_unknown(true)),
+            RecoveryAction::Nothing
+        );
     }
 
     #[derive(Debug, PartialEq)]

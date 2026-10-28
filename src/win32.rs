@@ -776,7 +776,7 @@ pub(crate) fn record_drift_attempt(hwnd: HWND) {
 }
 
 /// Forgets `hwnd` (called when it is destroyed) along with its remembered
-/// restore state and drift attempt time.
+/// restore state, drift attempt time and hung-window log entry.
 pub fn forget_applied_window(hwnd: HWND) {
     unmark_applied_window(hwnd);
     lock_store(&RESTORE_STATES).forget(hwnd as isize);
@@ -1072,8 +1072,11 @@ pub(crate) fn show_taskbar_full() -> Result<u32, Win32Error> {
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
     // covered or that slid away. Re-send the appbar state read just now,
     // unchanged, then raise without activating.
-    let flags = read_appbar_flags(hwnd);
-    resend_appbar_state(|| flags, |lparam| send_appbar_setstate(hwnd, lparam));
+    // Unknown flags (Explorer hung since the check above) are not guessed.
+    let flags = read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?;
+    let mut sent = Ok(());
+    resend_appbar_state(|| flags, |lparam| sent = send_appbar_setstate(hwnd, lparam));
+    sent?;
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
     // SWP_NOSIZE, and SWP_NOACTIVATE keeps focus where it is.
     unsafe {
@@ -1161,7 +1164,9 @@ pub(crate) fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
     if !rect_ok {
         log!("taskbar judgement: GetWindowRect failed; rect is a zeroed placeholder");
     }
-    let windows_auto_hide = read_appbar_flags(taskbar) & ABS_AUTOHIDE != 0;
+    // Unknown flags (Explorer hung) are judged like Windows' auto-hide:
+    // visibility alone decides, so nothing is acted on from a guess.
+    let windows_auto_hide = read_appbar_flags(taskbar).is_none_or(|f| f & ABS_AUTOHIDE != 0);
     // Without a real rect, position and cover can't be judged: fall back to
     // visibility alone, exactly as under Windows' auto-hide.
     let verdict = judge_taskbar_hidden(
@@ -1209,12 +1214,13 @@ pub(crate) fn restore_taskbar_raw(
 }
 
 /// Reads the taskbar as it really is: `(window visible, appbar auto-hide
-/// state)`. Used by startup recovery. OS-facing.
-pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Error> {
+/// state). Used by startup recovery. The state is None when Explorer is
+/// hung (unknown, not AlwaysVisible). OS-facing.
+pub(crate) fn observe_taskbar() -> Result<(bool, Option<TaskbarAutohideState>), Win32Error> {
     let hwnd = find_taskbar_window()?;
     // Safety: `hwnd` is a live handle just resolved above.
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    Ok((visible, state_from_flags(read_appbar_flags(hwnd))))
+    Ok((visible, read_appbar_flags(hwnd).map(state_from_flags)))
 }
 
 /// Whether the taskbar is already hidden by any means, for the zone editor's
@@ -1222,7 +1228,8 @@ pub(crate) fn observe_taskbar() -> Result<(bool, TaskbarAutohideState), Win32Err
 /// auto-hide flag set (a HoverReveal hide, or the user's own auto-hide
 /// setting). Either way the editor must not take ownership of it. Direct
 /// reads only, no on-screen judgement. `false` when the taskbar cannot be
-/// found.
+/// found; `true` when its auto-hide state is unknown (Explorer hung), so the
+/// editor leaves it alone.
 ///
 /// OS-facing; not exercised by this crate's automated tests -- see module docs.
 pub fn taskbar_hidden_flag() -> bool {
@@ -1231,7 +1238,7 @@ pub fn taskbar_hidden_flag() -> bool {
     };
     // Safety: plain query on a live handle.
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    !visible || read_appbar_flags(hwnd) & ABS_AUTOHIDE != 0
+    !visible || read_appbar_flags(hwnd).is_none_or(|f| f & ABS_AUTOHIDE != 0)
 }
 
 /// `crate::taskbar::taskbar_debug_state` for an already-gathered judgement;
@@ -1247,7 +1254,8 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
     } = *judgement;
     // Safety: plain query, no arguments.
     let foreground = unsafe { GetForegroundWindow() };
-    let flags = read_appbar_flags(taskbar);
+    let flags =
+        read_appbar_flags(taskbar).map_or_else(|| "unknown".to_string(), |f| format!("{f:#x}"));
     let foreground_exe = if foreground.is_null() {
         "none".to_string()
     } else {
@@ -1261,7 +1269,7 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
     };
     let (armed, has_restore) = armed;
     format!(
-        "visible={visible} appbar_flags={flags:#x} rect=({},{})-({},{}) on_top_at_center={on_top} \
+        "visible={visible} appbar_flags={flags} rect=({},{})-({},{}) on_top_at_center={on_top} \
          judged_hidden={verdict:?} foreground={foreground:?} ({foreground_exe}) armed_windows={armed} armed_restore={has_restore}",
         rect.left, rect.top, rect.right, rect.bottom
     )
@@ -1288,9 +1296,9 @@ pub(crate) fn describe_taskbar(judgement: &TaskbarJudgement, armed: (usize, bool
 /// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
 pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32Error> {
     let hwnd = find_taskbar_window()?;
-    let current_flags = read_appbar_flags(hwnd);
-    write_appbar_state(hwnd, current_flags, state);
-    Ok(())
+    // Never write from a guessed value: that would clear always-on-top.
+    let current_flags = read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?;
+    write_appbar_state(hwnd, current_flags, state)
 }
 
 /// Sends the actual `SHAppBarMessage(ABM_SETSTATE, ...)` write, given a
@@ -1302,15 +1310,21 @@ pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32E
 ///
 /// # Unmarked: call through `crate::taskbar`
 /// Does not touch the recovery marker; only `crate::taskbar` may call it.
-pub(crate) fn write_appbar_state(hwnd: HWND, current_flags: u32, state: TaskbarAutohideState) {
-    send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize);
+pub(crate) fn write_appbar_state(
+    hwnd: HWND,
+    current_flags: u32,
+    state: TaskbarAutohideState,
+) -> Result<(), Win32Error> {
+    send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize)
 }
 
-/// Sends `SHAppBarMessage(ABM_SETSTATE)` with the given full-state `lParam`.
-fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
-    // The call is sent to Explorer's thread and would block on a hung one.
+/// Sends SHAppBarMessage(ABM_SETSTATE) with the given full-state lParam.
+/// Fails with [Win32Error::WindowHung] without sending when Explorer is hung
+/// (the call is sent to its thread and would block), so callers keep their
+/// recovery mark.
+fn send_appbar_setstate(hwnd: HWND, lparam: isize) -> Result<(), Win32Error> {
     if taskbar_is_hung(hwnd) {
-        return;
+        return Err(Win32Error::WindowHung);
     }
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
@@ -1324,6 +1338,7 @@ fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
     unsafe {
         SHAppBarMessage(ABM_SETSTATE, &mut data);
     }
+    Ok(())
 }
 
 /// Reads the appbar's current `ABM_GETSTATE` flags (a combination of
@@ -1333,11 +1348,12 @@ fn send_appbar_setstate(hwnd: HWND, lparam: isize) {
 /// `crate::taskbar::hide_taskbar`'s `HoverReveal` arm (which needs only the auto-hide bit, via
 /// [`state_from_flags`]).
 ///
-/// Returns 0 (flags unknown) without calling when the taskbar's thread is
-/// hung: `ABM_GETSTATE` is sent to Explorer and would block on it.
-pub(crate) fn read_appbar_flags(hwnd: HWND) -> u32 {
+/// Returns None (flags unknown) without calling when the taskbar's thread
+/// is hung: ABM_GETSTATE is sent to Explorer and would block on it. Callers
+/// must not treat unknown as `0` (no auto-hide, not always-on-top).
+pub(crate) fn read_appbar_flags(hwnd: HWND) -> Option<u32> {
     if taskbar_is_hung(hwnd) {
-        return 0;
+        return None;
     }
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
@@ -1348,7 +1364,7 @@ pub(crate) fn read_appbar_flags(hwnd: HWND) -> u32 {
     // `ABM_GETSTATE` contract; `SHAppBarMessage` takes only `dwMessage` and a
     // pointer to `data`, both valid here. `ABM_GETSTATE` does not read
     // `data.lParam`, so it's left zeroed.
-    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+    Some(unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 })
 }
 
 /// Interprets `ABM_GETSTATE`'s raw flags (as read by [`read_appbar_flags`])

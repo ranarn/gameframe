@@ -52,7 +52,9 @@ fn mark_and_hide_taskbar_window(hwnd: HWND) -> Result<(), Win32Error> {
     if taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden).is_some() {
         // A new FullyHidden session (not a join): read and remember the appbar
         // flags, before the hide, to compare at its end.
-        taskbar_recovery::note_session_start_flags(read_appbar_flags(hwnd));
+        if let Some(flags) = read_appbar_flags(hwnd) {
+            taskbar_recovery::note_session_start_flags(flags);
+        }
     }
     win32::hide_taskbar_window(hwnd);
     Ok(())
@@ -97,13 +99,20 @@ pub fn hide_taskbar(mode: TaskbarHideMode) -> Result<TaskbarHideRestore, Win32Er
         TaskbarHideMode::HoverReveal => {
             let hwnd = find_taskbar_window()?;
             ensure_taskbar_responsive(hwnd)?;
-            let current_flags = read_appbar_flags(hwnd);
+            // Unknown flags (Explorer hung since the check): no hide, no mark.
+            let current_flags = read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?;
             let current = state_from_flags(current_flags);
             let restore = plan_taskbar_hide(mode, current);
-            // `write_appbar_state` cannot fail; if it ever can, keep the handle
-            // and `undo_hide` it on the error path.
-            let _ = taskbar_recovery::mark_hidden(restore);
-            write_appbar_state(hwnd, current_flags, TaskbarAutohideState::AutoHidden);
+            let undo = taskbar_recovery::mark_hidden(restore);
+            if let Err(e) =
+                write_appbar_state(hwnd, current_flags, TaskbarAutohideState::AutoHidden)
+            {
+                // The hide never happened: don't claim it did.
+                if let Some(undo) = undo {
+                    taskbar_recovery::undo_hide(undo);
+                }
+                return Err(e);
+            }
             Ok(restore)
         }
     }
@@ -364,7 +373,7 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
             // Marker first, recording the state to go back to.
             let hwnd = find_taskbar_window()?;
             ensure_taskbar_responsive(hwnd)?;
-            let prior = state_from_flags(read_appbar_flags(hwnd));
+            let prior = state_from_flags(read_appbar_flags(hwnd).ok_or(Win32Error::WindowHung)?);
             let undo = taskbar_recovery::mark_hidden(TaskbarHideRestore::HoverReveal(prior));
             if let Err(e) = win32::set_appbar_state(target) {
                 // The hide never happened: don't claim it did.
@@ -492,13 +501,14 @@ pub fn set_taskbar_hide_absolute_armed(
 /// OS-facing: `judgement` is the just-gathered state of the real taskbar
 /// (`HoverReveal` additionally reads its appbar flags). Not exercised by this
 /// crate's automated tests -- see the `win32` module docs.
-fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement) -> bool {
+///
+/// `None` when HoverReveal's flags are unknown (Explorer hung): the caller
+/// must not act on a guess.
+fn is_taskbar_hidden(mode: TaskbarHideMode, judgement: &win32::TaskbarJudgement) -> Option<bool> {
     match mode {
-        TaskbarHideMode::FullyHidden => judgement.verdict.is_some(),
-        TaskbarHideMode::HoverReveal => {
-            state_from_flags(read_appbar_flags(judgement.taskbar))
-                == TaskbarAutohideState::AutoHidden
-        }
+        TaskbarHideMode::FullyHidden => Some(judgement.verdict.is_some()),
+        TaskbarHideMode::HoverReveal => read_appbar_flags(judgement.taskbar)
+            .map(|flags| state_from_flags(flags) == TaskbarAutohideState::AutoHidden),
     }
 }
 
@@ -530,7 +540,10 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
         "taskbar hotkey ({mode:?}): before: {}",
         describe_taskbar(&judgement)
     );
-    let hidden = is_taskbar_hidden(mode, &judgement);
+    // Explorer hung: neither hide nor show on a guess.
+    let Some(hidden) = is_taskbar_hidden(mode, &judgement) else {
+        return Err(Win32Error::WindowHung);
+    };
     let reason = judgement
         .verdict
         .filter(|_| mode == TaskbarHideMode::FullyHidden);
@@ -607,7 +620,9 @@ pub(crate) fn live_reapply_running_window(
     // opt-out so auto-apply and drift re-apply cover the window again.
     win32::allow_auto_apply(hwnd);
 
-    if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode) {
+    if let Err(e) = set_taskbar_hide_absolute_armed(hwnd, hide_taskbar, mode)
+        && !e.is_window_hung()
+    {
         log!("live re-apply: failed to set taskbar auto-hide for {display_name}: {e}");
     }
 
