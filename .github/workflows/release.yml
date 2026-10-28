@@ -83,14 +83,24 @@ jobs:
           PREV_VERSION: ${{ steps.next.outputs.previous-version }}
           ALLOW_MAJOR: ${{ inputs.allow-major }}
         run: |
-          prev_tag=$PREV_TAG
-          prev=${PREV_VERSION:-0.0.0}
+          # Release Pilot reports no previous tag as an empty value. Only then
+          # is 0.0.0 the right baseline; a tag without a version means the
+          # output is missing or renamed, so fail closed rather than treat
+          # every run as coming from 0.0.0.
+          if [ -z "$PREV_TAG" ]; then
+            prev=0.0.0
+          elif [ -z "$PREV_VERSION" ]; then
+            echo "::error::Release Pilot reported previous tag '$PREV_TAG' but no previous-version output; refusing to guess the baseline."
+            exit 1
+          else
+            prev=$PREV_VERSION
+          fi
           prev_major=${prev%%.*}
           next_major=${VERSION%%.*}
           # Fail closed: a non-numeric major would make the comparison below
           # error out inside `if` and silently fall through to "allowed".
           if ! [[ "$prev_major" =~ ^[0-9]+$ && "$next_major" =~ ^[0-9]+$ ]]; then
-            echo "::error::Cannot compare versions: previous '$prev' (tag '$prev_tag'), next '$VERSION'. Both must start with a numeric major."
+            echo "::error::Cannot compare versions: previous '$prev' (tag '$PREV_TAG'), next '$VERSION'. Both must start with a numeric major."
             exit 1
           fi
           if [ "$next_major" -gt "$prev_major" ] && [ "$prev_major" -lt 1 ]; then
@@ -176,16 +186,20 @@ jobs:
           REUSED: ${{ steps.existing.outputs.exists }}
         run: |
           if [ "$REUSED" = "true" ]; then
-            # `gh release view <tag>` uses the tag endpoint, which only
-            # returns published releases, so a draft from the first attempt
-            # is found by listing instead (the list includes drafts). Any
-            # lookup failure (network, auth, rate limit) must fail the job
-            # rather than risk a duplicate draft.
-            if ! releases=$(gh release list --limit 1000 --json tagName,isDraft 2>&1); then
-              echo "::error::Could not list releases: $releases"
+            # Find an existing release (draft or published, either counts on a
+            # re-run) by listing, which includes drafts, so the lookup does
+            # not depend on gh's tag-to-draft fallback. Any lookup failure
+            # (network, auth, rate limit, bad JSON) must fail the job rather
+            # than risk a duplicate draft.
+            if ! releases=$(gh release list --limit 1000 --json tagName); then
+              echo "::error::Could not list releases"
               exit 1
             fi
-            if [ "$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | length' <<<"$releases")" != "0" ]; then
+            if ! count=$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | length' <<<"$releases") || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not parse the release list"
+              exit 1
+            fi
+            if [ "$count" -gt 0 ]; then
               echo "Found the existing release for $PLANNED"
             else
               echo "::warning::No release exists for $PLANNED; creating a draft with generated notes. Review the notes before publishing."
