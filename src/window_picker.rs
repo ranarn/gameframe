@@ -5,14 +5,16 @@
 //! libraries (which can stall for seconds on a spun-down or unreachable
 //! drive). A tray hover therefore only calls [`WindowPicker::request`], which
 //! starts one worker thread; the finished list comes back through a channel
-//! and a no-op thread message wakes the event loop, which then rebuilds the
-//! menu from [`WindowPicker::take_latest`].
+//! and a no-op message to the command window wakes the event loop, which then
+//! rebuilds the menu from [`WindowPicker::take_latest`]. A menu that is
+//! already open (its modal loop does not run the event loop) keeps showing the
+//! previous list; the next open shows the new one.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL};
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, PostThreadMessageW, WM_NULL};
 
 /// One picker entry: the window handle (as `isize`, so it is `Send`) and its
 /// title.
@@ -31,6 +33,35 @@ impl RefreshGate {
 
     fn finish(&self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Releases the gate when dropped, so a worker that panics cannot leave the
+/// picker refusing every later request.
+struct GateGuard(Arc<RefreshGate>);
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+/// Wakes the event loop so it picks up the finished list. Posts to the
+/// process's real command window rather than the thread: a thread message is
+/// dropped by a modal loop, a window message is dispatched. Falls back to a
+/// thread message if the window does not exist.
+fn wake_loop(loop_thread: u32) {
+    // Safety: plain integer/handle arguments; a failed post only delays the
+    // menu rebuild to the next message.
+    unsafe {
+        match crate::instance_channel::command_window() {
+            Some(hwnd) => {
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+            }
+            None => {
+                PostThreadMessageW(loop_thread, WM_NULL, 0, 0);
+            }
+        }
     }
 }
 
@@ -68,6 +99,10 @@ impl WindowPicker {
         let spawned = std::thread::Builder::new()
             .name("window-picker".into())
             .spawn(move || {
+                // Released when the closure ends -- also on a panic -- and
+                // after the send below, so a newer worker can never queue its
+                // list ahead of this one.
+                let _guard = GateGuard(gate);
                 let tracked_exes = match crate::profile_store::load(&config_dir) {
                     Ok(config) => config
                         .tracked_games
@@ -83,15 +118,12 @@ impl WindowPicker {
                     .into_iter()
                     .map(|(hwnd, title)| (hwnd as isize, title))
                     .collect();
-                gate.finish();
                 if sender.send(entries).is_ok() {
-                    // Safety: plain integer arguments; a failed post only
-                    // delays the menu rebuild to the next message.
-                    unsafe { PostThreadMessageW(loop_thread, WM_NULL, 0, 0) };
+                    wake_loop(loop_thread);
                 }
             });
+        // A failed spawn drops the closure, and with it the gate guard.
         if let Err(e) = spawned {
-            self.gate.finish();
             log!("couldn't start the window picker refresh: {e}");
         }
     }
@@ -118,6 +150,19 @@ mod tests {
         let gate = RefreshGate::default();
         assert!(gate.try_begin());
         gate.finish();
+        assert!(gate.try_begin());
+    }
+
+    #[test]
+    fn a_panicking_worker_still_releases_the_gate() {
+        let gate = Arc::new(RefreshGate::default());
+        assert!(gate.try_begin());
+        let worker_gate = Arc::clone(&gate);
+        let worker = std::thread::spawn(move || {
+            let _guard = GateGuard(worker_gate);
+            panic!("worker failed");
+        });
+        assert!(worker.join().is_err());
         assert!(gate.try_begin());
     }
 }

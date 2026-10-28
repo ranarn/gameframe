@@ -463,8 +463,10 @@ fn drain_events(
     // at no extra cost. No crate-native "menu about to show" event exists
     // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
     // comment).
-    // A background window-list refresh (started by a hover below) that has
-    // finished since the last pass swaps its result into the submenu.
+    // The window list is built on a worker thread (see
+    // `Tray::refresh_apply_to_window_menu`); a refresh started by a hover
+    // below that has finished since the last pass swaps its result into the
+    // submenu here.
     tray.apply_finished_window_refresh();
 
     crate::watchdog::step("drain_events: tray icon events");

@@ -274,40 +274,20 @@ impl Tray {
     /// previous list until [`Self::apply_finished_window_refresh`] swaps the
     /// new one in. Never blocks the UI thread.
     ///
-    /// Live-refresh mechanism: `muda`/`tray-icon` (as vendored -- see
-    /// `Cargo.toml`) expose no "menu about to show"/`WM_INITMENUPOPUP`-style
-    /// event to hook a just-in-time rebuild to (confirmed by inspecting the
-    /// vendored crate sources; there's no such event in either crate's
-    /// public API, nor any `WM_INITMENUPOPUP` handling in `muda`'s Windows
-    /// backend). Instead, [`crate::app::run_event_loop`] calls this method
-    /// when it observes a [`tray_icon::TrayIconEvent::Enter`] or
-    /// [`tray_icon::TrayIconEvent::Click`] event on
-    /// [`tray_icon::TrayIconEvent::receiver`] -- i.e. right before the user
-    /// is actually about to see the menu, since (per `tray-icon`'s Windows
-    /// backend) the mouse must hover onto the tray icon (`Enter`) before a
-    /// click on it (`Click`) can open the context menu. It is deliberately not
-    /// called before every pumped message: `tray-icon` sets a 15ms `WM_TIMER`
-    /// while the mouse merely rests near the icon, which would drive a full
-    /// `EnumWindows` + per-window `GetWindowTextW` + submenu rebuild (real
-    /// Win32 syscalls) up to ~66 times/second just from the cursor resting
-    /// nearby -- needlessly expensive on this process's one and only message
-    /// loop. A secondary, less certain consideration also favors keeping the
-    /// refresh off the hot path: per the documented
-    /// `GetWindowText`/`GetWindowTextW` contract, a *same-process* target
-    /// window causes a `WM_GETTEXT` to be sent via `SendMessage` (which can
-    /// block if that window's own message handling is stuck), whereas a
-    /// *cross-process* target -- the common case when enumerating the whole
-    /// desktop -- is documented to read the window's cached caption text
-    /// directly instead, specifically so callers don't hang on an
-    /// unresponsive foreign process. So the SendMessage-hang risk this
-    /// refresh could hit is narrower than "any hung window anywhere on the
-    /// desktop" -- it's closer to "one of GameFrame's own top-level windows
-    /// (e.g. an open Settings window) getting stuck", which is a real but
-    /// much smaller surface. Gating on `Enter`/`Click` avoids that residual
-    /// risk too, at effectively no cost.
+    /// `muda`/`tray-icon` (as vendored) expose no "menu about to show"
+    /// event, so [`crate::app::run_event_loop`] calls this on a
+    /// [`tray_icon::TrayIconEvent::Enter`] or
+    /// [`tray_icon::TrayIconEvent::Click`] -- the hover that precedes a click.
+    /// It is not called before every pumped message: `tray-icon` sets a 15ms
+    /// `WM_TIMER` while the cursor rests near the icon. At most one refresh
+    /// runs at a time.
     ///
-    /// OS-facing: enumerates real windows and mutates a real `muda` submenu.
-    /// Not exercised by this crate's automated tests -- see module docs.
+    /// Known limit: the tray popup's modal menu loop does not run the event
+    /// loop, so a menu that is already open keeps the previous list; the
+    /// hover normally started the refresh early enough for the next open.
+    ///
+    /// OS-facing; not exercised by this crate's automated tests -- see module
+    /// docs.
     pub fn refresh_apply_to_window_menu(&self, config_dir: &std::path::Path) {
         self.picker.request(config_dir.to_path_buf());
     }
