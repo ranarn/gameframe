@@ -28,6 +28,7 @@ mod update_ui;
 mod updater;
 mod version;
 mod watchdog;
+mod wide;
 mod win32;
 mod window_filter;
 mod window_picker;

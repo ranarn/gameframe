@@ -45,6 +45,9 @@ windows-sys = { version = "0.61.2", features = [
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3.27.0"
 
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 opt-level = "z"
 lto = true

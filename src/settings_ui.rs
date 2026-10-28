@@ -19,6 +19,7 @@
 use crate::autostart::{self, AutostartError};
 use crate::cursor_style::{self, CursorShape};
 use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
+use crate::instance_channel::SETTINGS_TITLE;
 use crate::keyboard_hook;
 use crate::placement;
 use crate::profile_store::{
@@ -35,9 +36,6 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-
-/// Title of the Settings window; `crate::instance_channel` finds the window by it.
-pub(crate) const SETTINGS_TITLE: &str = "GameFrame Settings";
 
 /// The editable state backing the Settings window: the single optional
 /// [`Zone`], the three hotkey binding strings (empty = unbound) and the other
@@ -534,10 +532,11 @@ pub(crate) fn persist_zone(
     config_dir: &Path,
     zone: Option<Zone>,
 ) -> Result<Config, SettingsUiError> {
-    let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
-    let updated = config_with_zone(config, zone);
-    profile_store::save(config_dir, &updated).map_err(SettingsUiError::Config)?;
-    Ok(updated)
+    profile_store::update(config_dir, |config| {
+        *config = config_with_zone(std::mem::take(config), zone);
+        config.clone()
+    })
+    .map_err(SettingsUiError::Config)
 }
 
 /// Live re-applies the Zone on disk to every running tracked game in `games`
@@ -1056,20 +1055,26 @@ pub fn run_settings_window(
 
     loop {
         match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
-            SettingsExit::Saved(mut config, start_with_windows) => {
+            SettingsExit::Saved(config, start_with_windows) => {
                 // Keep what the tray and hotkeys changed on disk while
-                // Settings was open. A failed re-read must not abort the Save.
-                match profile_store::load(config_dir) {
-                    Ok(on_disk) => {
-                        config.tracked_games = merge_tracked_games(
-                            &opened_games,
-                            std::mem::take(&mut config.tracked_games),
-                            &on_disk.tracked_games,
-                        );
-                    }
-                    Err(e) => log!("could not re-read config to merge on Save: {e}"),
-                }
-                profile_store::save(config_dir, &config).map_err(SettingsUiError::Config)?;
+                // Settings was open. The merge and the write are serialized
+                // against other `update` calls, so a tray upsert cannot land
+                // between the re-read and the save. A failure (re-read or
+                // write) is surfaced rather than retried unmerged outside
+                // that serialization: if the disk cannot be read it can
+                // hardly be written.
+                profile_store::update(config_dir, |on_disk| {
+                    let tracked_games = merge_tracked_games(
+                        &opened_games,
+                        config.tracked_games.clone(),
+                        &on_disk.tracked_games,
+                    );
+                    *on_disk = Config {
+                        tracked_games,
+                        ..config.clone()
+                    };
+                })
+                .map_err(SettingsUiError::Config)?;
                 // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).

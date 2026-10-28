@@ -555,6 +555,7 @@ mod tests {
         // The real GetGUIThreadInfo query on this (test) thread, which is in
         // no menu or move/size loop; an unknown thread id fails and counts as
         // not modal.
+        // SAFETY: no arguments or preconditions.
         let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         assert!(!thread_in_user_modal(current));
         assert!(!thread_in_user_modal(0));

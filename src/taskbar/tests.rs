@@ -1,6 +1,13 @@
 use super::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
+/// Non-zero when hwnd is visible. The ignored real-desktop tests only pass it
+/// the live taskbar window (or a window handle they created).
+fn window_visible(hwnd: HWND) -> i32 {
+    // SAFETY: `IsWindowVisible` only reads window state and tolerates any handle.
+    unsafe { IsWindowVisible(hwnd) }
+}
+
 #[test]
 fn armed_state_exposes_the_session_restore_and_not_after_the_session_ends() {
     let mut state = ArmedTaskbarWindows::default();
@@ -156,14 +163,14 @@ fn hide_taskbar_completely_and_show_taskbar_actually_change_the_real_taskbars_wi
 
     hide_taskbar_completely()
         .expect("hide_taskbar_completely should succeed on a real desktop session");
-    let visible_while_hidden = unsafe { IsWindowVisible(hwnd) };
+    let visible_while_hidden = window_visible(hwnd);
     assert_eq!(
         visible_while_hidden, 0,
         "Shell_TrayWnd should be invisible after hide_taskbar_completely"
     );
 
     show_taskbar().expect("show_taskbar should succeed on a real desktop session");
-    let visible_after_show = unsafe { IsWindowVisible(hwnd) };
+    let visible_after_show = window_visible(hwnd);
     assert_ne!(
         visible_after_show, 0,
         "Shell_TrayWnd should be visible again after show_taskbar"
@@ -210,7 +217,7 @@ fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_re
 
     set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
         .expect("hide should succeed on a real desktop session");
-    let visible_while_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_while_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
         visible_while_hidden, 0,
         "Shell_TrayWnd should be invisible after arming a hide for fake_game_hwnd"
@@ -222,7 +229,7 @@ fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_re
         .expect("a restore should be armed for the window that was just hidden");
     restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
 
-    let visible_after_restore = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_after_restore = window_visible(taskbar_hwnd);
     assert_ne!(
         visible_after_restore, 0,
         "Shell_TrayWnd should be visible again after the simulated window-close restore"
@@ -257,7 +264,7 @@ fn take_armed_taskbar_restore_for_window_leaves_an_unrelated_windows_hide_untouc
         take_armed_taskbar_restore_for_window(unrelated_hwnd).is_none(),
         "an unrelated window's destroy event must not take the armed restore"
     );
-    let visible_after_unrelated_destroy = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_after_unrelated_destroy = window_visible(taskbar_hwnd);
     assert_eq!(
         visible_after_unrelated_destroy, 0,
         "Shell_TrayWnd should remain hidden -- an unrelated window's close must have no effect"
@@ -303,7 +310,7 @@ fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_
         .expect("hiding for window A should succeed on a real desktop session");
     set_taskbar_hide_absolute_armed(window_b, true, TaskbarHideMode::FullyHidden)
         .expect("hiding for window B (joining the already-active session) should succeed");
-    let visible_while_both_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_while_both_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
         visible_while_both_hidden, 0,
         "Shell_TrayWnd should be invisible while both windows are armed"
@@ -314,7 +321,7 @@ fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_
         take_armed_taskbar_restore_for_window(window_a).is_none(),
         "window B is still armed, so window A closing must not yield a restore value yet"
     );
-    let visible_after_a_closes = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_after_a_closes = window_visible(taskbar_hwnd);
     assert_eq!(
         visible_after_a_closes, 0,
         "Shell_TrayWnd must remain hidden -- window B still wants it hidden (a premature restore is what this test guards against)"
@@ -325,7 +332,7 @@ fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_
         .expect("window B was the last armed window, so a restore value should now be returned");
     restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
 
-    let visible_after_b_closes = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_after_b_closes = window_visible(taskbar_hwnd);
     assert_ne!(
         visible_after_b_closes, 0,
         "Shell_TrayWnd should be visible again once the last armed window closes"
@@ -357,7 +364,7 @@ fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar
 
     set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
         .expect("hide should succeed on a real desktop session");
-    let visible_while_hidden = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_while_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
         visible_while_hidden, 0,
         "Shell_TrayWnd should be invisible after arming a hide"
@@ -369,7 +376,7 @@ fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar
         take_any_armed_taskbar_restore().expect("a restore should be armed after the hide above");
     restore_taskbar(restore).expect("restore_taskbar should succeed on a real desktop session");
 
-    let visible_after_restore = unsafe { IsWindowVisible(taskbar_hwnd) };
+    let visible_after_restore = window_visible(taskbar_hwnd);
     assert_ne!(
         visible_after_restore, 0,
         "Shell_TrayWnd should be visible again after the simulated tray-Exit restore"
@@ -405,7 +412,7 @@ fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
     set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
         .expect("hide should succeed on a real desktop session");
     assert_eq!(
-        unsafe { IsWindowVisible(taskbar_hwnd) },
+        window_visible(taskbar_hwnd),
         0,
         "Shell_TrayWnd should be hidden by the simulated game launch"
     );
@@ -415,7 +422,7 @@ fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
     toggle_taskbar_hide(TaskbarHideMode::FullyHidden)
         .expect("toggle should succeed on a real desktop session");
     assert_ne!(
-        unsafe { IsWindowVisible(taskbar_hwnd) },
+        window_visible(taskbar_hwnd),
         0,
         "toggle should show the taskbar since it was actually hidden"
     );
@@ -425,7 +432,7 @@ fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
     toggle_taskbar_hide(TaskbarHideMode::FullyHidden)
         .expect("toggle should succeed on a real desktop session");
     assert_eq!(
-        unsafe { IsWindowVisible(taskbar_hwnd) },
+        window_visible(taskbar_hwnd),
         0,
         "toggle should hide the taskbar again since it was actually visible"
     );

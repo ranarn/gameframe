@@ -37,6 +37,7 @@
 
 use crate::profile_store::TaskbarHideMode;
 use crate::region_calc::{MonitorGeometry, Region};
+use crate::wide::encode_wide;
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
@@ -465,6 +466,7 @@ fn set_window_long(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, value: u32) -> Resu
 /// Reads a window's current bounding rectangle (screen coordinates) as a
 /// [`Region`].
 fn get_window_region(hwnd: HWND) -> Result<Region, Win32Error> {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut rect: RECT = unsafe { std::mem::zeroed() };
     // Safety: `hwnd` is a live handle; `rect` is a valid, correctly-sized
     // out-pointer for `GetWindowRect` to write into.
@@ -487,6 +489,7 @@ fn get_restorable_region(hwnd: HWND, maximized: bool) -> Result<Region, Win32Err
     if !maximized {
         return get_window_region(hwnd);
     }
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
     placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
     // Safety: `hwnd` is a live handle; `placement` is a valid out-pointer
@@ -526,6 +529,7 @@ fn workspace_to_screen(region: Region, work_origin: (i32, i32)) -> Region {
 /// The screen position of the top-left of the work area of the monitor `hwnd`
 /// is on.
 fn work_area_origin(hwnd: HWND) -> Result<(i32, i32), Win32Error> {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // Safety: `hwnd` is a live handle; `info` is a valid out-pointer with
@@ -695,16 +699,151 @@ impl RestoreStore {
     }
 }
 
-static RESTORE_STATES: std::sync::Mutex<RestoreStore> = std::sync::Mutex::new(RestoreStore::new());
+/// What a deferred re-check re-runs (see [`PlacedWindows::set_recheck`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RecheckKind {
+    /// The drift handler, for a window GameFrame placed.
+    Drift,
+    /// Auto-apply, for a tracked game that was hung when it took the
+    /// foreground and so was never placed.
+    AutoApply,
+}
 
-fn lock_store(store: &std::sync::Mutex<RestoreStore>) -> std::sync::MutexGuard<'_, RestoreStore> {
+/// Everything GameFrame remembers per window handle, in one place behind one
+/// lock ([`PLACED_WINDOWS`]) so [`Self::forget`] is the single cleanup for a
+/// window that is gone: a reused handle can never inherit a stale restore
+/// state, auto-apply opt-out, rate-limit time, hung-log entry or timer.
+///
+/// Pure data (no OS calls) so it is unit testable. The only other per-window
+/// state, the reference-counted armed-taskbar set (`crate::taskbar`), is
+/// shared across windows (it owns one taskbar restore for all of them), so it
+/// stays there; [`crate::launch_watcher`]'s destroy callback releases it next
+/// to [`forget_window`].
+#[derive(Debug, Default)]
+pub(crate) struct PlacedWindows {
+    /// Pre-strip restore states and the windows the user restored by hand.
+    restore: RestoreStore,
+    /// Windows the Zone was applied to, with their owning pid (the drift
+    /// watcher's registry).
+    applied: Vec<(isize, u32)>,
+    /// Drift re-apply rate limit, cap and once-only failure logs.
+    drift: DriftAttempts,
+    /// Hung-window skips already logged.
+    hung: HungSkipLog,
+    /// The one pending deferred re-check (thread timer id) per window and kind.
+    rechecks: std::collections::BTreeMap<(isize, RecheckKind), usize>,
+}
+
+impl PlacedWindows {
+    const fn new() -> Self {
+        Self {
+            restore: RestoreStore::new(),
+            applied: Vec::new(),
+            drift: DriftAttempts::new(),
+            hung: HungSkipLog::new(),
+            rechecks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Drops everything remembered about `window` (it is gone) and returns the
+    /// thread timer ids of its pending re-checks, which the caller must kill
+    /// (this type makes no OS calls).
+    fn forget(&mut self, window: isize) -> Vec<usize> {
+        self.restore.forget(window);
+        self.applied.retain(|(h, _)| *h != window);
+        self.drift.reset(window);
+        self.hung.logged.remove(&window);
+        let mut timers = Vec::new();
+        for kind in [RecheckKind::Drift, RecheckKind::AutoApply] {
+            timers.extend(self.rechecks.remove(&(window, kind)));
+        }
+        timers
+    }
+
+    /// Brings the applied-window registry in line with the live windows (see
+    /// [`reconcile_entries`]) and fully [`Self::forget`]s every window that
+    /// turned out to be dead (killed without an `EVENT_OBJECT_DESTROY`), so its
+    /// restore state, rate-limit time and timers go too. Returns the pids
+    /// owning applied windows, whether some pid is still unknown, and the
+    /// timer ids the caller must kill.
+    fn reconcile_applied(
+        &mut self,
+        probe: impl Fn(isize) -> Option<u32>,
+    ) -> (std::collections::BTreeSet<u32>, bool, Vec<usize>) {
+        let before: Vec<isize> = self.applied.iter().map(|(h, _)| *h).collect();
+        let unresolved = reconcile_entries(&mut self.applied, probe);
+        let mut timers = Vec::new();
+        for window in before {
+            if !self.applied.iter().any(|(h, _)| *h == window) {
+                timers.extend(self.forget(window));
+            }
+        }
+        (pids_of(&self.applied), unresolved, timers)
+    }
+
+    /// Whether a re-check of `kind` is already pending for `window`.
+    pub(crate) fn has_recheck(&self, window: isize, kind: RecheckKind) -> bool {
+        self.rechecks.contains_key(&(window, kind))
+    }
+
+    /// Records `timer` as the pending re-check of `kind` for `window`. Kinds
+    /// are tracked separately, so a pending drift re-check never swallows an
+    /// auto-apply retry of the same window (or the reverse).
+    pub(crate) fn set_recheck(&mut self, window: isize, kind: RecheckKind, timer: usize) {
+        self.rechecks.insert((window, kind), timer);
+    }
+
+    /// Removes and returns the re-check whose thread timer is `timer`.
+    pub(crate) fn take_recheck_by_timer(&mut self, timer: usize) -> Option<(isize, RecheckKind)> {
+        let key = self
+            .rechecks
+            .iter()
+            .find_map(|(key, id)| (*id == timer).then_some(*key))?;
+        self.rechecks.remove(&key);
+        Some(key)
+    }
+}
+
+static PLACED_WINDOWS: std::sync::Mutex<PlacedWindows> =
+    std::sync::Mutex::new(PlacedWindows::new());
+
+fn lock_store(store: &std::sync::Mutex<PlacedWindows>) -> std::sync::MutexGuard<'_, PlacedWindows> {
     store.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Runs `f` on the process-wide [`PlacedWindows`] under its lock. Poison
+/// tolerant: the maps and sets hold no invariant a panic could break. Never
+/// call anything that pumps messages, or takes this lock, from inside `f`.
+fn with_placed<R>(f: impl FnOnce(&mut PlacedWindows) -> R) -> R {
+    f(&mut lock_store(&PLACED_WINDOWS))
+}
+
+/// Whether a re-check of `kind` is already pending for `hwnd`.
+pub(crate) fn recheck_pending(hwnd: HWND, kind: RecheckKind) -> bool {
+    with_placed(|p| p.has_recheck(hwnd as isize, kind))
+}
+
+/// Records `timer` as the pending re-check of `kind` for `hwnd`. Returns the
+/// timer it displaced, if a concurrent caller armed one first; the caller
+/// must kill it. The timer itself is created and killed outside the registry
+/// lock.
+pub(crate) fn store_recheck(hwnd: HWND, kind: RecheckKind, timer: usize) -> Option<usize> {
+    with_placed(|p| {
+        let displaced = p.rechecks.get(&(hwnd as isize, kind)).copied();
+        p.set_recheck(hwnd as isize, kind, timer);
+        displaced
+    })
+}
+
+/// Removes and returns the re-check whose thread timer is `timer`.
+pub(crate) fn take_recheck(timer: usize) -> Option<(HWND, RecheckKind)> {
+    with_placed(|p| p.take_recheck_by_timer(timer)).map(|(window, kind)| (window as HWND, kind))
 }
 
 /// Whether `hwnd` has a remembered pre-strip state, i.e. the next borderless
 /// hotkey press on it restores rather than strips.
 pub fn has_restore_state(hwnd: HWND) -> bool {
-    lock_store(&RESTORE_STATES).get(hwnd as isize).is_some()
+    with_placed(|p| p.restore.get(hwnd as isize).is_some())
 }
 
 /// Restores `window` from its remembered pre-strip state through `mutate`; a
@@ -717,50 +856,43 @@ pub fn has_restore_state(hwnd: HWND) -> bool {
 ///
 /// `store` is locked only around each read/write, never while `mutate` runs.
 fn restore_with_store<E>(
-    store: &std::sync::Mutex<RestoreStore>,
+    store: &std::sync::Mutex<PlacedWindows>,
     window: isize,
     mutate: impl FnOnce(RestoreState) -> Result<(), E>,
 ) -> Result<(), E> {
-    let Some(remembered) = lock_store(store).get(window) else {
+    let Some(remembered) = lock_store(store).restore.get(window) else {
         return Ok(());
     };
     mutate(remembered)?;
     let mut guard = lock_store(store);
-    guard.states.remove(&window);
-    guard.opted_out.insert(window);
+    guard.restore.states.remove(&window);
+    guard.restore.opted_out.insert(window);
     Ok(())
 }
-
-/// Windows GameFrame applied the Zone to, as `(window handle, owning process
-/// id)`. The pid is captured at registration because a destroyed window can no
-/// longer be asked for it.
-static APPLIED_WINDOWS: std::sync::Mutex<Vec<(isize, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether the user restored `hwnd` with the borderless hotkey, so auto-apply
 /// and drift re-apply must leave it alone until it is destroyed or stripped
 /// again.
 pub fn auto_apply_suppressed(hwnd: HWND) -> bool {
-    lock_store(&RESTORE_STATES)
-        .opted_out
-        .contains(&(hwnd as isize))
+    with_placed(|p| p.restore.opted_out.contains(&(hwnd as isize)))
 }
 
 /// Lifts the suppression set by a hotkey restore: the user explicitly asked
 /// for `hwnd` to be placed again (tray picker).
 pub fn allow_auto_apply(hwnd: HWND) {
-    lock_store(&RESTORE_STATES)
-        .opted_out
-        .remove(&(hwnd as isize));
+    with_placed(|p| {
+        p.restore.opted_out.remove(&(hwnd as isize));
+    });
 }
 
 /// Remembers `hwnd` as one GameFrame applied the Zone to, so the
 /// location-change watcher can cheaply (one mutex lock + scan) ignore every
-/// other window's move events.
+/// other window's move events. The pid is captured now because a destroyed
+/// window can no longer be asked for it.
 pub fn remember_applied_window(hwnd: HWND) {
     let pid = window_process_id(hwnd);
-    {
-        let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
-        match windows.iter_mut().find(|(h, _)| *h == hwnd as isize) {
+    with_placed(|p| {
+        match p.applied.iter_mut().find(|(h, _)| *h == hwnd as isize) {
             // A reused handle (or one first seen with an unreadable pid) takes
             // the live owner's pid instead of keeping a stale one.
             Some(entry) => {
@@ -768,9 +900,9 @@ pub fn remember_applied_window(hwnd: HWND) {
                     entry.1 = pid;
                 }
             }
-            None => windows.push((hwnd as isize, pid)),
+            None => p.applied.push((hwnd as isize, pid)),
         }
-    }
+    });
     crate::launch_watcher::sync_drift_hooks();
 }
 
@@ -786,11 +918,7 @@ fn window_process_id(hwnd: HWND) -> u32 {
 
 /// Whether `hwnd` was previously registered via [`remember_applied_window`].
 pub fn is_applied_window(hwnd: HWND) -> bool {
-    APPLIED_WINDOWS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|(h, _)| *h == hwnd as isize)
+    with_placed(|p| p.applied.iter().any(|(h, _)| *h == hwnd as isize))
 }
 
 /// Process ids owning at least one applied window (never 0).
@@ -827,17 +955,31 @@ fn reconcile_entries(
 /// [`reconcile_entries`]) and returns the pids owning applied windows plus
 /// whether some window's pid is still unknown.
 pub fn refresh_applied_window_pids() -> (std::collections::BTreeSet<u32>, bool) {
-    let mut windows = APPLIED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
-    let unresolved = reconcile_entries(&mut windows, |h| {
-        let hwnd = h as HWND;
-        // Safety: `IsWindow` tolerates any handle value.
-        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) } == 0 {
-            None
-        } else {
-            Some(window_process_id(hwnd))
-        }
+    let (pids, unresolved, timers) = with_placed(|p| {
+        p.reconcile_applied(|h| {
+            let hwnd = h as HWND;
+            // Safety: `IsWindow` tolerates any handle value.
+            if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) } == 0 {
+                None
+            } else {
+                Some(window_process_id(hwnd))
+            }
+        })
     });
-    (pids_of(&windows), unresolved)
+    kill_timers(&timers);
+    (pids, unresolved)
+}
+
+/// Kills the thread timers `timers` (ids this process created with a null
+/// window); a no-op for an empty list.
+fn kill_timers(timers: &[usize]) {
+    for timer in timers {
+        // Safety: a thread timer id this process created; `KillTimer` fails
+        // harmlessly for one that already fired.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(std::ptr::null_mut(), *timer);
+        }
+    }
 }
 
 /// Minimum time between two drift re-apply attempts on one window. A game that
@@ -972,9 +1114,6 @@ impl DriftAttempts {
     }
 }
 
-static DRIFT_ATTEMPTS: std::sync::Mutex<DriftAttempts> =
-    std::sync::Mutex::new(DriftAttempts::new());
-
 /// Whether `hwnd` is minimized (`IsIconic`).
 pub(crate) fn is_window_minimized(hwnd: HWND) -> bool {
     // Safety: `IsIconic` only reads window state and tolerates a stale handle.
@@ -985,59 +1124,43 @@ pub(crate) fn is_window_minimized(hwnd: HWND) -> bool {
 pub(crate) fn decide_drift_for_window(hwnd: HWND, drifted: bool) -> DriftDecision {
     // Only a drifted window needs the live fullscreen read.
     let fullscreen = drifted && window_is_fullscreen(hwnd);
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .decide(
+    with_placed(|p| {
+        p.drift.decide(
             hwnd as isize,
             std::time::Instant::now(),
             drifted,
             fullscreen,
         )
+    })
 }
 
 /// Records now as the time of `hwnd`'s latest drift re-apply attempt.
 pub(crate) fn record_drift_attempt(hwnd: HWND) {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record(hwnd as isize, std::time::Instant::now());
+    with_placed(|p| p.drift.record(hwnd as isize, std::time::Instant::now()));
 }
 
 /// True the first time a capped `hwnd`'s event is skipped, so the caller logs
 /// the cap once, when it actually stops a re-apply.
 pub(crate) fn note_drift_capped(hwnd: HWND) -> bool {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .note_capped(hwnd as isize)
+    with_placed(|p| p.drift.note_capped(hwnd as isize))
 }
 
 /// True the first time a config/Zone failure is reported for `hwnd`'s drift
 /// path since [`clear_drift_failure`] (or a reset / destroy).
 pub(crate) fn note_drift_failure(hwnd: HWND) -> bool {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .note_failure(hwnd as isize)
+    with_placed(|p| p.drift.note_failure(hwnd as isize))
 }
 
 /// Re-arms the once-per-window drift failure log of `hwnd`.
 pub(crate) fn clear_drift_failure(hwnd: HWND) {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear_failure(hwnd as isize);
+    with_placed(|p| p.drift.clear_failure(hwnd as isize));
 }
 
 /// Lifts `hwnd`'s drift re-apply cap and forgets its recent attempts. Called
 /// by [`crate::placement::apply_zone`] for a placement the user asked for (the
 /// hotkey, the tray picker or Settings' live re-apply).
 pub fn reset_drift_cap(hwnd: HWND) {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .reset(hwnd as isize);
+    with_placed(|p| p.drift.reset(hwnd as isize));
 }
 
 /// Pure decision: is a window in exclusive fullscreen? `d3d_fullscreen` is
@@ -1063,25 +1186,22 @@ pub(crate) fn window_is_fullscreen(hwnd: HWND) -> bool {
     is_fullscreen(d3d, foreground)
 }
 
-/// Forgets `hwnd` (called when it is destroyed) along with its remembered
-/// restore state, drift attempt time and hung-window log entry.
-pub fn forget_applied_window(hwnd: HWND) {
-    unmark_applied_window(hwnd);
-    lock_store(&RESTORE_STATES).forget(hwnd as isize);
-    lock_hung_log().logged.remove(&(hwnd as isize));
+/// Forgets `hwnd` (called when it is destroyed): the single cleanup for
+/// everything remembered per window (see [`PlacedWindows::forget`]), including
+/// killing its pending re-check timers.
+pub fn forget_window(hwnd: HWND) {
+    let timers = with_placed(|p| p.forget(hwnd as isize));
+    kill_timers(&timers);
+    crate::launch_watcher::sync_drift_hooks();
 }
 
 /// Stops the drift watcher treating `hwnd` as GameFrame-placed and drops its
 /// drift attempt time.
 fn unmark_applied_window(hwnd: HWND) {
-    DRIFT_ATTEMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .reset(hwnd as isize);
-    APPLIED_WINDOWS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|(h, _)| *h != hwnd as isize);
+    with_placed(|p| {
+        p.drift.reset(hwnd as isize);
+        p.applied.retain(|(h, _)| *h != hwnd as isize);
+    });
     crate::launch_watcher::sync_drift_hooks();
 }
 
@@ -1153,17 +1273,9 @@ impl HungSkipLog {
     }
 }
 
-static HUNG_SKIP_LOG: std::sync::Mutex<HungSkipLog> = std::sync::Mutex::new(HungSkipLog::new());
-
 /// How long the drift handler waits before re-checking a window it skipped
 /// because it was not responding.
 pub(crate) const HUNG_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Poison-tolerant lock on [`HUNG_SKIP_LOG`]: the set has no invariant a panic
-/// could break.
-fn lock_hung_log() -> std::sync::MutexGuard<'static, HungSkipLog> {
-    HUNG_SKIP_LOG.lock().unwrap_or_else(|p| p.into_inner())
-}
 
 /// Whether `hwnd`'s thread has stopped pumping messages (`IsHungAppWindow`).
 /// Logs the first request on a window that is hung. Every blocking call into
@@ -1172,7 +1284,7 @@ pub(crate) fn is_window_hung_logged(hwnd: HWND) -> bool {
     // Safety: `IsHungAppWindow` only reads window state and tolerates a stale
     // handle.
     let hung = unsafe { IsHungAppWindow(hwnd) } != 0;
-    let first = lock_hung_log().note(hwnd as isize, hung);
+    let first = with_placed(|p| p.hung.note(hwnd as isize, hung));
     if first {
         log!("window {hwnd:?} is not responding; skipping calls into it until it is");
     }
@@ -1227,8 +1339,10 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         // un-maximized with no way back. Only when it really took effect, so
         // a window GameFrame cannot change (e.g. elevated) gets no entry.
         if !is_maximized(hwnd) {
-            lock_store(&RESTORE_STATES)
-                .record_if_absent(hwnd as isize, RestoreState::new(style, ex_style, region));
+            with_placed(|p| {
+                p.restore
+                    .record_if_absent(hwnd as isize, RestoreState::new(style, ex_style, region));
+            });
         }
         Some((style, ex_style, region))
     } else {
@@ -1258,10 +1372,12 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     // window, already recorded at its un-maximize), so a window GameFrame
     // could not change (e.g. an elevated game) never gets a restore entry; the
     // remaining calls below can still fail with the original already safe.
-    lock_store(&RESTORE_STATES).record_if_absent(
-        hwnd as isize,
-        RestoreState::new(live_style, live_ex_style, live_region),
-    );
+    with_placed(|p| {
+        p.restore.record_if_absent(
+            hwnd as isize,
+            RestoreState::new(live_style, live_ex_style, live_region),
+        );
+    });
     set_window_ex_style(hwnd, strip_border_ex_style(live_ex_style))?;
     set_window_region(hwnd, target_region)?;
     disable_rounded_corners(hwnd)?;
@@ -1286,7 +1402,7 @@ pub fn restore_window(hwnd: HWND) -> Result<(), Win32Error> {
     if is_window_hung_logged(hwnd) {
         return Err(Win32Error::WindowHung);
     }
-    restore_with_store(&RESTORE_STATES, hwnd as isize, |restore| {
+    restore_with_store(&PLACED_WINDOWS, hwnd as isize, |restore| {
         // Re-maximized since the strip: un-maximize through the OS (hung
         // check already passed) rather than overwriting the style and
         // clearing WS_MAXIMIZE by hand.
@@ -1431,6 +1547,7 @@ pub(crate) fn gather_taskbar_judgement(taskbar: HWND) -> TaskbarJudgement {
         right: 0,
         bottom: 0,
     };
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // Safety: plain queries on a live handle with valid out-pointers.
@@ -1619,6 +1736,7 @@ fn send_appbar_setstate(hwnd: HWND, lparam: isize) -> Result<(), Win32Error> {
     if taskbar_is_hung(hwnd) {
         return Err(Win32Error::WindowHung);
     }
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
     data.hWnd = hwnd;
@@ -1648,6 +1766,7 @@ pub(crate) fn read_appbar_flags(hwnd: HWND) -> Option<u32> {
     if taskbar_is_hung(hwnd) {
         return None;
     }
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
     data.hWnd = hwnd;
@@ -1735,12 +1854,6 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
         )));
     }
     Ok(())
-}
-
-/// Encodes a Rust string as a null-terminated UTF-16 buffer, the string
-/// format every wide (`*W`) Win32 API used here expects.
-pub(crate) fn encode_wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Per-`EnumWindows`-call userdata smuggled through `EnumWindows`'s `LPARAM`
@@ -1996,6 +2109,7 @@ fn find_pid_by_exe_path(exe_path: &Path) -> Option<u32> {
         return None;
     }
 
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
@@ -2097,6 +2211,7 @@ pub fn primary_monitor_geometry() -> MonitorGeometry {
     // that takes a plain integer index and returns a plain integer; no
     // pointers or lifetimes are involved.
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    // SAFETY: plain integer query with no pointers.
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     MonitorGeometry {
         x: 0,
@@ -2227,10 +2342,10 @@ mod tests {
 
     #[test]
     fn the_ex_style_round_trips_through_a_restore() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         let ex = WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME;
         let state = RestoreState::new(BORDERED, ex, ORIGINAL);
-        lock_store(&store).record_if_absent(1, state);
+        lock_store(&store).restore.record_if_absent(1, state);
 
         let seen = restore(&store, 1, Ok(()));
 
@@ -2550,7 +2665,7 @@ mod tests {
     /// Runs one restore of `window`; returns the states `mutate` was asked to
     /// restore.
     fn restore(
-        store: &std::sync::Mutex<RestoreStore>,
+        store: &std::sync::Mutex<PlacedWindows>,
         window: isize,
         mutate_result: Result<(), ()>,
     ) -> Vec<RestoreState> {
@@ -2562,8 +2677,8 @@ mod tests {
         seen
     }
 
-    fn remembered(store: &std::sync::Mutex<RestoreStore>, window: isize) {
-        lock_store(store).record_if_absent(
+    fn remembered(store: &std::sync::Mutex<PlacedWindows>, window: isize) {
+        lock_store(store).restore.record_if_absent(
             window,
             RestoreState {
                 style: BORDERED,
@@ -2575,7 +2690,7 @@ mod tests {
 
     #[test]
     fn restore_with_store_restores_a_stripped_window_and_forgets_it() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
 
         let seen = restore(&store, 1, Ok(()));
@@ -2588,39 +2703,39 @@ mod tests {
                 region: ORIGINAL
             }]
         );
-        assert_eq!(lock_store(&store).get(1), None);
+        assert_eq!(lock_store(&store).restore.get(1), None);
     }
 
     #[test]
     fn restore_with_store_does_nothing_for_a_window_it_has_no_state_for() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
 
         let seen = restore(&store, 1, Ok(()));
 
         assert!(seen.is_empty());
-        assert!(!lock_store(&store).opted_out.contains(&1));
+        assert!(!lock_store(&store).restore.opted_out.contains(&1));
     }
 
     #[test]
     fn restore_with_store_keeps_the_entry_when_a_restore_fails() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
 
         restore(&store, 1, Err(()));
 
-        assert!(lock_store(&store).get(1).is_some());
+        assert!(lock_store(&store).restore.get(1).is_some());
     }
 
     #[test]
     fn restore_with_store_treats_windows_independently() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
         remembered(&store, 2);
 
         restore(&store, 2, Ok(()));
 
-        assert!(lock_store(&store).get(1).is_some());
-        assert!(lock_store(&store).get(2).is_none());
+        assert!(lock_store(&store).restore.get(1).is_some());
+        assert!(lock_store(&store).restore.get(2).is_none());
     }
 
     #[test]
@@ -2663,33 +2778,115 @@ mod tests {
 
     #[test]
     fn a_hotkey_restore_suppresses_auto_apply_until_it_is_lifted() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
 
         restore(&store, 1, Ok(()));
 
-        assert!(lock_store(&store).opted_out.contains(&1));
+        assert!(lock_store(&store).restore.opted_out.contains(&1));
     }
 
     #[test]
     fn a_failed_restore_does_not_suppress_auto_apply() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
 
         restore(&store, 1, Err(()));
 
-        assert!(!lock_store(&store).opted_out.contains(&1));
+        assert!(!lock_store(&store).restore.opted_out.contains(&1));
     }
 
     #[test]
     fn forgetting_a_window_clears_its_suppression() {
-        let store = std::sync::Mutex::new(RestoreStore::new());
+        let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
         restore(&store, 1, Ok(()));
 
         lock_store(&store).forget(1);
 
-        assert!(!lock_store(&store).opted_out.contains(&1));
+        assert!(!lock_store(&store).restore.opted_out.contains(&1));
+    }
+
+    /// A registry with every kind of per-window state set for `window`.
+    fn fully_populated(window: isize) -> PlacedWindows {
+        let mut placed = PlacedWindows::new();
+        placed.restore.record_if_absent(
+            window,
+            RestoreState {
+                style: BORDERED,
+                ex_style: 0,
+                region: ORIGINAL,
+            },
+        );
+        placed.restore.opted_out.insert(window);
+        placed.applied.push((window, 42));
+        placed.drift.record(window, std::time::Instant::now());
+        placed.drift.note_failure(window);
+        placed.hung.note(window, true);
+        placed.set_recheck(window, RecheckKind::Drift, 7);
+        placed.set_recheck(window, RecheckKind::AutoApply, 8);
+        placed
+    }
+
+    #[test]
+    fn forget_clears_every_kind_of_per_window_state_and_returns_the_timers() {
+        let mut placed = fully_populated(1);
+        placed.restore.record_if_absent(
+            2,
+            RestoreState {
+                style: BORDERED,
+                ex_style: 0,
+                region: ORIGINAL,
+            },
+        );
+
+        let mut timers = placed.forget(1);
+        timers.sort_unstable();
+
+        assert_eq!(timers, [7, 8]);
+        assert!(placed.restore.get(1).is_none());
+        assert!(placed.restore.opted_out.is_empty());
+        assert!(placed.applied.is_empty());
+        assert!(placed.drift.recent.is_empty());
+        assert!(placed.drift.failure_logged.is_empty());
+        assert!(placed.hung.logged.is_empty());
+        assert!(!placed.has_recheck(1, RecheckKind::Drift));
+        assert!(!placed.has_recheck(1, RecheckKind::AutoApply));
+        assert!(placed.restore.get(2).is_some(), "other windows are kept");
+    }
+
+    #[test]
+    fn a_pending_drift_recheck_does_not_swallow_an_auto_apply_retry() {
+        let mut placed = PlacedWindows::new();
+        placed.set_recheck(1, RecheckKind::Drift, 7);
+
+        assert!(!placed.has_recheck(1, RecheckKind::AutoApply));
+        placed.set_recheck(1, RecheckKind::AutoApply, 8);
+
+        assert_eq!(
+            placed.take_recheck_by_timer(8),
+            Some((1, RecheckKind::AutoApply))
+        );
+        assert!(placed.has_recheck(1, RecheckKind::Drift));
+        assert_eq!(placed.take_recheck_by_timer(8), None);
+    }
+
+    #[test]
+    fn reconciling_drops_a_dead_window_with_all_its_state() {
+        let mut placed = fully_populated(1);
+        placed.applied.push((2, 43));
+
+        let (pids, unresolved, mut timers) = placed.reconcile_applied(|h| (h == 2).then_some(43));
+        timers.sort_unstable();
+
+        assert_eq!(pids, [43].into_iter().collect());
+        assert!(!unresolved);
+        assert_eq!(timers, [7, 8]);
+        assert!(placed.restore.get(1).is_none());
+        assert!(placed.restore.opted_out.is_empty());
+        assert!(placed.drift.recent.is_empty());
+        assert!(placed.hung.logged.is_empty());
+        assert_eq!(placed.applied, [(2, 43)]);
     }
 
     #[test]

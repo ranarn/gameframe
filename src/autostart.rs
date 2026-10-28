@@ -13,6 +13,7 @@
 //! restores the default (enabled) state. A Task-Manager-disabled entry
 //! therefore still reads as enabled here until toggled.
 
+use crate::wide::encode_wide;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
@@ -104,10 +105,11 @@ fn run_command(exe: &Path) -> String {
 }
 
 fn is_enabled_at(location: &RegistryLocation) -> bool {
-    let subkey = wide(location.run_subkey);
-    let value = wide(location.value_name);
+    let subkey = encode_wide(location.run_subkey);
+    let value = encode_wide(location.value_name);
     let mut size: u32 = 0;
     // A size-only query: succeeds iff the value exists, whatever its type.
+    // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
     let code = unsafe {
         RegGetValueW(
             location.root,
@@ -123,9 +125,10 @@ fn is_enabled_at(location: &RegistryLocation) -> bool {
 }
 
 fn enable_at(location: &RegistryLocation, exe: &Path) -> Result<(), AutostartError> {
-    let data = wide(&run_command(exe));
-    let subkey = wide(location.run_subkey);
-    let value = wide(location.value_name);
+    let data = encode_wide(&run_command(exe));
+    let subkey = encode_wide(location.run_subkey);
+    let value = encode_wide(location.value_name);
+    // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
     let code = unsafe {
         RegSetKeyValueW(
             location.root,
@@ -161,8 +164,9 @@ fn disable_at(location: &RegistryLocation) -> Result<(), AutostartError> {
 
 /// Deletes one value; a value (or key) that doesn't exist counts as success.
 fn delete_value(root: HKEY, subkey: &str, value_name: &str) -> Result<(), AutostartError> {
-    let subkey = wide(subkey);
-    let value = wide(value_name);
+    let subkey = encode_wide(subkey);
+    let value = encode_wide(value_name);
+    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 strings that outlive the call.
     let code = unsafe { RegDeleteKeyValueW(root, subkey.as_ptr(), value.as_ptr()) };
     match code {
         ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
@@ -171,11 +175,6 @@ fn delete_value(root: HKEY, subkey: &str, value_name: &str) -> Result<(), Autost
             code,
         }),
     }
-}
-
-/// NUL-terminated UTF-16, as the `W` registry APIs expect.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]
@@ -211,10 +210,11 @@ mod tests {
         }
 
         fn read_run_value(&self) -> Option<String> {
-            let subkey = wide(&self.run);
-            let value = wide(VALUE_NAME);
+            let subkey = encode_wide(&self.run);
+            let value = encode_wide(VALUE_NAME);
             let mut buf = [0u16; 1024];
             let mut size = (buf.len() * size_of::<u16>()) as u32;
+            // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
             let code = unsafe {
                 RegGetValueW(
                     HKEY_CURRENT_USER,
@@ -235,9 +235,10 @@ mod tests {
         }
 
         fn set_approved_override(&self) {
-            let subkey = wide(&self.approved);
-            let value = wide(VALUE_NAME);
+            let subkey = encode_wide(&self.approved);
+            let value = encode_wide(VALUE_NAME);
             let data = [3u8; 12];
+            // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
             let code = unsafe {
                 RegSetKeyValueW(
                     HKEY_CURRENT_USER,
@@ -252,9 +253,10 @@ mod tests {
         }
 
         fn approved_override_exists(&self) -> bool {
-            let subkey = wide(&self.approved);
-            let value = wide(VALUE_NAME);
+            let subkey = encode_wide(&self.approved);
+            let value = encode_wide(VALUE_NAME);
             let mut size = 0u32;
+            // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
             let code = unsafe {
                 RegGetValueW(
                     HKEY_CURRENT_USER,
@@ -272,9 +274,10 @@ mod tests {
 
     impl Drop for ScratchKey {
         fn drop(&mut self) {
-            let key = wide(&self.root_key);
+            let key = encode_wide(&self.root_key);
             // Given a subkey, RegDeleteTreeW removes that key itself along with
             // everything under it.
+            // SAFETY: `key` is a NUL-terminated UTF-16 string that outlives the call.
             unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) };
         }
     }

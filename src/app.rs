@@ -304,18 +304,21 @@ fn run_event_loop(
     // Prewarm the "Apply to Window" list so the first menu open has content.
     tray.refresh_apply_to_window_menu(config_dir);
 
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
         // Waiting here is healthy; the label tells an idle pump from a stuck step.
         crate::watchdog::step("event loop: waiting for a message");
         crate::watchdog::idle();
         // 0 (WM_QUIT) or -1 (error) both mean: stop pumping.
+        // SAFETY: `msg` is a valid out-pointer for the call.
         let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if ret <= 0 {
             return;
         }
         crate::watchdog::step("event loop: dispatching a message");
         crate::watchdog::beat();
+        // SAFETY: both calls take the `msg` just filled in by `GetMessageW`.
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -734,23 +737,21 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
 ///
 /// Returns the new `cursor.enabled`, or `None` when the toggle failed.
 fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) -> Option<bool> {
-    let mut config = match profile_store::load(config_dir) {
-        Ok(config) => config,
+    let enabled = match profile_store::update(config_dir, |config| {
+        config.cursor.enabled = !config.cursor.enabled;
+        config.cursor.enabled
+    }) {
+        Ok(enabled) => enabled,
         Err(e) => {
-            log!("game cursor toggle: failed to load config: {e}");
+            log!("game cursor toggle: failed to update config: {e}");
             return None;
         }
     };
-    config.cursor.enabled = !config.cursor.enabled;
-    if let Err(e) = profile_store::save(config_dir, &config) {
-        log!("game cursor toggle: failed to save config: {e}");
-        return None;
-    }
     cursor_overlay.reload(config_dir);
-    if config.cursor.enabled {
+    if enabled {
         cursor_overlay.pulse();
     }
-    Some(config.cursor.enabled)
+    Some(enabled)
 }
 
 /// Opens Settings (what the tray item and a second launch both do) and, once

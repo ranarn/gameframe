@@ -33,7 +33,7 @@
 
 use crate::cursor_style::{self, Bitmap, CursorSettings, CursorShape, ShakeDetector};
 use crate::profile_store::{self, Config};
-use crate::win32::encode_wide;
+use crate::wide::encode_wide;
 use crate::window_filter;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -417,6 +417,7 @@ struct CursorState {
 /// desktop).
 fn read_cursor() -> Option<CursorState> {
     let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: CURSORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
     // Safety: valid out-pointers sized per the API contract.
@@ -434,6 +435,7 @@ fn read_cursor() -> Option<CursorState> {
 }
 
 fn pump_messages() {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // Safety: standard non-blocking message pump on this thread's queue.
     unsafe {
@@ -477,6 +479,7 @@ pub fn last_game_cursor() -> Option<Bitmap> {
 /// color with alpha (or without, using the AND mask) and old monochrome
 /// cursors (AND mask on top of XOR mask in one double-height bitmap).
 fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: ICONINFO = unsafe { std::mem::zeroed() };
     // Safety: valid out-pointer; on success we own (and delete below) the
     // two bitmaps it returns.
@@ -520,9 +523,10 @@ fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
 
 /// A bitmap's pixels as 32-bit top-down BGRA: `(width, height, bytes)`.
 fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut bm: BITMAP = unsafe { std::mem::zeroed() };
-    // Safety: valid out-pointer sized per the API contract.
     let size = std::mem::size_of::<BITMAP>() as i32;
+    // SAFETY: `bm` is a valid out-pointer of the size passed.
     if unsafe { GetObjectW(bitmap as HGDIOBJ, size, (&raw mut bm).cast()) } == 0 {
         return None;
     }
@@ -530,6 +534,7 @@ fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     if width == 0 || height == 0 || width > 256 || height > 512 {
         return None;
     }
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut header: BITMAPINFO = unsafe { std::mem::zeroed() };
     header.bmiHeader = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -538,6 +543,7 @@ fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB,
+        // SAFETY: all-zero bytes are a valid value of this plain C struct.
         ..unsafe { std::mem::zeroed() }
     };
     let mut pixels = vec![0u8; (width * height * 4) as usize];
@@ -616,6 +622,7 @@ unsafe extern "system" fn window_proc(
         // Belt and braces next to WS_EX_TRANSPARENT: never take a click.
         return HTTRANSPARENT as LRESULT;
     }
+    // SAFETY: forwards this window procedure's own arguments unchanged.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -840,6 +847,7 @@ impl Drop for LayeredWindow {
 
 /// A top-down 32-bit DIB section and a pointer to its pixels.
 fn create_dib(width: u32, height: u32) -> (HBITMAP, *mut u8) {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: BITMAPINFO = unsafe { std::mem::zeroed() };
     info.bmiHeader = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -849,6 +857,7 @@ fn create_dib(width: u32, height: u32) -> (HBITMAP, *mut u8) {
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB,
+        // SAFETY: all-zero bytes are a valid value of this plain C struct.
         ..unsafe { std::mem::zeroed() }
     };
     let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();

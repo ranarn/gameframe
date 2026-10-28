@@ -462,6 +462,31 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
     Ok(())
 }
 
+/// Serializes [`update`] calls so two read-modify-writes never interleave.
+static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read-modify-write of the stored config: loads the current config, applies
+/// `change` to it and saves the result, serialized against other `update`
+/// calls, so concurrent updates (tray, hotkeys, Settings) never overwrite each
+/// other's fields with a stale snapshot. Returns what `change` returned.
+/// (A plain [`save`] does not take that lock.)
+///
+/// This is the way to change a few fields. [`save`] of a config loaded earlier
+/// is only right when the caller deliberately replaces the whole snapshot.
+///
+/// `change` must not call [`update`] (it would deadlock) nor pump Windows
+/// messages. Nothing is written when loading fails.
+pub fn update<R>(
+    config_dir: &Path,
+    change: impl FnOnce(&mut Config) -> R,
+) -> Result<R, ProfileStoreError> {
+    let _write = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut config = load(config_dir)?;
+    let result = change(&mut config);
+    save(config_dir, &config)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +494,82 @@ mod tests {
     fn write_config_file(config_dir: &Path, contents: &str) {
         std::fs::create_dir_all(config_dir).unwrap();
         std::fs::write(config_dir.join(CONFIG_FILE_NAME), contents).unwrap();
+    }
+
+    #[test]
+    fn update_applies_the_closure_to_the_stored_config_and_persists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+
+        let was_enabled = update(&config_dir, |config| {
+            let was = config.cursor.enabled;
+            config.cursor.enabled = !was;
+            was
+        })
+        .unwrap();
+
+        assert!(!was_enabled);
+        assert!(load(&config_dir).unwrap().cursor.enabled);
+        assert!(
+            load_from_disk(&config_dir).unwrap().cursor.enabled,
+            "the change is on disk, not only in the cache"
+        );
+    }
+
+    #[test]
+    fn update_starts_from_the_latest_saved_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        let zone = Zone {
+            x: 1,
+            y: 2,
+            width: 300,
+            height: 200,
+        };
+        save(
+            &config_dir,
+            &Config {
+                zone: Some(zone),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+
+        update(&config_dir, |config| config.cursor.enabled = true).unwrap();
+
+        let stored = load(&config_dir).unwrap();
+        assert_eq!(
+            stored.zone,
+            Some(zone),
+            "fields the closure left alone survive"
+        );
+        assert!(stored.cursor.enabled);
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let config_dir = &config_dir;
+                scope.spawn(move || {
+                    update(config_dir, |config| {
+                        upsert_tracked_game(
+                            &mut config.tracked_games,
+                            PathBuf::from(format!("C:\\Games\\game{n}.exe")),
+                            format!("Game {n}"),
+                        );
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(load(&config_dir).unwrap().tracked_games.len(), 8);
     }
 
     #[test]
