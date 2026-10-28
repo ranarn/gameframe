@@ -1986,7 +1986,8 @@ fn save_exit(
 
 impl eframe::App for SettingsApp<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Heartbeat for the hang watchdog (#171); idle again when the frame is built.
+        // Heartbeat for the hang watchdog; idle again when the frame is built.
+        // `on_tick` (tray, hotkey and update events) runs below, inside this scope.
         crate::watchdog::beat();
         let _idle = crate::watchdog::IdleOnDrop;
         self.sync_keyboard_hook();

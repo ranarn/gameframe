@@ -12,14 +12,15 @@ pub(crate) fn show_message_box(text: &str, style: u32) -> i32 {
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let text = wide(text);
     let title = wide("GameFrame");
-    unsafe {
+    // The box pumps its own loop and may stay open: not a hang for the watchdog.
+    crate::watchdog::modal(|| unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
             text.as_ptr(),
             title.as_ptr(),
             style | MB_SETFOREGROUND,
         )
-    }
+    })
 }
 
 /// Shows `text` in a warning box and waits for it to be dismissed.

@@ -9,7 +9,7 @@
 //! ship without a PDB. The ping interval is seconds, so the idle cost is
 //! negligible. Switched by `Config::log_ui_hangs` through [`set_enabled`].
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -169,23 +169,75 @@ impl ErrorReporter {
     }
 }
 
-/// Heartbeat count, bumped by the main thread; read by the watchdog thread.
-static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
-/// Whether the main thread is working (`true`) or waiting for a message.
-static BUSY: AtomicBool = AtomicBool::new(false);
+/// The heartbeat in one atomic word, so a reader sees count and busy flag
+/// together: the count in the upper 63 bits, the busy flag in bit 0.
+#[derive(Debug, Default)]
+struct Heartbeat(AtomicU64);
+
+impl Heartbeat {
+    const BUSY_BIT: u64 = 1;
+
+    /// One relaxed read-modify-write; never blocks.
+    fn beat(&self) {
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some((((v >> 1).wrapping_add(1)) << 1) | Self::BUSY_BIT)
+            });
+    }
+
+    fn idle(&self) {
+        self.0.fetch_and(!Self::BUSY_BIT, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> Beat {
+        let v = self.0.load(Ordering::Relaxed);
+        Beat {
+            count: v >> 1,
+            busy: v & Self::BUSY_BIT != 0,
+        }
+    }
+
+    /// Runs `f` (a call that pumps its own message loop, e.g. a modal box)
+    /// marked idle when `watched`, so a box the user leaves open is no stall;
+    /// busy again afterwards if it was before.
+    fn around_modal<R>(&self, watched: bool, f: impl FnOnce() -> R) -> R {
+        let was_busy = watched && self.read().busy;
+        if was_busy {
+            self.idle();
+        }
+        let result = f();
+        if was_busy {
+            self.beat();
+        }
+        result
+    }
+}
+
+static HEARTBEAT: Heartbeat = Heartbeat(AtomicU64::new(0));
+/// Id of the thread the watchdog watches (0 until it is first enabled).
+static WATCHED_THREAD: AtomicU32 = AtomicU32::new(0);
 
 /// Heartbeat: call at the start of each UI step on the main thread (message
-/// dispatch, Settings' and the zone editor's `ui()`). Two relaxed atomic
-/// operations, never blocks.
+/// dispatch, Settings' and the zone editor's `ui()`). One relaxed atomic
+/// operation, never blocks.
 pub fn beat() {
-    HEARTBEAT.fetch_add(1, Ordering::Relaxed);
-    BUSY.store(true, Ordering::Relaxed);
+    HEARTBEAT.beat();
 }
 
 /// Marks the main thread as waiting (idle) until the next [`beat`], so a quiet
 /// window that has nothing to redraw is not mistaken for a stall.
 pub fn idle() {
-    BUSY.store(false, Ordering::Relaxed);
+    HEARTBEAT.idle();
+}
+
+/// Runs `f`, a call that pumps its own message loop (a modal message box),
+/// with the heartbeat idle if the caller is the watched main thread: the user
+/// may leave the box open as long as they like. Other threads are untouched.
+pub fn modal<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: plain Win32 call.
+    let watched = unsafe { GetCurrentThreadId() } == WATCHED_THREAD.load(Ordering::Relaxed);
+    HEARTBEAT.around_modal(watched, f)
 }
 
 /// Calls [`idle`] on drop, so every exit from a `ui()` marks the thread idle.
@@ -198,10 +250,7 @@ impl Drop for IdleOnDrop {
 }
 
 fn read_beat() -> Beat {
-    Beat {
-        count: HEARTBEAT.load(Ordering::Relaxed),
-        busy: BUSY.load(Ordering::Relaxed),
-    }
+    HEARTBEAT.read()
 }
 
 /// Last breadcrumb: label and when it was entered.
@@ -294,6 +343,7 @@ pub fn set_enabled(enabled: bool) {
     ensure_running(&mut state, || {
         // SAFETY: plain Win32 call.
         let main_thread = unsafe { GetCurrentThreadId() };
+        WATCHED_THREAD.store(main_thread, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         ALIVE.fetch_add(1, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
@@ -319,10 +369,17 @@ fn log_if_settings_hung(logged: &mut bool) {
     let hung = crate::instance_channel::find_settings_window()
         // SAFETY: plain Win32 call; a stale handle only makes it return FALSE.
         .is_some_and(|hwnd| unsafe { IsHungAppWindow(hwnd) } != 0);
-    if hung && !*logged {
+    if first_hung_report(hung, logged) {
         log!("Windows reports the Settings window as not responding");
     }
+}
+
+/// Whether to log now: only on the first `hung` reading of an episode.
+/// `logged` re-arms as soon as the window is responsive again.
+fn first_hung_report(hung: bool, logged: &mut bool) -> bool {
+    let report = hung && !*logged;
     *logged = hung;
+    report
 }
 
 fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
@@ -512,13 +569,56 @@ mod tests {
 
     #[test]
     fn beat_marks_busy_and_idle_clears_it() {
-        let before = read_beat().count;
-        beat();
-        let b = read_beat();
-        assert!(b.busy);
-        assert!(b.count > before);
-        idle();
-        assert!(!read_beat().busy);
+        let hb = Heartbeat::default();
+        let at = |count, busy| Beat { count, busy };
+        assert_eq!(hb.read(), at(0, false));
+        hb.beat();
+        assert_eq!(hb.read(), at(1, true));
+        hb.idle();
+        assert_eq!(hb.read(), at(1, false));
+        hb.beat();
+        assert_eq!(hb.read(), at(2, true));
+    }
+
+    #[test]
+    fn a_modal_call_is_idle_inside_and_busy_again_after() {
+        let hb = Heartbeat::default();
+        hb.beat();
+        let inside = hb.around_modal(true, || hb.read());
+        assert!(!inside.busy);
+        let after = hb.read();
+        assert!(after.busy);
+        assert!(after.count > inside.count);
+    }
+
+    #[test]
+    fn a_modal_call_leaves_an_idle_heartbeat_idle() {
+        let hb = Heartbeat::default();
+        hb.beat();
+        hb.idle();
+        hb.around_modal(true, || {});
+        assert!(!hb.read().busy);
+    }
+
+    #[test]
+    fn a_modal_call_on_another_thread_does_not_touch_the_heartbeat() {
+        let hb = Heartbeat::default();
+        hb.beat();
+        let before = hb.read();
+        let inside = hb.around_modal(false, || hb.read());
+        assert_eq!(inside, before);
+        assert_eq!(hb.read(), before);
+    }
+
+    #[test]
+    fn a_hung_settings_window_is_reported_once_per_episode() {
+        let mut logged = false;
+        assert!(!first_hung_report(false, &mut logged));
+        assert!(first_hung_report(true, &mut logged));
+        assert!(!first_hung_report(true, &mut logged));
+        assert!(!first_hung_report(false, &mut logged));
+        // Responsive in between: the next episode reports again.
+        assert!(first_hung_report(true, &mut logged));
     }
 
     #[test]
