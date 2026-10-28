@@ -434,8 +434,8 @@ pub fn set_taskbar_hide_absolute_armed(
             with_armed_taskbar_windows(|state| (state.is_active(), state.session_restore()));
         if active {
             // A taskbar the hotkey showed in the meantime goes away again
-            // when the game is returned to. `hide_taskbar_window` marks
-            // the recovery record hidden first (the hotkey show cleared it)
+            // when the game is returned to. `mark_and_hide_taskbar_window`
+            // marks the recovery record hidden first (the hotkey show cleared it)
             // and hides; the session's remembered restore is not touched.
             let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
             let rehide = judgement

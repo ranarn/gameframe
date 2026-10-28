@@ -1084,6 +1084,9 @@ pub(crate) fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
     }
 }
 
+/// The most windows [`HungSkipLog`] remembers; past it the log starts over.
+const HUNG_LOG_CAP: usize = 64;
+
 /// Windows whose hung skip is already logged, so a hung game costs one log
 /// line, not one per foreground event.
 #[derive(Debug, Default)]
@@ -1103,6 +1106,11 @@ impl HungSkipLog {
     /// re-arms the log.
     fn note(&mut self, window: isize, hung: bool) -> bool {
         if hung {
+            // Entries normally leave on destroy or recovery; the cap bounds
+            // what a missed destroy (or a replaced taskbar window) leaves.
+            if self.logged.len() >= HUNG_LOG_CAP && !self.logged.contains(&window) {
+                self.logged.clear();
+            }
             self.logged.insert(window)
         } else {
             self.logged.remove(&window);
@@ -2321,6 +2329,15 @@ mod tests {
         assert!(log.note(8, true), "another window has its own line");
         assert!(!log.note(7, false));
         assert!(log.note(7, true), "a recovered window logs a new hang");
+    }
+
+    #[test]
+    fn the_hung_log_stays_bounded() {
+        let mut log = HungSkipLog::default();
+        for window in 0..(HUNG_LOG_CAP as isize * 3) {
+            assert!(log.note(window, true));
+        }
+        assert!(log.logged.len() <= HUNG_LOG_CAP);
     }
 
     #[test]

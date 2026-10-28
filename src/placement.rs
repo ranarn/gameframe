@@ -352,8 +352,12 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
 }
 
 /// A launch-detected foreground change: places a tracked auto-apply game.
-pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
-    apply_zone(config_dir, hwnd, Trigger::AutoApply);
+///
+/// Returns how long to wait before trying again when the game was hung: auto
+/// apply only runs on a foreground change, so without a retry a game that is
+/// hung as it takes the foreground would never be placed (see [`retry_after`]).
+pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) -> Option<Duration> {
+    retry_after(&apply_zone(config_dir, hwnd, Trigger::AutoApply))
 }
 
 /// A location-change event on a window GameFrame placed: re-applies the Zone
@@ -366,13 +370,14 @@ pub(crate) fn handle_auto_apply_launch(config_dir: &Path, hwnd: HWND) {
 /// because of the rate limit or because the window is hung (see
 /// [`drift_retry`]).
 pub(crate) fn handle_applied_window_drift(config_dir: &Path, hwnd: HWND) -> Option<Duration> {
-    drift_retry(&apply_zone(config_dir, hwnd, Trigger::Drift))
+    retry_after(&apply_zone(config_dir, hwnd, Trigger::Drift))
 }
 
-/// When to re-check a window after a drift [`Outcome`]: after the rate limit,
-/// or -- since a hung window produces no location-change events -- polling
-/// until it responds again.
-fn drift_retry(outcome: &Outcome) -> Option<Duration> {
+/// When to try a window again after an automatic [`Outcome`]: after the rate
+/// limit, or -- since a hung window produces no location-change events and
+/// auto-apply only fires on a foreground change -- polling until it responds
+/// again.
+fn retry_after(outcome: &Outcome) -> Option<Duration> {
     match outcome {
         Outcome::RetryIn(retry_in) => Some(*retry_in),
         Outcome::Failed(e) if e.is_window_hung() => Some(win32::HUNG_RECHECK_INTERVAL),
@@ -900,14 +905,24 @@ mod tests {
         let hung = Outcome::Failed(Win32Error::WindowHung);
         let retry_in = Duration::from_millis(300);
 
-        assert_eq!(drift_retry(&hung), Some(win32::HUNG_RECHECK_INTERVAL));
-        assert_eq!(drift_retry(&Outcome::RetryIn(retry_in)), Some(retry_in));
-        assert_eq!(drift_retry(&Outcome::Applied), None);
-        assert_eq!(drift_retry(&Outcome::Skipped), None);
+        assert_eq!(retry_after(&hung), Some(win32::HUNG_RECHECK_INTERVAL));
+        assert_eq!(retry_after(&Outcome::RetryIn(retry_in)), Some(retry_in));
+        assert_eq!(retry_after(&Outcome::Applied), None);
+        assert_eq!(retry_after(&Outcome::Skipped), None);
         assert_eq!(
-            drift_retry(&Outcome::Failed(Win32Error::TaskbarNotFound)),
+            retry_after(&Outcome::Failed(Win32Error::TaskbarNotFound)),
             None
         );
+    }
+
+    #[test]
+    fn a_hung_auto_apply_game_is_retried_later() {
+        let mut ops = tracked_ops(true);
+        ops.place_result = || Err(Win32Error::WindowHung);
+
+        let outcome = apply_zone_with(&ops, hwnd(), Trigger::AutoApply);
+
+        assert_eq!(retry_after(&outcome), Some(win32::HUNG_RECHECK_INTERVAL));
     }
 
     #[test]
