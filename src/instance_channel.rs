@@ -330,6 +330,8 @@ impl Drop for Receiver {
             DestroyWindow(self.hwnd);
             if !self.session_hwnd.is_null() {
                 DestroyWindow(self.session_hwnd);
+                let class = wide(SESSION_CLASS_NAME);
+                UnregisterClassW(class.as_ptr(), GetModuleHandleW(std::ptr::null()));
             }
         }
     }
@@ -399,18 +401,40 @@ unsafe extern "system" fn session_wndproc(
     if msg == WM_ENDSESSION && should_restore_on_end_session(wparam) {
         // The process may be ended as soon as this returns: restore now, the
         // same way the tray's Exit item does, and clear the marker.
-        log!("session ending: restoring the taskbar");
-        crate::taskbar_recovery::restore_all_for_exit();
+        //
+        // A sent WM_ENDSESSION can be dispatched from inside a cross-process
+        // `SendMessage` of an in-flight hide (appbar state write). That is
+        // acceptable: the process is ending, and if the hide then finishes it
+        // has already written the marker, so the next start recovers. No lock
+        // is held across an OS call in the hide/restore paths, so this cannot
+        // deadlock.
+        end_session_restore();
         return 0;
     }
     // SAFETY: forwards the exact arguments we were called with.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// The restore a session end performs.
+#[cfg(not(test))]
+fn end_session_restore() {
+    log!("session ending: restoring the taskbar");
+    crate::taskbar_recovery::restore_all_for_exit();
+}
+
+/// Tests count the calls instead of touching the real taskbar.
+#[cfg(test)]
+static END_SESSION_RESTORES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn end_session_restore() {
+    END_SESSION_RESTORES.fetch_add(1, Ordering::SeqCst);
+}
+
 /// Creates the never-shown top-level window (`WS_POPUP`, `WS_EX_TOOLWINDOW`,
 /// no `ShowWindow` ever): an unshown window has no taskbar button and is not
-/// in Alt+Tab, and the tool-window style keeps it out of both regardless.
-/// Must run on the main thread so its pump dispatches the message.
+/// in Alt+Tab. Must run on the main thread so its pump dispatches the message.
 fn create_session_window(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
     let class = wide(SESSION_CLASS_NAME);
     // SAFETY: plain Win32 calls with NUL-terminated strings that outlive them;
@@ -590,6 +614,35 @@ mod tests {
     fn end_session_restores_only_when_the_session_really_ends() {
         assert!(should_restore_on_end_session(1));
         assert!(!should_restore_on_end_session(0));
+    }
+
+    /// Destroys the session window and unregisters its class on drop.
+    struct SessionWindow(HWND);
+    impl Drop for SessionWindow {
+        fn drop(&mut self) {
+            // SAFETY: our own window, created on this thread.
+            unsafe {
+                DestroyWindow(self.0);
+                let class = wide(SESSION_CLASS_NAME);
+                UnregisterClassW(class.as_ptr(), GetModuleHandleW(std::ptr::null()));
+            }
+        }
+    }
+
+    #[test]
+    fn session_window_restores_on_a_real_end_session_only() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        // SAFETY: plain Win32 calls on a window created and destroyed here.
+        unsafe {
+            let hwnd = create_session_window(GetModuleHandleW(std::ptr::null()));
+            assert!(!hwnd.is_null(), "session window must be creatable");
+            let _guard = SessionWindow(hwnd);
+            let before = END_SESSION_RESTORES.load(Ordering::SeqCst);
+            SendMessageW(hwnd, WM_ENDSESSION, 0, 0);
+            assert_eq!(END_SESSION_RESTORES.load(Ordering::SeqCst), before);
+            SendMessageW(hwnd, WM_ENDSESSION, 1, 0);
+            assert_eq!(END_SESSION_RESTORES.load(Ordering::SeqCst), before + 1);
+        }
     }
 
     #[test]

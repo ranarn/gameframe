@@ -80,7 +80,7 @@ pub enum RawRestorePath {
 
 /// Which show a [`RawRestorePath`] uses. Startup recovery has the time and the
 /// locks for the full show (a bare `SW_SHOW` can leave an auto-hidden taskbar
-/// collapsed, #116); the panic hook must not do more than one plain call.
+/// collapsed); the panic hook must not do more than one plain call.
 pub fn show_kind_for(path: RawRestorePath) -> ShowKind {
     match path {
         RawRestorePath::Startup => ShowKind::Full,
@@ -353,7 +353,8 @@ static MARKER_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// before the next hide and at exit.
 static RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set once this run has hidden the taskbar window (`FullyHidden`), so a
-/// graceful exit knows a still-hidden taskbar is its doing.
+/// graceful exit knows a still-hidden taskbar is its doing. Never reset on
+/// purpose: any later exit that finds the taskbar not visible shows it.
 static HID_FULLY_THIS_RUN: AtomicBool = AtomicBool::new(false);
 /// The appbar flags read when the current `FullyHidden` session started.
 static SESSION_START_FLAGS: Mutex<Option<u32>> = Mutex::new(None);

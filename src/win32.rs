@@ -958,13 +958,15 @@ pub fn show_taskbar() -> Result<(), Win32Error> {
 }
 
 /// The full normal show without marker bookkeeping or the record lock: what
-/// [`show_taskbar`] does, and what startup recovery uses (#116).
+/// [`show_taskbar`] does, and what startup recovery uses.
 fn show_taskbar_full() -> Result<(), Win32Error> {
     let hwnd = show_taskbar_window()?;
     // `SW_SHOW` alone does not re-lay-out or raise a taskbar that a game
     // covered or that slid away. Re-send the appbar state read just now,
     // unchanged, then raise without activating.
     let flags = read_appbar_flags(hwnd);
+    // Also ends the FullyHidden session for the flags-changed log (a no-op
+    // when none is open, e.g. startup recovery).
     taskbar_recovery::finish_session_flags(flags);
     resend_appbar_state(|| flags, |lparam| send_appbar_setstate(hwnd, lparam));
     // Safety: live handle; zero position/size are ignored via SWP_NOMOVE |
