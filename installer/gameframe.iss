@@ -405,7 +405,7 @@ begin
     end;
     if MsgBox('GameFrame is still running and setup cannot close it. It may be running as ' +
               'administrator or in another session.'#13#10#13#10 +
-              'Quit GameFrame from its tray icon, then press Retry.',
+              'Exit GameFrame from its tray icon, then press Retry.',
               mbError, MB_RETRYCANCEL) <> IDRETRY then
     begin
       Log('User cancelled while GameFrame could not be stopped');
@@ -524,7 +524,7 @@ begin
   else
     // Non-empty aborts before any file is touched (non-zero exit when silent).
     Result := 'GameFrame is still running and could not be closed, so it was not installed. ' +
-              'Quit GameFrame from its tray icon and run setup again.';
+              'Exit GameFrame from its tray icon and run setup again.';
 end;
 
 // Whether setup was started with the bare /RELAUNCH switch.
@@ -571,7 +571,7 @@ begin
       if not UninstallSilent then
         MsgBox('GameFrame was started again and setup cannot close it. It may be running as ' +
                'administrator or in another session.'#13#10#13#10 +
-               'Quit GameFrame from its tray icon and run the uninstall again.', mbError, MB_OK);
+               'Exit GameFrame from its tray icon and run the uninstall again.', mbError, MB_OK);
       Abort;
     end;
     // Remove autostart however it was enabled -- by this installer or by
