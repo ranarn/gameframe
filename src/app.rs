@@ -1322,30 +1322,33 @@ pub(crate) fn config_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn zone_editor_tick_allows_only_the_cursor_hotkey() {
-        use super::{HotkeyAction::*, SettingsMode::ZoneEditor, hotkey_allowed};
-        assert!(hotkey_allowed(ZoneEditor, ToggleGameCursor));
-        assert!(!hotkey_allowed(ZoneEditor, ToggleTaskbarAutohide));
-        assert!(!hotkey_allowed(ZoneEditor, ToggleBorderless));
-    }
-
-    #[test]
-    fn settings_ticks_allow_every_hotkey_except_while_capturing() {
-        use super::{HotkeyAction::*, SettingsMode, hotkey_allowed};
-        for action in [ToggleBorderless, ToggleTaskbarAutohide, ToggleGameCursor] {
-            assert!(hotkey_allowed(SettingsMode::Closed, action));
-            assert!(hotkey_allowed(SettingsMode::Open, action));
-            assert!(!hotkey_allowed(SettingsMode::Capturing, action));
-        }
-    }
-
     use super::*;
     use crate::hotkeys::register_each;
     use crate::profile_store::{Config, TrackedGame, Zone};
     use global_hotkey::hotkey::HotKey;
     use std::path::PathBuf;
     use windows_sys::Win32::UI::WindowsAndMessaging::IDNO;
+
+    #[test]
+    fn zone_editor_tick_allows_only_the_cursor_hotkey() {
+        use HotkeyAction::*;
+        assert!(hotkey_allowed(SettingsMode::ZoneEditor, ToggleGameCursor));
+        assert!(!hotkey_allowed(
+            SettingsMode::ZoneEditor,
+            ToggleTaskbarAutohide
+        ));
+        assert!(!hotkey_allowed(SettingsMode::ZoneEditor, ToggleBorderless));
+    }
+
+    #[test]
+    fn settings_ticks_allow_every_hotkey_except_while_capturing() {
+        use HotkeyAction::*;
+        for action in [ToggleBorderless, ToggleTaskbarAutohide, ToggleGameCursor] {
+            assert!(hotkey_allowed(SettingsMode::Closed, action));
+            assert!(hotkey_allowed(SettingsMode::Open, action));
+            assert!(!hotkey_allowed(SettingsMode::Capturing, action));
+        }
+    }
 
     #[test]
     fn first_run_choice_sets_up_only_on_yes() {
