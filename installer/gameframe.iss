@@ -150,6 +150,8 @@ function CloseHandle(Handle: Longint): Longint;
   external 'CloseHandle@kernel32.dll stdcall';
 function PeekMessage(var Msg: TMsg; Wnd, MsgFilterMin, MsgFilterMax, RemoveMsg: Longint): Longint;
   external 'PeekMessageW@user32.dll stdcall';
+procedure PostQuitMessage(ExitCode: Longint);
+  external 'PostQuitMessage@user32.dll stdcall';
 function TranslateMessage(var Msg: TMsg): Longint;
   external 'TranslateMessage@user32.dll stdcall';
 function DispatchMessage(var Msg: TMsg): Longint;
@@ -164,13 +166,21 @@ end;
 
 // Dispatches everything waiting in this thread's queue (Pascal Script has no
 // Application.ProcessMessages), so the wizard repaints and the window stays
-// responsive.
+// responsive. Wizard buttons stay clickable meanwhile (no IsDialogMessage, so
+// no Tab/Enter/Esc handling); the wait is short, and a Cancel click is handled
+// by Inno's own confirmation, re-entrantly but modally.
 procedure PumpMessages;
 var
   Msg: TMsg;
 begin
   while PeekMessage(Msg, 0, 0, 0, 1 { PM_REMOVE }) <> 0 do
   begin
+    if Msg.Message = $0012 { WM_QUIT } then
+    begin
+      // Not ours to swallow: hand it back for the outer message loop.
+      PostQuitMessage(Msg.WParam);
+      Exit;
+    end;
     TranslateMessage(Msg);
     DispatchMessage(Msg);
   end;
@@ -241,7 +251,10 @@ end;
 // True while something still holds gameframe.exe open without write sharing,
 // i.e. the process image is still mapped. The mutex disappears while the
 // process is still shutting down, so it does not prove the file is replaceable.
-// A missing file (fresh install) is not locked.
+// Only a sharing violation counts as locked; any other failure (missing file on
+// a fresh install, access denied on a read-only or ACL-protected exe) is
+// treated as unlocked on purpose -- waiting would not help, and the wait is
+// only an optimisation before Inno's own copy retry.
 function ExeLocked: Boolean;
 var
   Handle: Longint;
@@ -262,14 +275,17 @@ end;
 procedure WaitForExeUnlocked;
 var
   Waited: Integer;
+  Locked: Boolean;
 begin
   Waited := 0;
-  while ExeLocked and (Waited < {#ExitWaitMs}) do
+  Locked := ExeLocked;
+  while Locked and (Waited < {#ExitWaitMs}) do
   begin
     PumpSleep(100);
     Waited := Waited + 100;
+    Locked := ExeLocked;
   end;
-  if ExeLocked then
+  if Locked then
     Log('gameframe.exe is still locked; continuing (the file copy retries)')
   else
     Log(Format('gameframe.exe is writable after %d ms', [Waited]));
@@ -287,7 +303,12 @@ begin
   // go; force-kill only if it does not. Nothing to do when it is not running.
   Result := True;
   if not GameFrameRunning then
+  begin
+    // The mutex goes before the process has fully exited (e.g. a retry after
+    // quitting from the tray), so the exe can still be locked.
+    WaitForExeUnlocked;
     Exit;
+  end;
   if GameFrameRunsElevated then
   begin
     Log('GameFrame runs elevated; setup cannot stop it');
@@ -441,9 +462,14 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     // Backstop: GameFrame may have been started after InitializeUninstall.
-    // This event runs before any file is removed and an exception here is
-    // fatal (HandleException=False in Setup.Uninstall.pas), so Abort stops the
-    // uninstall untouched.
+    // Source: jrsoftware/issrc Projects/Src/Setup.Uninstall.pas calls
+    // CurUninstallStepChanged(usUninstall, HandleException=False) immediately
+    // before UninstLog.PerformUninstall (the file removal); with False the
+    // script's exception is re-raised ("fatal"), so Abort (EAbort) ends the
+    // uninstall before any file is removed. It takes the same exit path as
+    // InitializeUninstall returning False (that also calls Abort); the exact
+    // exit code is not documented and not run here (it would need a throwaway
+    // machine).
     if not StopGameFrame then
     begin
       Log('Uninstall aborted by the backstop: GameFrame is running and cannot be stopped');
