@@ -13,13 +13,14 @@
 //! otherwise paints an opaque background behind the egui content regardless
 //! of the viewport's transparency flag.
 //!
-//! Drives [`crate::zone_editor::AppState`] from real pointer input, and
-//! hides the taskbar for the duration of the editing session via
-//! [`crate::win32::hide_taskbar`] (mode-aware -- see
-//! [`crate::profile_store::TaskbarHideMode`]), restoring exactly the
-//! previous state via [`crate::win32::restore_taskbar`] once the session
-//! ends -- Save, Cancel, or the window being closed any other way (an RAII
-//! guard, [`TaskbarRestoreGuard`], holds the remembered
+//! Drives [`crate::zone_editor::AppState`] from real pointer input. The
+//! taskbar is left as found when the editor opens; a control-box toggle hides
+//! it via [`crate::win32::hide_taskbar`] (mode-aware -- see
+//! [`crate::profile_store::TaskbarHideMode`]) and shows it again, and
+//! whatever the session still has hidden is restored via
+//! [`crate::win32::restore_taskbar`] once the session ends -- Save, Cancel,
+//! or the window being closed any other way (an RAII guard,
+//! [`TaskbarRestoreGuard`], holds the remembered
 //! [`crate::win32::TaskbarHideRestore`] and restores it on drop, covering
 //! early returns). A panic is covered separately: the release profile is
 //! `panic = "abort"`, so the guard's `Drop` does NOT run then; instead the
@@ -63,20 +64,15 @@ const HANDLE_DRAW_PT: f32 = 28.0;
 /// of the Zone's width/height so a small Zone keeps a Move area.
 const HANDLE_HIT_PT: f32 = 40.0;
 
-/// Reasons opening the zone-editor overlay (or restoring the taskbar
-/// afterward) can fail.
+/// Reasons opening the zone-editor overlay can fail.
 #[derive(Debug)]
 pub enum ZoneOverlayError {
-    Taskbar(win32::Win32Error),
     Window(eframe::Error),
 }
 
 impl std::fmt::Display for ZoneOverlayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ZoneOverlayError::Taskbar(e) => {
-                write!(f, "failed to force taskbar auto-hide for zone editing: {e}")
-            }
             ZoneOverlayError::Window(e) => write!(f, "failed to open the zone editor overlay: {e}"),
         }
     }
@@ -85,7 +81,6 @@ impl std::fmt::Display for ZoneOverlayError {
 impl std::error::Error for ZoneOverlayError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ZoneOverlayError::Taskbar(e) => Some(e),
             ZoneOverlayError::Window(e) => Some(e),
         }
     }
@@ -99,12 +94,13 @@ impl std::error::Error for ZoneOverlayError {
 /// already-configured Zone) so resizing it doesn't require
 /// redrawing from scratch. All eight resize handles are always active.
 ///
-/// Hides the taskbar for the session using whichever technique `mode`
-/// selects (see module docs) and always restores exactly the state found
-/// beforehand before returning -- whether the window ran cleanly, failed to
-/// run, or returned early -- via the [`TaskbarRestoreGuard`] RAII guard held
-/// across the call. A panic mid-session is handled by the panic hook, not
-/// the guard (see the module docs).
+/// Leaves the taskbar as it is on open. The control box has a toggle that
+/// hides/shows it using whichever technique `mode` selects (see module
+/// docs); whatever the session hid is restored exactly before returning --
+/// whether the window ran cleanly, failed to run, or returned early -- via
+/// the [`TaskbarRestoreGuard`] RAII guard held across the call. A panic
+/// mid-session is handled by the panic hook, not the guard (see the module
+/// docs).
 pub fn run_zone_editor_overlay(
     initial: Option<Zone>,
     mode: TaskbarHideMode,
@@ -115,7 +111,7 @@ pub fn run_zone_editor_overlay(
         height: monitor_geometry.height,
     };
 
-    let remembered_taskbar_state = win32::hide_taskbar(mode).map_err(ZoneOverlayError::Taskbar)?;
+    let taskbar = Rc::new(RefCell::new(TaskbarSession::default()));
 
     // RAII guard, not a manual "call restore after run_native" step, so
     // every non-panic exit path -- normal return and early `?` propagation
@@ -123,7 +119,7 @@ pub fn run_zone_editor_overlay(
     // build (`panic = "abort"`); the panic hook installed at startup
     // (`crate::taskbar_recovery`) restores the taskbar in that case, e.g.
     // after a wgpu device-lost panic on sleep/resume or a monitor unplug.
-    let _taskbar_restore_guard = TaskbarRestoreGuard::new(remembered_taskbar_state);
+    let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar));
 
     let state = match initial {
         Some(zone) => AppState::new_with_zone(monitor, zone),
@@ -166,6 +162,8 @@ pub fn run_zone_editor_overlay(
                 state,
                 outcome: outcome_for_app,
                 hwnd,
+                taskbar,
+                taskbar_mode: mode,
             };
             app.strip_frame();
             Ok(Box::new(app))
@@ -180,29 +178,85 @@ pub fn run_zone_editor_overlay(
     }
 }
 
-/// RAII guard that restores the taskbar's remembered state (which technique
-/// hid it, plus whatever it needs to restore exactly -- see
-/// [`win32::TaskbarHideRestore`]) when dropped, whether that happens via
-/// normal return or early `?` propagation. It does not cover a panic in the
-/// release build (`panic = "abort"` skips destructors); the panic hook in
+/// What the editing session has done to the taskbar: `hidden` holds the
+/// remembered state (see [`win32::TaskbarHideRestore`]) only while the
+/// session itself has the taskbar hidden. Opening the editor leaves the
+/// taskbar alone, so closing restores nothing unless the toggle was used.
+#[derive(Debug, Default)]
+struct TaskbarSession {
+    hidden: Option<win32::TaskbarHideRestore>,
+}
+
+/// What the toggle button must do next.
+#[derive(Debug, PartialEq, Eq)]
+enum TaskbarToggle {
+    /// The session has not hidden the taskbar: hide it.
+    Hide,
+    /// The session hid the taskbar: restore this state.
+    Show(win32::TaskbarHideRestore),
+}
+
+impl TaskbarSession {
+    /// Pure decision for the toggle button.
+    fn toggle_action(&self) -> TaskbarToggle {
+        match self.hidden {
+            None => TaskbarToggle::Hide,
+            Some(remembered) => TaskbarToggle::Show(remembered),
+        }
+    }
+
+    /// Takes what must be restored when the session ends: the state to undo,
+    /// or `None` when the session never hid the taskbar (or already showed it
+    /// again) so the pre-editor state is left alone.
+    fn take_restore_on_close(&mut self) -> Option<win32::TaskbarHideRestore> {
+        self.hidden.take()
+    }
+
+    /// Performs the toggle with `mode`. A failure is logged and leaves the
+    /// bookkeeping unchanged.
+    fn toggle(&mut self, mode: TaskbarHideMode) {
+        match self.toggle_action() {
+            TaskbarToggle::Hide => match win32::hide_taskbar(mode) {
+                Ok(remembered) => self.hidden = Some(remembered),
+                Err(e) => log!("zone editor: failed to hide the taskbar: {e}"),
+            },
+            TaskbarToggle::Show(remembered) => match win32::restore_taskbar(remembered) {
+                Ok(()) => self.hidden = None,
+                Err(e) => log!("zone editor: failed to show the taskbar: {e}"),
+            },
+        }
+    }
+}
+
+/// RAII guard that restores whatever the session hid (see
+/// [`TaskbarSession`]) when dropped, whether that happens via normal return
+/// or early `?` propagation. It does not cover a panic in the release build
+/// (`panic = "abort"` skips destructors); the panic hook in
 /// `crate::taskbar_recovery` does.
 ///
 /// `restore_taskbar`'s own error is logged rather than propagated or
 /// unwrapped -- a `Drop` impl must not panic (it could run during a debug
 /// build's unwind, where a second panic aborts).
 struct TaskbarRestoreGuard {
-    remembered: win32::TaskbarHideRestore,
+    session: Rc<RefCell<TaskbarSession>>,
 }
 
 impl TaskbarRestoreGuard {
-    fn new(remembered: win32::TaskbarHideRestore) -> Self {
-        Self { remembered }
+    fn new(session: Rc<RefCell<TaskbarSession>>) -> Self {
+        Self { session }
     }
 }
 
 impl Drop for TaskbarRestoreGuard {
     fn drop(&mut self) {
-        if let Err(e) = win32::restore_taskbar(self.remembered) {
+        // `try_borrow_mut`: never panic in a destructor.
+        let Ok(mut session) = self.session.try_borrow_mut() else {
+            log!("zone editor: taskbar state busy at close; not restored");
+            return;
+        };
+        if let Some(remembered) = session.take_restore_on_close()
+            && let Err(e) = win32::restore_taskbar(remembered)
+        {
             log!("zone editor: failed to restore taskbar state: {e}");
         }
     }
@@ -340,6 +394,10 @@ struct OverlayApp {
     outcome: Rc<RefCell<Option<SessionOutcome>>>,
     /// The overlay's window, for [`strip_window_frame`] (egui #8750).
     hwnd: Option<HWND>,
+    /// What this session has hidden; shared with the [`TaskbarRestoreGuard`].
+    taskbar: Rc<RefCell<TaskbarSession>>,
+    /// The configured technique for the toggle button's hide.
+    taskbar_mode: TaskbarHideMode,
 }
 
 impl eframe::App for OverlayApp {
@@ -393,18 +451,7 @@ impl OverlayApp {
         let scale = scale_of(ui.ctx());
         painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
 
-        let live_rect = match &self.state.editor {
-            EditorState::Empty => None,
-            EditorState::Dragging { anchor, current } => {
-                Some(rect_from_points(*anchor, *current, scale))
-            }
-            EditorState::Placed { zone, .. } => Some(rect_from_zone(zone, scale)),
-            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => {
-                Some(rect_from_zone(live, scale))
-            }
-        };
-
-        if let Some(rect) = live_rect {
+        if let Some(rect) = self.live_rect(scale) {
             painter.rect_filled(
                 rect,
                 0.0,
@@ -425,14 +472,30 @@ impl OverlayApp {
             for handle in Handle::ALL {
                 let center = handle_center(zone, handle, scale);
                 let color = egui::Color32::from_rgb(80, 200, 255);
+                let size = handle_draw_size_pt(
+                    pixels_to_points(zone.width, scale),
+                    pixels_to_points(zone.height, scale),
+                );
                 painter.rect_filled(
-                    egui::Rect::from_center_size(
-                        center,
-                        egui::vec2(HANDLE_DRAW_PT, HANDLE_DRAW_PT),
-                    ),
+                    egui::Rect::from_center_size(center, egui::vec2(size.0, size.1)),
                     2.0,
                     color,
                 );
+            }
+        }
+    }
+
+    /// The Zone as currently drawn (in points), if any: the live drag, the
+    /// placed Zone, or the Zone being moved/resized.
+    fn live_rect(&self, scale: f32) -> Option<egui::Rect> {
+        match &self.state.editor {
+            EditorState::Empty => None,
+            EditorState::Dragging { anchor, current } => {
+                Some(rect_from_points(*anchor, *current, scale))
+            }
+            EditorState::Placed { zone, .. } => Some(rect_from_zone(zone, scale)),
+            EditorState::Resizing { live, .. } | EditorState::Moving { live, .. } => {
+                Some(rect_from_zone(live, scale))
             }
         }
     }
@@ -504,16 +567,8 @@ impl OverlayApp {
                 .or(response.interact_pointer_pos());
             let Some(press) = press else { return };
             let press = point_from_points(press.x, press.y, scale);
-            match hit_test(&zone, press, grab_px) {
-                Some(Target::Resize(handle)) => {
-                    self.state.apply(Action::Grab(handle, press));
-                }
-                Some(Target::Move) => {
-                    self.state.apply(Action::GrabMove(press));
-                }
-                // A press outside the Zone is ignored: a new Zone can't be
-                // drawn from the Placed state (same as before moving existed).
-                None => {}
+            if let Some(action) = press_action(&zone, press, grab_px) {
+                self.state.apply(action);
             }
         }
 
@@ -569,7 +624,27 @@ impl OverlayApp {
                                 *self.outcome.borrow_mut() = Some(outcome);
                             }
                         });
+                        let hidden = self.taskbar.borrow().hidden.is_some();
+                        let toggle_text = if hidden {
+                            "Show taskbar"
+                        } else {
+                            "Hide taskbar"
+                        };
                         ui.vertical_centered(|ui| {
+                            let toggle = control_button(toggle_text, egui::Color32::from_gray(70));
+                            if ui.add(toggle).clicked() {
+                                self.taskbar.borrow_mut().toggle(self.taskbar_mode);
+                            }
+                            let scale = scale_of(ctx);
+                            ui.label(
+                                egui::RichText::new(format_zone_readout(
+                                    self.live_rect(scale),
+                                    scale,
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .monospace()
+                                .size(18.0),
+                            );
                             ui.label(
                                 egui::RichText::new(&self.state.last_message)
                                     .color(egui::Color32::LIGHT_GRAY)
@@ -615,6 +690,43 @@ fn rect_from_zone(zone: &Zone, scale: f32) -> egui::Rect {
     )
 }
 
+/// Drawn size (width, height) in points of a resize handle on a Zone that is
+/// `zone_w_pt` x `zone_h_pt` points: [`HANDLE_DRAW_PT`], capped per axis at a
+/// third of the Zone's size (like the hit bands in [`hit_test`]) so handles
+/// don't overlap on a very small Zone.
+fn handle_draw_size_pt(zone_w_pt: f32, zone_h_pt: f32) -> (f32, f32) {
+    (
+        HANDLE_DRAW_PT.min(zone_w_pt / 3.0),
+        HANDLE_DRAW_PT.min(zone_h_pt / 3.0),
+    )
+}
+
+/// The editor action a press at `press` starts on a placed `zone`, or `None`
+/// when it lands outside the Zone. A press outside is ignored: a new Zone
+/// can't be drawn from the Placed state.
+fn press_action(zone: &Zone, press: Point, grab_px: i32) -> Option<Action> {
+    match hit_test(zone, press, grab_px)? {
+        Target::Resize(handle) => Some(Action::Grab(handle, press)),
+        Target::Move => Some(Action::GrabMove(press)),
+    }
+}
+
+/// The control box's readout of the Zone being edited: x, y, width and height
+/// in physical pixels (the unit the Zone is saved in), converted from the
+/// drawn `rect` (points) at `scale`. A placeholder when no Zone exists yet.
+fn format_zone_readout(rect: Option<egui::Rect>, scale: f32) -> String {
+    let Some(rect) = rect else {
+        return "x \u{2014}  y \u{2014}  w \u{2014}  h \u{2014}  px".to_string();
+    };
+    format!(
+        "x {}  y {}  w {}  h {}  px",
+        points_to_pixels(rect.min.x, scale),
+        points_to_pixels(rect.min.y, scale),
+        points_to_pixels(rect.width(), scale),
+        points_to_pixels(rect.height(), scale),
+    )
+}
+
 /// The mouse cursor shown over (or while dragging) a grab target.
 fn cursor_for(target: Target) -> egui::CursorIcon {
     match target {
@@ -642,6 +754,123 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
         Handle::Nw => egui::pos2(x, y),
         Handle::Se => egui::pos2(x + w, y + h),
         Handle::Sw => egui::pos2(x, y + h),
+    }
+}
+
+#[cfg(test)]
+mod editor_ui_tests {
+    use super::*;
+    use crate::win32::TaskbarHideRestore;
+
+    #[test]
+    fn readout_shows_pixels_for_a_rect_drawn_in_points() {
+        // 100 % scale: points are pixels.
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+        assert_eq!(
+            format_zone_readout(Some(rect), 1.0),
+            "x 10  y 20  w 300  h 200  px"
+        );
+        // 150 %: the same Zone in points is 1.5x in physical pixels.
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+        assert_eq!(
+            format_zone_readout(Some(rect), 1.5),
+            "x 15  y 30  w 450  h 300  px"
+        );
+    }
+
+    #[test]
+    fn readout_shows_a_placeholder_without_a_zone() {
+        let text = format_zone_readout(None, 1.0);
+        assert_eq!(text, "x \u{2014}  y \u{2014}  w \u{2014}  h \u{2014}  px");
+    }
+
+    #[test]
+    fn toggle_hides_when_the_session_has_not_hidden_the_taskbar() {
+        assert_eq!(
+            TaskbarSession::default().toggle_action(),
+            TaskbarToggle::Hide
+        );
+    }
+
+    #[test]
+    fn toggle_shows_the_remembered_state_when_the_session_hid_the_taskbar() {
+        let session = TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+        };
+        assert_eq!(
+            session.toggle_action(),
+            TaskbarToggle::Show(TaskbarHideRestore::FullyHidden)
+        );
+    }
+
+    #[test]
+    fn close_restores_nothing_when_the_taskbar_was_never_hidden() {
+        assert_eq!(TaskbarSession::default().take_restore_on_close(), None);
+    }
+
+    #[test]
+    fn close_restores_what_the_session_hid_exactly_once() {
+        let mut session = TaskbarSession {
+            hidden: Some(TaskbarHideRestore::FullyHidden),
+        };
+        assert_eq!(
+            session.take_restore_on_close(),
+            Some(TaskbarHideRestore::FullyHidden)
+        );
+        assert_eq!(session.take_restore_on_close(), None);
+    }
+
+    #[test]
+    fn drawn_handles_are_28_points_on_a_big_zone() {
+        assert_eq!(handle_draw_size_pt(900.0, 600.0), (28.0, 28.0));
+    }
+
+    #[test]
+    fn drawn_handles_shrink_to_a_third_of_a_small_zone() {
+        assert_eq!(handle_draw_size_pt(30.0, 600.0), (10.0, 28.0));
+        assert_eq!(handle_draw_size_pt(900.0, 45.0), (28.0, 15.0));
+    }
+
+    #[test]
+    fn press_on_a_handle_grabs_it() {
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let press = Point { x: 100, y: 100 };
+        assert!(matches!(
+            press_action(&zone, press, 40),
+            Some(Action::Grab(Handle::Nw, _))
+        ));
+    }
+
+    #[test]
+    fn press_inside_the_zone_moves_it() {
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let press = Point { x: 300, y: 250 };
+        assert!(matches!(
+            press_action(&zone, press, 40),
+            Some(Action::GrabMove(_))
+        ));
+    }
+
+    #[test]
+    fn press_outside_the_zone_does_nothing() {
+        let zone = Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let press = Point { x: 10, y: 10 };
+        assert!(press_action(&zone, press, 40).is_none());
     }
 }
 
