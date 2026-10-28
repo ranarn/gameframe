@@ -43,10 +43,16 @@ use crate::zone_editor::{
     point_from_points, scale_from_dpi,
 };
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMNCRP_DISABLED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Reasons opening the zone-editor overlay (or restoring the taskbar
@@ -125,7 +131,21 @@ pub fn run_zone_editor_overlay(
     let run_result = eframe::run_native(
         "GameFrame zone editor",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Workaround for egui #8750, see `remove_dwm_frame`.
+            match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => {
+                    let hwnd = h.hwnd.get() as HWND;
+                    match remove_dwm_frame(hwnd) {
+                        Ok(()) => log!(
+                            "zone editor: DWM frame removed (NCRENDERING_ENABLED={:?})",
+                            nc_rendering_enabled(hwnd)
+                        ),
+                        Err(e) => log!("zone editor: could not remove the DWM frame: {e}"),
+                    }
+                }
+                other => log!("zone editor: no Win32 window handle ({other:?}); DWM frame kept"),
+            }
             Ok(Box::new(OverlayApp {
                 state,
                 outcome: outcome_for_app,
@@ -167,6 +187,69 @@ impl Drop for TaskbarRestoreGuard {
             log!("zone editor: failed to restore taskbar state: {e}");
         }
     }
+}
+
+/// Removes the DWM non-client frame (drop shadow and extended frame) from the
+/// overlay's own window.
+///
+/// WORKAROUND for egui #8750 (https://github.com/emilk/egui/issues/8750):
+/// since egui 0.35, egui-winit enables winit's "undecorated shadow" on every
+/// undecorated, non-fullscreen window, and on a transparent DX12 +
+/// DirectComposition window the DWM frame then shows through every
+/// transparent pixel as solid light grey (seen on an NVIDIA machine). Remove
+/// this, and the call site in [`run_zone_editor_overlay`], once an egui
+/// release fixes it.
+///
+/// Zero frame margins plus `DWMNCRP_DISABLED` is applied once, on window
+/// creation; egui-winit only touches the shadow again on a
+/// `ViewportCommand::Decorations`, which the overlay never sends.
+fn remove_dwm_frame(hwnd: HWND) -> Result<(), win32::Win32Error> {
+    let margins = MARGINS {
+        cxLeftWidth: 0,
+        cxRightWidth: 0,
+        cyTopHeight: 0,
+        cyBottomHeight: 0,
+    };
+    // Safety: `hwnd` is a live window handle; `&margins` and `&policy` point
+    // to correctly sized buffers that outlive the calls, per the documented
+    // contracts of these DWM functions.
+    unsafe {
+        let hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        if hr < 0 {
+            return Err(win32::Win32Error::from_hresult(hr));
+        }
+        let policy = DWMNCRP_DISABLED;
+        let hr = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY as u32,
+            &policy as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        if hr < 0 {
+            return Err(win32::Win32Error::from_hresult(hr));
+        }
+    }
+    Ok(())
+}
+
+/// Reads back `DWMWA_NCRENDERING_ENABLED` (`POLICY` itself is set-only; 0 =
+/// non-client rendering off), to verify [`remove_dwm_frame`] took effect. DWM
+/// has no readback for frame margins.
+fn nc_rendering_enabled(hwnd: HWND) -> Result<i32, win32::Win32Error> {
+    let mut policy = 0i32;
+    // Safety: `&mut policy` is a valid, correctly sized out-buffer.
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_ENABLED as u32,
+            &mut policy as *mut i32 as *mut core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    if hr < 0 {
+        return Err(win32::Win32Error::from_hresult(hr));
+    }
+    Ok(policy)
 }
 
 /// The primary monitor's live DPI as a points-to-pixels factor, for placing
@@ -486,5 +569,42 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
         Handle::Nw => egui::pos2(x, y),
         Handle::Se => egui::pos2(x + w, y + h),
         Handle::Sw => egui::pos2(x, y + h),
+    }
+}
+
+#[cfg(test)]
+mod dwm_frame_tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WS_CAPTION, WS_POPUP,
+    };
+
+    #[test]
+    fn remove_dwm_frame_disables_non_client_rendering_on_a_captioned_window() {
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        // Safety: built-in STATIC class, no parent, destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_POPUP | WS_CAPTION,
+                0,
+                0,
+                100,
+                100,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        assert_ne!(nc_rendering_enabled(hwnd).unwrap(), 0);
+
+        remove_dwm_frame(hwnd).unwrap();
+
+        assert_eq!(nc_rendering_enabled(hwnd).unwrap(), 0);
+        unsafe { DestroyWindow(hwnd) };
     }
 }
