@@ -1,7 +1,8 @@
 # Builds the GameFrame installer: third-party notices (cargo about) + release exe -> Inno Setup -> target\installer\GameFrame-Setup-<version>.exe and GameFrame-Third-Party-Notices.txt
 #
 # -NoticesOnly: only generate the notices file (no Inno Setup, no release build); the PR job uses this.
-# -NoticesPath: where to write the notices file (default target\installer\GameFrame-Third-Party-Notices.txt).
+# -NoticesPath: with -NoticesOnly, where to write the notices file (relative paths resolve against the caller's
+# current directory; default target\installer\GameFrame-Third-Party-Notices.txt, which gameframe.iss packages).
 # This script is the single place for the `cargo about generate` invocation, the cargo-about version
 # check and the about.toml / deny.toml license-list parity check.
 #
@@ -18,6 +19,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($NoticesPath -and -not $NoticesOnly) { throw '-NoticesPath requires -NoticesOnly (the installer always packages the default notices file)' }
+if ($NoticesPath) { $NoticesPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($NoticesPath) }
 $repo = Split-Path -Parent $PSScriptRoot
 
 # Quoted strings inside the first `[ ... ]` array assigned to `allow`/`accepted` in a TOML snippet.
@@ -32,16 +35,18 @@ function Assert-LicenseListsMatch([string]$AboutToml, [string]$DenyToml) {
     $denyText = Get-Content $DenyToml -Raw
     if ($denyText -notmatch '(?ms)^\[licenses\]\s*$(.*?)(?=^\[|\z)') { throw "no [licenses] section in $DenyToml" }
     $allow = @(Get-TomlLicenseList $Matches[1] 'allow')
-    $onlyAccepted = $accepted | Where-Object { $_ -notin $allow } | Sort-Object -Unique
-    $onlyAllow = $allow | Where-Object { $_ -notin $accepted } | Sort-Object -Unique
+    $onlyAccepted = @($accepted | Where-Object { $_ -cnotin $allow } | Sort-Object -Unique)
+    $onlyAllow = @($allow | Where-Object { $_ -cnotin $accepted } | Sort-Object -Unique)
     if ($onlyAccepted -or $onlyAllow) {
-        throw ("License lists differ between about.toml 'accepted' and deny.toml [licenses].allow. " +
-            "Only in about.toml: $($onlyAccepted -join ', '). Only in deny.toml: $($onlyAllow -join ', ').")
+        $parts = @()
+        if ($onlyAccepted) { $parts += "Only in about.toml: $($onlyAccepted -join ', ')." }
+        if ($onlyAllow) { $parts += "Only in deny.toml: $($onlyAllow -join ', ')." }
+        throw ("License lists differ between about.toml 'accepted' and deny.toml [licenses].allow. " + ($parts -join ' '))
     }
 }
 
 function Get-PinnedCargoAboutVersion([string]$ActionFile) {
-    if ((Get-Content $ActionFile -Raw) -notmatch '(?m)^\s*CARGO_ABOUT_VERSION:\s*(\S+)\s*$') {
+    if ((Get-Content $ActionFile -Raw) -notmatch '(?m)^\s*CARGO_ABOUT_VERSION:\s*[\x22\x27]?([^\x22\x27\s]+)[\x22\x27]?\s*$') {
         throw "CARGO_ABOUT_VERSION not found in $ActionFile"
     }
     $Matches[1]
@@ -51,8 +56,12 @@ Assert-LicenseListsMatch (Join-Path $repo 'about.toml') (Join-Path $repo 'deny.t
 
 $pinned = Get-PinnedCargoAboutVersion (Join-Path $repo '.github\actions\install-cargo-about\action.yml')
 $installHint = "install it: cargo install cargo-about --locked --features cli --version $pinned"
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $aboutVersion = cargo about --version 2>$null
-if ($LASTEXITCODE -ne 0) { throw "cargo-about not found -- $installHint" }
+$aboutExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($aboutExit -ne 0) { throw "cargo-about not found -- $installHint" }
 if (($aboutVersion | Out-String).Trim() -notmatch "(^|\s)$([regex]::Escape($pinned))$") {
     throw "cargo-about version mismatch: found '$(($aboutVersion | Out-String).Trim())', pinned $pinned -- $installHint"
 }
