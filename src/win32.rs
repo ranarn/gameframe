@@ -923,7 +923,7 @@ pub fn foreground_window() -> Option<HWND> {
 /// automated tests -- see module docs.
 ///
 /// # Unmarked: call through `crate::taskbar`
-/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
+/// Does not touch the recovery marker; only `crate::taskbar` may call it.
 pub(crate) fn hide_taskbar_window(hwnd: HWND) {
     // Safety: `hwnd` is a live handle just resolved by the caller; `ShowWindow`
     // performs no writes through pointers, only a plain `i32` command.
@@ -1168,7 +1168,7 @@ pub(crate) fn set_appbar_state(state: TaskbarAutohideState) -> Result<(), Win32E
 /// [`find_taskbar_window`] + [`read_appbar_flags`] round trip just to write.
 ///
 /// # Unmarked: call through `crate::taskbar`
-/// Does not touch the recovery marker; only `crate::taskbar` (and `taskbar_recovery`) may call it.
+/// Does not touch the recovery marker; only `crate::taskbar` may call it.
 pub(crate) fn write_appbar_state(hwnd: HWND, current_flags: u32, state: TaskbarAutohideState) {
     send_appbar_setstate(hwnd, apply_autohide_state(current_flags, state) as isize);
 }

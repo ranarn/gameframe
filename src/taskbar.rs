@@ -30,12 +30,12 @@ use windows_sys::Win32::Foundation::HWND;
 /// `ShowWindow` call. Not exercised by this crate's automated tests -- see
 /// the `win32` module docs.
 fn hide_taskbar_completely() -> Result<(), Win32Error> {
-    hide_taskbar_window(find_taskbar_window()?);
+    mark_and_hide_taskbar_window(find_taskbar_window()?);
     Ok(())
 }
 
 /// [`hide_taskbar_completely`] on an already-resolved taskbar handle.
-fn hide_taskbar_window(hwnd: HWND) {
+fn mark_and_hide_taskbar_window(hwnd: HWND) {
     let flags = read_appbar_flags(hwnd);
     // Marker first: a kill right after the hide is then covered.
     if taskbar_recovery::mark_hidden(TaskbarHideRestore::FullyHidden).is_some() {
@@ -46,9 +46,9 @@ fn hide_taskbar_window(hwnd: HWND) {
 }
 
 /// Shows the real taskbar via `ShowWindow(Shell_TrayWnd, SW_SHOW)` -- undoes
-/// [`hide_taskbar_completely`] -- and clears its recovery mark. Does not touch
-/// the appbar auto-hide state at all (per the `FullyHidden`/`HoverReveal`
-/// split -- see [`TaskbarHideRestore`]'s doc comment).
+/// [`hide_taskbar_completely`] -- and clears its recovery mark. The full show
+/// re-sends the current appbar state unchanged and raises the taskbar; it
+/// never flips the auto-hide flag (see [`TaskbarHideRestore`]'s doc comment).
 ///
 /// OS-facing: locates the real taskbar window and sends it a real
 /// `ShowWindow` call. Not exercised by this crate's automated tests.
@@ -428,7 +428,7 @@ pub fn set_taskbar_hide_absolute_armed(
             // `hwnd` out of the armed set.
             join_taskbar_hide_session(hwnd);
             if rehide && let Some(j) = judgement {
-                hide_taskbar_window(j.taskbar);
+                mark_and_hide_taskbar_window(j.taskbar);
             }
             Ok(())
         } else {
