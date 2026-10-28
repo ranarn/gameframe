@@ -1380,13 +1380,16 @@ impl SettingsApp<'_> {
             ui.label(label);
 
             if is_capturing {
-                ui.colored_label(egui::Color32::YELLOW, "Press a key... (Esc to cancel)");
+                ui.colored_label(ui.visuals().warn_fg_color, "Press a key... (Esc to cancel)");
             } else {
                 let bound = self.state.binding(field);
                 ui.monospace(if bound.is_empty() { "Not bound" } else { bound });
             }
             if let Some(reason) = self.state.hotkey_failure(field) {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ Not working: {reason}"));
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("⚠ Not working: {reason}"),
+                );
             }
 
             let set_hotkey_response = ui.button(if is_capturing { "Cancel" } else { "Set hotkey" });
@@ -1409,12 +1412,12 @@ impl SettingsApp<'_> {
         if is_capturing {
             if self.state.unsupported_key_pressed {
                 ui.colored_label(
-                    egui::Color32::RED,
+                    ui.visuals().error_fg_color,
                     "That key isn't supported -- try another.",
                 );
             }
             if let Some(error) = &self.state.duplicate_hotkey_error {
-                ui.colored_label(egui::Color32::RED, error);
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
 
             for event in ui.ctx().input(|i| i.events.clone()) {
@@ -1776,7 +1779,7 @@ impl SettingsApp<'_> {
                 }
                 UpdateCheck::Lost => {
                     ui.colored_label(
-                        egui::Color32::LIGHT_RED,
+                        ui.visuals().error_fg_color,
                         "Update check failed: it ended unexpectedly",
                     );
                 }
@@ -1785,7 +1788,7 @@ impl SettingsApp<'_> {
                     if result.is_ok() {
                         ui.label(message);
                     } else {
-                        ui.colored_label(egui::Color32::LIGHT_RED, message);
+                        ui.colored_label(ui.visuals().error_fg_color, message);
                     }
                 }
             }
@@ -1855,13 +1858,13 @@ impl SettingsApp<'_> {
             }
             UpdateInstall::TimedOut => {
                 ui.colored_label(
-                    egui::Color32::LIGHT_RED,
+                    ui.visuals().error_fg_color,
                     "The installer didn't finish. Try installing again.",
                 );
             }
             UpdateInstall::Failed(e) => {
                 ui.colored_label(
-                    egui::Color32::LIGHT_RED,
+                    ui.visuals().error_fg_color,
                     crate::update_install::install_error_message(e),
                 );
             }
@@ -1870,13 +1873,13 @@ impl SettingsApp<'_> {
             }
             UpdateInstall::NotStarted => {
                 ui.colored_label(
-                    egui::Color32::LIGHT_RED,
+                    ui.visuals().error_fg_color,
                     "Couldn't start the update install.",
                 );
             }
             UpdateInstall::Lost => {
                 ui.colored_label(
-                    egui::Color32::LIGHT_RED,
+                    ui.visuals().error_fg_color,
                     "Installing the update failed: it ended unexpectedly",
                 );
             }
@@ -1940,12 +1943,15 @@ impl SettingsApp<'_> {
                     }
                     None => {
                         ui.label("No zone set");
-                        ui.colored_label(egui::Color32::YELLOW, ZONE_SECTION_REQUIRED_NOTE);
+                        ui.colored_label(ui.visuals().warn_fg_color, ZONE_SECTION_REQUIRED_NOTE);
                     }
                 }
                 if let ZoneView::Unresolvable(reason) = &view {
-                    ui.colored_label(egui::Color32::RED, format!("Unavailable: {reason}"))
-                        .on_hover_text("The zone doesn't fit the current monitor. Edit it to fix.");
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Unavailable: {reason}"),
+                    )
+                    .on_hover_text("The zone doesn't fit the current monitor. Edit it to fix.");
                 }
                 ui.horizontal(|ui| {
                     let label = if self.state.zone.is_some() {
@@ -2090,7 +2096,7 @@ impl eframe::App for SettingsApp<'_> {
             // open.
             if !self.pending_status_messages.is_empty() {
                 for message in &self.pending_status_messages {
-                    ui.colored_label(egui::Color32::YELLOW, message);
+                    ui.colored_label(ui.visuals().warn_fg_color, message);
                 }
                 ui.separator();
             }
@@ -2113,7 +2119,7 @@ impl eframe::App for SettingsApp<'_> {
                     SettingsTab::Games | SettingsTab::Cursor => {
                         let enabled = zone_dependent_tabs_enabled(self.state.zone.as_ref());
                         if !enabled {
-                            ui.colored_label(egui::Color32::YELLOW, ZONE_REQUIRED_NOTE);
+                            ui.colored_label(ui.visuals().warn_fg_color, ZONE_REQUIRED_NOTE);
                             ui.add_space(4.0);
                         }
                         ui.add_enabled_ui(enabled, |ui| {
