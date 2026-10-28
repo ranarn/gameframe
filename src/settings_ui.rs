@@ -1011,6 +1011,17 @@ fn merge_tracked_games(
     edited
 }
 
+/// Which window's frame loop is ticking the app's event handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickContext {
+    /// The Settings window is open.
+    Settings,
+    /// Settings is waiting for the next key to bind; hotkey presses are dropped.
+    SettingsCapturing,
+    /// The zone-editor overlay is open (Settings is closed meanwhile).
+    ZoneEditor,
+}
+
 /// Opens the Settings window, blocking until it's closed, then returns.
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
@@ -1048,7 +1059,7 @@ fn merge_tracked_games(
 pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
-    on_tick: &mut dyn FnMut(bool) -> Option<bool>,
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let opened_games = config.tracked_games.clone();
@@ -1096,7 +1107,7 @@ pub fn run_settings_window(
                 // game-cursor toggle made meanwhile is folded into the state.
                 let mut cursor_toggled = None;
                 let mut tick = || {
-                    if let Some(enabled) = on_tick(false) {
+                    if let Some(enabled) = on_tick(TickContext::ZoneEditor) {
                         cursor_toggled = Some(enabled);
                     }
                 };
@@ -1164,7 +1175,7 @@ fn run_settings_frame(
     state: SettingsState,
     monitor: MonitorGeometry,
     initial_status_messages: Vec<String>,
-    on_tick: &mut dyn FnMut(bool) -> Option<bool>,
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
@@ -1239,7 +1250,7 @@ struct SettingsApp<'a> {
     /// loop's tray, hotkey and update events keep being handled while this
     /// window blocks that loop. Returns the new `cursor.enabled` when a
     /// hotkey press toggled it during the call.
-    on_tick: &'a mut dyn FnMut(bool) -> Option<bool>,
+    on_tick: &'a mut dyn FnMut(TickContext) -> Option<bool>,
     /// Where the Zone is persisted immediately on Clear (the overlay-Save
     /// persist lives in [`run_settings_window`]).
     config_dir: std::path::PathBuf,
@@ -1970,7 +1981,12 @@ impl eframe::App for SettingsApp<'_> {
         // so pressing a bound combo to rebind it doesn't also run its action.
         // A game-cursor hotkey press while Settings is open changed
         // `cursor.enabled` on disk: show it in the checkbox so Save keeps it.
-        if let Some(enabled) = (self.on_tick)(self.state.capturing.is_some()) {
+        let context = if self.state.capturing.is_some() {
+            TickContext::SettingsCapturing
+        } else {
+            TickContext::Settings
+        };
+        if let Some(enabled) = (self.on_tick)(context) {
             self.state.apply_external_cursor_enabled(enabled);
         }
 
