@@ -668,8 +668,19 @@ mod tests {
         use crate::taskbar_recovery::{MARKER_FILE, init, mark_hidden};
         use crate::win32::TaskbarHideRestore;
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        struct RemoveDir(std::path::PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!("gameframe-endsession-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = RemoveDir(dir.clone());
+        // `taskbar_recovery::init` sets a process-wide OnceLock (first call
+        // wins, never reset). This is the only test that calls it; a second
+        // one must share this directory (e.g. via a helper) or it will write
+        // its marker here.
         init(&dir);
         let marker = dir.join(MARKER_FILE);
         let _ = mark_hidden(TaskbarHideRestore::FullyHidden);
@@ -685,7 +696,6 @@ mod tests {
             SendMessageW(hwnd, WM_ENDSESSION, 1, 0);
             assert!(!marker.exists(), "a real end must clear the marker");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

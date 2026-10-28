@@ -386,9 +386,10 @@ pub fn note_session_start_flags(flags: u32) {
         .unwrap_or_else(|e| e.into_inner()) = Some(flags);
 }
 
-/// At the end of a `FullyHidden` session (called by the session-end restore
-/// only): logs both values if the appbar flags
-/// differ from the session start (Windows' auto-hide was toggled meanwhile).
+/// When a marked `FullyHidden` hide is undone through `restore_marked` (the
+/// hotkey show, a session end or exit -- never startup recovery or the panic
+/// hook): logs both values if the appbar flags differ from the session start
+/// (Windows' auto-hide was toggled meanwhile).
 /// Log only; the normal show happens regardless.
 #[cfg_attr(test, allow(dead_code))] // tests fake the OS show that calls it
 pub fn finish_session_flags(flags_now: u32) {
