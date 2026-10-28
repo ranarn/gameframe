@@ -12,8 +12,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{ERROR_TIMEOUT, GetLastError, SetLastError};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_WINDOW_HANDLE, ERROR_TIMEOUT, GetLastError, SetLastError,
+};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
@@ -86,6 +89,32 @@ impl StallTracker {
         }
         None
     }
+
+    /// Records a ping that told nothing about the main thread (no window, the
+    /// window vanished mid-ping). It breaks a run of misses: miss, skip, miss
+    /// is not two in a row.
+    pub fn skip(&mut self) {
+        self.misses = 0;
+    }
+}
+
+/// Remembers whether an unexpected `SendMessageTimeoutW` error code was
+/// already reported, so a persistent failure logs one line, not one per ping.
+#[derive(Debug, Default)]
+pub struct ErrorReporter {
+    reported: bool,
+}
+
+impl ErrorReporter {
+    /// Returns the code if it is the first unexpected one (neither a timeout
+    /// nor an invalid window handle) and so should be logged.
+    pub fn first_unexpected(&mut self, code: u32) -> Option<u32> {
+        if code == ERROR_TIMEOUT || code == ERROR_INVALID_WINDOW_HANDLE || self.reported {
+            return None;
+        }
+        self.reported = true;
+        Some(code)
+    }
 }
 
 /// Last breadcrumb: label and when it was entered.
@@ -108,57 +137,98 @@ pub fn step(label: &'static str) {
 pub fn scoped(label: &'static str) -> Scoped {
     let mut c = crumb();
     let previous = *c;
-    *c = (label, Some(Instant::now()));
-    Scoped(previous)
+    let set = (label, Some(Instant::now()));
+    *c = set;
+    Scoped { previous, set }
 }
 
 /// Restores the previous breadcrumb on drop; see [`scoped`].
-pub struct Scoped((&'static str, Option<Instant>));
+pub struct Scoped {
+    previous: (&'static str, Option<Instant>),
+    /// What the scope itself set: only restore if it is still current.
+    set: (&'static str, Option<Instant>),
+}
 
 impl Drop for Scoped {
     fn drop(&mut self) {
-        *crumb() = self.0;
-    }
-}
-
-/// Sender whose drop tells the running watchdog thread to stop.
-static STOP: Mutex<Option<Sender<()>>> = Mutex::new(None);
-/// Watchdog threads currently alive (0 or 1 in practice; tests read it).
-static ALIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// Starts (`true`) or stops (`false`) the watchdog. Call on the main thread:
-/// that is the thread it watches. Idempotent; takes effect at once.
-pub fn set_enabled(enabled: bool) {
-    let mut stop = STOP.lock().unwrap_or_else(|e| e.into_inner());
-    if !enabled {
-        // Dropping the sender wakes the thread out of its sleep, and it exits.
-        *stop = None;
-        return;
-    }
-    if stop.is_some() {
-        return;
-    }
-    // SAFETY: plain Win32 call.
-    let main_thread = unsafe { GetCurrentThreadId() };
-    let (tx, rx) = mpsc::channel();
-    ALIVE.fetch_add(1, Ordering::SeqCst);
-    let spawned = std::thread::Builder::new()
-        .name("hang-watchdog".into())
-        .spawn(move || {
-            run(main_thread, rx);
-            ALIVE.fetch_sub(1, Ordering::SeqCst);
-        });
-    match spawned {
-        Ok(_) => *stop = Some(tx),
-        Err(e) => {
-            ALIVE.fetch_sub(1, Ordering::SeqCst);
-            log!("hang watchdog: could not start its thread: {e}");
+        let mut c = crumb();
+        // A `step()` made inside the scope is newer information: keep it.
+        if *c == self.set {
+            *c = self.previous;
         }
     }
 }
 
+/// A running watchdog thread. Dropping `stop` tells it to exit.
+struct Running {
+    /// Held only for its drop.
+    _stop: Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+static STATE: Mutex<Option<Running>> = Mutex::new(None);
+/// Watchdog threads currently alive (tests read it). Normally 0 or 1; it can
+/// read 2 briefly after a disable straight followed by an enable, until the
+/// old thread wakes (its channel is already disconnected, so that is at once)
+/// and exits. Accepted: there is never a lasting double ping.
+static ALIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements its counter when the thread ends, including by panic.
+struct AliveGuard(&'static AtomicUsize);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Makes sure `slot` holds a live thread: keeps a running one, replaces one
+/// that has died (panicked or exited) by calling `start`.
+fn ensure_running(slot: &mut Option<Running>, start: impl FnOnce() -> Option<Running>) {
+    if slot.as_ref().is_some_and(|r| !r.thread.is_finished()) {
+        return;
+    }
+    if slot.is_some() {
+        log!("hang watchdog: its thread had died; restarting it");
+    }
+    *slot = start();
+}
+
+/// Starts (`true`) or stops (`false`) the watchdog. Call on the main thread:
+/// that is the thread it watches. Idempotent; takes effect at once. Enabling
+/// restarts a watchdog thread that has died.
+pub fn set_enabled(enabled: bool) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !enabled {
+        // Dropping the sender wakes the thread out of its sleep, and it exits.
+        *state = None;
+        return;
+    }
+    ensure_running(&mut state, || {
+        // SAFETY: plain Win32 call.
+        let main_thread = unsafe { GetCurrentThreadId() };
+        let (tx, rx) = mpsc::channel();
+        ALIVE.fetch_add(1, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
+            .name("hang-watchdog".into())
+            .spawn(move || {
+                let _alive = AliveGuard(&ALIVE);
+                run(main_thread, rx);
+            });
+        match spawned {
+            Ok(thread) => Some(Running { _stop: tx, thread }),
+            Err(e) => {
+                ALIVE.fetch_sub(1, Ordering::SeqCst);
+                log!("hang watchdog: could not start its thread: {e}");
+                None
+            }
+        }
+    });
+}
+
 fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
     let mut tracker = StallTracker::default();
+    let mut errors = ErrorReporter::default();
     let mut warned_no_window = false;
     let mut warned_wrong_thread = false;
     loop {
@@ -173,6 +243,7 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                 warned_no_window = true;
                 log!("hang watchdog: no window to ping yet; idle until it exists");
             }
+            tracker.skip();
             continue;
         };
         warned_no_window = false;
@@ -186,12 +257,14 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                     warned_wrong_thread = true;
                     log!("hang watchdog: the ping window is not on the main thread; not watching");
                 }
+                tracker.skip();
                 continue;
             }
             warned_wrong_thread = false;
-            SetLastError(0);
             let started = Instant::now();
             let mut result = 0usize;
+            // Directly before the call, so a stale error cannot be misread.
+            SetLastError(0);
             // Answered only while the main thread pumps.
             let ok = SendMessageTimeoutW(
                 hwnd,
@@ -208,6 +281,10 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
                 // mid-ping, says nothing about the main thread: skip it.
                 let err = GetLastError();
                 if err != 0 && err != ERROR_TIMEOUT {
+                    if let Some(code) = errors.first_unexpected(err) {
+                        log!("hang watchdog: ping skipped, unexpected error code {code}");
+                    }
+                    tracker.skip();
                     continue;
                 }
             }
@@ -384,6 +461,86 @@ mod tests {
             assert_eq!(crumb().0, "inner");
         }
         assert_eq!(crumb().0, "test step");
+        {
+            let _inner = scoped("inner");
+            step("nested step");
+        }
+        assert_eq!(crumb().0, "nested step");
+    }
+
+    #[test]
+    fn a_skipped_ping_breaks_a_run_of_misses() {
+        let base = Instant::now();
+        let mut t = StallTracker::default();
+        assert_eq!(miss(&mut t, base, 0, 3), None);
+        t.skip();
+        // Would be the second miss, and a stall, without the skip.
+        assert_eq!(miss(&mut t, base, 3, 6), None);
+    }
+
+    #[test]
+    fn an_unexpected_error_code_is_reported_once() {
+        let mut r = ErrorReporter::default();
+        assert_eq!(r.first_unexpected(ERROR_TIMEOUT), None);
+        assert_eq!(r.first_unexpected(ERROR_INVALID_WINDOW_HANDLE), None);
+        assert_eq!(r.first_unexpected(5), Some(5));
+        assert_eq!(r.first_unexpected(5), None);
+        assert_eq!(r.first_unexpected(6), None);
+    }
+
+    fn finished_running() -> Running {
+        let (stop, _rx) = mpsc::channel();
+        let thread = std::thread::spawn(|| {});
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !thread.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "helper thread did not finish within 5 s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Running {
+            _stop: stop,
+            thread,
+        }
+    }
+
+    #[test]
+    fn enabling_restarts_a_thread_that_has_died() {
+        let mut slot = Some(finished_running());
+        let mut started = 0;
+        ensure_running(&mut slot, || {
+            started += 1;
+            Some(finished_running())
+        });
+        assert_eq!(started, 1);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn a_panicking_thread_still_decrements_its_alive_count() {
+        static COUNT: AtomicUsize = AtomicUsize::new(1);
+        let handle = std::thread::spawn(|| {
+            let _alive = AliveGuard(&COUNT);
+            // The default hook prints the message to stderr; harmless here.
+            panic!("deliberate panic to test the drop guard");
+        });
+        assert!(handle.join().is_err());
+        assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn enabling_keeps_a_thread_that_is_still_running() {
+        let (stop, rx) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let mut slot = Some(Running {
+            _stop: stop,
+            thread,
+        });
+        ensure_running(&mut slot, || panic!("must not restart a live thread"));
+        // Dropping the slot drops the sender and ends the thread.
     }
 
     #[test]
