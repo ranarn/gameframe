@@ -273,7 +273,9 @@ pub(crate) fn download(
     max_bytes: u64,
 ) -> Result<(), HttpError> {
     let mut url = url.to_string();
-    for redirects in 0.. {
+    // Bounded on its own: `vet_hop` rejects hop `MAX_REDIRECTS + 1`, and the
+    // range ends there too.
+    for redirects in 0..=MAX_REDIRECTS + 1 {
         let (host, path) = vet_hop(redirects, &url, trusted_hosts)
             .map_err(|reject| HttpError::Failed(reject.message().to_string()))?;
         let mut written: u64 = 0;
@@ -296,7 +298,9 @@ pub(crate) fn download(
             Reply::Redirect(location) => url = resolve_location(host, &location),
         }
     }
-    unreachable!("the loop only ends through a return")
+    Err(HttpError::Failed(
+        HopRejected::TooManyRedirects.message().to_string(),
+    ))
 }
 
 /// Why [`vet_hop`] refused to follow a URL.
