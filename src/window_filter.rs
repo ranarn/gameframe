@@ -392,6 +392,34 @@ pub(crate) struct ProcessRankSignals {
     has_graphics_module: bool,
 }
 
+/// The process-level Layer-2 signals for `exe_path`.
+///
+/// A tracked game (`tracked_exes` holds the tracked games' executable paths)
+/// is never module-snapshotted: that opens a handle to a process that may be
+/// protected by anti-cheat, and the user already told GameFrame it is a game,
+/// so it ranks as a launcher match without any lookup. For any other process
+/// the Steam install directories (`steam_dirs`) and the loaded modules
+/// (`modules`) are gathered lazily, only if called.
+///
+/// Pure: the two OS lookups come in as closures, so the skip is unit tested.
+fn process_rank_signals(
+    exe_path: &std::path::Path,
+    tracked_exes: &[std::path::PathBuf],
+    steam_dirs: impl FnOnce() -> Vec<std::path::PathBuf>,
+    modules: impl FnOnce() -> Vec<String>,
+) -> ProcessRankSignals {
+    if tracked_exes.iter().any(|tracked| tracked == exe_path) {
+        return ProcessRankSignals {
+            is_launcher_match: true,
+            has_graphics_module: false,
+        };
+    }
+    ProcessRankSignals {
+        is_launcher_match: matches_known_install(exe_path, &steam_dirs()),
+        has_graphics_module: has_known_graphics_module(&modules()),
+    }
+}
+
 /// Gathers `hwnd`'s Layer-2 signals and combines them via [`rank_window`].
 /// `exe_path` is the already-resolved executable of `hwnd`'s process.
 /// `cache` memoizes only the two genuinely process-level signals
@@ -416,6 +444,7 @@ pub(crate) struct ProcessRankSignals {
 pub(crate) fn rank_window_for_hwnd(
     hwnd: HWND,
     exe_path: &std::path::Path,
+    tracked_exes: &[std::path::PathBuf],
     cache: &mut std::collections::HashMap<u32, ProcessRankSignals>,
 ) -> WindowRank {
     let mut pid: u32 = 0;
@@ -426,12 +455,9 @@ pub(crate) fn rank_window_for_hwnd(
     }
 
     let process_signals = *cache.entry(pid).or_insert_with(|| {
-        let is_launcher_match = matches_known_install(exe_path, &known_steam_install_dirs());
-        let has_graphics_module = has_known_graphics_module(&loaded_module_names(pid));
-        ProcessRankSignals {
-            is_launcher_match,
-            has_graphics_module,
-        }
+        process_rank_signals(exe_path, tracked_exes, known_steam_install_dirs, || {
+            loaded_module_names(pid)
+        })
     });
 
     let has_known_engine_class = is_known_engine_window_class(&window_class_name(hwnd));
@@ -868,6 +894,29 @@ mod tests {
         let exe_path =
             std::path::PathBuf::from(r"C:\Users\Player\Downloads\SomeIndieGame\game.exe");
         assert!(!matches_known_install(&exe_path, &[install_dir]));
+    }
+
+    #[test]
+    fn a_tracked_game_is_never_module_snapshotted_or_steam_scanned() {
+        let exe = std::path::PathBuf::from(r"D:\Games\Foo\foo.exe");
+        let signals = process_rank_signals(
+            &exe,
+            std::slice::from_ref(&exe),
+            || panic!("steam scan for a tracked game"),
+            || panic!("module snapshot of a tracked game"),
+        );
+        assert!(signals.is_launcher_match);
+        assert!(!signals.has_graphics_module);
+    }
+
+    #[test]
+    fn an_untracked_process_is_still_module_ranked() {
+        let exe = std::path::PathBuf::from(r"D:\Games\Bar\bar.exe");
+        let other = std::path::PathBuf::from(r"D:\Games\Foo\foo.exe");
+        let signals =
+            process_rank_signals(&exe, &[other], Vec::new, || vec!["d3d11.dll".to_string()]);
+        assert!(!signals.is_launcher_match);
+        assert!(signals.has_graphics_module);
     }
 
     #[test]

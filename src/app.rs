@@ -304,6 +304,9 @@ fn run_event_loop(
         return;
     }
 
+    // Prewarm the "Apply to Window" list so the first menu open has content.
+    tray.refresh_apply_to_window_menu(config_dir);
+
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
         // Waiting here is healthy; the label tells an idle pump from a stuck step.
@@ -460,13 +463,17 @@ fn drain_events(
     // at no extra cost. No crate-native "menu about to show" event exists
     // to hook instead (see `Tray::refresh_apply_to_window_menu`'s doc
     // comment).
+    // A background window-list refresh (started by a hover below) that has
+    // finished since the last pass swaps its result into the submenu.
+    tray.apply_finished_window_refresh();
+
     crate::watchdog::step("drain_events: tray icon events");
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
         if matches!(
             event,
             TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }
         ) {
-            tray.refresh_apply_to_window_menu();
+            tray.refresh_apply_to_window_menu(config_dir);
             tray.sync_start_with_windows_check();
         }
     }
