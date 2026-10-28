@@ -180,8 +180,8 @@ pub(crate) fn spawn_install(
 }
 
 /// Deletes the update folders in `temp` except those of the process `own_pid`,
-/// whose install may be writing to its folder right now, and returns how many could not be
-/// deleted (a running installer holds its file open).
+/// whose install may be writing to its folder right now, and returns how many
+/// could not be deleted (a running installer holds its file open).
 fn remove_stale_update_dirs(temp: &Path, own_pid: u32) -> usize {
     let own_prefix = format!("{UPDATE_DIR_PREFIX}{own_pid}-");
     let Ok(entries) = std::fs::read_dir(temp) else {

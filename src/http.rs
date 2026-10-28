@@ -273,12 +273,9 @@ pub(crate) fn download(
     max_bytes: u64,
 ) -> Result<(), HttpError> {
     let mut url = url.to_string();
-    for _ in 0..=MAX_REDIRECTS {
-        let (host, path) = split_https_url(&url)
-            .filter(|(host, _)| trusted_hosts.contains(host))
-            .ok_or_else(|| {
-                HttpError::Failed("the download leads to an untrusted address".to_string())
-            })?;
+    for redirects in 0.. {
+        let (host, path) = vet_hop(redirects, &url, trusted_hosts)
+            .map_err(|reject| HttpError::Failed(reject.message().to_string()))?;
         let mut written: u64 = 0;
         let reply = request(
             host,
@@ -299,7 +296,41 @@ pub(crate) fn download(
             Reply::Redirect(location) => url = resolve_location(host, &location),
         }
     }
-    Err(HttpError::Failed("too many redirects".to_string()))
+    unreachable!("the loop only ends through a return")
+}
+
+/// Why [`vet_hop`] refused to follow a URL.
+#[derive(Debug, PartialEq, Eq)]
+enum HopRejected {
+    /// More than [`MAX_REDIRECTS`] redirects were followed already.
+    TooManyRedirects,
+    /// Not an HTTPS URL on one of the trusted hosts.
+    Untrusted,
+}
+
+impl HopRejected {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::TooManyRedirects => "too many redirects",
+            Self::Untrusted => "the download leads to an untrusted address",
+        }
+    }
+}
+
+/// Decides whether the download may request `url`, reached after `redirects`
+/// redirects (0 for the original URL): it must be within [`MAX_REDIRECTS`]
+/// and an HTTPS URL on one of `trusted_hosts`. Returns its host and path.
+fn vet_hop<'a>(
+    redirects: usize,
+    url: &'a str,
+    trusted_hosts: &[&str],
+) -> Result<(&'a str, String), HopRejected> {
+    if redirects > MAX_REDIRECTS {
+        return Err(HopRejected::TooManyRedirects);
+    }
+    split_https_url(url)
+        .filter(|(host, _)| trusted_hosts.contains(host))
+        .ok_or(HopRejected::Untrusted)
 }
 
 #[cfg(test)]
@@ -353,6 +384,57 @@ mod tests {
         ] {
             assert_eq!(resolve_location("github.com", location), location);
         }
+    }
+
+    const TRUSTED: [&str; 2] = ["github.com", "release-assets.githubusercontent.com"];
+
+    #[test]
+    fn vet_hop_follows_https_on_each_trusted_host() {
+        assert_eq!(
+            vet_hop(0, "https://github.com/a/b.exe", &TRUSTED),
+            Ok(("github.com", "/a/b.exe".to_string()))
+        );
+        assert_eq!(
+            vet_hop(
+                1,
+                "https://release-assets.githubusercontent.com/x?y=1",
+                &TRUSTED
+            ),
+            Ok(("release-assets.githubusercontent.com", "/x?y=1".to_string()))
+        );
+    }
+
+    #[test]
+    fn vet_hop_rejects_plain_http() {
+        assert_eq!(
+            vet_hop(1, "http://github.com/a", &TRUSTED),
+            Err(HopRejected::Untrusted)
+        );
+    }
+
+    #[test]
+    fn vet_hop_rejects_other_hosts() {
+        for url in [
+            "https://evil.test/a",
+            "https://github.com.evil.test/a",
+            "https://github.com@evil.test/a",
+        ] {
+            assert_eq!(
+                vet_hop(1, url, &TRUSTED),
+                Err(HopRejected::Untrusted),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn vet_hop_allows_five_redirects_and_rejects_the_sixth() {
+        let url = "https://github.com/a";
+        assert!(vet_hop(MAX_REDIRECTS, url, &TRUSTED).is_ok());
+        assert_eq!(
+            vet_hop(MAX_REDIRECTS + 1, url, &TRUSTED),
+            Err(HopRejected::TooManyRedirects)
+        );
     }
 
     #[test]
