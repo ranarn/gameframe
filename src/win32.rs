@@ -1267,22 +1267,10 @@ fn is_last_armed_window(hwnd: HWND) -> bool {
     with_armed_taskbar_windows(|state| state.is_last(hwnd as isize))
 }
 
-/// True if a hidden session is currently active -- see
-/// [`ArmedTaskbarWindows::is_active`].
-fn is_taskbar_hide_session_active() -> bool {
-    with_armed_taskbar_windows(|state| state.is_active())
-}
-
-/// The active session's hide technique -- see
-/// [`ArmedTaskbarWindows::session_restore`].
-fn taskbar_hide_session_restore() -> Option<TaskbarHideRestore> {
-    with_armed_taskbar_windows(|state| state.session_restore())
-}
-
 /// Starts a brand new hidden session for `hwnd`, remembering `restore` as
 /// what to restore to once the session ends. Called only by
 /// [`set_taskbar_hide_absolute_armed`]'s `hide == true` path when
-/// [`is_taskbar_hide_session_active`] was `false` beforehand.
+/// no session was active beforehand ([`ArmedTaskbarWindows::is_active`]).
 fn start_taskbar_hide_session(hwnd: HWND, restore: TaskbarHideRestore) {
     with_armed_taskbar_windows(|state| state.start(hwnd as isize, restore));
 }
@@ -1290,7 +1278,7 @@ fn start_taskbar_hide_session(hwnd: HWND, restore: TaskbarHideRestore) {
 /// Joins `hwnd` to an already-active hidden session, without touching the
 /// remembered restore value. Called only by
 /// [`set_taskbar_hide_absolute_armed`]'s `hide == true` path when
-/// [`is_taskbar_hide_session_active`] was already `true`.
+/// a session was already active ([`ArmedTaskbarWindows::is_active`]).
 fn join_taskbar_hide_session(hwnd: HWND) {
     with_armed_taskbar_windows(|state| state.join(hwnd as isize));
 }
@@ -1442,18 +1430,20 @@ pub fn set_taskbar_hide_absolute_armed(
     mode: TaskbarHideMode,
 ) -> Result<(), Win32Error> {
     if hide {
-        if is_taskbar_hide_session_active() {
+        // One lock for both reads, so the session can't drain in between.
+        let (active, session) =
+            with_armed_taskbar_windows(|state| (state.is_active(), state.session_restore()));
+        if active {
             // A taskbar the hotkey showed in the meantime goes away again
             // when the game is returned to. `hide_taskbar_window` marks
             // the recovery record hidden first (the hotkey show cleared it)
             // and hides; the session's remembered restore is not touched.
             let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
-            let session = taskbar_hide_session_restore();
             let rehide = judgement
                 .as_ref()
                 .is_some_and(|j| should_rehide_on_join(session, j.verdict));
             log!(
-                "taskbar hide for {hwnd:?}: joining the active session (re-hide={rehide}); {}",
+                "taskbar hide for {hwnd:?}: joining the active session (session={session:?}, re-hide={rehide}); {}",
                 judgement
                     .as_ref()
                     .map_or_else(|| "Shell_TrayWnd not found".to_string(), describe_taskbar)
