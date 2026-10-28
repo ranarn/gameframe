@@ -98,7 +98,6 @@ pub enum EditorState {
 pub struct AppState {
     pub monitor: Monitor,
     pub editor: EditorState,
-    pub last_message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +129,6 @@ impl AppState {
         Self {
             monitor,
             editor: EditorState::Empty,
-            last_message: "Click and drag to draw a zone".to_string(),
         }
     }
 
@@ -141,7 +139,6 @@ impl AppState {
         Self {
             monitor,
             editor: EditorState::Placed { zone },
-            last_message: "editing existing zone -- grab a handle".to_string(),
         }
     }
 
@@ -156,7 +153,6 @@ impl AppState {
                             anchor: p,
                             current: p,
                         };
-                        self.last_message = "drawing from corner".to_string();
                     }
                     _ => self.reject("`start` is only legal from Empty"),
                 }
@@ -166,7 +162,6 @@ impl AppState {
                 match &mut self.editor {
                     EditorState::Dragging { current, .. } => {
                         *current = p;
-                        self.last_message = "live preview updated".to_string();
                     }
                     EditorState::Resizing {
                         original,
@@ -179,7 +174,6 @@ impl AppState {
                             y: p.y + offset.y,
                         };
                         *live = apply_handle_drag(*original, *handle, target, self.monitor);
-                        self.last_message = "live resize updated".to_string();
                     }
                     EditorState::Moving {
                         original,
@@ -187,7 +181,6 @@ impl AppState {
                         live,
                     } => {
                         *live = move_zone(*original, *grab, p, self.monitor);
-                        self.last_message = "live move updated".to_string();
                     }
                     _ => self.reject("`drag` needs an active draw or resize"),
                 }
@@ -198,15 +191,12 @@ impl AppState {
                     EditorState::Dragging { anchor, current } => {
                         let zone = normalize(*anchor, *current, self.monitor);
                         self.editor = EditorState::Placed { zone };
-                        self.last_message = "zone drawn".to_string();
                     }
                     EditorState::Resizing { live, .. } => {
                         self.editor = EditorState::Placed { zone: *live };
-                        self.last_message = "resize committed".to_string();
                     }
                     EditorState::Moving { live, .. } => {
                         self.editor = EditorState::Placed { zone: *live };
-                        self.last_message = "move committed".to_string();
                     }
                     _ => self.reject("nothing to commit"),
                 }
@@ -222,7 +212,6 @@ impl AppState {
                             offset,
                             live: *zone,
                         };
-                        self.last_message = format!("resizing via {handle:?}");
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -236,7 +225,6 @@ impl AppState {
                             grab: p,
                             live: *zone,
                         };
-                        self.last_message = "moving zone".to_string();
                     }
                     _ => self.reject("`grab` needs a placed zone"),
                 }
@@ -245,7 +233,7 @@ impl AppState {
             Action::Save => match &self.editor {
                 EditorState::Placed { zone, .. } => {
                     let zone = *zone;
-                    self.last_message = format!("saved: {zone:?}");
+                    log!("zone editor: saved {zone:?}");
                     Some(SessionOutcome::Saved(zone))
                 }
                 _ => {
@@ -258,14 +246,28 @@ impl AppState {
                 // prototype this was lifted from). The caller (`zone_overlay`) drops the whole
                 // `AppState` as soon as `apply` returns `Some(outcome)`, so it never re-reads
                 // `editor` after a session-ending outcome -- resetting it here would be dead work.
-                self.last_message = "cancelled -- discarded any in-progress edit".to_string();
                 Some(SessionOutcome::Cancelled)
             }
         }
     }
 
-    fn reject(&mut self, reason: &str) {
-        self.last_message = format!("reject: {reason}");
+    fn reject(&self, reason: &str) {
+        log!("zone editor: rejected: {reason}");
+    }
+
+    /// The short user-facing hint for the editor's current state, or `None`
+    /// while a drag/resize/move is live (the zone readout is enough then).
+    /// Internal diagnostics go to the log, never here.
+    pub fn hint(&self) -> Option<&'static str> {
+        match &self.editor {
+            EditorState::Empty => Some("Drag to draw your Zone"),
+            EditorState::Placed { .. } => {
+                Some("Drag edges to resize, drag inside to move. Save when done.")
+            }
+            EditorState::Dragging { .. }
+            | EditorState::Resizing { .. }
+            | EditorState::Moving { .. } => None,
+        }
     }
 
     /// The Zone as it currently stands, in physical pixels: the placed Zone,
@@ -550,9 +552,49 @@ mod tests {
     }
 
     #[test]
-    fn new_state_shows_draw_instruction_before_any_drag_starts() {
+    fn hint_with_no_zone_invites_drawing() {
         let state = AppState::new(monitor());
-        assert_eq!(state.last_message, "Click and drag to draw a zone");
+        assert_eq!(state.hint(), Some("Drag to draw your Zone"));
+    }
+
+    #[test]
+    fn hint_with_placed_zone_explains_edit_and_save() {
+        let state = placed(Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        });
+        assert_eq!(
+            state.hint(),
+            Some("Drag edges to resize, drag inside to move. Save when done.")
+        );
+    }
+
+    #[test]
+    fn hint_is_empty_while_dragging_resizing_or_moving() {
+        let mut state = AppState::new(monitor());
+        state.apply(Action::Start(Point { x: 10, y: 10 }));
+        assert_eq!(state.hint(), None);
+
+        let mut state = placed(Zone {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        });
+        state.apply(Action::GrabMove(Point { x: 200, y: 200 }));
+        assert_eq!(state.hint(), None);
+        state.apply(Action::Commit);
+        state.apply(Action::Grab(Handle::E, Point { x: 500, y: 200 }));
+        assert_eq!(state.hint(), None);
+    }
+
+    #[test]
+    fn rejected_action_leaves_the_hint_unchanged() {
+        let mut state = AppState::new(monitor());
+        state.apply(Action::Save);
+        assert_eq!(state.hint(), Some("Drag to draw your Zone"));
     }
 
     #[test]

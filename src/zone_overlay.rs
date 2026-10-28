@@ -584,11 +584,13 @@ impl OverlayApp<'_> {
                                     .monospace()
                                     .size(18.0),
                             );
-                            ui.label(
-                                egui::RichText::new(&self.state.last_message)
-                                    .color(egui::Color32::LIGHT_GRAY)
-                                    .size(16.0),
-                            );
+                            if let Some(hint) = self.state.hint() {
+                                ui.label(
+                                    egui::RichText::new(hint)
+                                        .color(egui::Color32::LIGHT_GRAY)
+                                        .size(16.0),
+                                );
+                            }
                         });
                     });
             });
