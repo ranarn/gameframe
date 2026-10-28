@@ -74,9 +74,13 @@ fn main() {
                 log!("second launch: could not reach the running instance; exiting");
             }
         }
+        logging::flush();
         return;
     }
-    if let Err(e) = app::run() {
+    // Flushed whatever `run` returns, so no exit path loses pending repeat counts.
+    let result = app::run();
+    logging::flush();
+    if let Err(e) = result {
         log!("gameframe failed to start: {e}");
         std::process::exit(1);
     }

@@ -103,7 +103,8 @@ enum Repeat {
 struct RepeatFilter {
     seen: HashMap<String, (Instant, u32)>,
     /// Counts of records dropped from `seen` while still pending, waiting to
-    /// be written (see [`RepeatFilter::take_pending`]).
+    /// be written. Drained by [`LogBridge::log`] after every `check` and by
+    /// [`RepeatFilter::take_pending`], so it stays small.
     evicted: Vec<(String, u32)>,
 }
 
@@ -342,17 +343,18 @@ mod tests {
     /// Serialises tests that touch the global [`LOG`].
     static GLOBAL_LOG_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Releases the global log file (so a temp dir can be removed) even if an
+    /// assert panics.
+    struct ResetLog;
+    impl Drop for ResetLog {
+        fn drop(&mut self) {
+            *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     #[test]
     fn init_is_idempotent() {
         let _serial = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Releases the file (so the temp dir can be removed) even if an
-        // assert below panics.
-        struct ResetLog;
-        impl Drop for ResetLog {
-            fn drop(&mut self) {
-                *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            }
-        }
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         // Declared after the temp dirs so it drops (and closes the file) first.
@@ -528,6 +530,8 @@ mod tests {
     fn claim_rotation_marks_an_open_log_and_does_nothing_before_init() {
         let _serial = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
+        // Declared after the temp dir so it drops (and closes the file) first.
+        let _reset = ResetLog;
         *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         claim_rotation(); // before init: no file to mark, no panic
@@ -549,8 +553,65 @@ mod tests {
             .as_ref()
             .unwrap()
             .owner;
-        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
         assert!(owner);
+    }
+
+    #[test]
+    fn a_rotation_failure_starts_the_retry_throttle_and_success_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory at the target makes the rename fail.
+        std::fs::create_dir(tmp.path().join(OLD_LOG_FILE)).unwrap();
+        let mut log = LogFile::open(tmp.path(), 10).unwrap();
+        log.owner = true;
+
+        log.append("12345678\n");
+        assert!(log.last_failed_rotation.is_none());
+        log.append("abc\n"); // over the cap: rotation fails
+        assert!(log.last_failed_rotation.is_some());
+
+        // Within the retry interval the rename is not attempted again, and a
+        // stale failure time (past the interval) allows a retry that succeeds.
+        std::fs::remove_dir(tmp.path().join(OLD_LOG_FILE)).unwrap();
+        log.append("def\n");
+        assert!(!tmp.path().join(OLD_LOG_FILE).exists());
+        log.last_failed_rotation = Some(Instant::now() - ROTATE_RETRY);
+        log.append("ghi\n");
+        assert!(tmp.path().join(OLD_LOG_FILE).exists());
+        assert!(log.last_failed_rotation.is_none());
+    }
+
+    #[test]
+    fn flush_writes_evicted_and_pending_count_lines_to_the_log() {
+        let _serial = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _reset = ResetLog;
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(LogFile::open(tmp.path(), 1 << 20).unwrap());
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            f.check("evictme", t0);
+        }
+        for i in 0..MAX_TRACKED {
+            f.check(&i.to_string(), t0);
+        }
+        for _ in 0..2 {
+            f.check("pending", t0);
+        }
+        *REPEATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+
+        log::Log::flush(&LogBridge);
+
+        let text = std::fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        assert!(text.contains("evictme (repeated 2 more times)"), "{text}");
+        assert!(text.contains("pending (repeated 1 more times)"), "{text}");
+        // Flushing again writes nothing new.
+        log::Log::flush(&LogBridge);
+        let again = std::fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        // (Other tests' `log!` lines may land in the file meanwhile; count ours.)
+        assert_eq!(again.matches("evictme (repeated").count(), 1, "{again}");
+        assert_eq!(again.matches("pending (repeated").count(), 1, "{again}");
+        *REPEATS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]

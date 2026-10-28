@@ -165,9 +165,8 @@ pub fn run() -> Result<(), TrayUiError> {
         launch_watcher::unregister(hook);
     }
 
-    // Last, so repeat counts from the shutdown above are included.
-    crate::logging::flush();
-
+    // The log bridge's pending repeat counts are flushed by `main`, after this
+    // returns, so every exit path (including errors) is covered.
     Ok(())
 }
 
