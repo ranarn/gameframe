@@ -53,7 +53,7 @@ use crate::instance_channel::{self, Command};
 use crate::launch_watcher;
 use crate::profile_store;
 use crate::region_calc::{Region, resolve_region};
-use crate::settings_ui::{self, primary_monitor_geometry};
+use crate::settings_ui::{self, TickContext, primary_monitor_geometry};
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::update_ui::{
     Failure, UpdateEvent, UpdateEvents, handle_update_event, schedule_startup_update_check,
@@ -220,7 +220,8 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
         return;
     }
 
-    match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode) {
+    // No tray or hotkeys exist yet at first run, so there is nothing to tick.
+    match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode, &mut || {}) {
         Ok(Some(zone)) => {
             if let Err(e) = settings_ui::persist_zone(config_dir, Some(zone)) {
                 log!("failed to save the zone: {e}");
@@ -364,13 +365,39 @@ struct Shared<'a> {
     updates: &'a UpdateEvents,
 }
 
-/// Whether Settings is open while [`drain_events`] runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Which window, if any, is blocking the main loop while [`drain_events`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsMode {
     Closed,
     Open,
     /// Open and waiting for the next key to bind; hotkey presses are dropped.
     Capturing,
+    /// The zone-editor overlay is open (Settings is closed meanwhile).
+    ZoneEditor,
+}
+
+impl From<TickContext> for SettingsMode {
+    fn from(context: TickContext) -> Self {
+        match context {
+            TickContext::Settings => Self::Open,
+            TickContext::SettingsCapturing => Self::Capturing,
+            TickContext::ZoneEditor => Self::ZoneEditor,
+        }
+    }
+}
+
+/// Whether a hotkey action may run while `mode` is blocking the main loop.
+///
+/// The zone editor owns the taskbar (its session caches the state and its
+/// guard restores on close), so the taskbar hotkey would desync it; the
+/// borderless hotkey would only target the always-on-top overlay itself.
+/// Everything else, the game-cursor hotkey included, runs as usual.
+fn hotkey_allowed(mode: SettingsMode, action: HotkeyAction) -> bool {
+    match mode {
+        SettingsMode::Capturing => false,
+        SettingsMode::ZoneEditor => matches!(action, HotkeyAction::ToggleGameCursor),
+        SettingsMode::Closed | SettingsMode::Open => true,
+    }
 }
 
 /// What one pass of [`drain_events`] asks its caller to do.
@@ -380,16 +407,21 @@ struct Drained {
     exit: bool,
     /// The tray's Settings item was clicked and Settings is not open.
     show_settings: bool,
+    /// The game-cursor hotkey toggled `cursor.enabled`; the new value, for an
+    /// open Settings window to show.
+    cursor_enabled: Option<bool>,
 }
 
 /// Handles the pending update, tray-icon, tray-menu and hotkey events.
 ///
 /// Shared by [`run_event_loop`] and, through [`show_settings`], the open
-/// Settings window (the `settings` parameter), whose own loop blocks the main one:
-/// without it nothing would react until Settings closed. Stops early on an
-/// exit request, or on a Settings click while it is closed (events queued
-/// behind it stay in their channels for the next call). With Settings open,
-/// that click focuses the window instead.
+/// Settings window and the zone-editor overlay it launches (the `settings`
+/// parameter says which), whose own loops block the main one: without it
+/// nothing would react until they closed. Stops early on an exit request, or
+/// on a Settings click while it is closed (events queued behind it stay in
+/// their channels for the next call). With Settings open, that click focuses
+/// the window instead. While the zone editor is open only the game-cursor
+/// hotkey runs (see [`hotkey_allowed`]).
 fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
@@ -508,6 +540,7 @@ fn drain_events(
     }
 
     crate::watchdog::step("drain_events: hotkey events");
+    let mut cursor_enabled = None;
     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
         // Only act on the key-down edge; the crate also emits a
         // `Released` event on key-up (see `global_hotkey`'s Windows
@@ -526,6 +559,12 @@ fn drain_events(
         // anyway) or resolves to no action for `event.id()` --
         // either way, nothing happens here and nothing panics.
         let action = hotkeys.as_ref().and_then(|h| h.action_for(event.id()));
+        if let Some(action) = action
+            && !hotkey_allowed(settings, action)
+        {
+            log!("hotkey ignored while the zone editor is open; use the editor's own controls");
+            continue;
+        }
         match action {
             Some(HotkeyAction::ToggleBorderless) => {
                 if handle_toggle_borderless(config_dir) {
@@ -542,13 +581,18 @@ fn drain_events(
                 handle_toggle_taskbar_autohide(config_dir);
             }
             Some(HotkeyAction::ToggleGameCursor) => {
-                handle_toggle_game_cursor(config_dir, cursor_overlay);
+                if let Some(enabled) = handle_toggle_game_cursor(config_dir, cursor_overlay) {
+                    cursor_enabled = Some(enabled);
+                }
             }
             None => {}
         }
     }
 
-    Drained::default()
+    Drained {
+        cursor_enabled,
+        ..Drained::default()
+    }
 }
 
 /// Resolves the tracked game (if any) whose executable path is `exe_path`,
@@ -641,17 +685,16 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// foreground window's owning process against the tracked-games list (see
 /// [`resolve_tracked_apply`]) and, if it's tracked (or a restore is already
 /// pending for *this same window* -- see below), applies (or reverts) the
-/// border-strip via [`win32::toggle_borderless_on_window`], then,
-/// on a successful strip only, sets the taskbar absolutely from the global
+/// border-strip via [`win32::toggle_borderless_on_window`], then, on a
+/// successful strip only, sets the taskbar absolutely from the global
 /// `hide_taskbar_on_apply` and `taskbar_hide_mode`.
 ///
 /// The tracked-game gate ([`should_block_untracked_toggle`]) only applies to
 /// the *strip* direction: an untracked foreground window blocks an initial
 /// strip (applying the Zone to a window whose process is not a tracked game
-/// does nothing),
-/// but never blocks a pending *restore* purely because the untracked window
-/// happens to be the one now in the foreground -- see that function's doc
-/// comment for the full reasoning.
+/// does nothing), but never blocks a pending *restore* purely because the
+/// untracked window happens to be the one now in the foreground -- see that
+/// function's doc comment for the full reasoning.
 ///
 /// Restore state is remembered per window ([`win32::has_restore_state`]), so
 /// the press acts on the foreground window alone: a window with state is
@@ -672,8 +715,8 @@ fn should_block_untracked_toggle(is_restoring: bool, tracked: bool) -> bool {
 /// which serves its in-memory copy, refreshed by every save) so a Zone/game
 /// added/edited via Settings since the last press is picked up immediately.
 /// The hotkey binding itself is re-registered separately, right after the
-/// Settings window closes -- see [`show_settings`] -- so a changed binding also takes effect without a
-/// restart.
+/// Settings window closes -- see [`show_settings`] -- so a changed binding also
+/// takes effect without a restart.
 fn handle_toggle_borderless(config_dir: &Path) -> bool {
     let config = match profile_store::load(config_dir) {
         Ok(config) => config,
@@ -1155,23 +1198,26 @@ fn handle_toggle_taskbar_autohide(config_dir: &Path) {
 /// `cursor.enabled` flag (so Settings and the next start agree with what's on
 /// screen), hands the change to the overlay thread and, when turning it on,
 /// plays the find-my-cursor pulse so the user sees where it is.
-fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) {
+///
+/// Returns the new `cursor.enabled`, or `None` when the toggle failed.
+fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) -> Option<bool> {
     let mut config = match profile_store::load(config_dir) {
         Ok(config) => config,
         Err(e) => {
             log!("game cursor toggle: failed to load config: {e}");
-            return;
+            return None;
         }
     };
     config.cursor.enabled = !config.cursor.enabled;
     if let Err(e) = profile_store::save(config_dir, &config) {
         log!("game cursor toggle: failed to save config: {e}");
-        return;
+        return None;
     }
     cursor_overlay.reload(config_dir);
     if config.cursor.enabled {
         cursor_overlay.pulse();
     }
+    Some(config.cursor.enabled)
 }
 
 /// Opens Settings (what the tray item and a second launch both do) and, once
@@ -1201,12 +1247,8 @@ fn show_settings(
     // "in use". Settings hides a failure once its binding has been changed.
     let mut on_tick = {
         let hotkeys = &*hotkeys;
-        move |capturing: bool| {
-            let mode = if capturing {
-                SettingsMode::Capturing
-            } else {
-                SettingsMode::Open
-            };
+        move |context: TickContext| -> Option<bool> {
+            let mode = SettingsMode::from(context);
             let drained = drain_events(ctx, hotkeys, offered_update, mode);
             if drained.exit {
                 // Settings closes on a queued Quit and the main loop exits.
@@ -1215,6 +1257,7 @@ fn show_settings(
             // Back in Settings' frame loop (rendering, window messages): a stall
             // from here until the next tick happened in Settings itself (#128).
             crate::watchdog::step("settings: frame loop");
+            drained.cursor_enabled
         }
     };
     crate::watchdog::step("settings: opening window");
@@ -1259,7 +1302,7 @@ fn sync_hang_watchdog(config_dir: &Path, startup: bool) {
 fn open_settings(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
-    on_tick: &mut dyn FnMut(bool),
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<(), settings_ui::SettingsUiError> {
     // While open, a second launch's OpenSettings focuses this window instead.
     let _modal = instance_channel::enter_settings();
@@ -1285,6 +1328,27 @@ mod tests {
     use global_hotkey::hotkey::HotKey;
     use std::path::PathBuf;
     use windows_sys::Win32::UI::WindowsAndMessaging::IDNO;
+
+    #[test]
+    fn zone_editor_tick_allows_only_the_cursor_hotkey() {
+        use HotkeyAction::*;
+        assert!(hotkey_allowed(SettingsMode::ZoneEditor, ToggleGameCursor));
+        assert!(!hotkey_allowed(
+            SettingsMode::ZoneEditor,
+            ToggleTaskbarAutohide
+        ));
+        assert!(!hotkey_allowed(SettingsMode::ZoneEditor, ToggleBorderless));
+    }
+
+    #[test]
+    fn settings_ticks_allow_every_hotkey_except_while_capturing() {
+        use HotkeyAction::*;
+        for action in [ToggleBorderless, ToggleTaskbarAutohide, ToggleGameCursor] {
+            assert!(hotkey_allowed(SettingsMode::Closed, action));
+            assert!(hotkey_allowed(SettingsMode::Open, action));
+            assert!(!hotkey_allowed(SettingsMode::Capturing, action));
+        }
+    }
 
     #[test]
     fn first_run_choice_sets_up_only_on_yes() {

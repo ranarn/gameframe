@@ -239,6 +239,13 @@ impl SettingsState {
         }
     }
 
+    /// Adopts a `cursor.enabled` change made outside Settings while it is open
+    /// (the game-cursor hotkey persists it straight to disk), so the checkbox
+    /// shows it and Save writes it. Other unsaved edits are left alone.
+    pub fn apply_external_cursor_enabled(&mut self, enabled: bool) {
+        self.cursor.enabled = enabled;
+    }
+
     /// Replaces the Zone entirely with `zone` -- the result of a completed
     /// zone-editor overlay session
     /// ([`crate::zone_overlay::run_zone_editor_overlay`] returning
@@ -1004,11 +1011,15 @@ fn merge_tracked_games(
     edited
 }
 
-/// The `cursor.enabled` value Save writes. The game-cursor hotkey persists the
-/// toggle straight to disk while Settings is open, so when the user didn't
-/// touch the setting in Settings (`edited == opened`) the on-disk value wins.
-fn merge_cursor_enabled(opened: bool, edited: bool, on_disk: bool) -> bool {
-    if edited == opened { on_disk } else { edited }
+/// Which window's frame loop is ticking the app's event handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickContext {
+    /// The Settings window is open.
+    Settings,
+    /// Settings is waiting for the next key to bind; hotkey presses are dropped.
+    SettingsCapturing,
+    /// The zone-editor overlay is open (Settings is closed meanwhile).
+    ZoneEditor,
 }
 
 /// Opens the Settings window, blocking until it's closed, then returns.
@@ -1048,11 +1059,10 @@ fn merge_cursor_enabled(opened: bool, edited: bool, on_disk: bool) -> bool {
 pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
-    on_tick: &mut dyn FnMut(bool),
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let opened_games = config.tracked_games.clone();
-    let opened_cursor_enabled = config.cursor.enabled;
     let mut state = SettingsState::from_config(&config);
     state.set_hotkey_reports(hotkey_reports);
     let started_with_windows = autostart::is_enabled();
@@ -1071,11 +1081,6 @@ pub fn run_settings_window(
                             &opened_games,
                             std::mem::take(&mut config.tracked_games),
                             &on_disk.tracked_games,
-                        );
-                        config.cursor.enabled = merge_cursor_enabled(
-                            opened_cursor_enabled,
-                            config.cursor.enabled,
-                            on_disk.cursor.enabled,
                         );
                     }
                     Err(e) => log!("could not re-read config to merge on Save: {e}"),
@@ -1098,10 +1103,23 @@ pub fn run_settings_window(
                 // itself a commit, so whatever status messages were already
                 // showing must survive it.
                 status_messages = latest_status_messages;
-                match zone_overlay::run_zone_editor_overlay(
+                // The overlay keeps the tray and hotkeys working too; a
+                // game-cursor toggle made meanwhile is folded into the state.
+                let mut cursor_toggled = None;
+                let mut tick = || {
+                    if let Some(enabled) = on_tick(TickContext::ZoneEditor) {
+                        cursor_toggled = Some(enabled);
+                    }
+                };
+                let overlay = zone_overlay::run_zone_editor_overlay(
                     latest_state.zone,
                     latest_state.taskbar_hide_mode,
-                ) {
+                    &mut tick,
+                );
+                if let Some(enabled) = cursor_toggled {
+                    latest_state.apply_external_cursor_enabled(enabled);
+                }
+                match overlay {
                     Ok(Some(zone)) => {
                         // Persist first, then apply: the Zone on disk (read by
                         // the drift and launch re-apply paths) must never
@@ -1157,7 +1175,7 @@ fn run_settings_frame(
     state: SettingsState,
     monitor: MonitorGeometry,
     initial_status_messages: Vec<String>,
-    on_tick: &mut dyn FnMut(bool),
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
     let exit_for_app = Rc::clone(&exit);
@@ -1230,8 +1248,9 @@ fn window_icon() -> egui::IconData {
 struct SettingsApp<'a> {
     /// Called once per frame (at least every [`QUIT_POLL`]) so the main
     /// loop's tray, hotkey and update events keep being handled while this
-    /// window blocks that loop.
-    on_tick: &'a mut dyn FnMut(bool),
+    /// window blocks that loop. Returns the new `cursor.enabled` when a
+    /// hotkey press toggled it during the call.
+    on_tick: &'a mut dyn FnMut(TickContext) -> Option<bool>,
     /// Where the Zone is persisted immediately on Clear (the overlay-Save
     /// persist lives in [`run_settings_window`]).
     config_dir: std::path::PathBuf,
@@ -1960,7 +1979,16 @@ impl eframe::App for SettingsApp<'_> {
         self.sync_keyboard_hook();
         // The flag tells the app to swallow hotkey presses during a capture,
         // so pressing a bound combo to rebind it doesn't also run its action.
-        (self.on_tick)(self.state.capturing.is_some());
+        // A game-cursor hotkey press while Settings is open changed
+        // `cursor.enabled` on disk: show it in the checkbox so Save keeps it.
+        let context = if self.state.capturing.is_some() {
+            TickContext::SettingsCapturing
+        } else {
+            TickContext::Settings
+        };
+        if let Some(enabled) = (self.on_tick)(context) {
+            self.state.apply_external_cursor_enabled(enabled);
+        }
 
         // A Quit (installer/updater) closes Settings as Cancel does. Polled
         // here, not only via the window procedure's WM_CLOSE, so a Quit that
@@ -2095,15 +2123,30 @@ mod tests {
     }
 
     #[test]
-    fn merge_cursor_enabled_keeps_the_on_disk_toggle_when_settings_did_not_change_it() {
-        assert!(merge_cursor_enabled(false, false, true));
-        assert!(!merge_cursor_enabled(true, true, false));
+    fn an_outside_cursor_toggle_updates_the_checkbox_and_save_writes_it() {
+        let mut state = SettingsState::from_config(&Config::default());
+        assert!(!state.cursor.enabled);
+
+        // The game-cursor hotkey turns it on while Settings is open.
+        state.apply_external_cursor_enabled(true);
+        assert!(state.cursor.enabled);
+        assert!(state.to_config().cursor.enabled);
+
+        // The user then unticks the checkbox; a later outside toggle wins again.
+        state.cursor.enabled = false;
+        state.apply_external_cursor_enabled(true);
+        assert!(state.to_config().cursor.enabled);
     }
 
     #[test]
-    fn merge_cursor_enabled_keeps_the_users_change_in_settings() {
-        assert!(merge_cursor_enabled(false, true, false));
-        assert!(!merge_cursor_enabled(true, false, true));
+    fn an_outside_cursor_toggle_leaves_other_unsaved_edits_alone() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.cursor.size += 10;
+        let size = state.cursor.size;
+
+        state.apply_external_cursor_enabled(true);
+
+        assert_eq!(state.cursor.size, size);
     }
 
     #[test]
