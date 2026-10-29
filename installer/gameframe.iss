@@ -105,7 +105,9 @@ Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
 Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent; Check: not IsAdmin
+; Not offered when setup runs elevated (a hand-run "as administrator"): the app
+; would start with that elevated token.
 ; An update started by GameFrame itself passes /RELAUNCH (src/update_install.rs) and has no
 ; wizard to tick the box above, so it starts the app here. A plain silent install
 ; leaves the app stopped.
@@ -527,7 +529,10 @@ begin
               'Exit GameFrame from its tray icon and run setup again.';
 end;
 
-// Whether setup was started with the bare /RELAUNCH switch.
+// Whether setup was started with the bare /RELAUNCH switch and should start
+// GameFrame. Never when setup itself runs elevated: it would hand GameFrame its
+// elevated token and make the elevation sticky. GameFrame refuses to start an
+// update while elevated; this covers a hand-started elevated run.
 function RelaunchRequested: Boolean;
 var
   I: Integer;
@@ -536,6 +541,8 @@ begin
   for I := 1 to ParamCount do
     if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
       Result := True;
+  if Result and IsAdmin then
+    Result := False;
 end;
 
 function StartupChoiceChanged: Boolean;

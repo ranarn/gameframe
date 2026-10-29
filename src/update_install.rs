@@ -1,6 +1,8 @@
 //! Update install: downloads the installer of an available update into a
-//! fresh temp folder, checks it against the release's SHA-256 (a file that
-//! fails is deleted and never run) and starts it silently and detached.
+//! fresh folder under `%LOCALAPPDATA%\GameFrame\updates`, checks it against
+//! the release's SHA-256 (a file that fails is deleted and never run) and
+//! starts it silently and detached. An elevated instance never installs: it
+//! refuses before anything starts, see [`ensure_unelevated`].
 //!
 //! The installer asks the running instance to quit before it replaces files
 //! (the same command as tray Exit) and, because of its `/RELAUNCH` parameter,
@@ -15,7 +17,8 @@
 
 use crate::http::HttpError;
 use crate::updater::{
-    ASSET_HOST, FlagGuard, SpawnError, UpdateError, UpdateInfo, installer_name, verify_sha256,
+    ASSET_HOST, FlagGuard, SpawnError, UpdateError, UpdateInfo, ensure_unelevated, installer_name,
+    verify_sha256,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -28,7 +31,7 @@ const ASSET_REDIRECT_HOST: &str = "release-assets.githubusercontent.com";
 /// Largest installer a download accepts; the real one is a few MB.
 const MAX_INSTALLER_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Name prefix of the temp folder an install downloads into.
+/// Name prefix of the per-install folder an install downloads into.
 const UPDATE_DIR_PREFIX: &str = "GameFrame-update-";
 
 /// The installer's command line: silent, no restart, and the custom switch
@@ -92,15 +95,31 @@ fn prepare_installer(
     }
 }
 
-/// Creates an empty, uniquely named update folder in the temp directory.
-fn fresh_update_dir() -> std::io::Result<PathBuf> {
+/// The folder updates download into: `%LOCALAPPDATA%\GameFrame\updates`, which
+/// inherits the user profile's ACL (the user, SYSTEM and administrators). A
+/// fixed, app-owned location that doesn't depend on a redirectable `%TEMP%`.
+/// Not created here.
+fn updates_root() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(local).join("GameFrame").join("updates"))
+}
+
+/// Creates an empty, uniquely named update folder inside `root`.
+fn fresh_update_dir_in(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let dir =
-        std::env::temp_dir().join(format!("{UPDATE_DIR_PREFIX}{}-{nanos}", std::process::id()));
+    let dir = root.join(format!("{UPDATE_DIR_PREFIX}{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir)?;
     Ok(dir)
+}
+
+fn fresh_update_dir() -> std::io::Result<PathBuf> {
+    let root = updates_root().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "%LOCALAPPDATA% is not set")
+    })?;
+    fresh_update_dir_in(&root)
 }
 
 /// Starts the verified installer silently, as a detached process that outlives
@@ -153,6 +172,12 @@ pub(crate) fn spawn_install(
     on_start: impl FnOnce() + Send + 'static,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), SpawnError> {
+    // Before anything is reported as started: the installer would inherit this
+    // process's token and relaunch GameFrame with it, so an elevated instance
+    // installs nothing.
+    if ensure_unelevated(crate::win32::is_process_elevated()).is_err() {
+        return Err(SpawnError::Elevated);
+    }
     let Some(in_flight) = FlagGuard::acquire(&INSTALL_IN_FLIGHT) else {
         return Err(SpawnError::Busy);
     };
@@ -179,12 +204,12 @@ pub(crate) fn spawn_install(
         })
 }
 
-/// Deletes the update folders in `temp` except those of the process `own_pid`,
+/// Deletes the update folders in `root` except those of the process `own_pid`,
 /// whose install may be writing to its folder right now, and returns how many
 /// could not be deleted (a running installer holds its file open).
-fn remove_stale_update_dirs(temp: &Path, own_pid: u32) -> usize {
+fn remove_stale_update_dirs(root: &Path, own_pid: u32) -> usize {
     let own_prefix = format!("{UPDATE_DIR_PREFIX}{own_pid}-");
-    let Ok(entries) = std::fs::read_dir(temp) else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
     entries
@@ -210,9 +235,18 @@ pub(crate) fn clean_stale_downloads() {
     let spawned = std::thread::Builder::new()
         .name("update-cleanup".into())
         .spawn(|| {
-            let temp = std::env::temp_dir();
+            // The old temp location is swept too, for downloads made by
+            // earlier versions.
+            let roots: Vec<PathBuf> = updates_root()
+                .into_iter()
+                .chain(std::iter::once(std::env::temp_dir()))
+                .collect();
             for _ in 0..ATTEMPTS {
-                if remove_stale_update_dirs(&temp, std::process::id()) == 0 {
+                let left: usize = roots
+                    .iter()
+                    .map(|root| remove_stale_update_dirs(root, std::process::id()))
+                    .sum();
+                if left == 0 {
                     return;
                 }
                 std::thread::sleep(RETRY_AFTER);
@@ -330,6 +364,26 @@ mod tests {
 
         // The program rejects the installer switches and exits at once.
         assert_eq!(launch_installer(installer), Ok(()));
+    }
+
+    #[test]
+    fn fresh_update_dir_in_creates_a_unique_prefixed_folder_and_its_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("GameFrame").join("updates");
+
+        let first = fresh_update_dir_in(&root).unwrap();
+        let second = fresh_update_dir_in(&root).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        assert_eq!(first.parent(), Some(root.as_path()));
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(UPDATE_DIR_PREFIX)
+        );
     }
 
     #[test]

@@ -1738,7 +1738,7 @@ impl SettingsApp<'_> {
                 self.update_check = match started {
                     Ok(()) => UpdateCheck::Running(receiver),
                     Err(SpawnError::Busy) => UpdateCheck::Busy,
-                    Err(SpawnError::ThreadFailed) => UpdateCheck::Lost,
+                    Err(SpawnError::ThreadFailed | SpawnError::Elevated) => UpdateCheck::Lost,
                 };
                 self.update_install = UpdateInstall::Idle;
             }
@@ -1819,6 +1819,7 @@ impl SettingsApp<'_> {
                 Ok(()) => UpdateInstall::Running(receiver),
                 Err(SpawnError::Busy) => UpdateInstall::Busy,
                 Err(SpawnError::ThreadFailed) => UpdateInstall::NotStarted,
+                Err(SpawnError::Elevated) => UpdateInstall::Failed(UpdateError::ElevatedInstance),
             };
         }
         match &self.update_install {

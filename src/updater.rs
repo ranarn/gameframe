@@ -91,6 +91,21 @@ pub(crate) enum UpdateError {
     Download(String),
     /// The verified installer could not be started.
     LaunchInstaller(String),
+    /// This instance runs elevated and never installs updates (the installer
+    /// would inherit the elevated token and relaunch GameFrame elevated).
+    ElevatedInstance,
+}
+
+/// What an elevated instance tells the user instead of installing.
+pub(crate) const ELEVATED_UPDATE_ADVICE: &str = "GameFrame is running as administrator, so it doesn't install updates. Restart GameFrame normally (not as administrator) to update.";
+
+/// Refuses an install while this instance runs elevated.
+pub(crate) fn ensure_unelevated(elevated: bool) -> Result<(), UpdateError> {
+    if elevated {
+        Err(UpdateError::ElevatedInstance)
+    } else {
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for UpdateError {
@@ -129,6 +144,7 @@ impl std::fmt::Display for UpdateError {
             ),
             UpdateError::Download(e) => write!(f, "downloading the update failed: {e}"),
             UpdateError::LaunchInstaller(e) => write!(f, "couldn't start the installer: {e}"),
+            UpdateError::ElevatedInstance => write!(f, "{ELEVATED_UPDATE_ADVICE}"),
         }
     }
 }
@@ -296,14 +312,22 @@ pub(crate) enum StartupAction {
     InstallNow(UpdateInfo),
     /// Offer this update as a tray item.
     OfferInTray(UpdateInfo),
+    /// An update exists but this instance runs elevated: tell the user to
+    /// restart GameFrame normally; install nothing.
+    ReportElevated(UpdateInfo),
 }
 
 /// Decides what to do with the result of the startup check under `mode`.
+/// An `elevated` instance never installs, whatever the mode.
 pub(crate) fn startup_action(
     mode: UpdateMode,
+    elevated: bool,
     result: Result<CheckOutcome, UpdateError>,
 ) -> StartupAction {
     match (result, mode) {
+        (Ok(CheckOutcome::UpdateAvailable(info)), _) if elevated => {
+            StartupAction::ReportElevated(info)
+        }
         (Ok(CheckOutcome::UpdateAvailable(info)), UpdateMode::Auto) => {
             StartupAction::InstallNow(info)
         }
@@ -353,6 +377,8 @@ pub(crate) enum SpawnError {
     Busy,
     /// The operating system refused the thread.
     ThreadFailed,
+    /// An install was asked for by an elevated instance, which never installs.
+    Elevated,
 }
 
 /// Runs a check for the running build on a worker thread and hands the
@@ -928,8 +954,37 @@ mod tests {
         };
 
         assert_eq!(
-            startup_action(UpdateMode::Auto, Ok(available())),
+            startup_action(UpdateMode::Auto, false, Ok(available())),
             StartupAction::InstallNow(info)
+        );
+    }
+
+    #[test]
+    fn startup_action_never_installs_when_elevated() {
+        let CheckOutcome::UpdateAvailable(info) = available() else {
+            unreachable!()
+        };
+
+        for mode in [UpdateMode::Auto, UpdateMode::Ask] {
+            assert_eq!(
+                startup_action(mode, true, Ok(available())),
+                StartupAction::ReportElevated(info.clone())
+            );
+        }
+        assert_eq!(
+            startup_action(UpdateMode::Auto, true, Ok(CheckOutcome::UpToDate)),
+            StartupAction::Nothing
+        );
+    }
+
+    #[test]
+    fn ensure_unelevated_refuses_only_an_elevated_instance() {
+        assert_eq!(ensure_unelevated(false), Ok(()));
+        assert_eq!(ensure_unelevated(true), Err(UpdateError::ElevatedInstance));
+        assert!(
+            UpdateError::ElevatedInstance
+                .to_string()
+                .contains("Restart GameFrame normally")
         );
     }
 
@@ -940,7 +995,7 @@ mod tests {
         };
 
         assert_eq!(
-            startup_action(UpdateMode::Ask, Ok(available())),
+            startup_action(UpdateMode::Ask, false, Ok(available())),
             StartupAction::OfferInTray(info)
         );
     }
@@ -956,7 +1011,7 @@ mod tests {
                 Err(UpdateError::HttpStatus(403)),
                 Err(UpdateError::Malformed("x".into())),
             ] {
-                assert_eq!(startup_action(mode, result), StartupAction::Nothing);
+                assert_eq!(startup_action(mode, false, result), StartupAction::Nothing);
             }
         }
     }
