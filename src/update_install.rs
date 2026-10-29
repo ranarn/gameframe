@@ -19,7 +19,7 @@
 
 use crate::http::HttpError;
 use crate::updater::{
-    ASSET_HOST, FlagGuard, PUBLIC_KEY, SpawnError, UpdateError, UpdateInfo, ensure_unelevated,
+    ASSET_HOST, FlagGuard, SpawnError, TRUSTED_KEYS, UpdateError, UpdateInfo, ensure_unelevated,
     installer_name, verify_sha256, verify_signature,
 };
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// The host `github.com` redirects a release-asset download to (a 302 whose
-/// `Location` carries a signed URL).
+/// `Location` carries a SIGNED_CONTENT URL).
 const ASSET_REDIRECT_HOST: &str = "release-assets.githubusercontent.com";
 
 /// Largest installer a download accepts; the real one is a few MB.
@@ -58,8 +58,8 @@ pub(crate) fn install_error_message(error: &UpdateError) -> String {
 }
 
 /// A downloaded installer whose digest matched and whose signature verified.
-/// `_lock` is the handle they were computed through, opened with a share mode that denies write
-/// and delete: while it is open, the file cannot change.
+/// `_lock` is the handle they were computed through, opened with a share mode
+/// that denies write and delete: while it is open, the file cannot change.
 struct VerifiedInstaller {
     path: PathBuf,
     _lock: std::fs::File,
@@ -67,13 +67,14 @@ struct VerifiedInstaller {
 
 /// Writes the installer into `dir` through `download`, then verifies it
 /// against the digest of `info` and the Minisign `signature` against
-/// `public_key`. Any failure deletes `dir`, so a file that was
-/// not verified is never left to be run.
+/// `public_keys`, which must have been made for this release's installer
+/// name. Any failure deletes `dir`, so a file that was not verified is never
+/// left to be run.
 fn prepare_installer(
     info: &UpdateInfo,
     dir: &Path,
     signature: &str,
-    public_key: &str,
+    public_keys: &[&str],
     download: impl FnOnce(&mut std::fs::File) -> Result<(), UpdateError>,
 ) -> Result<VerifiedInstaller, UpdateError> {
     use std::io::{Seek, SeekFrom};
@@ -96,7 +97,7 @@ fn prepare_installer(
         // Same handle again, from the start: the signature covers the content
         // that was just hashed.
         (&lock).seek(SeekFrom::Start(0)).map_err(io)?;
-        verify_signature(&lock, signature, public_key)?;
+        verify_signature(&lock, signature, public_keys, &installer_name(info.version))?;
         Ok(lock)
     })();
     match result {
@@ -178,7 +179,7 @@ fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
     // First, so an unsigned release costs no installer download.
     let signature = download_signature(&info.signature_url)?;
     let dir = fresh_update_dir().map_err(|e| UpdateError::Download(e.to_string()))?;
-    let installer = prepare_installer(info, &dir, &signature, PUBLIC_KEY, |file| {
+    let installer = prepare_installer(info, &dir, &signature, &TRUSTED_KEYS, |file| {
         crate::http::download(
             &info.download_url,
             &[ASSET_HOST, ASSET_REDIRECT_HOST],
@@ -295,20 +296,11 @@ pub(crate) fn clean_stale_downloads() {
 mod tests {
     use super::*;
     use crate::updater::Version;
+    use crate::updater::test_signing::*;
     use sha2::Digest;
 
-    // Content, key and signature made with minisign 0.12 for these tests only
-    // (the secret key was thrown away; not GameFrame's key).
-    const SIGNED: &[u8] = b"gameframe test installer";
-    const KEY: &str = "RWRxNC0yLOQy/hw1eBWJeGOpXKHvQutd1QOylDUvDibdWvEY4xx6/LaW";
-    const OTHER_KEY: &str = "RWR5V9eIUOhvVABgQXNW1DdCi23HMnK3p56Px+ldGZbWvci1XG9kIl7Q";
-    const SIG: &str = "untrusted comment: signature from minisign secret key\n\
-        RURxNC0yLOQy/v4hJSQX0rxIVlzK0PCR2V0+MJrrLOq3mU89i4KZ7HsEZJ9pJbm+rcBADNTUC93/k6zpaqAyCk7hnK1b5PJSiQE=\n\
-        trusted comment: timestamp:1793255643\tfile:payload.bin\thashed\n\
-        iAxFHuR+2NA1plwGWanAoGiAoGsa9iUir+ka82wHXnO+NB9Bbpa8x/5z7PfxH/z8aPGZ9Fd6UJbgES10AZO2BA==\n";
-
     fn sha_signed() -> String {
-        sha2::Sha256::digest(SIGNED)
+        sha2::Sha256::digest(SIGNED_CONTENT)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
@@ -325,7 +317,7 @@ mod tests {
 
     fn write_signed(file: &mut std::fs::File) -> Result<(), UpdateError> {
         use std::io::Write;
-        file.write_all(SIGNED)
+        file.write_all(SIGNED_CONTENT)
             .map_err(|e| UpdateError::Download(e.to_string()))
     }
 
@@ -340,19 +332,31 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
 
-        let installer =
-            prepare_installer(&info_for(&sha_signed()), &dir, SIG, KEY, write_signed).unwrap();
+        let installer = prepare_installer(
+            &info_for(&sha_signed()),
+            &dir,
+            SIGNATURE,
+            &[PUBLIC],
+            write_signed,
+        )
+        .unwrap();
 
         assert_eq!(installer.path, dir.join("GameFrame-Setup-1.2.0.exe"));
-        assert_eq!(std::fs::read(&installer.path).unwrap(), SIGNED);
+        assert_eq!(std::fs::read(&installer.path).unwrap(), SIGNED_CONTENT);
     }
 
     #[test]
     fn prepare_installer_keeps_the_verified_file_from_being_changed() {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
-        let installer =
-            prepare_installer(&info_for(&sha_signed()), &dir, SIG, KEY, write_signed).unwrap();
+        let installer = prepare_installer(
+            &info_for(&sha_signed()),
+            &dir,
+            SIGNATURE,
+            &[PUBLIC],
+            write_signed,
+        )
+        .unwrap();
         let other = dir.join("other.exe");
         std::fs::write(&other, b"evil").unwrap();
 
@@ -365,7 +369,7 @@ mod tests {
         assert!(write.is_err(), "the file was opened for writing");
         assert!(delete.is_err(), "the file was deleted");
         assert!(replace.is_err(), "the file was replaced");
-        assert_eq!(std::fs::read(&installer.path).unwrap(), SIGNED);
+        assert_eq!(std::fs::read(&installer.path).unwrap(), SIGNED_CONTENT);
     }
 
     #[test]
@@ -373,7 +377,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
 
-        let result = prepare_installer(&info_for(&"0".repeat(64)), &dir, SIG, KEY, write_signed);
+        let result = prepare_installer(
+            &info_for(&"0".repeat(64)),
+            &dir,
+            SIGNATURE,
+            &[PUBLIC],
+            write_signed,
+        );
 
         assert_eq!(result.err(), Some(UpdateError::DigestMismatch));
         assert!(!dir.exists());
@@ -384,10 +394,32 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
 
-        let result =
-            prepare_installer(&info_for(&sha_signed()), &dir, SIG, OTHER_KEY, write_signed);
+        let result = prepare_installer(
+            &info_for(&sha_signed()),
+            &dir,
+            SIGNATURE,
+            &[OTHER_PUBLIC],
+            write_signed,
+        );
 
         assert_eq!(result.err(), Some(UpdateError::SignatureMismatch));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn prepare_installer_deletes_a_download_with_the_signature_of_another_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = update_dir(&temp);
+
+        let result = prepare_installer(
+            &info_for(&sha_signed()),
+            &dir,
+            SIGNATURE_FOR_1_1_0,
+            &[PUBLIC],
+            write_signed,
+        );
+
+        assert_eq!(result.err(), Some(UpdateError::SignatureForOtherFile));
         assert!(!dir.exists());
     }
 
@@ -401,11 +433,17 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
 
-        let result = prepare_installer(&info_for(&evil_digest), &dir, SIG, KEY, |file| {
-            use std::io::Write;
-            file.write_all(evil)
-                .map_err(|e| UpdateError::Download(e.to_string()))
-        });
+        let result = prepare_installer(
+            &info_for(&evil_digest),
+            &dir,
+            SIGNATURE,
+            &[PUBLIC],
+            |file| {
+                use std::io::Write;
+                file.write_all(evil)
+                    .map_err(|e| UpdateError::Download(e.to_string()))
+            },
+        );
 
         assert_eq!(result.err(), Some(UpdateError::SignatureMismatch));
         assert!(!dir.exists());
@@ -416,7 +454,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
 
-        let result = prepare_installer(&info_for(&sha_signed()), &dir, "", KEY, write_signed);
+        let result = prepare_installer(&info_for(&sha_signed()), &dir, "", &[PUBLIC], write_signed);
 
         assert!(matches!(
             result.err(),
@@ -430,10 +468,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = update_dir(&temp);
 
-        let result = prepare_installer(&info_for(&sha_signed()), &dir, SIG, KEY, |file| {
-            write_signed(file)?;
-            Err(UpdateError::Download("connection reset".into()))
-        });
+        let result = prepare_installer(
+            &info_for(&sha_signed()),
+            &dir,
+            SIGNATURE,
+            &[PUBLIC],
+            |file| {
+                write_signed(file)?;
+                Err(UpdateError::Download("connection reset".into()))
+            },
+        );
 
         assert_eq!(
             result.err(),

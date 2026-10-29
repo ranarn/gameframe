@@ -1,10 +1,11 @@
 //! Update check: asks GitHub's "latest release" endpoint whether a release
-//! newer than the running build exists, and which installer and SHA-256 digest
-//! belong to it. Installing it is [`crate::update_install`].
+//! newer than the running build exists, and which installer, SHA-256 digest and
+//! Minisign signature belong to it. Installing it is [`crate::update_install`].
 //!
 //! The decision logic is pure: [`check`] takes the running version and a
-//! fetch closure, and [`parse_release`], [`Version`], [`select_asset`] and
-//! [`verify_sha256`] work on plain strings and readers, so all of it is unit
+//! fetch closure, and [`parse_release`], [`Version`], [`select_asset`],
+//! [`select_signature_asset`], [`verify_sha256`] and [`verify_signature`] work
+//! on plain strings and readers, so all of it is unit
 //! tested without a network. The network part is [`fetch_latest_release`] (a
 //! blocking WinHTTP request, see [`crate::http`]) and [`spawn_check`], which
 //! runs the whole check on a worker thread so no UI thread ever waits on it.
@@ -33,13 +34,24 @@ const SIGNATURE_SUFFIX: &str = ".minisig";
 
 /// The Minisign public key (the base64 second line of `minisign.pub`) every
 /// installer must be signed with. The release workflow checks, after signing,
-/// that the signature verifies against this exact line, so keep it on one line
-/// as `pub(crate) const PUBLIC_KEY: &str = "...";`.
+/// that the signature verifies against this exact line (or
+/// [`NEXT_PUBLIC_KEY`]), so keep it on one line as
+/// `pub(crate) const PUBLIC_KEY: &str = "...";`.
 ///
 /// PLACEHOLDER: the maintainer replaces this with the public key of the
 /// release signing key (see SECURITY.md). Until then no installer verifies,
 /// so the updater installs nothing and the release workflow refuses to publish.
 pub(crate) const PUBLIC_KEY: &str = "REPLACE_WITH_MINISIGN_PUBLIC_KEY";
+
+/// Second accepted key, empty normally. It only exists to rotate the signing
+/// key: a release signed with the old key sets this to the new public key, so
+/// that installs made by it accept releases signed with the new key (see
+/// SECURITY.md). Keep it on one line as
+/// `pub(crate) const NEXT_PUBLIC_KEY: &str = "...";`.
+pub(crate) const NEXT_PUBLIC_KEY: &str = "";
+
+/// The keys an installer's signature may verify against.
+pub(crate) const TRUSTED_KEYS: [&str; 2] = [PUBLIC_KEY, NEXT_PUBLIC_KEY];
 
 /// The host of an asset's `browser_download_url`.
 pub(crate) const ASSET_HOST: &str = "github.com";
@@ -105,6 +117,11 @@ pub(crate) enum UpdateError {
     InvalidSignature(String),
     /// The installer is not signed by the key built into GameFrame.
     SignatureMismatch,
+    /// The signature is genuine but was made for another installer file, e.g.
+    /// an older release's.
+    SignatureForOtherFile,
+    /// Reading the downloaded file back from disk failed.
+    ReadFile(String),
     /// Downloading or storing the installer failed.
     Download(String),
     /// The verified installer could not be started.
@@ -171,6 +188,13 @@ impl std::fmt::Display for UpdateError {
                 f,
                 "the downloaded installer is not signed by the GameFrame publisher key, so it was not run"
             ),
+            UpdateError::SignatureForOtherFile => write!(
+                f,
+                "the installer's signature was made for a different release, so it was not run"
+            ),
+            UpdateError::ReadFile(e) => {
+                write!(f, "reading the downloaded installer failed: {e}")
+            }
             UpdateError::Download(e) => write!(f, "downloading the update failed: {e}"),
             UpdateError::LaunchInstaller(e) => write!(f, "couldn't start the installer: {e}"),
             UpdateError::ElevatedInstance => write!(f, "{ELEVATED_UPDATE_ADVICE}"),
@@ -325,29 +349,52 @@ pub(crate) fn select_signature_asset(release: &Release) -> Result<String, Update
     Ok(asset.download_url.clone())
 }
 
-/// Checks that the bytes `reader` yields were signed with the Minisign key
-/// `public_key` (the base64 line of `minisign.pub`); `signature` is the text of
+/// The trusted comment the release workflow signs `installer_file` with. The
+/// signature covers it, so a valid signature of an older installer cannot be
+/// passed off as the one of a newer release.
+pub(crate) fn expected_trusted_comment(installer_file: &str) -> String {
+    format!("file:{installer_file}")
+}
+
+/// Checks that the bytes `reader` yield were signed with one of the Minisign
+/// keys `public_keys` (the base64 line of `minisign.pub`; empty entries are
+/// ignored) and that the signature was made for `installer_file`, i.e. its
+/// trusted comment is [`expected_trusted_comment`]. `signature` is the text of
 /// the `.minisig` file. Authenticity, as opposed to [`verify_sha256`]'s
 /// integrity. Streams the data; only pre-hashed signatures (minisign's default)
 /// are accepted, never the legacy format.
 pub(crate) fn verify_signature(
     mut reader: impl Read,
     signature: &str,
-    public_key: &str,
+    public_keys: &[&str],
+    installer_file: &str,
 ) -> Result<(), UpdateError> {
     use minisign_verify::{PublicKey, Signature};
-    let key = PublicKey::from_base64(public_key)
-        .map_err(|e| UpdateError::InvalidSignature(format!("no usable public key ({e})")))?;
     let signature = Signature::decode(signature)
         .map_err(|e| UpdateError::InvalidSignature(format!("malformed signature ({e})")))?;
-    let mut verifier = key
-        .verify_stream(&signature)
-        .map_err(|_| UpdateError::SignatureMismatch)?;
+    let mut keys = Vec::new();
+    let mut key_error = None;
+    for text in public_keys.iter().filter(|k| !k.is_empty()) {
+        match PublicKey::from_base64(text) {
+            Ok(key) => keys.push(key),
+            Err(e) => key_error = Some(format!("no usable public key ({e})")),
+        }
+    }
+    // Only the key the signature names accepts it.
+    let mut verifier = match keys.iter().find_map(|k| k.verify_stream(&signature).ok()) {
+        Some(verifier) => verifier,
+        None => {
+            return Err(match key_error {
+                Some(e) => UpdateError::InvalidSignature(e),
+                None => UpdateError::SignatureMismatch,
+            });
+        }
+    };
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let read = reader
             .read(&mut chunk)
-            .map_err(|e| UpdateError::Download(format!("reading the file failed: {e}")))?;
+            .map_err(|e| UpdateError::ReadFile(e.to_string()))?;
         if read == 0 {
             break;
         }
@@ -355,7 +402,12 @@ pub(crate) fn verify_signature(
     }
     verifier
         .finalize()
-        .map_err(|_| UpdateError::SignatureMismatch)
+        .map_err(|_| UpdateError::SignatureMismatch)?;
+    // The trusted comment is covered by the signature just verified.
+    if signature.trusted_comment() != expected_trusted_comment(installer_file) {
+        return Err(UpdateError::SignatureForOtherFile);
+    }
+    Ok(())
 }
 
 /// Runs an update check for the build `current_version`. `fetch` returns the
@@ -502,7 +554,7 @@ pub(crate) fn verify_sha256(mut reader: impl Read, expected: &str) -> Result<(),
     loop {
         let read = reader
             .read(&mut chunk)
-            .map_err(|e| UpdateError::Download(format!("reading the file failed: {e}")))?;
+            .map_err(|e| UpdateError::ReadFile(e.to_string()))?;
         if read == 0 {
             break;
         }
@@ -520,8 +572,38 @@ pub(crate) fn verify_sha256(mut reader: impl Read, expected: &str) -> Result<(),
     }
 }
 
+/// Minisign test vectors shared by the `updater` and `update_install` tests.
+/// Generated for these tests only (Ed25519 over the BLAKE2b-512 prehash, the
+/// minisign file format); the secret keys were thrown away. Not GameFrame's key.
+#[cfg(test)]
+pub(crate) mod test_signing {
+    /// What every signature below signs.
+    pub(crate) const SIGNED_CONTENT: &[u8] = b"gameframe test installer";
+    /// The installer file name the main signatures were made for (version 1.2.0).
+    pub(crate) const INSTALLER: &str = "GameFrame-Setup-1.2.0.exe";
+    pub(crate) const PUBLIC: &str = "RWRrGo2Vw3gmNJZptjsa/37+ZTtVrbFkkXcc+XyrVUCUxAPbS7k6d5L5";
+    pub(crate) const OTHER_PUBLIC: &str =
+        "RWTsnKflULaSFmYA5FZZdOdzaAD97A0iJj6lOGFGKg+17gEHhjSxRzPx";
+    pub(crate) const NEXT_PUBLIC: &str = "RWQhJM6CesdFX7EFgT+SQpIi9dxocDra/bRxn1lIkKekAC968AOXW1vj";
+    /// By [`PUBLIC`]'s key, trusted comment `file:GameFrame-Setup-1.2.0.exe`.
+    pub(crate) const SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
+        RURrGo2Vw3gmNFJujZcPLpNOs/uNSEA368saYb5N7XeK/hw3OsWNCiAjTlHYSHAE09Fgg8mzUEBpADXhwr36cQfwp8dc6eCcfwk=\n\
+        trusted comment: file:GameFrame-Setup-1.2.0.exe\n\
+        WGe2I1VGTUuKZNOoTB+hYf3p2DyI4IxCp3mzO/+13XBRig+fmU9xq5LJ2DRtr2IKEQvBHP7LY+WQ5p829gu8AA==\n";
+    /// By [`PUBLIC`]'s key, trusted comment `file:GameFrame-Setup-1.1.0.exe`.
+    pub(crate) const SIGNATURE_FOR_1_1_0: &str = "untrusted comment: signature from minisign secret key\n\
+        RURrGo2Vw3gmNFJujZcPLpNOs/uNSEA368saYb5N7XeK/hw3OsWNCiAjTlHYSHAE09Fgg8mzUEBpADXhwr36cQfwp8dc6eCcfwk=\n\
+        trusted comment: file:GameFrame-Setup-1.1.0.exe\n\
+        mRnWB3t+DxL6cYca1CQboHDpxA1aXPrsZRhdmEl2mcCnoyITM5fEzz9zDHXK9WIZc2ohozCldO9GpnJXyHNyCA==\n";
+    /// By [`NEXT_PUBLIC`]'s key, trusted comment `file:GameFrame-Setup-1.2.0.exe`.
+    pub(crate) const SIGNATURE_BY_NEXT_KEY: &str = "untrusted comment: signature from minisign secret key\n\
+        RUQhJM6CesdFX3EqyoOzzl3aqspV7h9gOMFgF8zhOs6UacG6UidPTzOCXy+paIAiLgzFOkCXAwxS+awbKsd3lV6AyudDQqrQ0wE=\n\
+        trusted comment: file:GameFrame-Setup-1.2.0.exe\n\
+        uVUZ4gW1ZaOwEquutsIVGqkA3JDjiOkpLdi67pZ3Z62pZ7hO4x0dbeS1IWoyVSkwo6j+zV/8s1B84vRhEA2vBg==\n";
+}
 #[cfg(test)]
 mod tests {
+    use super::test_signing::*;
     use super::*;
     use std::cell::Cell;
 
@@ -1031,24 +1113,14 @@ mod tests {
 
         assert!(matches!(
             verify_sha256(Failing, SHA_ABC),
-            Err(UpdateError::Download(e)) if e.contains("disk gone")
+            Err(UpdateError::ReadFile(e)) if e.contains("disk gone")
         ));
     }
-
-    // Generated with minisign 0.12 (`minisign -G -W`, `minisign -S`) for these
-    // tests only; the secret keys were thrown away. Not GameFrame's key.
-    const TEST_PUBLIC_KEY: &str = "RWRxNC0yLOQy/hw1eBWJeGOpXKHvQutd1QOylDUvDibdWvEY4xx6/LaW";
-    const OTHER_PUBLIC_KEY: &str = "RWR5V9eIUOhvVABgQXNW1DdCi23HMnK3p56Px+ldGZbWvci1XG9kIl7Q";
-    const SIGNED_CONTENT: &[u8] = b"gameframe test installer";
-    const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
-        RURxNC0yLOQy/v4hJSQX0rxIVlzK0PCR2V0+MJrrLOq3mU89i4KZ7HsEZJ9pJbm+rcBADNTUC93/k6zpaqAyCk7hnK1b5PJSiQE=\n\
-        trusted comment: timestamp:1793255643\tfile:payload.bin\thashed\n\
-        iAxFHuR+2NA1plwGWanAoGiAoGsa9iUir+ka82wHXnO+NB9Bbpa8x/5z7PfxH/z8aPGZ9Fd6UJbgES10AZO2BA==\n";
 
     #[test]
     fn verify_signature_accepts_a_file_signed_with_the_key() {
         assert_eq!(
-            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &[PUBLIC], INSTALLER),
             Ok(())
         );
     }
@@ -1059,11 +1131,11 @@ mod tests {
         tampered[0] ^= 1;
 
         assert_eq!(
-            verify_signature(&tampered[..], TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            verify_signature(&tampered[..], SIGNATURE, &[PUBLIC], INSTALLER),
             Err(UpdateError::SignatureMismatch)
         );
         assert_eq!(
-            verify_signature(&SIGNED_CONTENT[1..], TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            verify_signature(&SIGNED_CONTENT[1..], SIGNATURE, &[PUBLIC], INSTALLER),
             Err(UpdateError::SignatureMismatch)
         );
     }
@@ -1071,7 +1143,7 @@ mod tests {
     #[test]
     fn verify_signature_rejects_another_key() {
         assert_eq!(
-            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, OTHER_PUBLIC_KEY),
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &[OTHER_PUBLIC], INSTALLER),
             Err(UpdateError::SignatureMismatch)
         );
     }
@@ -1081,7 +1153,7 @@ mod tests {
         for signature in ["", "not a signature", "untrusted comment: x\n"] {
             assert!(
                 matches!(
-                    verify_signature(SIGNED_CONTENT, signature, TEST_PUBLIC_KEY),
+                    verify_signature(SIGNED_CONTENT, signature, &[PUBLIC], INSTALLER),
                     Err(UpdateError::InvalidSignature(_))
                 ),
                 "{signature:?}"
@@ -1092,9 +1164,37 @@ mod tests {
     #[test]
     fn verify_signature_rejects_the_unconfigured_placeholder_key() {
         assert!(matches!(
-            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, PUBLIC_KEY),
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &TRUSTED_KEYS, INSTALLER),
             Err(UpdateError::InvalidSignature(_)) | Err(UpdateError::SignatureMismatch)
         ));
+    }
+
+    #[test]
+    fn verify_signature_refuses_a_genuine_signature_made_for_another_release() {
+        // Valid for the content and the key, but its trusted comment names 1.1.0:
+        // an old signed installer re-published under a newer name.
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE_FOR_1_1_0, &[PUBLIC], INSTALLER),
+            Err(UpdateError::SignatureForOtherFile)
+        );
+    }
+
+    #[test]
+    fn verify_signature_accepts_the_next_key_next_to_the_current_one() {
+        let keys = [PUBLIC, "", NEXT_PUBLIC];
+
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &keys, INSTALLER),
+            Ok(())
+        );
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE_BY_NEXT_KEY, &keys, INSTALLER),
+            Ok(())
+        );
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE_BY_NEXT_KEY, &[PUBLIC], INSTALLER),
+            Err(UpdateError::SignatureMismatch)
+        );
     }
 
     #[test]
@@ -1107,8 +1207,8 @@ mod tests {
         }
 
         assert!(matches!(
-            verify_signature(Failing, TEST_SIGNATURE, TEST_PUBLIC_KEY),
-            Err(UpdateError::Download(e)) if e.contains("disk gone")
+            verify_signature(Failing, SIGNATURE, &[PUBLIC], INSTALLER),
+            Err(UpdateError::ReadFile(e)) if e.contains("disk gone")
         ));
     }
 

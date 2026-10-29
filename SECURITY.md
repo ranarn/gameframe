@@ -50,9 +50,13 @@ store and proxy settings apply:
   workflow, which attaches the detached `GameFrame-Setup-<version>.exe.minisig`
   next to it. GameFrame embeds the matching public key (`PUBLIC_KEY` in
   `src/updater.rs`) and, before it runs an installer, downloads the `.minisig`
-  (same host rules as the installer) and verifies the file against it. A release
-  with no signature, a signature that does not verify, or a key mismatch is
-  refused: the download is deleted, nothing runs, and the Settings update row
+  (same host rules as the installer) and verifies the file against it. The
+  signature carries a trusted comment, covered by it, that names the exact
+  installer file (`file:GameFrame-Setup-<version>.exe`), and GameFrame requires
+  it to match the release it is installing, so a genuinely signed older
+  installer cannot be re-published as a newer release (replay or downgrade). A
+  release with no signature, a signature that does not verify, a signature made
+  for another release, or a key mismatch is refused: the download is deleted, nothing runs, and the Settings update row
   and the log say why. There is no unsigned fallback. This is what protects you
   if the GitHub account or release page is compromised, because the signing key
   is held only as a secret of the protected `release` environment, which
@@ -103,7 +107,9 @@ signed release:
    `minisign -G -p gameframe.pub -s gameframe.key`. Keep `gameframe.key` and the
    password offline (a password manager); never commit them.
 2. In the repository, create the GitHub Environment `release`
-   (Settings -> Environments) with **required reviewers**, and add two
+   (Settings -> Environments) with **required reviewers**, set **Deployment
+   branches and tags** to **Selected branches and tags** -> `main` (so a
+   workflow on another branch can never read the secrets), and add two
    environment secrets there: `MINISIGN_SECRET_KEY` (the full contents of
    `gameframe.key`) and `MINISIGN_PASSWORD` (its password; leave empty only for
    a key made with `-W`).
@@ -111,10 +117,27 @@ signed release:
    of `gameframe.pub` (the base64 string starting `RW`), commit it, and let it
    reach `main` before running the Release workflow. The workflow refuses to
    publish while the placeholder is in place, and it checks after signing that
-   the signature verifies against that exact constant.
+   the signature verifies against that exact constant (or NEXT_PUBLIC_KEY, see below).
 4. Enable **immutable releases** (Settings -> General -> Releases), so a
    published release and its assets can no longer be replaced.
 
-To rotate the key, repeat 1-3; installs made by versions that embed the old key
-keep requiring the old key, so rotate by releasing a version signed with the old
-key that embeds the new one.
+### Rotating the signing key
+
+GameFrame trusts `PUBLIC_KEY` and, when set, `NEXT_PUBLIC_KEY` (both in
+`src/updater.rs`; the second is empty normally). The release workflow accepts a
+signature that verifies against either. A running install only knows the keys of
+its own version, so rotate in two releases:
+
+1. Generate the new key pair (step 1). Release N: set `NEXT_PUBLIC_KEY` to the
+   new public key, keep the old secrets. N is signed with the old key and
+   installs accept it; from then on they also trust the new key.
+2. Once N is out, replace the `MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD`
+   environment secrets with the new key. Release N+1: set `PUBLIC_KEY` to the
+   new key and `NEXT_PUBLIC_KEY` back to the empty string. It is signed with the
+   new key; installs of N accept it.
+
+Limitation: an install older than N never learned the new key and refuses N+1
+(the updater only offers the latest release). Keep releasing N+1 only after
+those installs have updated through N, or have those users install the new
+version manually. If the old key is already compromised, there is no trusted
+channel left: every install has to be replaced by hand.
