@@ -490,8 +490,8 @@ struct Drained {
 /// (events queued behind it stay in their channels for the next call). With
 /// Settings open, that click focuses the window instead. While the zone editor
 /// is open only the game-cursor hotkey runs (see [`hotkey_allowed`]). The
-/// progress of installs Settings asked for is appended to `install_progress`,
-/// for [`forward_install_progress`].
+/// progress of installs Settings asked for is appended to `install_progress` as
+/// (request id, progress), for [`forward_install_progress`].
 fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
@@ -515,7 +515,6 @@ fn drain_events(
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
         install_progress.extend(InstallProgress::from_event(&event));
-        // (request id, progress); the id lets Settings tell its own apart.
         handle_update_event(event, tray, config_dir, offered_update);
     }
 

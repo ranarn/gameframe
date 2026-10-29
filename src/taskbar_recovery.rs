@@ -704,17 +704,24 @@ pub fn recover_on_startup(dir: &Path) {
     recover_own_marker(dir);
     // Markers of Settings / zone editor children that died with the tray
     // process (or that it never got to clean up).
-    for name in orphaned_child_markers(dir, is_gameframe_process) {
+    for name in orphaned_child_markers(dir, std::process::id(), gameframe_process_created) {
         recover_named(dir, &name);
     }
 }
 
 /// The child markers in `dir` whose child has ended, by file name. A marker
-/// whose pid `is_running` as a GameFrame process belongs to a live child (of
-/// another tray, e.g. a second instance still running): restoring the taskbar
-/// under it would desync it. Its tray restores it when the child ends, or the
-/// next startup does.
-fn orphaned_child_markers(dir: &Path, is_running: impl Fn(u32) -> bool) -> Vec<String> {
+/// belongs to a live child (of another tray, e.g. a second instance still
+/// running) if its pid is not `own_pid` and `created` says that pid is a
+/// GameFrame process created no later than the marker was last written:
+/// restoring the taskbar under it would desync it. Its tray restores the marker
+/// when the child ends, or the next startup does. A pid reused by a younger
+/// process (or by this very process) is not the child, so the marker is stale.
+/// A marker whose age can't be read counts as stale too.
+fn orphaned_child_markers(
+    dir: &Path,
+    own_pid: u32,
+    created: impl Fn(u32) -> Option<std::time::SystemTime>,
+) -> Vec<String> {
     child_marker_names(dir)
         .into_iter()
         .filter(|name| {
@@ -722,22 +729,31 @@ fn orphaned_child_markers(dir: &Path, is_running: impl Fn(u32) -> bool) -> Vec<S
                 .strip_prefix(CHILD_MARKER_PREFIX)
                 .and_then(|rest| rest.strip_suffix(MARKER_EXTENSION))
                 .and_then(|pid| pid.parse::<u32>().ok());
-            !pid.is_some_and(&is_running)
+            let written = std::fs::metadata(dir.join(name))
+                .and_then(|m| m.modified())
+                .ok();
+            let live = match (pid, written) {
+                (Some(pid), Some(written)) if pid != own_pid => {
+                    created(pid).is_some_and(|created| created <= written)
+                }
+                _ => false,
+            };
+            !live
         })
         .collect()
 }
 
-/// Whether `pid` is a running GameFrame process (its image has this
-/// executable's file name, which guards against a reused pid). OS-facing.
-fn is_gameframe_process(pid: u32) -> bool {
-    let own = std::env::current_exe().ok();
+/// When `pid` was created, if it is a running GameFrame process (its image has
+/// this executable's file name). OS-facing.
+fn gameframe_process_created(pid: u32) -> Option<std::time::SystemTime> {
+    let own = std::env::current_exe().ok()?;
+    let other = crate::window_filter::process_exe_path(pid)?;
     let name = |path: &Path| path.file_name().map(|n| n.to_ascii_lowercase());
-    match (crate::window_filter::process_exe_path(pid), own) {
-        (Some(other), Some(own)) => name(&other) == name(&own),
-        _ => false,
+    if name(&other) != name(&own) {
+        return None;
     }
+    crate::window_filter::process_creation_time(pid)
 }
-
 fn recover_own_marker(dir: &Path) {
     let marker = read_marker_file(dir);
     if marker == MarkerState::None {
@@ -887,23 +903,39 @@ mod tests {
     }
 
     #[test]
-    fn startup_skips_the_marker_of_a_child_that_is_still_running() {
+    fn startup_skips_only_the_marker_of_a_child_that_is_still_running() {
+        use std::time::{Duration, SystemTime};
         let dir = tempfile::tempdir().unwrap();
-        for pid in [7, 12, 40] {
+        for pid in [7, 12, 40, 50, 60] {
             std::fs::write(dir.path().join(child_marker_name(pid)), "fully-hidden\n").unwrap();
         }
+        let written = std::fs::metadata(dir.path().join(child_marker_name(12)))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let older = written - Duration::from_secs(60);
+        let younger = written + Duration::from_secs(60);
+        let created = |pid: u32| -> Option<SystemTime> {
+            match pid {
+                12 => Some(older),   // started before the marker: the child
+                50 => Some(younger), // pid reused by a process started later
+                60 => Some(older),   // would be live, but is the starting tray
+                _ => None,           // not running / not a GameFrame process
+            }
+        };
 
-        let to_recover = orphaned_child_markers(dir.path(), |pid| pid == 12);
+        let to_recover = orphaned_child_markers(dir.path(), 60, created);
 
         assert_eq!(
             to_recover,
             vec![
                 "taskbar-hidden-child-40.marker".to_string(),
+                "taskbar-hidden-child-50.marker".to_string(),
+                "taskbar-hidden-child-60.marker".to_string(),
                 "taskbar-hidden-child-7.marker".to_string()
             ]
         );
     }
-
     #[test]
     fn a_child_marker_is_read_and_cleared_independently_of_the_trays() {
         let dir = tempfile::tempdir().unwrap();

@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     TH32CS_SNAPMODULE32,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GA_ROOTOWNER, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup, GetWindow,
@@ -497,6 +497,37 @@ fn window_class_name(hwnd: HWND) -> String {
         return String::new();
     }
     String::from_utf16_lossy(&buffer[..len as usize])
+}
+
+/// When the process `pid` was created; `None` when it can't be opened or queried
+/// (gone, or access denied).
+pub(crate) fn process_creation_time(pid: u32) -> Option<std::time::SystemTime> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    // Safety: `pid` is a plain integer; `OpenProcess` takes no pointers.
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // Safety: `handle` is a live handle just opened above; the four out
+    // pointers are valid `FILETIME`s on this stack frame.
+    let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+    // Safety: `handle` is a valid handle owned solely by this function.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    // 100 ns ticks since 1601-01-01; the Unix epoch is 11_644_473_600 s later.
+    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    let since_1601 = std::time::Duration::from_nanos(ticks.checked_mul(100)?);
+    let epoch_offset = std::time::Duration::from_secs(11_644_473_600);
+    Some(std::time::UNIX_EPOCH + since_1601.checked_sub(epoch_offset)?)
 }
 
 /// Resolves a process's executable path via `OpenProcess` (with the minimal

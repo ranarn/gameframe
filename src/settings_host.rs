@@ -485,16 +485,17 @@ mod tests {
         );
     }
 
-    /// A stdin whose pipe is full: every write blocks until released.
-    struct StuckStdin(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    /// A stdin whose pipe is full: the first write announces itself on
+    /// `entered`, then blocks until `release` yields.
+    struct StuckStdin {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
 
     impl Write for StuckStdin {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let (released, cv) = &*self.0;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = cv.wait(released).unwrap();
-            }
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -504,7 +505,8 @@ mod tests {
 
     #[test]
     fn sending_never_blocks_on_a_child_that_does_not_read() {
-        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered) = channel();
+        let (release_tx, release) = channel();
         let (_to_tray, events) = channel();
         let mut process = SettingsProcess::from_parts(
             FakeChild {
@@ -512,36 +514,25 @@ mod tests {
                 killed: Rc::new(Cell::new(false)),
                 check_fails: Rc::new(Cell::new(false)),
             },
-            Some(Box::new(StuckStdin(Arc::clone(&gate)))),
+            Some(Box::new(StuckStdin {
+                entered: entered_tx,
+                release,
+            })),
             events,
             TickContext::Settings,
             None,
         );
         process.close_grace = Duration::from_millis(10);
-        // Releases the pipe after a while, so a blocking `send` shows up as a
-        // slow one instead of hanging the test.
-        let release = Arc::clone(&gate);
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            *release.0.lock().unwrap() = true;
-            release.1.notify_all();
-        });
 
-        let started = Instant::now();
+        process.send(&ParentMsg::CursorEnabled(true));
+        // The writer thread is now provably stuck inside the pipe write.
+        entered.recv().unwrap();
+        // Were `send` to write itself, it would block here forever.
         for _ in 0..1000 {
             process.send(&ParentMsg::CursorEnabled(true));
         }
-        let took = started.elapsed();
-        *gate.0.lock().unwrap() = true;
-        gate.1.notify_all();
-        releaser.join().unwrap();
-
-        assert!(
-            took < Duration::from_secs(1),
-            "send blocked on a stdin that never drains: {took:?}"
-        );
+        drop(release_tx); // unblocks the stuck write (recv errs) for teardown
     }
-
     #[test]
     fn a_child_that_ignores_the_close_request_is_killed_after_the_grace_period() {
         let mut rig = rig();

@@ -45,6 +45,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the child waits for the tray process to live re-apply the Zone
 /// (it contacts every running tracked game, which can take a few seconds).
 const REAPPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an install request may stay unanswered before later progress of a
+/// tray install is shown again (matches the installer's own fallback).
+const PENDING_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Which window a child process shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,8 +243,9 @@ struct Inbox {
     init: Option<(Vec<BindingReport>, Option<Bitmap>)>,
     /// Install progress not taken yet, oldest first.
     install: Vec<InstallProgress>,
-    /// The id of the install request this window made and has no answer to yet.
-    pending_install: Option<u64>,
+    /// The id of the install request this window made and has no answer to yet,
+    /// and when it was made. Given up on after [`PENDING_INSTALL_TIMEOUT`].
+    pending_install: Option<(u64, Instant)>,
     /// The last context reported, so only changes are sent.
     last_context: Option<TickContext>,
 }
@@ -255,7 +259,9 @@ impl Inbox {
                 game_cursor,
             } => self.init = Some((hotkey_reports, game_cursor)),
             ParentMsg::CursorEnabled(enabled) => self.cursor_enabled = Some(enabled),
-            ParentMsg::Install { request, progress } => self.file_install(request, progress),
+            ParentMsg::Install { request, progress } => {
+                self.file_install(request, progress, Instant::now());
+            }
             // A stray answer (its request timed out) or `Close`, which the
             // reader thread already turned into `on_close`.
             ParentMsg::ReapplyDone(_) | ParentMsg::Close => {}
@@ -266,8 +272,15 @@ impl Inbox {
     /// pending request, or, with none pending, progress of a tray install
     /// (`request` is `None`). Anything else (a tray install that finished
     /// meanwhile, a stale answer) must not become the pending request's result.
-    fn file_install(&mut self, request: Option<u64>, progress: InstallProgress) {
-        match (self.pending_install, request) {
+    /// A request unanswered for [`PENDING_INSTALL_TIMEOUT`] at `now` is given up
+    /// on (the link broke mid-request), so it cannot hide tray progress forever.
+    fn file_install(&mut self, request: Option<u64>, progress: InstallProgress, now: Instant) {
+        if let Some((_, asked)) = self.pending_install
+            && now.saturating_duration_since(asked) >= PENDING_INSTALL_TIMEOUT
+        {
+            self.pending_install = None;
+        }
+        match (self.pending_install.map(|(id, _)| id), request) {
             (Some(pending), Some(id)) if pending == id => {
                 self.pending_install = None;
                 self.install.push(progress);
@@ -398,7 +411,7 @@ impl ChildLink {
         }
         inbox.install.clear();
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        inbox.pending_install = Some(id);
+        inbox.pending_install = Some((id, Instant::now()));
         drop(inbox);
         self.send(&ChildMsg::Install(InstallRequest::new(id, info)));
     }
@@ -733,6 +746,26 @@ mod tests {
             link.take_install_progress(),
             vec![InstallProgress::Launched]
         );
+    }
+
+    #[test]
+    fn an_unanswered_install_request_stops_hiding_tray_progress_after_the_timeout() {
+        let (link, _to_child, _from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        let mut inbox = link.lock_inbox();
+        let asked = inbox.pending_install.unwrap().1;
+
+        let soon = asked + Duration::from_secs(1);
+        inbox.file_install(None, InstallProgress::Launched, soon);
+        assert!(inbox.install.is_empty(), "still pending: not shown");
+
+        inbox.file_install(
+            None,
+            InstallProgress::Launched,
+            asked + PENDING_INSTALL_TIMEOUT,
+        );
+        assert_eq!(inbox.install, vec![InstallProgress::Launched]);
+        assert!(inbox.pending_install.is_none());
     }
 
     #[test]
