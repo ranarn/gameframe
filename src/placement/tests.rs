@@ -27,7 +27,7 @@ fn config_with_zone_and_game(zone: Option<Zone>, auto_apply: bool) -> Config {
         zone,
         ..Config::default()
     };
-    let mut game = TrackedGame::new_default(the_exe(), "Thing".to_string());
+    let mut game = TrackedGame::new_for_cursor_setting(the_exe(), "Thing".to_string(), true);
     game.auto_apply = auto_apply;
     config.tracked_games.push(game);
     config
@@ -39,6 +39,8 @@ struct FakeOps {
     suppressed: bool,
     eligible: bool,
     config_ok: bool,
+    /// Saving a newly tracked game succeeds.
+    track_ok: bool,
     /// The window's exe path can be read.
     exe_known: bool,
     minimized: bool,
@@ -60,6 +62,7 @@ impl FakeOps {
             suppressed: false,
             eligible: true,
             config_ok: true,
+            track_ok: true,
             exe_known: true,
             minimized: false,
             region_ok: true,
@@ -90,6 +93,9 @@ impl PlacementOps for FakeOps {
     }
     fn track_game(&self, exe_path: &Path, display_name: &str) -> Result<TrackedGame, String> {
         self.note("track_game");
+        if !self.track_ok {
+            return Err("config is locked".to_string());
+        }
         let mut config = self.config.borrow_mut();
         let config = &mut *config;
         let index = profile_store::upsert_tracked_game(
@@ -635,6 +641,24 @@ fn tray_apply_tracks_a_new_game_with_auto_apply_and_saves_before_placing() {
     assert_eq!(saved.tracked_games.len(), 1);
     assert_eq!(saved.tracked_games[0].display_name, "Thing Window");
     assert!(saved.tracked_games[0].auto_apply);
+}
+
+#[test]
+fn tray_apply_still_places_with_an_in_memory_game_when_saving_the_tracked_game_fails() {
+    let mut ops = FakeOps::new(Config {
+        zone: Some(A_ZONE),
+        ..Config::default()
+    });
+    ops.track_ok = false;
+
+    let outcome = apply_zone_with(&ops, hwnd(), Trigger::Tray);
+
+    assert!(matches!(outcome, Outcome::Applied));
+    assert_eq!(ops.calls()[..3], ["eligibility", "track_game", "place"]);
+    assert!(
+        ops.config.borrow().tracked_games.is_empty(),
+        "nothing was persisted"
+    );
 }
 
 #[test]

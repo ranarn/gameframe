@@ -91,7 +91,7 @@ fn request(
     sink: Sink,
 ) -> Result<Reply, HttpError> {
     let agent = encode_wide(USER_AGENT);
-    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
+    // SAFETY: `agent` is a NUL-terminated UTF-16 string that outlives the call; the other arguments are plain values or null; the returned handle is wrapped in its guard right away.
     let session = Handle::new(unsafe {
         WinHttpOpen(
             agent.as_ptr(),
@@ -102,14 +102,14 @@ fn request(
         )
     })
     .ok_or_else(|| failed("WinHttpOpen"))?;
-    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+    // SAFETY: `session.0` is an open session handle owned by its guard; the call takes only plain timeout values, no pointers.
     if unsafe { WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS) } == 0
     {
         return Err(failed("WinHttpSetTimeouts"));
     }
 
     let host = encode_wide(host);
-    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
+    // SAFETY: `host` is a NUL-terminated UTF-16 string that outlives the call; `session.0` is an open session handle; the returned handle is wrapped in its guard right away.
     let connection = Handle::new(unsafe {
         WinHttpConnect(session.0, host.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT, 0)
     })
@@ -119,7 +119,7 @@ fn request(
     let path = encode_wide(path);
     let accept_type = encode_wide(accept);
     let accept_types = [accept_type.as_ptr(), std::ptr::null()];
-    // SAFETY: the arguments are valid NUL-terminated strings or plain values that outlive the call; the returned handle is wrapped in its guard right away.
+    // SAFETY: `verb`, `path` and the string `accept_types` points to are NUL-terminated UTF-16 that outlive the call, and `accept_types` is a null-terminated pointer array; the returned handle is wrapped in its guard right away.
     let request = Handle::new(unsafe {
         WinHttpOpenRequest(
             connection.0,
@@ -135,7 +135,7 @@ fn request(
 
     if !follow_redirects {
         let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+        // SAFETY: `request.0` is an open request handle; `&policy` points to a `u32` valid for the `size_of::<u32>()` length passed.
         if unsafe {
             WinHttpSetOption(
                 request.0,
@@ -149,7 +149,7 @@ fn request(
         }
     }
 
-    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+    // SAFETY: `request.0` is an open request handle owned by its guard; the optional headers and body pointers are null with length 0.
     if unsafe { WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) } == 0
     {
         return Err(failed("sending the request"));
@@ -161,7 +161,7 @@ fn request(
 
     let mut status: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
-    // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+    // SAFETY: `request.0` is an open request handle; `status` is a writable `u32` of the `status_len` bytes passed (updated in place); the name and index pointers are null.
     if unsafe {
         WinHttpQueryHeaders(
             request.0,
@@ -178,7 +178,7 @@ fn request(
     if !follow_redirects && matches!(status, 301 | 302 | 303 | 307 | 308) {
         let mut location = vec![0u16; LOCATION_CAPACITY];
         let mut location_len = (location.len() * 2) as u32;
-        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+        // SAFETY: `request.0` is an open request handle; `location` is writable for the `location_len` bytes passed (updated in place); the name and index pointers are null.
         if unsafe {
             WinHttpQueryHeaders(
                 request.0,
@@ -203,7 +203,7 @@ fn request(
     let mut chunk = [0u8; 16 * 1024];
     loop {
         let mut read: u32 = 0;
-        // SAFETY: handles come from the guards in this function; every pointer is valid for the length passed and outlives the call.
+        // SAFETY: `request.0` is an open request handle; `chunk` is writable for the `chunk.len()` bytes passed and `read` is a writable `u32`.
         if unsafe {
             WinHttpReadData(
                 request.0,
