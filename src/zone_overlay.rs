@@ -828,7 +828,7 @@ mod window_frame_tests {
     }
 
     fn create_window(style: u32) -> TestWindow {
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let class = crate::wide::encode_wide("STATIC");
         // Safety: built-in STATIC class, no parent; destroyed by `TestWindow`.
         let hwnd = unsafe {
             CreateWindowExW(

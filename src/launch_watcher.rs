@@ -296,7 +296,54 @@ static DRIFT_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// [`sync_drift_hooks`] tries again.
 const DRIFT_SYNC_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Thread timer id of the pending [`sync_drift_hooks`] retry, 0 if none.
+/// How often [`sync_drift_hooks`] re-runs while any hook exists, so hooks of
+/// processes killed without a destroy event are dropped.
+const DRIFT_SYNC_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Fast retries of an unreadable window pid before leaving it to the sweep.
+const DRIFT_UNRESOLVED_RETRY_LIMIT: u32 = 5;
+
+/// Consecutive [`sync_drift_hooks`] runs that ended with an unreadable pid.
+static DRIFT_UNRESOLVED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// When the next [`sync_drift_hooks`] run is due, and the new count of
+/// consecutive runs with an unreadable pid.
+#[derive(Debug, PartialEq, Eq)]
+struct NextSync {
+    after: Option<std::time::Duration>,
+    unresolved_runs: u32,
+}
+
+/// Pure scheduling decision. A failed hook registration is retried every
+/// [`DRIFT_SYNC_RETRY`]; an unreadable pid likewise, but only
+/// [`DRIFT_UNRESOLVED_RETRY_LIMIT`] runs in a row. Otherwise, while any hook
+/// exists, the run repeats every [`DRIFT_SYNC_SWEEP`]; with none, never.
+fn plan_next_sync(
+    register_failed: bool,
+    unresolved: bool,
+    previous_unresolved_runs: u32,
+    hooks_exist: bool,
+) -> NextSync {
+    let unresolved_runs = if unresolved {
+        previous_unresolved_runs.saturating_add(1)
+    } else {
+        0
+    };
+    let retry_unresolved = unresolved && unresolved_runs <= DRIFT_UNRESOLVED_RETRY_LIMIT;
+    let after = if register_failed || retry_unresolved {
+        Some(DRIFT_SYNC_RETRY)
+    } else if hooks_exist {
+        Some(DRIFT_SYNC_SWEEP)
+    } else {
+        None
+    };
+    NextSync {
+        after,
+        unresolved_runs,
+    }
+}
+
+/// Thread timer id of the pending [`sync_drift_hooks`] retry or sweep, 0 if none.
 static DRIFT_SYNC_TIMER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Arms the drift watcher. Hooks are then registered per applied game process
@@ -331,7 +378,9 @@ pub fn disable_drift_watcher() {
 /// scoped to one game pid with `WINEVENT_SKIPOWNPROCESS`. Same
 /// thread/message-loop requirements as [`register`]. If a registration fails or
 /// a window's pid can't be read, a timer re-runs this after
-/// [`DRIFT_SYNC_RETRY`]. OS-facing.
+/// [`DRIFT_SYNC_RETRY`] (an unreadable pid only [`DRIFT_UNRESOLVED_RETRY_LIMIT`]
+/// times in a row); while any hook exists a [`DRIFT_SYNC_SWEEP`] timer re-runs
+/// it to drop hooks of exited processes. OS-facing.
 pub fn sync_drift_hooks() {
     let enabled = DRIFT_WATCHER_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
     if enabled {
@@ -343,11 +392,12 @@ pub fn sync_drift_hooks() {
             "sync_drift_hooks must run on the message-loop thread"
         );
     }
-    let (applied, mut needs_retry) = if enabled {
+    let (applied, unresolved) = if enabled {
         crate::win32::refresh_applied_window_pids()
     } else {
         (std::collections::BTreeSet::new(), false)
     };
+    let mut register_failed = false;
     let mut hooks = DRIFT_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
     let hooked = hooks.keys().copied().collect();
     let plan = plan_drift_hooks(&applied, &hooked, std::process::id());
@@ -375,24 +425,39 @@ pub fn sync_drift_hooks() {
         };
         if hook.is_null() {
             log!("drift watcher: SetWinEventHook failed for pid {pid}; retrying shortly");
-            needs_retry = true;
+            register_failed = true;
         } else {
             hooks.insert(pid, hook as isize);
         }
     }
+    let hooks_exist = !hooks.is_empty();
     drop(hooks);
-    if needs_retry {
-        schedule_drift_sync_retry();
-    }
+    use std::sync::atomic::Ordering;
+    let next = plan_next_sync(
+        register_failed,
+        unresolved,
+        DRIFT_UNRESOLVED_RUNS.load(Ordering::SeqCst),
+        hooks_exist,
+    );
+    DRIFT_UNRESOLVED_RUNS.store(next.unresolved_runs, Ordering::SeqCst);
+    schedule_drift_sync(next.after);
 }
 
-/// Arms the one pending [`sync_drift_hooks`] retry timer, if not armed yet.
-fn schedule_drift_sync_retry() {
+/// Replaces the one pending [`sync_drift_hooks`] timer (retry or sweep) with
+/// one firing after `after`; with `None` only cancels it.
+fn schedule_drift_sync(after: Option<std::time::Duration>) {
     use std::sync::atomic::Ordering;
-    if DRIFT_SYNC_TIMER.load(Ordering::SeqCst) != 0 {
-        return;
+    let previous = DRIFT_SYNC_TIMER.swap(0, Ordering::SeqCst);
+    if previous != 0 {
+        // Safety: a thread timer id this module created.
+        unsafe {
+            KillTimer(std::ptr::null_mut(), previous);
+        }
     }
-    let delay_ms = u32::try_from(DRIFT_SYNC_RETRY.as_millis()).unwrap_or(u32::MAX);
+    let Some(after) = after else {
+        return;
+    };
+    let delay_ms = u32::try_from(after.as_millis()).unwrap_or(u32::MAX);
     // Safety: a null window makes this a thread timer on the message-loop
     // thread, delivered to `drift_sync_timer` by `DispatchMessageW`.
     let timer = unsafe { SetTimer(std::ptr::null_mut(), 0, delay_ms, Some(drift_sync_timer)) };
@@ -553,6 +618,40 @@ mod tests {
 
     fn set(pids: &[u32]) -> BTreeSet<u32> {
         pids.iter().copied().collect()
+    }
+
+    #[test]
+    fn next_sync_sweeps_slowly_while_a_hook_exists_and_stops_without_one() {
+        assert_eq!(
+            plan_next_sync(false, false, 0, true),
+            NextSync {
+                after: Some(DRIFT_SYNC_SWEEP),
+                unresolved_runs: 0
+            }
+        );
+        assert_eq!(plan_next_sync(false, false, 0, false).after, None);
+    }
+
+    #[test]
+    fn next_sync_retries_a_failed_registration_quickly() {
+        assert_eq!(
+            plan_next_sync(true, false, 0, false).after,
+            Some(DRIFT_SYNC_RETRY)
+        );
+    }
+
+    #[test]
+    fn next_sync_stops_retrying_an_unreadable_pid_after_the_limit() {
+        let mut runs = 0;
+        for _ in 0..DRIFT_UNRESOLVED_RETRY_LIMIT {
+            let next = plan_next_sync(false, true, runs, true);
+            assert_eq!(next.after, Some(DRIFT_SYNC_RETRY));
+            runs = next.unresolved_runs;
+        }
+        let next = plan_next_sync(false, true, runs, true);
+        assert_eq!(next.after, Some(DRIFT_SYNC_SWEEP));
+        let resolved = plan_next_sync(false, false, next.unresolved_runs, true);
+        assert_eq!(resolved.unresolved_runs, 0);
     }
 
     #[test]

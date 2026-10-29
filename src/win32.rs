@@ -781,20 +781,26 @@ impl PlacedWindows {
         (pids_of(&self.applied), unresolved, timers)
     }
 
+    /// Whether the Zone was applied to `window`.
+    fn is_applied(&self, window: isize) -> bool {
+        self.applied.iter().any(|(h, _)| *h == window)
+    }
+
     /// Whether a re-check of `kind` is already pending for `window`.
-    pub(crate) fn has_recheck(&self, window: isize, kind: RecheckKind) -> bool {
+    fn has_recheck(&self, window: isize, kind: RecheckKind) -> bool {
         self.rechecks.contains_key(&(window, kind))
     }
 
     /// Records `timer` as the pending re-check of `kind` for `window`. Kinds
     /// are tracked separately, so a pending drift re-check never swallows an
     /// auto-apply retry of the same window (or the reverse).
-    pub(crate) fn set_recheck(&mut self, window: isize, kind: RecheckKind, timer: usize) {
-        self.rechecks.insert((window, kind), timer);
+    /// Returns the timer it displaced, if any.
+    fn set_recheck(&mut self, window: isize, kind: RecheckKind, timer: usize) -> Option<usize> {
+        self.rechecks.insert((window, kind), timer)
     }
 
     /// Removes and returns the re-check whose thread timer is `timer`.
-    pub(crate) fn take_recheck_by_timer(&mut self, timer: usize) -> Option<(isize, RecheckKind)> {
+    fn take_recheck_by_timer(&mut self, timer: usize) -> Option<(isize, RecheckKind)> {
         let key = self
             .rechecks
             .iter()
@@ -828,11 +834,7 @@ pub(crate) fn recheck_pending(hwnd: HWND, kind: RecheckKind) -> bool {
 /// must kill it. The timer itself is created and killed outside the registry
 /// lock.
 pub(crate) fn store_recheck(hwnd: HWND, kind: RecheckKind, timer: usize) -> Option<usize> {
-    with_placed(|p| {
-        let displaced = p.rechecks.get(&(hwnd as isize, kind)).copied();
-        p.set_recheck(hwnd as isize, kind, timer);
-        displaced
-    })
+    with_placed(|p| p.set_recheck(hwnd as isize, kind, timer))
 }
 
 /// Removes and returns the re-check whose thread timer is `timer`.
@@ -918,7 +920,7 @@ fn window_process_id(hwnd: HWND) -> u32 {
 
 /// Whether `hwnd` was previously registered via [`remember_applied_window`].
 pub fn is_applied_window(hwnd: HWND) -> bool {
-    with_placed(|p| p.applied.iter().any(|(h, _)| *h == hwnd as isize))
+    with_placed(|p| p.is_applied(hwnd as isize))
 }
 
 /// Process ids owning at least one applied window (never 0).
@@ -1188,11 +1190,17 @@ pub(crate) fn window_is_fullscreen(hwnd: HWND) -> bool {
 
 /// Forgets `hwnd` (called when it is destroyed): the single cleanup for
 /// everything remembered per window (see [`PlacedWindows::forget`]), including
-/// killing its pending re-check timers.
+/// killing its pending re-check timers. The drift hooks are re-synced only if
+/// the window was applied (only then can a hook have become unneeded).
 pub fn forget_window(hwnd: HWND) {
-    let timers = with_placed(|p| p.forget(hwnd as isize));
+    let (was_applied, timers) = with_placed(|p| {
+        let was_applied = p.is_applied(hwnd as isize);
+        (was_applied, p.forget(hwnd as isize))
+    });
     kill_timers(&timers);
-    crate::launch_watcher::sync_drift_hooks();
+    if was_applied {
+        crate::launch_watcher::sync_drift_hooks();
+    }
 }
 
 /// Stops the drift watcher treating `hwnd` as GameFrame-placed and drops its
@@ -2146,22 +2154,35 @@ fn windows_for_pid(target_pid: u32) -> (Vec<HWND>, Vec<window_filter::Refusal>) 
 /// docs; [`exe_file_name_matches`] above is the pure decision this pre-filter
 /// delegates to, and is what's actually unit tested.
 fn find_pid_by_exe_path(exe_path: &Path) -> Option<u32> {
-    // Safety: `0` (ignored for `TH32CS_SNAPPROCESS`) is the only argument;
+    /// Owns a toolhelp snapshot handle and closes it on every exit path.
+    struct SnapshotGuard(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            // SAFETY: the handle was returned by `CreateToolhelp32Snapshot`,
+            // is owned solely by this guard and is closed exactly once here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    // SAFETY: `0` (ignored for `TH32CS_SNAPPROCESS`) is the only argument;
     // `CreateToolhelp32Snapshot` takes no pointers.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
         return None;
     }
+    let snapshot = SnapshotGuard(raw);
 
     // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-    // Safety: `snapshot` is the live handle just created above; `entry` is a
+    // SAFETY: `snapshot.0` is the live handle just created above; `entry` is a
     // valid, correctly-sized out-pointer with `dwSize` set, per
     // `Process32FirstW`/`Process32NextW`'s documented contract.
-    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    let mut found_pid = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
     while has_entry {
         let len = entry
             .szExeFile
@@ -2173,20 +2194,13 @@ fn find_pid_by_exe_path(exe_path: &Path) -> Option<u32> {
         if exe_file_name_matches(&file_name, exe_path)
             && window_filter::process_exe_path(entry.th32ProcessID).as_deref() == Some(exe_path)
         {
-            found_pid = Some(entry.th32ProcessID);
-            break;
+            return Some(entry.th32ProcessID);
         }
 
-        // Safety: same as above.
-        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        // SAFETY: same as above.
+        has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
-
-    // Safety: `snapshot` is a valid handle owned solely by this function; no
-    // other reference to it survives past this point.
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    found_pid
+    None
 }
 
 /// Resolves `hwnd`'s current on-screen area in pixels (width * height), used
@@ -2631,12 +2645,23 @@ mod tests {
 
     #[test]
     fn two_windows_of_one_process_keep_its_pid_when_one_is_removed() {
-        let mut entries = vec![(1isize, 42u32), (2, 42), (3, 7)];
-        assert_eq!(pids_of(&entries), [7, 42].into_iter().collect());
-        entries.retain(|(h, _)| *h != 1);
-        assert_eq!(pids_of(&entries), [7, 42].into_iter().collect());
-        entries.retain(|(h, _)| *h != 2);
-        assert_eq!(pids_of(&entries), [7].into_iter().collect());
+        let mut placed = PlacedWindows::new();
+        placed.applied = vec![(1isize, 42u32), (2, 42), (3, 7)];
+        assert_eq!(pids_of(&placed.applied), [7, 42].into_iter().collect());
+        placed.forget(1);
+        assert_eq!(pids_of(&placed.applied), [7, 42].into_iter().collect());
+        placed.forget(2);
+        assert_eq!(pids_of(&placed.applied), [7].into_iter().collect());
+    }
+
+    #[test]
+    fn is_applied_is_false_once_the_window_is_forgotten() {
+        let mut placed = PlacedWindows::new();
+        placed.applied = vec![(1isize, 42u32)];
+        assert!(placed.is_applied(1));
+        assert!(!placed.is_applied(2));
+        placed.forget(1);
+        assert!(!placed.is_applied(1));
     }
 
     #[test]

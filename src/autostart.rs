@@ -109,7 +109,7 @@ fn is_enabled_at(location: &RegistryLocation) -> bool {
     let value = encode_wide(location.value_name);
     let mut size: u32 = 0;
     // A size-only query: succeeds iff the value exists, whatever its type.
-    // SAFETY: the key and value names are NUL-terminated UTF-16 strings and the data/size arguments are valid for the stated length; all outlive the call.
+    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 strings that outlive the call; `&mut size` is a writable `u32` for the size-only query, and the type and data pointers are null (no data is requested).
     let code = unsafe {
         RegGetValueW(
             location.root,

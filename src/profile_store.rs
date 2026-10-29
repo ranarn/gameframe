@@ -58,32 +58,23 @@ fn default_true() -> bool {
 }
 
 impl TrackedGame {
-    /// Builds a freshly-added tracked game with the specified defaults:
-    /// auto-apply on, game cursor on.
-    pub fn new_default(exe_path: PathBuf, display_name: String) -> Self {
-        TrackedGame {
-            exe_path,
-            display_name,
-            auto_apply: true,
-            game_cursor: true,
-        }
-    }
-
-    /// Like [`Self::new_default`], but the "Game cursor" box starts ticked
-    /// only while the global game cursor feature (`cursor.enabled`) is on, so
-    /// a new game doesn't silently opt in to a feature that is off.
+    /// Builds a freshly-added tracked game: auto-apply on, and the "Game
+    /// cursor" box ticked only while the global game cursor feature
+    /// (`cursor.enabled`, passed as `cursor_enabled`) is on, so a new game
+    /// doesn't silently opt in to a feature that is off.
     pub fn new_for_cursor_setting(
         exe_path: PathBuf,
         display_name: String,
         cursor_enabled: bool,
     ) -> Self {
         TrackedGame {
+            exe_path,
+            display_name,
+            auto_apply: true,
             game_cursor: cursor_enabled,
-            ..Self::new_default(exe_path, display_name)
         }
     }
 }
-
 /// Finds a tracked game whose `exe_path` matches, or appends a fresh
 /// default-configured one ([`TrackedGame::new_for_cursor_setting`], with
 /// `cursor_enabled` the global cursor feature's state) if none matched --
@@ -1304,9 +1295,12 @@ mod tests {
     }
 
     #[test]
-    fn tracked_game_new_default_has_auto_apply_on() {
-        let game =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\thing.exe"), "Thing".to_string());
+    fn tracked_game_new_for_cursor_setting_has_auto_apply_on() {
+        let game = TrackedGame::new_for_cursor_setting(
+            PathBuf::from("C:\\Games\\thing.exe"),
+            "Thing".to_string(),
+            true,
+        );
 
         assert_eq!(game.exe_path, PathBuf::from("C:\\Games\\thing.exe"));
         assert_eq!(game.display_name, "Thing");
@@ -1360,9 +1354,10 @@ mod tests {
 
     #[test]
     fn upsert_tracked_game_reuses_the_existing_entry_for_a_matching_executable_path() {
-        let mut games = vec![TrackedGame::new_default(
+        let mut games = vec![TrackedGame::new_for_cursor_setting(
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            true,
         )];
         games[0].auto_apply = false;
 
@@ -1394,9 +1389,10 @@ mod tests {
 
     #[test]
     fn find_tracked_game_returns_the_matching_entry() {
-        let games = vec![TrackedGame::new_default(
+        let games = vec![TrackedGame::new_for_cursor_setting(
             PathBuf::from("C:\\Games\\thing.exe"),
             "Thing".to_string(),
+            true,
         )];
 
         let found = find_tracked_game(&games, std::path::Path::new("C:\\Games\\thing.exe"));

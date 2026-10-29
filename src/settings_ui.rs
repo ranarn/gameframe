@@ -1006,31 +1006,69 @@ enum SettingsExit {
     EditZone(SettingsState, Vec<String>),
 }
 
-/// The config Save writes: the user's `edited` config, except that what the
-/// tray changed on disk (`on_disk`) while Settings was open is kept -- games
-/// added through the tray (see [`merge_tracked_games`]) and the game-cursor
-/// toggle (see [`merge_cursor_enabled`]).
-fn merge_saved_config(
-    opened_games: &[TrackedGame],
+/// Applies Save to the config `on_disk`: only the fields the user changed
+/// (`edited` differs from `opened`, what Settings opened with) are written, so
+/// anything the tray or hotkeys changed on disk in a field the user left alone
+/// -- a tracked game, the game-cursor toggle, a setting -- is not overwritten
+/// with Settings' stale copy. A changed tracked-games list is merged with the
+/// disk (see [`merge_tracked_games`]); `cursor.enabled` follows
+/// [`merge_cursor_enabled`].
+fn apply_saved_changes(
+    opened: &Config,
     edited: Config,
     cursor_enabled_seen: bool,
-    on_disk: &Config,
-) -> Config {
-    let tracked_games = merge_tracked_games(
-        opened_games,
-        edited.tracked_games.clone(),
-        &on_disk.tracked_games,
-    );
-    let mut cursor = edited.cursor.clone();
-    cursor.enabled = merge_cursor_enabled(
-        cursor_enabled_seen,
-        edited.cursor.enabled,
-        on_disk.cursor.enabled,
-    );
-    Config {
+    on_disk: &mut Config,
+) {
+    // Moves, not clones: every field of `edited` is used at most once.
+    let Config {
+        zone,
+        hotkeys,
         tracked_games,
+        taskbar_hide_mode,
+        hide_taskbar_on_apply,
         cursor,
-        ..edited
+        update_mode,
+        log_ui_hangs,
+    } = edited;
+
+    if zone != opened.zone {
+        on_disk.zone = zone;
+    }
+    if hotkeys.toggle_borderless != opened.hotkeys.toggle_borderless {
+        on_disk.hotkeys.toggle_borderless = hotkeys.toggle_borderless;
+    }
+    if hotkeys.toggle_taskbar_autohide != opened.hotkeys.toggle_taskbar_autohide {
+        on_disk.hotkeys.toggle_taskbar_autohide = hotkeys.toggle_taskbar_autohide;
+    }
+    if hotkeys.toggle_game_cursor != opened.hotkeys.toggle_game_cursor {
+        on_disk.hotkeys.toggle_game_cursor = hotkeys.toggle_game_cursor;
+    }
+    if tracked_games != opened.tracked_games {
+        let merged =
+            merge_tracked_games(&opened.tracked_games, tracked_games, &on_disk.tracked_games);
+        on_disk.tracked_games = merged;
+    }
+    if taskbar_hide_mode != opened.taskbar_hide_mode {
+        on_disk.taskbar_hide_mode = taskbar_hide_mode;
+    }
+    if hide_taskbar_on_apply != opened.hide_taskbar_on_apply {
+        on_disk.hide_taskbar_on_apply = hide_taskbar_on_apply;
+    }
+    // `cursor.enabled` is also flipped by the tray's hotkey, so it is judged
+    // against what Settings last saw rather than what it opened with; the
+    // other cursor fields only the user edits.
+    let mut cursor = cursor;
+    let enabled = merge_cursor_enabled(cursor_enabled_seen, cursor.enabled, on_disk.cursor.enabled);
+    cursor.enabled = opened.cursor.enabled;
+    if cursor != opened.cursor {
+        on_disk.cursor = cursor;
+    }
+    on_disk.cursor.enabled = enabled;
+    if update_mode != opened.update_mode {
+        on_disk.update_mode = update_mode;
+    }
+    if log_ui_hangs != opened.log_ui_hangs {
+        on_disk.log_ui_hangs = log_ui_hangs;
     }
 }
 
@@ -1086,8 +1124,8 @@ pub enum TickContext {
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
 /// lets the user edit the Zone and hotkey bindings, and -- only if the user
-/// clicks "Save" -- persists the result via [`profile_store::save`] before
-/// returning. Closing the window any other way (the "Cancel" button, the
+/// clicks "Save" -- persists the fields the user changed via
+/// [`profile_store::update`] (see [`apply_saved_changes`]) before returning. Closing the window any other way (the "Cancel" button, the
 /// window's own close button) discards the edits -- except the Zone, which
 /// Save/Cancel don't govern: saving in the zone editor overlay (and "Clear")
 /// persists it immediately, so the disk and the windows it was live-applied
@@ -1131,8 +1169,9 @@ pub fn run_settings_window(
     reapply: &mut dyn FnMut() -> Vec<String>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
-    let opened_games = config.tracked_games.clone();
     let mut state = SettingsState::from_config(&config);
+    // What Save compares the user's edits against (see [`apply_saved_changes`]).
+    let opened = config;
     state.set_hotkey_reports(hotkey_reports);
     let started_with_windows = autostart::is_enabled();
     state.start_with_windows = started_with_windows;
@@ -1150,7 +1189,7 @@ pub fn run_settings_window(
                 // retried unmerged outside that lock: if the disk cannot be
                 // read it can hardly be written.
                 let saved = profile_store::update(config_dir, |on_disk| {
-                    *on_disk = merge_saved_config(&opened_games, config, cursor_seen, on_disk);
+                    apply_saved_changes(&opened, config, cursor_seen, on_disk);
                 })
                 .map_err(SettingsUiError::Config);
                 // Even after a failed write the tray process must not trust
@@ -2175,7 +2214,7 @@ mod tests {
     use super::*;
 
     fn game(path: &str) -> TrackedGame {
-        TrackedGame::new_default(std::path::PathBuf::from(path), path.to_string())
+        TrackedGame::new_for_cursor_setting(std::path::PathBuf::from(path), path.to_string(), true)
     }
 
     #[test]
@@ -2291,8 +2330,9 @@ mod tests {
 
     #[test]
     fn save_merges_games_and_the_cursor_toggle_from_disk_into_the_edited_config() {
+        let opened = Config::default();
         let edited = Config {
-            log_ui_hangs: true,
+            log_ui_hangs: !opened.log_ui_hangs,
             ..Config::default()
         };
 
@@ -2300,11 +2340,79 @@ mod tests {
         on_disk.cursor.enabled = true;
         on_disk.tracked_games = vec![game("b.exe")];
 
-        let merged = merge_saved_config(&[], edited, false, &on_disk);
+        apply_saved_changes(&opened, edited, false, &mut on_disk);
 
-        assert!(merged.log_ui_hangs, "the user's edit is saved");
-        assert!(merged.cursor.enabled, "the tray's toggle survives");
-        assert_eq!(merged.tracked_games, vec![game("b.exe")]);
+        assert_eq!(
+            on_disk.log_ui_hangs, !opened.log_ui_hangs,
+            "the user's edit is saved"
+        );
+        assert!(on_disk.cursor.enabled, "the tray's toggle survives");
+        assert_eq!(on_disk.tracked_games, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn save_leaves_fields_the_user_did_not_change_as_they_are_on_disk() {
+        let opened = Config::default();
+        let edited = opened.clone();
+
+        // Everything differs on disk: changed by the tray/hotkeys meanwhile.
+        let mut on_disk = Config {
+            hide_taskbar_on_apply: !opened.hide_taskbar_on_apply,
+            update_mode: UpdateMode::Ask,
+            log_ui_hangs: !opened.log_ui_hangs,
+            taskbar_hide_mode: TaskbarHideMode::HoverReveal,
+            ..Config::default()
+        };
+        on_disk.hotkeys.toggle_borderless = Some("Ctrl+F1".to_string());
+        on_disk.cursor.size += 5;
+        on_disk.tracked_games = vec![game("b.exe")];
+        let expected = on_disk.clone();
+
+        apply_saved_changes(&opened, edited, false, &mut on_disk);
+
+        assert_eq!(on_disk, expected);
+    }
+
+    #[test]
+    fn save_writes_a_changed_field_and_keeps_an_untouched_one_from_disk() {
+        let opened = Config::default();
+        let mut edited = opened.clone();
+        edited.hotkeys.toggle_taskbar_autohide = Some("Ctrl+F2".to_string());
+        edited.cursor.size += 3;
+
+        let mut on_disk = opened.clone();
+        on_disk.hotkeys.toggle_borderless = Some("Ctrl+F1".to_string());
+        on_disk.cursor.enabled = true;
+
+        apply_saved_changes(&opened, edited.clone(), false, &mut on_disk);
+
+        assert_eq!(
+            on_disk.hotkeys.toggle_taskbar_autohide,
+            Some("Ctrl+F2".to_string())
+        );
+        assert_eq!(
+            on_disk.hotkeys.toggle_borderless,
+            Some("Ctrl+F1".to_string())
+        );
+        assert_eq!(on_disk.cursor.size, edited.cursor.size);
+        assert!(
+            on_disk.cursor.enabled,
+            "the hotkey's toggle survives a cursor edit"
+        );
+    }
+
+    #[test]
+    fn save_does_not_overwrite_a_cursor_toggle_landing_between_the_last_tick_and_the_write() {
+        // Issue #215: the checkbox still shows what Settings saw (off); the
+        // hotkey turned the cursor on just before Save took the lock.
+        let opened = Config::default();
+        let edited = opened.clone();
+        let mut on_disk = opened.clone();
+        on_disk.cursor.enabled = true;
+
+        apply_saved_changes(&opened, edited, opened.cursor.enabled, &mut on_disk);
+
+        assert!(on_disk.cursor.enabled);
     }
 
     #[test]
@@ -2803,10 +2911,13 @@ mod tests {
     #[test]
     fn from_config_carries_the_tracked_games_list_through() {
         let mut config = Config::default();
-        config.tracked_games.push(TrackedGame::new_default(
-            std::path::PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-        ));
+        config
+            .tracked_games
+            .push(TrackedGame::new_for_cursor_setting(
+                std::path::PathBuf::from("C:\\Games\\thing.exe"),
+                "Thing".to_string(),
+                true,
+            ));
 
         let state = SettingsState::from_config(&config);
 
@@ -2816,10 +2927,13 @@ mod tests {
     #[test]
     fn to_config_carries_edited_tracked_games_through() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.tracked_games.push(TrackedGame::new_default(
-            std::path::PathBuf::from("C:\\Games\\thing.exe"),
-            "Thing".to_string(),
-        ));
+        state
+            .tracked_games
+            .push(TrackedGame::new_for_cursor_setting(
+                std::path::PathBuf::from("C:\\Games\\thing.exe"),
+                "Thing".to_string(),
+                true,
+            ));
         state.tracked_games[0].auto_apply = false;
 
         let config = state.to_config();
@@ -2831,14 +2945,20 @@ mod tests {
     #[test]
     fn remove_tracked_game_removes_the_entry_at_the_given_index_without_confirmation() {
         let mut state = SettingsState::from_config(&Config::default());
-        state.tracked_games.push(TrackedGame::new_default(
-            std::path::PathBuf::from("C:\\Games\\a.exe"),
-            "A".to_string(),
-        ));
-        state.tracked_games.push(TrackedGame::new_default(
-            std::path::PathBuf::from("C:\\Games\\b.exe"),
-            "B".to_string(),
-        ));
+        state
+            .tracked_games
+            .push(TrackedGame::new_for_cursor_setting(
+                std::path::PathBuf::from("C:\\Games\\a.exe"),
+                "A".to_string(),
+                true,
+            ));
+        state
+            .tracked_games
+            .push(TrackedGame::new_for_cursor_setting(
+                std::path::PathBuf::from("C:\\Games\\b.exe"),
+                "B".to_string(),
+                true,
+            ));
 
         state.remove_tracked_game(0);
 

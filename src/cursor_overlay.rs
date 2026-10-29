@@ -888,10 +888,17 @@ mod tests {
 
     #[test]
     fn overlay_input_keeps_only_games_with_the_game_cursor_on() {
-        let mut on = TrackedGame::new_default(PathBuf::from("C:\\Games\\on.exe"), "On".to_string());
+        let mut on = TrackedGame::new_for_cursor_setting(
+            PathBuf::from("C:\\Games\\on.exe"),
+            "On".to_string(),
+            true,
+        );
         on.game_cursor = true;
-        let mut off =
-            TrackedGame::new_default(PathBuf::from("C:\\Games\\off.exe"), "Off".to_string());
+        let mut off = TrackedGame::new_for_cursor_setting(
+            PathBuf::from("C:\\Games\\off.exe"),
+            "Off".to_string(),
+            true,
+        );
         off.game_cursor = false;
         let config = Config {
             tracked_games: vec![on, off],
