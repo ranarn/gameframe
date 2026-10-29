@@ -45,10 +45,26 @@ store and proxy settings apply:
 - The installer's download URL must be on `github.com`. The download follows
   redirects by hand (at most five), and every hop must be HTTPS on `github.com`
   or `release-assets.githubusercontent.com`; any other host is refused.
-- The installer is hashed and compared with the SHA-256 digest the release API
-  reports for it. This is an integrity check against a corrupted or altered
-  download, not a publisher signature: the installer is not Authenticode-signed
-  yet. A file that does not match is deleted and never run. The verified file
+- Authenticity: every release installer is signed with the maintainer's
+  [Minisign](https://jedisct1.github.io/minisign/) (Ed25519) key in the release
+  workflow, which attaches the detached `GameFrame-Setup-<version>.exe.minisig`
+  next to it. GameFrame embeds the matching public key (`PUBLIC_KEY` in
+  `src/updater.rs`) and, before it runs an installer, downloads the `.minisig`
+  (same host rules as the installer) and verifies the file against it. A release
+  with no signature, a signature that does not verify, or a key mismatch is
+  refused: the download is deleted, nothing runs, and the Settings update row
+  and the log say why. There is no unsigned fallback. This is what protects you
+  if the GitHub account or release page is compromised, because the signing key
+  is held only as a secret of the protected `release` environment, which
+  requires a reviewer's approval. (The installer is not Authenticode-signed, so
+  Windows SmartScreen and UAC still show an unknown publisher.) Versions up to
+  0.6.0 do not verify signatures; the check applies to every update installed by
+  a version that contains it.
+- Integrity: the installer is also hashed and compared with the SHA-256 digest
+  the release API reports for it, which catches a corrupted download. The digest
+  comes from the same GitHub response as the download URL, so on its own it
+  proves nothing about who published the file. A file that does not match is
+  deleted and never run. The verified file
   is held open with a share mode that denies writing and deleting until its
   process has started, so it cannot be swapped in between. It runs silently and
   detached from a folder under `%LOCALAPPDATA%\GameFrame\updates`, which the
@@ -76,3 +92,29 @@ store and proxy settings apply:
   Opening Settings uses a message that is let through, since that is harmless.
 
 Reports about any of these or the installer are in scope.
+
+## Release signing (maintainer)
+
+Updates are only accepted when signed with the release key, so before the first
+signed release:
+
+1. Generate the key pair with [minisign](https://jedisct1.github.io/minisign/)
+   0.12 or newer, on a trusted machine, with a password:
+   `minisign -G -p gameframe.pub -s gameframe.key`. Keep `gameframe.key` and the
+   password offline (a password manager); never commit them.
+2. In the repository, create the GitHub Environment `release`
+   (Settings -> Environments) with **required reviewers**, and add two
+   environment secrets there: `MINISIGN_SECRET_KEY` (the full contents of
+   `gameframe.key`) and `MINISIGN_PASSWORD` (its password; leave empty only for
+   a key made with `-W`).
+3. Replace the placeholder `PUBLIC_KEY` in `src/updater.rs` with the second line
+   of `gameframe.pub` (the base64 string starting `RW`), commit it, and let it
+   reach `main` before running the Release workflow. The workflow refuses to
+   publish while the placeholder is in place, and it checks after signing that
+   the signature verifies against that exact constant.
+4. Enable **immutable releases** (Settings -> General -> Releases), so a
+   published release and its assets can no longer be replaced.
+
+To rotate the key, repeat 1-3; installs made by versions that embed the old key
+keep requiring the old key, so rotate by releasing a version signed with the old
+key that embeds the new one.

@@ -130,8 +130,16 @@ jobs:
   publish:
     needs: [plan, build]
     runs-on: ubuntu-latest
+    # Holds the signing secrets and waits for the required reviewers set on the
+    # `release` environment (Settings -> Environments). See SECURITY.md.
+    environment: release
     permissions:
       contents: write
+    env:
+      # minisign 0.12, the Linux build of the upstream release. Pinned by
+      # SHA-256 like Inno Setup in build.yml; the tarball is not signed by us.
+      MINISIGN_URL: https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+      MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
     steps:
       # Release Pilot pushes the tag with git, so the checkout keeps its
       # credentials in this job only.
@@ -145,6 +153,51 @@ jobs:
           name: installer
           path: dist
 
+      # Sign the installer with the release key so GameFrame can check who
+      # published it (authenticity; the SHA-256 only covers integrity). Runs
+      # before anything is tagged: a missing secret or a signature that does
+      # not verify against the key built into src/updater.rs fails the release
+      # here. The secrets are visible to this step only.
+      - name: Sign the installer
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::The MINISIGN_SECRET_KEY secret is not set in the 'release' environment; the updater refuses unsigned installers. See SECURITY.md."
+            exit 1
+          fi
+          installer="dist/GameFrame-Setup-${VERSION}.exe"
+          if [ ! -f "$installer" ]; then
+            echo "::error::$installer not found in the build artifact"
+            exit 1
+          fi
+
+          # The public key GameFrame will check against, from the constant in
+          # src/updater.rs (the same commit the installer was built from).
+          pub=$(sed -n 's/^pub(crate) const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/updater.rs)
+          if [ -z "$pub" ] || [ "$pub" = "REPLACE_WITH_MINISIGN_PUBLIC_KEY" ]; then
+            echo "::error::PUBLIC_KEY in src/updater.rs is still the placeholder; set it to the public key of the signing key. See SECURITY.md."
+            exit 1
+          fi
+
+          bin_dir="$RUNNER_TEMP/minisign"
+          mkdir -p "$bin_dir"
+          curl --fail --silent --show-error --location "$MINISIGN_URL" --output "$bin_dir/minisign.tar.gz"
+          echo "$MINISIGN_SHA256  $bin_dir/minisign.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$bin_dir/minisign.tar.gz" -C "$bin_dir" minisign-linux/x86_64/minisign
+          minisign="$bin_dir/minisign-linux/x86_64/minisign"
+
+          key_file="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key_file"' EXIT
+          (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file")
+          # minisign reads the password of an encrypted key from stdin when it
+          # is not a terminal; an unencrypted key ignores it.
+          printf '%s\n' "$MINISIGN_PASSWORD" | "$minisign" -S -s "$key_file" -m "$installer" -x "$installer.minisig"
+
+          # Prove the secret belongs to the embedded public key.
+          "$minisign" -V -P "$pub" -m "$installer" -x "$installer.minisig"
       # A re-run of this job ("Re-run failed jobs") reuses plan's tag and
       # build's artifact, but the tag may already exist from the first
       # attempt. Reuse it when it points at the release commit; refuse when

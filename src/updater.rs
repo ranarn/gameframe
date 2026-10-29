@@ -28,6 +28,18 @@ pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTALLER_PREFIX: &str = "GameFrame-Setup-";
 const INSTALLER_SUFFIX: &str = ".exe";
 const DIGEST_PREFIX: &str = "sha256:";
+/// Appended to the installer's name for its detached Minisign signature.
+const SIGNATURE_SUFFIX: &str = ".minisig";
+
+/// The Minisign public key (the base64 second line of `minisign.pub`) every
+/// installer must be signed with. The release workflow checks, after signing,
+/// that the signature verifies against this exact line, so keep it on one line
+/// as `pub(crate) const PUBLIC_KEY: &str = "...";`.
+///
+/// PLACEHOLDER: the maintainer replaces this with the public key of the
+/// release signing key (see SECURITY.md). Until then no installer verifies,
+/// so the updater installs nothing and the release workflow refuses to publish.
+pub(crate) const PUBLIC_KEY: &str = "REPLACE_WITH_MINISIGN_PUBLIC_KEY";
 
 /// The host of an asset's `browser_download_url`.
 pub(crate) const ASSET_HOST: &str = "github.com";
@@ -87,6 +99,12 @@ pub(crate) enum UpdateError {
     UntrustedDownloadUrl(String),
     /// The downloaded file is not the one the release's digest describes.
     DigestMismatch,
+    /// The release has no `.minisig` signature next to its installer.
+    MissingSignature,
+    /// The signature, or the key it is checked against, cannot be read.
+    InvalidSignature(String),
+    /// The installer is not signed by the key built into GameFrame.
+    SignatureMismatch,
     /// Downloading or storing the installer failed.
     Download(String),
     /// The verified installer could not be started.
@@ -142,6 +160,17 @@ impl std::fmt::Display for UpdateError {
                 f,
                 "the downloaded installer does not match the release's SHA-256 digest, so it was not run"
             ),
+            UpdateError::MissingSignature => write!(
+                f,
+                "the latest release's installer has no signature ({SIGNATURE_SUFFIX} file), so it will not be installed"
+            ),
+            UpdateError::InvalidSignature(e) => {
+                write!(f, "the installer's signature can't be checked: {e}")
+            }
+            UpdateError::SignatureMismatch => write!(
+                f,
+                "the downloaded installer is not signed by the GameFrame publisher key, so it was not run"
+            ),
             UpdateError::Download(e) => write!(f, "downloading the update failed: {e}"),
             UpdateError::LaunchInstaller(e) => write!(f, "couldn't start the installer: {e}"),
             UpdateError::ElevatedInstance => write!(f, "{ELEVATED_UPDATE_ADVICE}"),
@@ -158,6 +187,8 @@ pub(crate) struct UpdateInfo {
     pub(crate) download_url: String,
     /// The expected SHA-256 of the installer, 64 lowercase hex digits.
     pub(crate) sha256: String,
+    /// Where the installer's detached Minisign signature is downloaded from.
+    pub(crate) signature_url: String,
 }
 
 /// What a successful check found.
@@ -276,6 +307,57 @@ pub(crate) fn select_asset(release: &Release) -> Result<(String, String), Update
     Ok((asset.download_url.clone(), hex.to_ascii_lowercase()))
 }
 
+/// Picks the `<installer>.minisig` asset of the release and returns its
+/// download URL (vetted like the installer's). Its absence is an error: an
+/// unsigned installer is never installed.
+pub(crate) fn select_signature_asset(release: &Release) -> Result<String, UpdateError> {
+    let name = format!("{}{SIGNATURE_SUFFIX}", installer_name(release.version));
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or(UpdateError::MissingSignature)?;
+    if !is_trusted_download_url(&asset.download_url) {
+        return Err(UpdateError::UntrustedDownloadUrl(
+            asset.download_url.clone(),
+        ));
+    }
+    Ok(asset.download_url.clone())
+}
+
+/// Checks that the bytes `reader` yields were signed with the Minisign key
+/// `public_key` (the base64 line of `minisign.pub`); `signature` is the text of
+/// the `.minisig` file. Authenticity, as opposed to [`verify_sha256`]'s
+/// integrity. Streams the data; only pre-hashed signatures (minisign's default)
+/// are accepted, never the legacy format.
+pub(crate) fn verify_signature(
+    mut reader: impl Read,
+    signature: &str,
+    public_key: &str,
+) -> Result<(), UpdateError> {
+    use minisign_verify::{PublicKey, Signature};
+    let key = PublicKey::from_base64(public_key)
+        .map_err(|e| UpdateError::InvalidSignature(format!("no usable public key ({e})")))?;
+    let signature = Signature::decode(signature)
+        .map_err(|e| UpdateError::InvalidSignature(format!("malformed signature ({e})")))?;
+    let mut verifier = key
+        .verify_stream(&signature)
+        .map_err(|_| UpdateError::SignatureMismatch)?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|e| UpdateError::Download(format!("reading the file failed: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        verifier.update(&chunk[..read]);
+    }
+    verifier
+        .finalize()
+        .map_err(|_| UpdateError::SignatureMismatch)
+}
+
 /// Runs an update check for the build `current_version`. `fetch` returns the
 /// latest-release JSON, or `None` when no release has been published, and is
 /// not called at all for a development build.
@@ -295,10 +377,12 @@ pub(crate) fn check(
         return Ok(CheckOutcome::UpToDate);
     }
     let (download_url, sha256) = select_asset(&release)?;
+    let signature_url = select_signature_asset(&release)?;
     Ok(CheckOutcome::UpdateAvailable(UpdateInfo {
         version: release.version,
         download_url,
         sha256,
+        signature_url,
     }))
 }
 
@@ -475,6 +559,12 @@ mod tests {
       "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe.sha256"
     },
     {
+      "id": 4,
+      "name": "GameFrame-Setup-1.2.0.exe.minisig",
+      "digest": null,
+      "browser_download_url": "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe.minisig"
+    },
+    {
       "id": 3,
       "name": "THIRD-PARTY-NOTICES.html",
       "digest": null,
@@ -495,11 +585,16 @@ mod tests {
         )
     }
 
+    /// The installer asset and its `.minisig`.
     fn installer_json(version: &str) -> String {
-        asset_json(
-            &format!("GameFrame-Setup-{version}.exe"),
-            Some(&format!("sha256:{SHA_A}")),
-        )
+        [
+            asset_json(
+                &format!("GameFrame-Setup-{version}.exe"),
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+            asset_json(&format!("GameFrame-Setup-{version}.exe.minisig"), None),
+        ]
+        .join(",")
     }
 
     fn check_json(current: &str, json: &str) -> Result<CheckOutcome, UpdateError> {
@@ -628,6 +723,7 @@ mod tests {
                 version: Version(1, 2, 0),
                 download_url: "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe".into(),
                 sha256: SHA_A.into(),
+                signature_url: "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe.minisig".into(),
             })
         );
     }
@@ -939,11 +1035,144 @@ mod tests {
         ));
     }
 
+    // Generated with minisign 0.12 (`minisign -G -W`, `minisign -S`) for these
+    // tests only; the secret keys were thrown away. Not GameFrame's key.
+    const TEST_PUBLIC_KEY: &str = "RWRxNC0yLOQy/hw1eBWJeGOpXKHvQutd1QOylDUvDibdWvEY4xx6/LaW";
+    const OTHER_PUBLIC_KEY: &str = "RWR5V9eIUOhvVABgQXNW1DdCi23HMnK3p56Px+ldGZbWvci1XG9kIl7Q";
+    const SIGNED_CONTENT: &[u8] = b"gameframe test installer";
+    const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
+        RURxNC0yLOQy/v4hJSQX0rxIVlzK0PCR2V0+MJrrLOq3mU89i4KZ7HsEZJ9pJbm+rcBADNTUC93/k6zpaqAyCk7hnK1b5PJSiQE=\n\
+        trusted comment: timestamp:1793255643\tfile:payload.bin\thashed\n\
+        iAxFHuR+2NA1plwGWanAoGiAoGsa9iUir+ka82wHXnO+NB9Bbpa8x/5z7PfxH/z8aPGZ9Fd6UJbgES10AZO2BA==\n";
+
+    #[test]
+    fn verify_signature_accepts_a_file_signed_with_the_key() {
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn verify_signature_rejects_a_tampered_file() {
+        let mut tampered = SIGNED_CONTENT.to_vec();
+        tampered[0] ^= 1;
+
+        assert_eq!(
+            verify_signature(&tampered[..], TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            Err(UpdateError::SignatureMismatch)
+        );
+        assert_eq!(
+            verify_signature(&SIGNED_CONTENT[1..], TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            Err(UpdateError::SignatureMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_signature_rejects_another_key() {
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, OTHER_PUBLIC_KEY),
+            Err(UpdateError::SignatureMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_signature_rejects_a_missing_or_malformed_signature() {
+        for signature in ["", "not a signature", "untrusted comment: x\n"] {
+            assert!(
+                matches!(
+                    verify_signature(SIGNED_CONTENT, signature, TEST_PUBLIC_KEY),
+                    Err(UpdateError::InvalidSignature(_))
+                ),
+                "{signature:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_signature_rejects_the_unconfigured_placeholder_key() {
+        assert!(matches!(
+            verify_signature(SIGNED_CONTENT, TEST_SIGNATURE, PUBLIC_KEY),
+            Err(UpdateError::InvalidSignature(_)) | Err(UpdateError::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_signature_reports_a_failing_reader() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk gone"))
+            }
+        }
+
+        assert!(matches!(
+            verify_signature(Failing, TEST_SIGNATURE, TEST_PUBLIC_KEY),
+            Err(UpdateError::Download(e)) if e.contains("disk gone")
+        ));
+    }
+
+    #[test]
+    fn select_signature_asset_finds_the_minisig_of_the_installer() {
+        let release = parse_release(FULL_RELEASE).unwrap();
+
+        assert_eq!(
+            select_signature_asset(&release).unwrap(),
+            "https://github.com/ranarn/gameframe/releases/download/v1.2.0/GameFrame-Setup-1.2.0.exe.minisig"
+        );
+    }
+
+    #[test]
+    fn select_signature_asset_fails_without_a_signature_for_this_installer() {
+        let assets = [
+            asset_json(
+                "GameFrame-Setup-1.2.0.exe",
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+            asset_json("GameFrame-Setup-1.1.0.exe.minisig", None),
+        ]
+        .join(",");
+        let release = parse_release(&release_json("v1.2.0", &assets)).unwrap();
+
+        assert_eq!(
+            select_signature_asset(&release),
+            Err(UpdateError::MissingSignature)
+        );
+    }
+
+    #[test]
+    fn select_signature_asset_rejects_an_untrusted_download_url() {
+        let json = r#"{"tag_name": "v1.2.0", "assets": [{"name": "GameFrame-Setup-1.2.0.exe.minisig",
+            "browser_download_url": "https://evil.test/a.minisig"}]}"#;
+
+        assert!(matches!(
+            select_signature_asset(&parse_release(json).unwrap()),
+            Err(UpdateError::UntrustedDownloadUrl(_))
+        ));
+    }
+
+    #[test]
+    fn check_refuses_a_release_whose_installer_is_unsigned() {
+        let json = release_json(
+            "v1.2.0",
+            &asset_json(
+                "GameFrame-Setup-1.2.0.exe",
+                Some(&format!("sha256:{SHA_A}")),
+            ),
+        );
+
+        assert_eq!(
+            check_json("1.1.0", &json),
+            Err(UpdateError::MissingSignature)
+        );
+    }
+
     fn available() -> CheckOutcome {
         CheckOutcome::UpdateAvailable(UpdateInfo {
             version: Version(1, 2, 0),
             download_url: "https://github.com/a.exe".into(),
             sha256: SHA_A.into(),
+            signature_url: "https://github.com/a.exe.minisig".into(),
         })
     }
 
@@ -1022,6 +1251,7 @@ mod tests {
             version: Version(1, 2, 0),
             download_url: "https://github.com/a.exe".into(),
             sha256: SHA_A.into(),
+            signature_url: "https://github.com/a.exe.minisig".into(),
         };
 
         assert_eq!(
