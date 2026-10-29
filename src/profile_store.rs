@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::cursor_style::CursorSettings;
 pub use crate::region_calc::Zone;
@@ -312,6 +313,9 @@ fn fold_per_game_taskbar_flags(table: &mut toml::Table) -> bool {
 /// cache with what it wrote. Edits made to the file by hand while GameFrame is
 /// running are therefore not picked up until the next start.
 pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
+    if !CACHE_ENABLED.load(Ordering::Relaxed) {
+        return load_from_disk(config_dir);
+    }
     if let Some(config) = lock_cache().get(config_dir) {
         return Ok(config.clone());
     }
@@ -323,6 +327,25 @@ pub fn load(config_dir: &Path) -> Result<Config, ProfileStoreError> {
         .entry(config_dir.to_path_buf())
         .or_insert(config)
         .clone())
+}
+
+/// Whether [`load`] may serve from the cache. Off in the Settings and zone
+/// editor child processes (`--settings`, `--zone-editor`): the tray process
+/// writes the same file while they run, so a cached copy would go stale and a
+/// read-modify-write ([`update`]) on it would overwrite those writes.
+static CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Makes [`load`] (and so [`update`]) read the file every time, for the rest of
+/// the process. See [`CACHE_ENABLED`].
+pub fn disable_cache() {
+    CACHE_ENABLED.store(false, Ordering::Relaxed);
+}
+
+/// Drops the cached copy of `config_dir`'s config, so the next [`load`] reads
+/// the file. The tray process calls this after the Settings child may have
+/// written it.
+pub fn forget_cached(config_dir: &Path) {
+    lock_cache().remove(config_dir);
 }
 
 /// The in-memory copy of each config directory's config, see [`load`].
@@ -514,6 +537,30 @@ mod tests {
     fn write_config_file(config_dir: &Path, contents: &str) {
         std::fs::create_dir_all(config_dir).unwrap();
         std::fs::write(config_dir.join(CONFIG_FILE_NAME), contents).unwrap();
+    }
+
+    #[test]
+    fn forgetting_the_cache_picks_up_a_write_made_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+        assert!(!load(&config_dir).unwrap().cursor.enabled);
+
+        // The Settings child process writes the file behind this cache's back.
+        let mut changed = Config::default();
+        changed.cursor.enabled = true;
+        std::fs::write(
+            config_dir.join(CONFIG_FILE_NAME),
+            toml::to_string_pretty(&changed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !load(&config_dir).unwrap().cursor.enabled,
+            "the cache is stale until it is forgotten"
+        );
+
+        forget_cached(&config_dir);
+        assert!(load(&config_dir).unwrap().cursor.enabled);
     }
 
     #[test]

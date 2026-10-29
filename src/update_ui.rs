@@ -66,10 +66,14 @@ impl UpdateNotifier {
     }
 }
 
-/// Sends `event` to the event loop; does nothing before the loop exists.
+/// Sends `event` to the event loop. In a Settings child process, which has no
+/// event loop, it goes to the tray process over the link instead; anywhere
+/// else, before the loop exists, it does nothing.
 pub(crate) fn notify(event: UpdateEvent) {
     if let Some(notifier) = NOTIFIER.get() {
         notifier.notify(event);
+    } else {
+        crate::settings_link::report_update(&event);
     }
 }
 

@@ -1,8 +1,9 @@
 //! Thin orchestrator: builds the tray icon/menu ([`crate::tray_ui`]) and
 //! then runs the Win32 message loop that keeps it alive, dispatching a
 //! click on "Exit" to a clean shutdown, a click on "Show Settings" to
-//! lazily opening (and fully tearing down, on close) the egui Settings
-//! window ([`crate::settings_ui`]), a press of the bound borderless hotkey
+//! starting a short-lived child process that shows the egui Settings
+//! window ([`crate::settings_ui`], see [`crate::settings_link`]) and applying
+//! what it changed once it exits, a press of the bound borderless hotkey
 //! ([`crate::hotkeys`]) to stripping/restoring the foreground window's
 //! border via [`crate::win32`], and a press of the bound taskbar-autohide
 //! hotkey to toggling the taskbar hidden/visible (mode-aware -- see
@@ -54,6 +55,8 @@ use crate::launch_watcher;
 use crate::message_box::show_message_box;
 use crate::placement::{self, Outcome, Trigger};
 use crate::profile_store;
+use crate::settings_host::SettingsProcess;
+use crate::settings_link::{ChildKind, ChildMsg, EXIT_ZONE_SAVED, ParentMsg};
 use crate::settings_ui::{self, TickContext};
 use crate::taskbar;
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
@@ -63,14 +66,13 @@ use crate::update_ui::{
 };
 use crate::updater::{CheckOutcome, FlagGuard, SpawnError, UpdateInfo};
 use crate::win32;
-use crate::zone_overlay;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
-    TranslateMessage,
+    PM_REMOVE, PeekMessageW, PostQuitMessage, TranslateMessage, WM_QUIT,
 };
 
 pub fn run() -> Result<(), TrayUiError> {
@@ -231,17 +233,62 @@ fn prompt_for_zone_if_unset(config_dir: &Path) {
         return;
     }
 
-    // No tray or hotkeys exist yet at first run, so there is nothing to tick.
-    match zone_overlay::run_zone_editor_overlay(None, config.taskbar_hide_mode, &mut || {}) {
-        Ok(Some(zone)) => match settings_ui::persist_zone(config_dir, Some(zone)) {
-            Ok(_) => {
+    // The editor runs in a child process (it saves the Zone itself and reports
+    // that through its exit code), so the GPU driver never loads here.
+    match run_zone_editor_process() {
+        Ok(exit_code) => {
+            // The child wrote the config file behind this process's cache.
+            profile_store::forget_cached(config_dir);
+            if exit_code == Some(EXIT_ZONE_SAVED) {
                 show_message_box(ZONE_SAVED_NEXT_STEPS, MB_OK | MB_ICONINFORMATION);
             }
-            Err(e) => log!("failed to save the zone: {e}"),
-        },
-        Ok(None) => {}
-        Err(e) => log!("failed to open the zone editor overlay: {e}"),
+        }
+        Err(e) => log!("failed to open the zone editor: {e}"),
     }
+}
+
+/// Runs the first-run zone editor child to completion and returns its exit
+/// code. Keeps pumping this thread's messages while it waits, so the tray and a
+/// second launch's command stay responsive; a queued `Quit` closes the editor.
+fn run_zone_editor_process() -> std::io::Result<Option<i32>> {
+    let mut process = SettingsProcess::spawn(ChildKind::ZoneEditor, Vec::new(), None)?;
+    let mut closing = false;
+    Ok(crate::watchdog::modal(|| {
+        loop {
+            if !pump_pending_messages() {
+                // Leave the WM_QUIT for the main loop; stop waiting.
+                process.close();
+            }
+            let polled = process.poll();
+            if polled.exited {
+                return polled.exit_code;
+            }
+            if !closing && instance_channel::quit_pending() {
+                closing = true;
+                process.send(&ParentMsg::Close);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }))
+}
+
+/// Dispatches the messages waiting for this thread. `false` after a `WM_QUIT`,
+/// which is posted again so the next pump sees it too.
+fn pump_pending_messages() -> bool {
+    // SAFETY: all-zero bytes are a valid value of this plain C struct.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // SAFETY: `msg` is a valid out-pointer; the calls take the message just read.
+    unsafe {
+        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if msg.message == WM_QUIT {
+                PostQuitMessage(msg.wParam as i32);
+                return false;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    true
 }
 
 /// Loads the config and registers its bound hotkeys with the OS, each on its
@@ -284,19 +331,28 @@ fn register_hotkeys(config_dir: &Path) -> (Option<Hotkeys>, Vec<BindingReport>) 
 /// `tray-icon` -- the latter is what gates the "Apply to Window" submenu's
 /// live refresh (see the loop body below).
 ///
-/// `hotkeys` is owned (not borrowed) specifically so the `ShowSettings`
-/// branch below can reassign it with a freshly re-registered [`Hotkeys`]
-/// after the Settings window closes -- see that branch's comment.
+/// `hotkeys` is owned (not borrowed) specifically so [`settings_closed`] can
+/// reassign it with a freshly re-registered [`Hotkeys`] after the Settings
+/// window closes -- see that function's comment.
+///
+/// The Settings window runs in a child process (#186), so this loop never
+/// blocks in it: tray, hotkeys, hooks and a second launch's commands keep being
+/// handled as usual, and [`service_settings`] picks up the child's messages.
 fn run_event_loop(
     tray: &Tray,
-    mut hotkeys: Option<Hotkeys>,
-    mut hotkey_reports: Vec<BindingReport>,
+    hotkeys: Option<Hotkeys>,
+    hotkey_reports: Vec<BindingReport>,
     config_dir: &Path,
     cursor_overlay: &CursorOverlay,
     updates: &UpdateEvents,
 ) {
-    // The update the tray item "Update to vX.Y.Z" offers (ask mode).
-    let mut offered_update: Option<UpdateInfo> = None;
+    let mut state = LoopState {
+        hotkeys,
+        hotkey_reports,
+        // The update the tray item "Update to vX.Y.Z" offers (ask mode).
+        offered_update: None,
+        settings: None,
+    };
     let ctx = Shared {
         tray,
         config_dir,
@@ -334,35 +390,58 @@ fn run_event_loop(
         }
 
         crate::watchdog::step("event loop: second-launch commands");
+        crate::watchdog::step("event loop: settings process");
+        // The Settings child's messages, and its exit (which re-registers the
+        // hotkeys it may have changed). First, so the window it reports is
+        // current for the hotkey events below.
+        service_settings(&ctx, &mut state);
+
+        crate::watchdog::step("event loop: second-launch commands");
         // Commands from a second launch (see crate::instance_channel); the
         // channel's window is dispatched by this pump, so they are queued by now.
-        // Keeps draining until the queue is empty, so a Quit that arrived
-        // while Settings was open is handled as soon as it closes. Quit exits
-        // through the same clean-shutdown path as the tray's Exit item below.
+        // Quit exits through the same clean-shutdown path as the tray's Exit
+        // item below (which also closes the Settings child).
         if instance_channel::dispatch_commands(instance_channel::drain, || {
-            show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
+            show_settings(&ctx, &mut state);
         }) {
             return;
         }
 
-        // Tray, hotkey and update events. Settings drains the same events while
-        // it is open (see `show_settings`), so nothing waits for it to close.
+        // Tray, hotkey and update events.
         loop {
-            let drained = drain_events(&ctx, &hotkeys, &mut offered_update, None);
+            let settings_context = state.settings.as_ref().map(|s| s.context);
+            let drained = drain_events(
+                &ctx,
+                &state.hotkeys,
+                &mut state.offered_update,
+                settings_context,
+            );
             if drained.exit {
                 return;
             }
+            // A game-cursor toggle by hotkey: the open window shows the new value.
+            if let (Some(enabled), Some(settings)) =
+                (drained.cursor_enabled, state.settings.as_mut())
+            {
+                settings.send(&ParentMsg::CursorEnabled(enabled));
+            }
             if drained.show_settings {
-                show_settings(&ctx, &mut hotkeys, &mut hotkey_reports, &mut offered_update);
-                if instance_channel::quit_pending() {
-                    return;
-                }
+                show_settings(&ctx, &mut state);
                 // Events queued behind the click are handled on the next pass.
                 continue;
             }
             break;
         }
     }
+}
+
+/// What the event loop owns and the Settings child's lifecycle touches.
+struct LoopState {
+    hotkeys: Option<Hotkeys>,
+    hotkey_reports: Vec<BindingReport>,
+    offered_update: Option<UpdateInfo>,
+    /// The running Settings child, if any. Dropping it closes it.
+    settings: Option<SettingsProcess>,
 }
 
 /// The long-lived handles the event handlers share.
@@ -807,55 +886,89 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
     Some(enabled)
 }
 
-/// Opens Settings (what the tray item and a second launch both do) and, once
-/// it closes, applies what it may have changed.
-fn show_settings(
-    ctx: &Shared,
-    hotkeys: &mut Option<Hotkeys>,
-    hotkey_reports: &mut Vec<BindingReport>,
-    offered_update: &mut Option<UpdateInfo>,
-) {
+/// Opens Settings (what the tray item and a second launch both do): starts the
+/// Settings child process, or brings the open one to the front. Returns at
+/// once; [`service_settings`] follows the child from here.
+fn show_settings(ctx: &Shared, state: &mut LoopState) {
+    if state.settings.is_some() {
+        instance_channel::focus_settings_window();
+        return;
+    }
+    // The outcome of the last registration is handed to Settings instead of
+    // re-checking: while the window is open this instance's own registrations
+    // hold the combos, so a fresh probe would report GameFrame's own bindings
+    // as "in use". Settings hides a failure once its binding has been changed.
+    match SettingsProcess::spawn(
+        ChildKind::Settings,
+        state.hotkey_reports.clone(),
+        crate::cursor_overlay::last_game_cursor(),
+    ) {
+        Ok(process) => state.settings = Some(process),
+        Err(e) => {
+            log!("failed to open Settings: {e}");
+            ctx.tray
+                .notify("GameFrame couldn't open Settings. See the log for details.");
+        }
+    }
+}
+
+/// Handles what the Settings child sent since the last pass, and its exit.
+///
+/// The child owns the window, the tray process owns everything else: it
+/// re-applies the Zone to running games (the per-window registry lives here),
+/// forgets its cached config when the child wrote the file, and runs update
+/// events for the tray.
+fn service_settings(ctx: &Shared, state: &mut LoopState) {
+    let Some(process) = state.settings.as_mut() else {
+        return;
+    };
+    let polled = process.poll();
+    for msg in polled.messages {
+        match msg {
+            ChildMsg::Context(context) => process.context = context,
+            ChildMsg::ConfigChanged => profile_store::forget_cached(ctx.config_dir),
+            ChildMsg::ReapplyAll => {
+                crate::watchdog::step("settings process: live re-apply");
+                profile_store::forget_cached(ctx.config_dir);
+                let messages = match profile_store::load(ctx.config_dir) {
+                    Ok(config) => {
+                        settings_ui::live_reapply_all(ctx.config_dir, &config.tracked_games)
+                    }
+                    Err(e) => {
+                        log!("live re-apply: failed to load the config: {e}");
+                        vec![format!("couldn't read the settings: {e}")]
+                    }
+                };
+                process.send(&ParentMsg::ReapplyDone(messages));
+            }
+            ChildMsg::Update(report) => {
+                if let Some(event) = report.into_event() {
+                    handle_update_event(event, ctx.tray, ctx.config_dir, &mut state.offered_update);
+                }
+            }
+            ChildMsg::Notify(text) => ctx.tray.notify(&text),
+        }
+    }
+    if polled.exited {
+        state.settings = None;
+        if polled.exit_code != Some(0) {
+            log!("the Settings process ended with {:?}", polled.exit_code);
+        }
+        settings_closed(ctx, state);
+    }
+}
+
+/// Applies what Settings may have changed, once its window has closed.
+fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
         tray,
         config_dir,
         cursor_overlay,
         ..
     } = *ctx;
-    // Synchronous/modal-style: opening Settings blocks this thread until the
-    // Settings window closes, at which point the egui/wgpu context it used is
-    // fully dropped and we resume pumping tray messages right where we left
-    // off. Meanwhile Settings' frame loop calls back into `drain_events`, so
-    // tray, hotkey and update events are handled immediately instead of
-    // queueing until it closes.
-    //
-    // The outcome of the last registration is handed to Settings instead of
-    // re-checking: while it is open this instance's own registrations hold
-    // the combos, so a fresh probe would report GameFrame's own bindings as
-    // "in use". Settings hides a failure once its binding has been changed.
-    let mut on_tick = {
-        let hotkeys = &*hotkeys;
-        move |context: TickContext| -> Option<bool> {
-            let drained = drain_events(ctx, hotkeys, offered_update, Some(context));
-            if drained.exit {
-                // Settings closes on a queued Quit and the main loop exits.
-                instance_channel::queue_quit();
-            }
-            // Back in Settings' frame loop (rendering, window messages): a stall
-            // from here until the next tick happened in Settings itself (#128).
-            crate::watchdog::step("settings: frame loop");
-            drained.cursor_enabled
-        }
-    };
-    crate::watchdog::step("settings: opening window");
-    // Window and GPU setup can take a while and are not a hang: idle until
-    // Settings' first `ui()` beats; busy again once it has closed.
-    crate::watchdog::idle();
-    if let Err(e) = open_settings(config_dir, hotkey_reports, &mut on_tick) {
-        log!("failed to open Settings: {e}");
-        tray.notify(e.notice());
-    }
-    crate::watchdog::beat();
     crate::watchdog::step("settings: closed, re-registering hotkeys");
+    // The child wrote the config file (Save) behind this process's cache.
+    profile_store::forget_cached(config_dir);
 
     // Settings may have changed the hotkey bindings on disk (Save persists via
     // `profile_store`) -- re-register from the freshly saved config so a newly
@@ -865,12 +978,14 @@ fn show_settings(
     // which releases its hotkeys): a plain `hotkeys = register_hotkeys(..)`
     // evaluates the right side first, so every unchanged key failed with
     // "already registered" and all hotkeys went dead after any Settings visit.
-    drop(hotkeys.take());
-    let previous_reports = std::mem::take(hotkey_reports);
-    (*hotkeys, *hotkey_reports) = register_hotkeys(config_dir);
+    drop(state.hotkeys.take());
+    let previous_reports = std::mem::take(&mut state.hotkey_reports);
+    (state.hotkeys, state.hotkey_reports) = register_hotkeys(config_dir);
     // Right after Save, not only on reopening Settings: one notice for the
     // bindings that just started failing (not for ones already reported).
-    if let Some(notice) = crate::hotkeys::new_failure_notice(&previous_reports, hotkey_reports) {
+    if let Some(notice) =
+        crate::hotkeys::new_failure_notice(&previous_reports, &state.hotkey_reports)
+    {
         tray.notify(&notice);
     }
     sync_hang_watchdog(config_dir, false);
@@ -891,19 +1006,6 @@ fn sync_hang_watchdog(config_dir: &Path, startup: bool) {
             }
         }
     }
-}
-
-/// Opens the Settings window at `config_dir`. See
-/// [`settings_ui::run_settings_window`] for what "opens" entails (blocks
-/// until closed, persists on Save).
-fn open_settings(
-    config_dir: &Path,
-    hotkey_reports: &[BindingReport],
-    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
-) -> Result<(), settings_ui::SettingsUiError> {
-    // While open, a second launch's OpenSettings focuses this window instead.
-    let _modal = instance_channel::enter_settings();
-    settings_ui::run_settings_window(config_dir, hotkey_reports, on_tick)
 }
 
 /// The real `%APPDATA%\GameFrame` directory GameFrame persists its config

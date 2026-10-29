@@ -544,11 +544,15 @@ pub(crate) fn persist_zone(
     config_dir: &Path,
     zone: Option<Zone>,
 ) -> Result<Config, SettingsUiError> {
-    profile_store::update(config_dir, |config| {
+    let saved = profile_store::update(config_dir, |config| {
         *config = config_with_zone(std::mem::take(config), zone);
         config.clone()
     })
-    .map_err(SettingsUiError::Config)
+    .map_err(SettingsUiError::Config)?;
+    // In the Settings child: the tray process caches the config, so it must
+    // learn that the file changed.
+    crate::settings_link::config_changed();
+    Ok(saved)
 }
 
 /// Live re-applies the Zone on disk to every running tracked game in `games`
@@ -565,7 +569,7 @@ pub(crate) fn persist_zone(
 /// OS-facing -- not exercised by this crate's automated tests; the
 /// orchestration is tested in `placement`, and
 /// [`live_apply_failure_message`] is the pure message text.
-fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
+pub(crate) fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
     games
         .iter()
         .filter_map(|game| {
@@ -1024,7 +1028,7 @@ fn merge_tracked_games(
 }
 
 /// Which window's frame loop is ticking the app's event handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TickContext {
     /// The Settings window is open.
     Settings,
@@ -1065,6 +1069,12 @@ pub enum TickContext {
 /// before "Edit Zone" was clicked survives the round trip through
 /// the overlay instead of vanishing with the torn-down `SettingsApp`.
 ///
+/// Runs in the short-lived `--settings` child process (see
+/// [`crate::child_main`]), so the GPU driver dies with the window instead of
+/// staying loaded in the tray process (#186). `on_tick` is how the tray process
+/// is kept informed, and `reapply` live re-applies the saved Zone to the games
+/// given: both go to the tray process, which owns the window state.
+///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
 /// each iteration and fully drops it before the next (or before returning).
 /// Not exercised by this crate's automated tests -- see module docs.
@@ -1072,6 +1082,7 @@ pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
+    reapply: &mut dyn FnMut(&[TrackedGame]) -> Vec<String>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let opened_games = config.tracked_games.clone();
@@ -1145,8 +1156,7 @@ pub fn run_settings_window(
                         match persist_zone(config_dir, Some(zone)) {
                             Ok(saved) => {
                                 latest_state.set_zone(zone);
-                                status_messages =
-                                    live_reapply_all(config_dir, &saved.tracked_games);
+                                status_messages = reapply(&saved.tracked_games);
                             }
                             Err(e) => {
                                 log!("failed to save the zone: {e}");

@@ -465,6 +465,12 @@ fn window_under(x: i32, y: i32) -> HWND {
 /// [`CursorShape::GameOwn`].
 static LAST_GAME_CURSOR: Mutex<Option<Bitmap>> = Mutex::new(None);
 
+/// Seeds [`last_game_cursor`] in the Settings child process, which has no
+/// overlay of its own: the tray process hands over the image it last read.
+pub fn set_last_game_cursor(image: Bitmap) {
+    *LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+}
+
 /// The last cursor image read over a game, if any yet.
 pub fn last_game_cursor() -> Option<Bitmap> {
     LAST_GAME_CURSOR
