@@ -11,7 +11,7 @@ use crate::profile_store;
 use crate::tray_ui::Tray;
 use crate::updater::{CheckOutcome, SpawnError, StartupAction, UpdateError, UpdateInfo, Version};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_OK, PostThreadMessageW, WM_NULL,
@@ -42,20 +42,6 @@ pub(crate) enum UpdateEvent {
     InstallFailed,
     /// An automatic install of this version was refused for its signature.
     SignatureRefused(Version),
-}
-
-/// The newest version an automatic install refused for its signature this
-/// session; it is not tried again until a newer release appears.
-static REFUSED_VERSION: Mutex<Option<Version>> = Mutex::new(None);
-
-fn refused_this_session(version: Version) -> bool {
-    let refused = REFUSED_VERSION.lock().unwrap_or_else(|e| e.into_inner());
-    refused.is_some_and(|r| version <= r)
-}
-
-fn remember_refused(version: Version) {
-    let mut refused = REFUSED_VERSION.lock().unwrap_or_else(|e| e.into_inner());
-    *refused = Some(refused.map_or(version, |r| r.max(version)));
 }
 
 /// Lets worker threads hand an [`UpdateEvent`] to the event loop and wake its
@@ -181,15 +167,8 @@ pub(crate) fn handle_update_event(
                     });
                 }
                 StartupAction::InstallNow(info) => {
-                    if refused_this_session(info.version) {
-                        log!(
-                            "startup update check: v{} was refused for its signature; not retrying",
-                            info.version
-                        );
-                    } else {
-                        log!("startup update check: installing v{}", info.version);
-                        start_install(info, Failure::LogOnly);
-                    }
+                    log!("startup update check: installing v{}", info.version);
+                    start_install(info, Failure::LogOnly);
                 }
                 StartupAction::OfferInTray(info) => {
                     log!("startup update check: offering v{}", info.version);
@@ -211,7 +190,6 @@ pub(crate) fn handle_update_event(
             tray.set_tooltip(&format!("GameFrame - installing update v{version}..."));
         }
         UpdateEvent::SignatureRefused(version) => {
-            remember_refused(version);
             tray.notify(&crate::updater::signature_refusal_notice(Some(version)));
         }
         UpdateEvent::InstallFailed => {

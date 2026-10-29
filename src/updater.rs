@@ -224,10 +224,10 @@ pub(crate) fn signature_refusal_notice(version: Option<Version>) -> String {
     match version {
         Some(v) => format!(
             "The update to v{v} can't be verified and was not installed. \
-             Check for Updates Now in Settings shows why."
+             Install v{v} in Settings shows why."
         ),
         None => "The latest GameFrame update can't be verified and was not installed. \
-                 Check for Updates Now in Settings shows why."
+                 Check for updates now in Settings shows why."
             .to_string(),
     }
 }

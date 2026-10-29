@@ -494,8 +494,14 @@ mod tests {
         let dir = update_dir(&temp);
         let path = dir.join("GameFrame-Setup-1.2.0.exe");
         std::fs::write(&path, &program).unwrap();
+        use std::os::windows::fs::OpenOptionsExt;
+        // The same share mode as `prepare_installer`'s lock: read only.
         let installer = VerifiedInstaller {
-            _lock: std::fs::File::open(&path).unwrap(),
+            _lock: std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1)
+                .open(&path)
+                .unwrap(),
             path,
         };
 

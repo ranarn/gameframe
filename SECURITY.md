@@ -60,8 +60,8 @@ store and proxy settings apply:
   nothing runs. There is no unsigned fallback. The refusal is never only in the
   log. A check or install you start in Settings shows why in the update row; an
   automatic install or the startup check shows one tray balloon ("... can't be
-  verified and was not installed"), and the same version is not retried until
-  you restart GameFrame or a newer release appears. Scope of the protection: the
+  verified and was not installed"); GameFrame tries again only at its next
+  start. Scope of the protection: the
   signing key is held only as a secret of the protected `release` environment, so
   someone who can merely change release assets or the release page (a leaked
   token with write access, another compromised workflow) cannot get a file
