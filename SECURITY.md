@@ -127,7 +127,10 @@ signed release:
    publish while the placeholder is in place, and it checks after signing that
    the signature verifies against that exact constant (or NEXT_PUBLIC_KEY, see below).
 4. Enable **immutable releases** (Settings -> General -> Releases), so a
-   published release and its assets can no longer be replaced.
+   published release and its assets can no longer be replaced. This setting is
+   the guarantee: the workflow also refuses to re-upload to a release that is
+   already published on a re-run, but a draft published between its check and
+   its upload would slip past that check.
 
 ### Rotating the signing key
 

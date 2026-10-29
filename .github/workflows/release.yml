@@ -263,23 +263,28 @@ jobs:
           REUSED: ${{ steps.existing.outputs.exists }}
         run: |
           if [ "$REUSED" = "true" ]; then
-            # Find an existing release (draft or published, either counts on a
-            # re-run) by listing, which includes drafts, so this existence
-            # check does not depend on gh's tag-to-draft fallback (the upload
-            # below still finds the draft by tag, and fails loudly if it
-            # can't, rather than creating a duplicate). Any lookup failure
-            # (network, auth, rate limit, bad JSON) must fail the job rather
-            # than risk a duplicate draft.
-            if ! releases=$(gh release list --limit 1000 --json tagName); then
+            # Find an existing release by listing, which includes drafts, so
+            # this existence check does not depend on gh's tag-to-draft
+            # fallback (the upload below still finds the draft by tag, and
+            # fails loudly if it can't, rather than creating a duplicate). A
+            # draft may be (re)filled with --clobber, but a published release
+            # must never have its assets replaced, so a re-run against one
+            # fails before uploading. Any lookup failure (network, auth, rate
+            # limit, bad JSON) must fail the job rather than risk a duplicate
+            # draft or an overwrite.
+            if ! releases=$(gh release list --limit 1000 --json tagName,isDraft); then
               echo "::error::Could not list releases"
               exit 1
             fi
-            if ! count=$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | length' <<<"$releases") || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+            if ! state=$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | if length == 0 then "none" elif any(.[]; .isDraft != true) then "published" else "draft" end' <<<"$releases") || ! [[ "$state" =~ ^(none|draft|published)$ ]]; then
               echo "::error::Could not parse the release list"
               exit 1
             fi
-            if [ "$count" -gt 0 ]; then
-              echo "Found the existing release for $PLANNED"
+            if [ "$state" = "published" ]; then
+              echo "::error::Release $PLANNED is already published; refusing to overwrite its assets"
+              exit 1
+            elif [ "$state" = "draft" ]; then
+              echo "Found the existing draft release for $PLANNED"
             else
               echo "::warning::No release exists for $PLANNED; creating a draft with generated notes. Review the notes before publishing."
               gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --generate-notes
