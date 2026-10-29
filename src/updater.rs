@@ -32,16 +32,12 @@ const DIGEST_PREFIX: &str = "sha256:";
 /// Appended to the installer's name for its detached Minisign signature.
 const SIGNATURE_SUFFIX: &str = ".minisig";
 
-/// The Minisign public key (the base64 second line of `minisign.pub`) every
-/// installer must be signed with. The release workflow checks, after signing,
-/// that the signature verifies against this exact line (or
-/// [`NEXT_PUBLIC_KEY`]), so keep it on one line as
-/// `pub(crate) const PUBLIC_KEY: &str = "...";`.
-///
-/// PLACEHOLDER: the maintainer replaces this with the public key of the
-/// release signing key (see SECURITY.md). Until then no installer verifies,
-/// so the updater installs nothing and the release workflow refuses to publish.
-pub(crate) const PUBLIC_KEY: &str = "REPLACE_WITH_MINISIGN_PUBLIC_KEY";
+/// The Minisign public key (the base64 second line of `gameframe.pub`, key id
+/// E6CE2092F0EE51EE) every installer must be signed with. The release workflow
+/// checks, after signing, that the signature verifies against this exact line
+/// (or [`NEXT_PUBLIC_KEY`]), so keep it on one line as
+/// `pub(crate) const PUBLIC_KEY: &str = "...";`. To rotate it, see SECURITY.md.
+pub(crate) const PUBLIC_KEY: &str = "RWTuUe7wkiDO5jFMnk3TwY6+iUGxIKPqSn70baKHvVFsXwdmCpaK68fS";
 
 /// Second accepted key, empty normally. It only exists to rotate the signing
 /// key: a release signed with the old key sets this to the new public key, so

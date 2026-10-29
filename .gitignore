@@ -11,3 +11,9 @@
 # maintainer's machine, not published.
 /docs/
 /CONTEXT.md
+
+# Release signing key pair (minisign): the secret key lives only in the
+# release environment's secrets and offline.
+/gameframe.key
+/gameframe.pub
+*.key
