@@ -4,7 +4,7 @@
 //! against the public key built into GameFrame (authenticity). A file that
 //! fails either, or has no signature, is deleted and never run. Then it starts
 //! it silently and detached. An elevated instance never installs: it
-//! refuses before anything starts, see [`ensure_unelevated`].
+//! refuses before anything starts, see [`spawn_install`].
 //!
 //! The installer asks the running instance to quit before it replaces files
 //! (the same command as tray Exit) and, because of its `/RELAUNCH` parameter,
@@ -19,7 +19,7 @@
 
 use crate::http::HttpError;
 use crate::updater::{
-    ASSET_HOST, SpawnError, TRUSTED_KEYS, UpdateError, UpdateInfo, ensure_unelevated,
+    ASSET_HOST, InstallStartError, SpawnError, TRUSTED_KEYS, UpdateError, UpdateInfo,
     installer_name, verify_sha256, verify_signature,
 };
 use std::path::{Path, PathBuf};
@@ -163,9 +163,25 @@ fn download_signature(url: &str) -> Result<String, UpdateError> {
         &mut body,
         MAX_SIGNATURE_BYTES,
     )
-    .map_err(download_error)?;
+    .map_err(signature_download_error)?;
     String::from_utf8(body)
         .map_err(|_| UpdateError::InvalidSignature("the signature file is not text".into()))
+}
+
+/// What a failed signature download means. A signature file the server refuses
+/// to serve or that is absurdly large is a missing or unusable signature, a
+/// refusal that is never left to the log; a transport failure is just a failed
+/// download.
+fn signature_download_error(e: HttpError) -> UpdateError {
+    match e {
+        HttpError::Status(status) => UpdateError::InvalidSignature(format!(
+            "the signature file could not be downloaded (HTTP status {status})"
+        )),
+        HttpError::TooLarge => {
+            UpdateError::InvalidSignature("the signature file is too large".into())
+        }
+        e @ HttpError::Failed(_) => download_error(e),
+    }
 }
 
 fn download_error(e: HttpError) -> UpdateError {
@@ -173,6 +189,7 @@ fn download_error(e: HttpError) -> UpdateError {
         HttpError::Status(status) => UpdateError::Download(format!(
             "the download server answered with HTTP status {status}"
         )),
+        HttpError::TooLarge => UpdateError::Download("the download is too large".into()),
         HttpError::Failed(e) => UpdateError::Download(e),
     }
 }
@@ -210,16 +227,34 @@ pub(crate) fn spawn_install(
     info: UpdateInfo,
     on_start: impl FnOnce() + Send + 'static,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
-) -> Result<(), SpawnError> {
+) -> Result<(), InstallStartError> {
+    spawn_install_as(
+        crate::win32::is_process_elevated(),
+        INSTALL_LOCK_NAME,
+        move || install(&info),
+        on_start,
+        on_done,
+    )
+}
+
+/// [`spawn_install`] with the elevation, the lock and the install itself
+/// given, so the refusal and the hand-over are testable.
+fn spawn_install_as(
+    elevated: bool,
+    lock_name: &'static str,
+    install: impl FnOnce() -> Result<(), UpdateError> + Send + 'static,
+    on_start: impl FnOnce() + Send + 'static,
+    on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
+) -> Result<(), InstallStartError> {
     // Before anything is reported as started: the installer would inherit this
     // process's token and relaunch GameFrame with it, so an elevated instance
     // installs nothing.
-    if ensure_unelevated(crate::win32::is_process_elevated()).is_err() {
-        return Err(SpawnError::Elevated);
+    if elevated {
+        return Err(InstallStartError::Elevated);
     }
-    spawn_guarded(INSTALL_LOCK_NAME, move |in_flight| {
+    spawn_guarded(lock_name, move |in_flight| {
         on_start();
-        match install(&info) {
+        match install() {
             Ok(()) => {
                 on_done(Ok(()));
                 drop(in_flight);
@@ -231,6 +266,7 @@ pub(crate) fn spawn_install(
             }
         }
     })
+    .map_err(InstallStartError::from)
 }
 
 /// Runs `job` on a worker thread that holds the named mutex `lock_name` for as
@@ -354,6 +390,73 @@ mod tests {
                 Err(e) => panic!("the lock should be free again, got {e:?}"),
             }
         }
+    }
+
+    #[test]
+    fn an_elevated_instance_installs_nothing_and_is_told_so() {
+        const LOCK: &str = "Local\\GameFrame-test-install-lock-elevated-9d41b7";
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = |ran: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            let ran = ran.clone();
+            move || ran.store(true, std::sync::atomic::Ordering::SeqCst)
+        };
+        let (install_flag, start_flag, done_flag) = (flag(&ran), flag(&ran), flag(&ran));
+
+        let result = spawn_install_as(
+            true,
+            LOCK,
+            move || {
+                install_flag();
+                Ok(())
+            },
+            start_flag,
+            move |_| done_flag(),
+        );
+
+        assert_eq!(result, Err(InstallStartError::Elevated));
+        // Nothing was started, not even the lock: a following install may run.
+        assert_eq!(spawn_guarded(LOCK, |_| {}), Ok(()));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_unelevated_instance_runs_the_install_and_reports_its_result() {
+        const LOCK: &str = "Local\\GameFrame-test-install-lock-unelevated-3a6e52";
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        spawn_install_as(
+            false,
+            LOCK,
+            || Err(UpdateError::DigestMismatch),
+            || {},
+            move |result| tx.send(result).unwrap(),
+        )
+        .expect("starts");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(UpdateError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn a_signature_file_the_server_refuses_or_that_is_too_large_is_a_signature_refusal() {
+        for e in [
+            HttpError::Status(404),
+            HttpError::Status(500),
+            HttpError::TooLarge,
+        ] {
+            let error = signature_download_error(e.clone());
+            assert!(error.is_signature_refusal(), "{e:?} -> {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_signature_transfer_is_only_a_failed_download() {
+        let error = signature_download_error(HttpError::Failed("timed out".into()));
+
+        assert_eq!(error, UpdateError::Download("timed out".into()));
+        assert!(!error.is_signature_refusal());
     }
 
     fn sha_signed() -> String {

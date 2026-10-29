@@ -105,12 +105,12 @@ Type: filesandordirs; Name: "{userappdata}\GameFrame Settings"
 Type: filesandordirs; Name: "{userappdata}\GameFrame zone editor"
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent; Check: not IsAdmin
 ; Not offered when setup runs elevated (a hand-run "as administrator"): the app
 ; would start with that elevated token.
-; An update started by GameFrame itself passes /RELAUNCH (src/update_install.rs) and has no
-; wizard to tick the box above, so it starts the app here. A plain silent install
-; leaves the app stopped.
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent; Check: not IsAdmin
+; An update started by GameFrame itself passes /RELAUNCH (src/update_install.rs)
+; and has no wizard to tick the box above, so it starts the app here. A plain
+; silent install leaves the app stopped.
 Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]

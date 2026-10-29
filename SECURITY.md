@@ -37,8 +37,9 @@ GameFrame checks about 20 seconds after it starts (and again when you choose
 ("Install updates automatically at startup") it then installs an available
 update without asking; with "Ask me" it adds a tray item and installs only when
 you choose it. (An elevated instance installs in neither mode, see below.) A
-failed startup check is only logged (except a refused signature, see below). The check and the download use HTTPS through Windows' own WinHTTP, so the system certificate
-store and proxy settings apply:
+failed startup check is only logged (except a refused signature, see below).
+The check and the download use HTTPS through Windows' own WinHTTP, so the
+system certificate store and proxy settings apply:
 
 - The check is a GET of `api.github.com/repos/ranarn/gameframe/releases/latest`.
   A development build (version `0.0.0`) never makes it.
@@ -55,8 +56,9 @@ store and proxy settings apply:
   installer file (`file:GameFrame-Setup-<version>.exe`), and GameFrame requires
   it to match the release it is installing, so a genuinely signed older
   installer cannot be re-published as a newer release (replay or downgrade). A
-  release with no signature, a signature that does not verify, a signature made
-  for another release, or a key mismatch is refused: the download is deleted and
+  release with no signature, a signature file that cannot be downloaded (an
+  HTTP error) or is too large, a signature that does not verify, a signature
+  made for another release, or a key mismatch is refused: the download is deleted and
   nothing runs. There is no unsigned fallback. The refusal is never only in the
   log. A check or install you start in Settings shows why in the update row; an
   automatic install or the startup check shows one tray balloon ("... can't be
@@ -125,7 +127,7 @@ signed release:
    of `gameframe.pub` (the base64 string starting `RW`), commit it, and let it
    reach `main` before running the Release workflow. The workflow refuses to
    publish while the placeholder is in place, and it checks after signing that
-   the signature verifies against that exact constant (or NEXT_PUBLIC_KEY, see below).
+   the signature verifies against that exact constant.
 4. Enable **immutable releases** (Settings -> General -> Releases), so a
    published release and its assets can no longer be replaced. This setting is
    the guarantee: the workflow also refuses to re-upload to a release that is
@@ -135,9 +137,10 @@ signed release:
 ### Rotating the signing key
 
 GameFrame trusts `PUBLIC_KEY` and, when set, `NEXT_PUBLIC_KEY` (both in
-`src/updater.rs`; the second is empty normally). The release workflow accepts a
-signature that verifies against either. A running install only knows the keys of
-its own version, so rotate in two releases:
+`src/updater.rs`; the second is empty normally). The release workflow checks
+the signature against `PUBLIC_KEY` only: a release is always signed with the key
+`PUBLIC_KEY` names. A running install only knows the keys of its own version, so
+rotate in two releases:
 
 1. Generate the new key pair (step 1). Release N: set `NEXT_PUBLIC_KEY` to the
    new public key, keep the old secrets. N is signed with the old key and

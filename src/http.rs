@@ -63,8 +63,10 @@ fn failed(what: &str) -> HttpError {
 pub(crate) enum HttpError {
     /// The server answered with a status other than 200.
     Status(u32),
-    /// Transport failure, timeout, oversized or undecodable body, with a
-    /// short description.
+    /// The body is larger than the caller accepts.
+    TooLarge,
+    /// Transport failure, timeout or undecodable body, with a short
+    /// description.
     Failed(String),
 }
 
@@ -231,7 +233,7 @@ pub(crate) fn get_text(host: &str, path: &str) -> Result<String, HttpError> {
         &mut |chunk| {
             body.extend_from_slice(chunk);
             if body.len() > MAX_BODY_BYTES {
-                return Err(HttpError::Failed("the response is too large".to_string()));
+                return Err(HttpError::TooLarge);
             }
             Ok(())
         },
@@ -296,7 +298,7 @@ pub(crate) fn download(
             &mut |chunk| {
                 written += chunk.len() as u64;
                 if written > max_bytes {
-                    return Err(HttpError::Failed("the download is too large".to_string()));
+                    return Err(HttpError::TooLarge);
                 }
                 dest.write_all(chunk)
                     .map_err(|e| HttpError::Failed(format!("writing the file failed: {e}")))
