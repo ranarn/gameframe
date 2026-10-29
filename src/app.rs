@@ -497,7 +497,7 @@ fn drain_events(
     hotkeys: &Option<Hotkeys>,
     offered_update: &mut Option<UpdateInfo>,
     settings: Option<TickContext>,
-    install_progress: &mut Vec<InstallProgress>,
+    install_progress: &mut Vec<(Option<u64>, InstallProgress)>,
 ) -> Drained {
     let Shared {
         tray,
@@ -515,6 +515,7 @@ fn drain_events(
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
         install_progress.extend(InstallProgress::from_event(&event));
+        // (request id, progress); the id lets Settings tell its own apart.
         handle_update_event(event, tray, config_dir, offered_update);
     }
 
@@ -965,7 +966,7 @@ trait ChildEffects {
     /// Installs `info` on a worker thread, as the tray's own item would; the
     /// outcome reaches the child as [`ParentMsg::Install`] (see
     /// [`route_install_progress`]).
-    fn start_install(&mut self, info: UpdateInfo);
+    fn start_install(&mut self, request: u64, info: UpdateInfo);
     fn notify(&mut self, text: &str);
 }
 
@@ -981,10 +982,18 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
             return Some(ParentMsg::ReapplyDone(effects.reapply_all()));
         }
         ChildMsg::UpToDate => effects.update_event(UpdateEvent::UpToDate),
-        ChildMsg::Install(request) => match request.into_info() {
-            Some(info) => effects.start_install(info),
-            None => return Some(ParentMsg::Install(InstallProgress::NotStarted)),
-        },
+        ChildMsg::Install(request) => {
+            let id = request.id;
+            match request.into_info() {
+                Some(info) => effects.start_install(id, info),
+                None => {
+                    return Some(ParentMsg::Install {
+                        request: Some(id),
+                        progress: InstallProgress::NotStarted,
+                    });
+                }
+            }
+        }
         ChildMsg::Notify(text) => effects.notify(&text),
     }
     None
@@ -1026,9 +1035,9 @@ impl ChildEffects for TrayEffects<'_, '_> {
         );
     }
 
-    fn start_install(&mut self, info: UpdateInfo) {
+    fn start_install(&mut self, request: u64, info: UpdateInfo) {
         // The install belongs to this process: closing Settings never stops it.
-        start_install(info, Failure::Forward);
+        start_install(info, Failure::Forward(request));
     }
 
     fn notify(&mut self, text: &str) {
@@ -1058,12 +1067,12 @@ fn route_install_progress(settings_open: bool, progress: InstallProgress) -> Ins
 
 /// Hands the install progress `drain_events` collected to the Settings child, or
 /// to a box when it is closed.
-fn forward_install_progress(state: &mut LoopState, progress: Vec<InstallProgress>) {
-    for progress in progress {
+fn forward_install_progress(state: &mut LoopState, progress: Vec<(Option<u64>, InstallProgress)>) {
+    for (request, progress) in progress {
         match route_install_progress(state.settings.is_some(), progress) {
             InstallRoute::ToSettings(progress) => {
                 if let Some(process) = state.settings.as_mut() {
-                    process.send(&ParentMsg::Install(progress));
+                    process.send(&ParentMsg::Install { request, progress });
                 }
             }
             // A box blocks, and this is the event loop's thread.
@@ -1164,8 +1173,9 @@ mod tests {
             self.calls
                 .push(format!("update {}", matches!(event, UpdateEvent::UpToDate)));
         }
-        fn start_install(&mut self, info: UpdateInfo) {
-            self.calls.push(format!("install {}", info.version));
+        fn start_install(&mut self, request: u64, info: UpdateInfo) {
+            self.calls
+                .push(format!("install {} #{request}", info.version));
         }
         fn notify(&mut self, text: &str) {
             self.calls.push(format!("notify {text}"));
@@ -1229,21 +1239,24 @@ mod tests {
 
     #[test]
     fn an_install_request_is_run_by_the_tray_process_not_the_child() {
-        let request = crate::settings_link::InstallRequest::new(&sample_update());
+        let request = crate::settings_link::InstallRequest::new(5, &sample_update());
         assert_eq!(
             react(ChildMsg::Install(request)),
-            (None, vec!["install 1.2.3".to_string()])
+            (None, vec!["install 1.2.3 #5".to_string()])
         );
     }
 
     #[test]
     fn an_install_request_with_an_unreadable_version_is_answered_as_not_started() {
-        let mut request = crate::settings_link::InstallRequest::new(&sample_update());
+        let mut request = crate::settings_link::InstallRequest::new(5, &sample_update());
         request.version = "garbage".to_string();
         assert_eq!(
             react(ChildMsg::Install(request)),
             (
-                Some(ParentMsg::Install(InstallProgress::NotStarted)),
+                Some(ParentMsg::Install {
+                    request: Some(5),
+                    progress: InstallProgress::NotStarted
+                }),
                 Vec::new()
             )
         );

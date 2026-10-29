@@ -704,8 +704,37 @@ pub fn recover_on_startup(dir: &Path) {
     recover_own_marker(dir);
     // Markers of Settings / zone editor children that died with the tray
     // process (or that it never got to clean up).
-    for name in child_marker_names(dir) {
+    for name in orphaned_child_markers(dir, is_gameframe_process) {
         recover_named(dir, &name);
+    }
+}
+
+/// The child markers in `dir` whose child has ended, by file name. A marker
+/// whose pid `is_running` as a GameFrame process belongs to a live child (of
+/// another tray, e.g. a second instance still running): restoring the taskbar
+/// under it would desync it. Its tray restores it when the child ends, or the
+/// next startup does.
+fn orphaned_child_markers(dir: &Path, is_running: impl Fn(u32) -> bool) -> Vec<String> {
+    child_marker_names(dir)
+        .into_iter()
+        .filter(|name| {
+            let pid = name
+                .strip_prefix(CHILD_MARKER_PREFIX)
+                .and_then(|rest| rest.strip_suffix(MARKER_EXTENSION))
+                .and_then(|pid| pid.parse::<u32>().ok());
+            !pid.is_some_and(&is_running)
+        })
+        .collect()
+}
+
+/// Whether `pid` is a running GameFrame process (its image has this
+/// executable's file name, which guards against a reused pid). OS-facing.
+fn is_gameframe_process(pid: u32) -> bool {
+    let own = std::env::current_exe().ok();
+    let name = |path: &Path| path.file_name().map(|n| n.to_ascii_lowercase());
+    match (crate::window_filter::process_exe_path(pid), own) {
+        (Some(other), Some(own)) => name(&other) == name(&own),
+        _ => false,
     }
 }
 
@@ -855,6 +884,24 @@ mod tests {
             ]
         );
         assert!(child_marker_names(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn startup_skips_the_marker_of_a_child_that_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        for pid in [7, 12, 40] {
+            std::fs::write(dir.path().join(child_marker_name(pid)), "fully-hidden\n").unwrap();
+        }
+
+        let to_recover = orphaned_child_markers(dir.path(), |pid| pid == 12);
+
+        assert_eq!(
+            to_recover,
+            vec![
+                "taskbar-hidden-child-40.marker".to_string(),
+                "taskbar-hidden-child-7.marker".to_string()
+            ]
+        );
     }
 
     #[test]

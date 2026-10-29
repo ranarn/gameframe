@@ -12,7 +12,7 @@ use crate::settings_ui::TickContext;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -67,10 +67,32 @@ enum Event {
     Eof,
 }
 
+/// Writes the queued lines to the child's stdin on a thread of its own, so a
+/// large message or a child that never reads cannot stall the caller. The
+/// thread ends when the sender is dropped, or when a write fails (the child
+/// is gone, which also unblocks a write stuck on a full pipe). `None` if the
+/// thread could not be created.
+fn spawn_writer(mut stdin: Box<dyn Write + Send>) -> Option<Sender<Vec<u8>>> {
+    let (tx, rx) = channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("settings-link-out".into())
+        .spawn(move || {
+            for line in rx {
+                if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
 /// A running child: the Settings window or the first-run zone editor.
 pub struct SettingsProcess<C: ProcessHandle = Child> {
     child: C,
-    stdin: Option<Box<dyn Write + Send>>,
+    /// Lines for the writer thread (see [`spawn_writer`]); `None` once the
+    /// pipe failed or was closed.
+    stdin: Option<Sender<Vec<u8>>>,
     events: Receiver<Event>,
     reader_done: bool,
     exited: bool,
@@ -183,7 +205,7 @@ impl<C: ProcessHandle> SettingsProcess<C> {
     ) -> Self {
         Self {
             child,
-            stdin,
+            stdin: stdin.and_then(spawn_writer),
             events,
             reader_done: false,
             exited: false,
@@ -203,18 +225,15 @@ impl<C: ProcessHandle> SettingsProcess<C> {
         }
     }
 
-    /// Sends `msg`; a failure (the child is gone) is dropped, `poll` reports
-    /// the exit.
+    /// Queues `msg` for the child; never blocks (the writer thread does the
+    /// pipe write, which stalls while a child does not read). A failure (the
+    /// child is gone) is dropped, `poll` reports the exit.
     pub fn send(&mut self, msg: &ParentMsg) {
-        let Some(stdin) = self.stdin.as_mut() else {
+        let Some(stdin) = self.stdin.as_ref() else {
             return;
         };
         let line = crate::settings_link::encode_line(msg);
-        if stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-            .is_err()
-        {
+        if stdin.send(line.into_bytes()).is_err() {
             self.stdin = None;
         }
     }
@@ -311,7 +330,6 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::mpsc::Sender;
 
     /// A child that exits when told to (or never).
     struct FakeChild {
@@ -454,10 +472,73 @@ mod tests {
 
         assert!(!rig.killed.get());
         assert_eq!(*rig.ended.borrow(), vec![4711]);
-        let sent = String::from_utf8(rig.sent.0.lock().unwrap().clone()).unwrap();
+        // The writer thread delivers it a moment later.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = String::new();
+        while !sent.contains("Close") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            sent = String::from_utf8(rig.sent.0.lock().unwrap().clone()).unwrap();
+        }
         assert!(
             sent.contains("Close"),
             "the child is asked to close first: {sent:?}"
+        );
+    }
+
+    /// A stdin whose pipe is full: every write blocks until released.
+    struct StuckStdin(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Write for StuckStdin {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (released, cv) = &*self.0;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sending_never_blocks_on_a_child_that_does_not_read() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (_to_tray, events) = channel();
+        let mut process = SettingsProcess::from_parts(
+            FakeChild {
+                exit_code: Rc::new(Cell::new(None)),
+                killed: Rc::new(Cell::new(false)),
+                check_fails: Rc::new(Cell::new(false)),
+            },
+            Some(Box::new(StuckStdin(Arc::clone(&gate)))),
+            events,
+            TickContext::Settings,
+            None,
+        );
+        process.close_grace = Duration::from_millis(10);
+        // Releases the pipe after a while, so a blocking `send` shows up as a
+        // slow one instead of hanging the test.
+        let release = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+        });
+
+        let started = Instant::now();
+        for _ in 0..1000 {
+            process.send(&ParentMsg::CursorEnabled(true));
+        }
+        let took = started.elapsed();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        releaser.join().unwrap();
+
+        assert!(
+            took < Duration::from_secs(1),
+            "send blocked on a stdin that never drains: {took:?}"
         );
     }
 
