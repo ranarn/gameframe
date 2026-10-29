@@ -24,8 +24,8 @@ const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(20);
 /// assumes it failed and restores the tray.
 const INSTALLER_QUIT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The event loop's notifier, for installs started outside this module
-/// (Settings, the "Check for Updates Now" box). Set once by [`UpdateEvents::new`].
+/// The event loop's notifier, for events raised outside this module (the
+/// "Check for Updates Now" box). Set once by [`UpdateEvents::new`].
 static NOTIFIER: OnceLock<UpdateNotifier> = OnceLock::new();
 
 /// What a worker thread reports to the event loop about updating.
@@ -42,6 +42,11 @@ pub(crate) enum UpdateEvent {
     InstallFailed,
     /// An automatic install of this version was refused for its signature.
     SignatureRefused(Version),
+    /// An install [`Failure::Forward`]ed to an open Settings window failed;
+    /// the text is for the user. The tray's own handling is [`Self::InstallFailed`].
+    InstallError(String),
+    /// An install [`Failure::Forward`]ed to Settings could not start.
+    InstallNotStarted(SpawnError),
 }
 
 /// Lets worker threads hand an [`UpdateEvent`] to the event loop and wake its
@@ -54,10 +59,8 @@ pub(crate) struct UpdateNotifier {
 
 impl UpdateNotifier {
     /// Queues `event` and wakes the loop. A failed post just delays the event
-    /// to the next message. So does a modal loop on the loop thread (Settings
-    /// or the zone editor): it consumes the wake-up message, and the event
-    /// waits until the next message reaches the main pump (in practice, the
-    /// next tray hover). That is harmless for a startup check.
+    /// to the next message (a modal loop on the loop thread, such as a menu,
+    /// can consume the wake-up). That is harmless for a startup check.
     fn notify(&self, event: UpdateEvent) {
         if self.sender.send(event).is_ok() {
             // SAFETY: plain post to the stored thread id; fails harmlessly if it is gone.
@@ -66,14 +69,10 @@ impl UpdateNotifier {
     }
 }
 
-/// Sends `event` to the event loop. In a Settings child process, which has no
-/// event loop, it goes to the tray process over the link instead; anywhere
-/// else, before the loop exists, it does nothing.
+/// Sends `event` to the event loop; does nothing before the loop exists.
 pub(crate) fn notify(event: UpdateEvent) {
     if let Some(notifier) = NOTIFIER.get() {
         notifier.notify(event);
-    } else {
-        crate::settings_link::report_update(&event);
     }
 }
 
@@ -203,6 +202,8 @@ pub(crate) fn handle_update_event(
                 tray.show_update_item(&info.version.to_string());
             }
         }
+        // For the Settings window, see `crate::app`.
+        UpdateEvent::InstallError(_) | UpdateEvent::InstallNotStarted(_) => {}
     }
 }
 
@@ -213,6 +214,9 @@ pub(crate) enum Failure {
     Report,
     /// Only log: the automatic startup install.
     LogOnly,
+    /// Settings asked for it (#186): the failure, or a refusal to start, goes
+    /// back to its window as an [`UpdateEvent`], and to a box if it is closed.
+    Forward,
 }
 
 /// Starts the install of `info` on a worker thread, see [`spawn_install`].
@@ -229,12 +233,19 @@ pub(crate) fn start_install(info: UpdateInfo, failure: Failure) {
             log!("automatic update to v{version} refused: {e}");
             notify(UpdateEvent::SignatureRefused(version));
         }
+        (Err(e), Failure::Forward) => {
+            notify(UpdateEvent::InstallError(
+                crate::update_install::install_error_message(&e),
+            ));
+        }
         _ => {}
     });
     if let Err(why) = started {
         log!("update install not started: {why:?}");
-        if matches!(failure, Failure::Report) {
-            show_not_started(why);
+        match failure {
+            Failure::Report => show_not_started(why),
+            Failure::Forward => notify(UpdateEvent::InstallNotStarted(why)),
+            Failure::LogOnly => {}
         }
     }
 }
@@ -261,7 +272,7 @@ pub(crate) fn show_not_started(why: SpawnError) {
 /// install stays "in flight" for that whole wait, so no second one starts
 /// while the first installer may still be running. `on_done` gets the result
 /// on the worker thread.
-pub(crate) fn spawn_install(
+fn spawn_install(
     info: UpdateInfo,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), SpawnError> {

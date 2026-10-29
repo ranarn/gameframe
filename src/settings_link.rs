@@ -20,7 +20,7 @@ use crate::cursor_style::Bitmap;
 use crate::hotkeys::BindingReport;
 use crate::settings_ui::TickContext;
 use crate::update_ui::UpdateEvent;
-use crate::updater::Version;
+use crate::updater::{SpawnError, UpdateInfo, Version};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -111,8 +111,13 @@ pub enum ChildMsg {
     ReapplyAll,
     /// The child changed the config file; drop the cached copy.
     ConfigChanged,
-    /// An update check or install progressed (see [`UpdateReport`]).
-    Update(UpdateReport),
+    /// A manual update check found no newer release (the tray hides its
+    /// "Update to" item).
+    UpToDate,
+    /// Install this update. The tray process runs the install, so closing
+    /// Settings can't interrupt it; progress comes back as
+    /// [`ParentMsg::Install`].
+    Install(InstallRequest),
     /// Show this text as a tray notification.
     Notify(String),
 }
@@ -130,44 +135,72 @@ pub enum ParentMsg {
     /// The answer to [`ChildMsg::ReapplyAll`]: one status line per game that
     /// could not be repositioned.
     ReapplyDone(Vec<String>),
+    /// How the install asked for with [`ChildMsg::Install`] is going.
+    Install(InstallProgress),
     /// Close the window (discarding unsaved edits) and exit.
     Close,
 }
 
-/// The [`UpdateEvent`]s a Settings-started update check or install produces,
-/// for the tray process to act on (hide/show the "Update to" item, tooltip).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateReport {
-    UpToDate,
-    InstallStarted(String),
-    InstallerLaunched(String),
-    InstallFailed,
-    SignatureRefused(String),
+/// An [`UpdateInfo`] on the wire. The tray process checks the download host,
+/// the digest and the signature itself, so it trusts nothing in here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallRequest {
+    pub(crate) version: String,
+    download_url: String,
+    sha256: String,
+    signature_url: String,
 }
 
-impl UpdateReport {
-    /// The report for `event`; `None` for events a child never produces.
-    pub(crate) fn from_event(event: &UpdateEvent) -> Option<Self> {
-        Some(match event {
-            UpdateEvent::UpToDate => Self::UpToDate,
-            UpdateEvent::InstallStarted(v) => Self::InstallStarted(v.to_string()),
-            UpdateEvent::InstallerLaunched(v) => Self::InstallerLaunched(v.to_string()),
-            UpdateEvent::InstallFailed => Self::InstallFailed,
-            UpdateEvent::SignatureRefused(v) => Self::SignatureRefused(v.to_string()),
-            UpdateEvent::Checked(_) => return None,
-        })
+impl InstallRequest {
+    pub(crate) fn new(info: &UpdateInfo) -> Self {
+        Self {
+            version: info.version.to_string(),
+            download_url: info.download_url.clone(),
+            sha256: info.sha256.clone(),
+            signature_url: info.signature_url.clone(),
+        }
     }
 
-    /// The event to run in the tray process; `None` for an unparsable version.
-    pub(crate) fn into_event(self) -> Option<UpdateEvent> {
-        let version = |text: &str| Version::parse(text).ok();
-        Some(match self {
-            Self::UpToDate => UpdateEvent::UpToDate,
-            Self::InstallStarted(v) => UpdateEvent::InstallStarted(version(&v)?),
-            Self::InstallerLaunched(v) => UpdateEvent::InstallerLaunched(version(&v)?),
-            Self::InstallFailed => UpdateEvent::InstallFailed,
-            Self::SignatureRefused(v) => UpdateEvent::SignatureRefused(version(&v)?),
+    /// The update to install; `None` for an unparsable version.
+    pub(crate) fn into_info(self) -> Option<UpdateInfo> {
+        Some(UpdateInfo {
+            version: Version::parse(&self.version).ok()?,
+            download_url: self.download_url,
+            sha256: self.sha256,
+            signature_url: self.signature_url,
         })
+    }
+}
+
+/// What the tray process tells Settings about the install it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallProgress {
+    /// The installer was started; it asks GameFrame to quit.
+    Launched,
+    /// The install failed; the text is for the user.
+    Failed(String),
+    /// Not started: another install is running.
+    Busy,
+    /// Not started: the worker thread could not be created, or the request
+    /// was unusable.
+    NotStarted,
+    /// Not started: this instance is elevated and never installs.
+    Elevated,
+}
+
+impl InstallProgress {
+    /// What `event` means for an open Settings window; `None` if nothing.
+    pub(crate) fn from_event(event: &UpdateEvent) -> Option<Self> {
+        match event {
+            UpdateEvent::InstallerLaunched(_) => Some(Self::Launched),
+            UpdateEvent::InstallError(text) => Some(Self::Failed(text.clone())),
+            UpdateEvent::InstallNotStarted(why) => Some(match why {
+                SpawnError::Busy => Self::Busy,
+                SpawnError::ThreadFailed => Self::NotStarted,
+                SpawnError::Elevated => Self::Elevated,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -192,6 +225,8 @@ struct Inbox {
     cursor_enabled: Option<bool>,
     /// The [`ParentMsg::Init`] data, once it has arrived.
     init: Option<(Vec<BindingReport>, Option<Bitmap>)>,
+    /// Install progress not taken yet, oldest first.
+    install: Vec<InstallProgress>,
     /// The last context reported, so only changes are sent.
     last_context: Option<TickContext>,
 }
@@ -205,6 +240,7 @@ impl Inbox {
                 game_cursor,
             } => self.init = Some((hotkey_reports, game_cursor)),
             ParentMsg::CursorEnabled(enabled) => self.cursor_enabled = Some(enabled),
+            ParentMsg::Install(progress) => self.install.push(progress),
             // A stray answer (its request timed out) or `Close`, which the
             // reader thread already turned into `on_close`.
             ParentMsg::ReapplyDone(_) | ParentMsg::Close => {}
@@ -254,6 +290,7 @@ impl ChildLink {
                 rx,
                 cursor_enabled: None,
                 init: None,
+                install: Vec::new(),
                 last_context: None,
             }),
         }
@@ -317,6 +354,28 @@ impl ChildLink {
         inbox.cursor_enabled.take()
     }
 
+    /// Asks the tray process to install `info`. Progress comes back through
+    /// [`Self::take_install_progress`]. Progress of an earlier request that was
+    /// not taken is dropped.
+    pub fn request_install(&self, info: &UpdateInfo) {
+        let mut inbox = self.lock_inbox();
+        while let Ok(msg) = inbox.rx.try_recv() {
+            inbox.file(msg);
+        }
+        inbox.install.clear();
+        drop(inbox);
+        self.send(&ChildMsg::Install(InstallRequest::new(info)));
+    }
+
+    /// The install progress the tray process reported since the last call.
+    pub fn take_install_progress(&self) -> Vec<InstallProgress> {
+        let mut inbox = self.lock_inbox();
+        while let Ok(msg) = inbox.rx.try_recv() {
+            inbox.file(msg);
+        }
+        std::mem::take(&mut inbox.install)
+    }
+
     /// Asks the tray process to live re-apply the saved Zone and waits for its
     /// status lines. Empty if it does not answer in time.
     pub fn request_reapply(&self) -> Vec<String> {
@@ -372,14 +431,29 @@ pub fn config_changed() {
     }
 }
 
-/// Tells the tray process about an update event (no-op without a link, or for
-/// an event a child never reports).
-pub(crate) fn report_update(event: &UpdateEvent) -> bool {
-    let (Some(link), Some(report)) = (link(), UpdateReport::from_event(event)) else {
+/// Tells the tray process a manual update check found no newer release (no-op
+/// without a link).
+pub(crate) fn report_up_to_date() {
+    if let Some(link) = link() {
+        link.send(&ChildMsg::UpToDate);
+    }
+}
+
+/// Asks the tray process to install `info`; `false` without a link (a
+/// standalone child has no tray process to run it).
+pub(crate) fn request_install(info: &UpdateInfo) -> bool {
+    let Some(link) = link() else {
         return false;
     };
-    link.send(&ChildMsg::Update(report));
+    link.request_install(info);
     true
+}
+
+/// The install progress reported since the last call (empty without a link).
+pub(crate) fn take_install_progress() -> Vec<InstallProgress> {
+    link()
+        .map(ChildLink::take_install_progress)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -417,7 +491,7 @@ mod tests {
         to_child.write_all(encode_line(msg).as_bytes()).unwrap();
     }
 
-    fn wait_until(condition: impl Fn() -> bool) {
+    fn wait_until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out");
@@ -483,34 +557,110 @@ mod tests {
         assert_eq!(decode_line::<ChildMsg>(""), None);
     }
 
-    #[test]
-    fn update_reports_round_trip_the_events_a_child_produces() {
-        let version = Version::parse("1.2.3").unwrap();
-        for event in [
-            UpdateEvent::UpToDate,
-            UpdateEvent::InstallStarted(version),
-            UpdateEvent::InstallerLaunched(version),
-            UpdateEvent::InstallFailed,
-            UpdateEvent::SignatureRefused(version),
-        ] {
-            let report = UpdateReport::from_event(&event).expect("reportable");
-            let back = report.into_event().expect("parsable");
-            assert_eq!(
-                std::mem::discriminant(&back),
-                std::mem::discriminant(&event)
-            );
+    fn sample_update() -> UpdateInfo {
+        UpdateInfo {
+            version: Version::parse("1.2.3").unwrap(),
+            download_url: "https://github.com/ranarn/gameframe/releases/download/v1.2.3/Setup.exe"
+                .to_string(),
+            sha256: "ab".repeat(32),
+            signature_url:
+                "https://github.com/ranarn/gameframe/releases/download/v1.2.3/Setup.exe.minisig"
+                    .to_string(),
         }
-        assert!(
-            UpdateReport::from_event(&UpdateEvent::Checked(Ok(
-                crate::updater::CheckOutcome::UpToDate
-            )))
-            .is_none()
+    }
+
+    #[test]
+    fn an_install_request_survives_the_wire_and_a_bad_version_is_refused() {
+        let info = sample_update();
+        let line = encode_line(&ChildMsg::Install(InstallRequest::new(&info)));
+        let Some(ChildMsg::Install(request)) = decode_line::<ChildMsg>(&line) else {
+            panic!("an install request");
+        };
+        assert_eq!(request.into_info(), Some(info));
+
+        let mut bad = InstallRequest::new(&sample_update());
+        bad.version = "garbage".to_string();
+        assert_eq!(bad.into_info(), None);
+    }
+
+    #[test]
+    fn only_install_events_become_progress_for_the_open_settings_window() {
+        let version = Version::parse("1.2.3").unwrap();
+        let progress = |event| InstallProgress::from_event(&event);
+        assert_eq!(
+            progress(UpdateEvent::InstallerLaunched(version)),
+            Some(InstallProgress::Launched)
         );
-        assert!(
-            UpdateReport::InstallStarted("garbage".into())
-                .into_event()
-                .is_none()
+        assert_eq!(
+            progress(UpdateEvent::InstallError("disk full".into())),
+            Some(InstallProgress::Failed("disk full".into()))
         );
+        assert_eq!(
+            progress(UpdateEvent::InstallNotStarted(SpawnError::Busy)),
+            Some(InstallProgress::Busy)
+        );
+        assert_eq!(
+            progress(UpdateEvent::InstallNotStarted(SpawnError::ThreadFailed)),
+            Some(InstallProgress::NotStarted)
+        );
+        assert_eq!(
+            progress(UpdateEvent::InstallNotStarted(SpawnError::Elevated)),
+            Some(InstallProgress::Elevated)
+        );
+        // Progress that needs no window of its own.
+        assert_eq!(progress(UpdateEvent::InstallStarted(version)), None);
+        assert_eq!(progress(UpdateEvent::InstallFailed), None);
+        assert_eq!(progress(UpdateEvent::UpToDate), None);
+    }
+
+    #[test]
+    fn an_install_request_goes_to_the_tray_process_and_its_progress_comes_back() {
+        let (link, mut to_child, mut from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        assert_eq!(
+            read_msg(&mut from_child),
+            ChildMsg::Install(InstallRequest::new(&sample_update()))
+        );
+
+        write_msg(
+            &mut to_child,
+            &ParentMsg::Install(InstallProgress::Launched),
+        );
+        write_msg(
+            &mut to_child,
+            &ParentMsg::Install(InstallProgress::Failed("no".into())),
+        );
+        let mut seen = Vec::new();
+        wait_until(|| {
+            seen.extend(link.take_install_progress());
+            seen.len() == 2
+        });
+        assert_eq!(
+            seen,
+            vec![
+                InstallProgress::Launched,
+                InstallProgress::Failed("no".into())
+            ]
+        );
+        assert!(link.take_install_progress().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn a_new_install_request_drops_progress_left_over_from_the_last_one() {
+        let (link, mut to_child, _from_child, _closed) = linked_pair();
+        write_msg(&mut to_child, &ParentMsg::Install(InstallProgress::Busy));
+        // The stale line is read by the link before the new request clears it.
+        wait_until(|| {
+            let mut inbox = link.lock_inbox();
+            while let Ok(msg) = inbox.rx.try_recv() {
+                inbox.file(msg);
+            }
+            !inbox.install.is_empty()
+        });
+
+        link.request_install(&sample_update());
+
+        assert!(link.take_install_progress().is_empty());
     }
 
     #[test]

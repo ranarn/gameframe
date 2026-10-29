@@ -232,7 +232,10 @@ impl<C: ProcessHandle> SettingsProcess<C> {
                     exit_code = code;
                 }
                 Err(e) => {
-                    log!("couldn't check the settings process: {e}");
+                    // Not known to be gone: end it, or it would run on orphaned
+                    // while the tray process undoes its effects underneath it.
+                    log!("couldn't check the settings process: {e}; ending it");
+                    self.child.kill();
                     self.end();
                 }
             }
@@ -277,10 +280,11 @@ impl<C: ProcessHandle> SettingsProcess<C> {
         let deadline = Instant::now() + self.close_grace;
         while Instant::now() < deadline {
             match self.child.try_exit() {
-                Ok(Some(_)) | Err(_) => {
+                Ok(Some(_)) => {
                     self.end();
                     return;
                 }
+                Err(_) => break,
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             }
         }
@@ -312,6 +316,8 @@ mod tests {
     struct FakeChild {
         exit_code: Rc<Cell<Option<i32>>>,
         killed: Rc<Cell<bool>>,
+        /// Makes the status check itself fail.
+        check_fails: Rc<Cell<bool>>,
     }
 
     impl ProcessHandle for FakeChild {
@@ -319,6 +325,9 @@ mod tests {
             4711
         }
         fn try_exit(&mut self) -> std::io::Result<Option<Option<i32>>> {
+            if self.check_fails.get() {
+                return Err(std::io::Error::other("no status"));
+            }
             Ok(self.exit_code.get().map(Some))
         }
         fn kill(&mut self) {
@@ -346,6 +355,7 @@ mod tests {
         process: SettingsProcess<FakeChild>,
         exit_code: Rc<Cell<Option<i32>>>,
         killed: Rc<Cell<bool>>,
+        check_fails: Rc<Cell<bool>>,
         to_tray: Sender<Event>,
         sent: Sent,
         ended: Rc<RefCell<Vec<u32>>>,
@@ -354,6 +364,7 @@ mod tests {
     fn rig() -> Rig {
         let exit_code = Rc::new(Cell::new(None));
         let killed = Rc::new(Cell::new(false));
+        let check_fails = Rc::new(Cell::new(false));
         let (to_tray, events) = channel();
         let sent = Sent::default();
         let ended = Rc::new(RefCell::new(Vec::new()));
@@ -361,6 +372,7 @@ mod tests {
             FakeChild {
                 exit_code: Rc::clone(&exit_code),
                 killed: Rc::clone(&killed),
+                check_fails: Rc::clone(&check_fails),
             },
             Some(Box::new(sent.clone())),
             events,
@@ -374,6 +386,7 @@ mod tests {
             process,
             exit_code,
             killed,
+            check_fails,
             to_tray,
             sent,
             ended,
@@ -474,6 +487,18 @@ mod tests {
 
         assert!(killed.get());
         assert_eq!(*ended.borrow(), vec![4711]);
+    }
+
+    #[test]
+    fn a_child_whose_status_cannot_be_read_is_ended_so_it_cannot_run_on_orphaned() {
+        let mut rig = rig();
+        rig.check_fails.set(true);
+
+        let polled = rig.process.poll();
+
+        assert!(polled.exited);
+        assert!(rig.killed.get());
+        assert_eq!(*rig.ended.borrow(), vec![4711]);
     }
 
     #[test]

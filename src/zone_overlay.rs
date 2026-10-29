@@ -56,6 +56,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_SYSMENU, WS_THICKFRAME,
 };
 
+/// The title of the zone editor's window (also what the hang watchdog of the
+/// zone-editor child process finds it by).
+pub(crate) const ZONE_EDITOR_TITLE: &str = "GameFrame zone editor";
+
 /// Drawn size of a resize handle square, in egui points (scales with DPI, so
 /// it stays usable at 100-200 %).
 const HANDLE_DRAW_PT: f32 = 28.0;
@@ -144,7 +148,7 @@ pub fn run_zone_editor_overlay(
     let native_options = native_options(&monitor_geometry, scale);
 
     let run_result = eframe::run_native(
-        "GameFrame zone editor",
+        ZONE_EDITOR_TITLE,
         native_options,
         Box::new(move |cc| {
             // The GPU path the overlay got, for tester logs. egui-wgpu logs
@@ -297,7 +301,7 @@ fn native_options(monitor: &MonitorGeometry, scale: f32) -> eframe::NativeOption
             ..Default::default()
         },
         viewport: egui::ViewportBuilder::default()
-            .with_title("GameFrame zone editor")
+            .with_title(ZONE_EDITOR_TITLE)
             .with_position([
                 pixels_to_points(monitor.x, scale),
                 pixels_to_points(monitor.y, scale),

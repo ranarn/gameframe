@@ -510,8 +510,11 @@ fn config_lock_name(config_dir: &Path) -> String {
 /// Takes the cross-process write lock of `config_dir`'s config. A holder that
 /// does not let go within [`CONFIG_LOCK_TIMEOUT`] is ignored (logged), so a
 /// stuck process can never freeze this one's saves.
-fn lock_config_file(config_dir: &Path) -> Option<crate::named_mutex::NamedMutexGuard> {
-    let guard = crate::named_mutex::lock(&config_lock_name(config_dir), CONFIG_LOCK_TIMEOUT);
+fn lock_config_file(
+    config_dir: &Path,
+    timeout: std::time::Duration,
+) -> Option<crate::named_mutex::NamedMutexGuard> {
+    let guard = crate::named_mutex::lock(&config_lock_name(config_dir), timeout);
     if guard.is_none() {
         log!("another GameFrame process held the config lock too long; writing anyway");
     }
@@ -519,6 +522,14 @@ fn lock_config_file(config_dir: &Path) -> Option<crate::named_mutex::NamedMutexG
 }
 
 pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError> {
+    // One writer at a time across processes.
+    let _write = lock_config_file(config_dir, CONFIG_LOCK_TIMEOUT);
+    save_locked(config_dir, config)
+}
+
+/// [`save`] for a caller that already took (or gave up on) the config lock, so
+/// a stuck holder is waited for once per write, not once per step of it.
+fn save_locked(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError> {
     std::fs::create_dir_all(config_dir).map_err(ProfileStoreError::Io)?;
 
     let contents = toml::to_string_pretty(config).map_err(ProfileStoreError::Serialize)?;
@@ -529,9 +540,6 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
     let final_path = config_dir.join(CONFIG_FILE_NAME);
     let temp_path = config_dir.join(temp_file_name());
 
-    // One writer at a time across processes (the lock is re-entrant, so
-    // `update` can hold it around its save).
-    let _write = lock_config_file(config_dir);
     let result = std::fs::write(&temp_path, contents)
         .and_then(|()| std::fs::rename(&temp_path, &final_path));
     if let Err(e) = result {
@@ -566,14 +574,25 @@ pub fn update<R>(
     config_dir: &Path,
     change: impl FnOnce(&mut Config) -> R,
 ) -> Result<R, ProfileStoreError> {
+    update_within(config_dir, CONFIG_LOCK_TIMEOUT, change)
+}
+
+/// [`update`] with its own wait for the cross-process lock. The lock is taken
+/// once for the whole read-modify-write.
+fn update_within<R>(
+    config_dir: &Path,
+    lock_timeout: std::time::Duration,
+    change: impl FnOnce(&mut Config) -> R,
+) -> Result<R, ProfileStoreError> {
     let _write = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _other_processes = lock_config_file(config_dir);
+    let _other_processes = lock_config_file(config_dir, lock_timeout);
     forget_cached(config_dir);
     let mut config = load(config_dir)?;
     let result = change(&mut config);
-    save(config_dir, &config)?;
+    save_locked(config_dir, &config)?;
     Ok(result)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +667,40 @@ mod tests {
         assert_ne!(a, config_lock_name(Path::new("C:\\b\\GameFrame")));
         assert!(a.starts_with("Local\\"));
     }
+
+    #[test]
+    fn an_update_waits_for_a_stuck_lock_holder_once_not_twice() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+
+        // Another thread (standing in for a stuck process) holds the lock.
+        let name = config_lock_name(&config_dir);
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = crate::named_mutex::lock(&name, Duration::ZERO).expect("free");
+            held_tx.send(()).unwrap();
+            let _ = hold.recv();
+        });
+        held.recv().unwrap();
+
+        let timeout = Duration::from_millis(400);
+        let started = Instant::now();
+        update_within(&config_dir, timeout, |config| config.log_ui_hangs = true).unwrap();
+        let waited = started.elapsed();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        assert!(waited >= timeout, "it did wait for the holder");
+        assert!(
+            waited < timeout * 2 - Duration::from_millis(100),
+            "{waited:?}"
+        );
+        assert!(load_from_disk(&config_dir).unwrap().log_ui_hangs);
+    }
+
     #[test]
     fn update_applies_the_closure_to_the_stored_config_and_persists_it() {
         let dir = tempfile::tempdir().unwrap();

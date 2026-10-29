@@ -247,9 +247,9 @@ pub fn drain() -> Vec<Command> {
         .collect()
 }
 
-/// Whether a `Quit` is waiting in the queue. The main loop checks this after
-/// Settings returns, since a `Quit` received while Settings was open arrives
-/// in the queue without any further message to wake the loop.
+/// Whether a `Quit` is waiting in the queue. The main loop checks this before
+/// it starts pumping, since a `Quit` that arrived earlier (during the first-run
+/// zone prompt) is in the queue without any further message to wake the loop.
 ///
 /// In a Settings or zone-editor child process there is no queue; the tray
 /// process asks it to close instead, and [`request_close`] makes this `true`.
@@ -540,13 +540,32 @@ pub fn should_restore_on_end_session(wparam: usize) -> bool {
 /// The open Settings window (owned by the process given to
 /// [`enter_settings`], or this one when none was), if it exists yet.
 pub(crate) fn find_settings_window() -> Option<HWND> {
-    let title = encode_wide(SETTINGS_TITLE);
+    let pid = match SETTINGS_PID.load(Ordering::SeqCst) {
+        0 => current_pid(),
+        pid => pid,
+    };
+    find_window_of(SETTINGS_TITLE, pid)
+}
+
+/// In a Settings or zone-editor child: this process's own window (Settings or
+/// the zone editor), if it exists yet. Lets [`crate::watchdog`] ping the
+/// child's main thread.
+pub(crate) fn find_own_ui_window() -> Option<HWND> {
+    let pid = current_pid();
+    find_window_of(SETTINGS_TITLE, pid)
+        .or_else(|| find_window_of(crate::zone_overlay::ZONE_EDITOR_TITLE, pid))
+}
+
+fn current_pid() -> u32 {
+    // SAFETY: no arguments or preconditions.
+    unsafe { GetCurrentProcessId() }
+}
+
+/// The top-level window titled `title` that belongs to process `pid`.
+fn find_window_of(title: &str, pid: u32) -> Option<HWND> {
+    let title = encode_wide(title);
     // SAFETY: plain Win32 calls; `title` outlives them.
     unsafe {
-        let pid = match SETTINGS_PID.load(Ordering::SeqCst) {
-            0 => GetCurrentProcessId(),
-            pid => pid,
-        };
         let mut prev: HWND = std::ptr::null_mut();
         loop {
             let hwnd = FindWindowExW(std::ptr::null_mut(), prev, std::ptr::null(), title.as_ptr());
@@ -563,7 +582,8 @@ pub(crate) fn find_settings_window() -> Option<HWND> {
     }
 }
 
-/// Brings this process's Settings window to the front. `false` if not found.
+/// Brings the open Settings window (the child process's, see
+/// [`enter_settings`]) to the front. `false` if not found.
 pub fn focus_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;
@@ -603,9 +623,8 @@ pub fn command_window() -> Option<HWND> {
     }
 }
 
-/// Asks this process's Settings window to close, as its close button would
-/// (the Settings loop then returns and discards unsaved edits). `false` if not
-/// found.
+/// Asks the open Settings window (the child process's) to close, as its close
+/// button would (unsaved edits are discarded). `false` if not found.
 fn close_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;

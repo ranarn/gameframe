@@ -27,6 +27,7 @@ use crate::profile_store::{
     UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
+use crate::settings_link::InstallProgress;
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
 use crate::zone_editor::pixels_to_points;
@@ -1155,7 +1156,8 @@ pub fn run_settings_window(
                 // Even after a failed write the tray process must not trust
                 // its cached copy.
                 crate::settings_link::config_changed();
-                saved?; // Only touch the registry on an actual change, so saving
+                saved?;
+                // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).
                 if start_with_windows != started_with_windows {
@@ -1360,20 +1362,21 @@ enum UpdateCheck {
 /// Progress of installing the update an `UpdateCheck` found.
 enum UpdateInstall {
     Idle,
-    /// Running on a worker thread, which sends the result here.
-    Running(std::sync::mpsc::Receiver<Result<(), UpdateError>>),
+    /// Asked for; the tray process downloads and verifies it and reports back
+    /// (see [`crate::settings_link::InstallProgress`]).
+    Running,
     /// The installer was started (at this time); it asks GameFrame to quit.
     Started(Instant),
     /// The installer was started but GameFrame wasn't quit within
     /// [`INSTALL_QUIT_TIMEOUT`].
     TimedOut,
-    Failed(UpdateError),
+    /// Failed; the text is the message for the user.
+    Failed(String),
     /// Not started: another install was already running.
     Busy,
-    /// Not started: the worker thread could not be created.
+    /// Not started: the worker thread could not be created, or there is no
+    /// tray process to ask.
     NotStarted,
-    /// The worker ended without sending a result.
-    Lost,
 }
 
 /// How long Settings waits, after the installer started, for it to quit
@@ -1381,6 +1384,24 @@ enum UpdateInstall {
 const INSTALL_QUIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl UpdateInstall {
+    /// Applies what the tray process reported about the install that is
+    /// `Running`; progress that arrives in any other state (an install the tray
+    /// item started) is not this window's business.
+    fn apply(&mut self, progress: InstallProgress, now: Instant) {
+        if !matches!(self, Self::Running) {
+            return;
+        }
+        *self = match progress {
+            InstallProgress::Launched => Self::Started(now),
+            InstallProgress::Failed(text) => Self::Failed(text),
+            InstallProgress::Busy => Self::Busy,
+            InstallProgress::NotStarted => Self::NotStarted,
+            InstallProgress::Elevated => Self::Failed(
+                crate::update_install::install_error_message(&UpdateError::ElevatedInstance),
+            ),
+        };
+    }
+
     /// Moves `Started` to `TimedOut` once [`INSTALL_QUIT_TIMEOUT`] has passed
     /// between its start and `now`.
     fn expire(&mut self, now: Instant) {
@@ -1776,7 +1797,7 @@ impl SettingsApp<'_> {
             // A new check while an install runs would drop the install's result.
             let installing = matches!(
                 self.update_install,
-                UpdateInstall::Running(_) | UpdateInstall::Started(_)
+                UpdateInstall::Running | UpdateInstall::Started(_)
             );
             let enabled = !installing && !matches!(self.update_check, UpdateCheck::Running(_));
             if ui
@@ -1787,7 +1808,7 @@ impl SettingsApp<'_> {
                 let ctx = ui.ctx().clone();
                 let started = crate::updater::spawn_check(move |result| {
                     if matches!(result, Ok(CheckOutcome::UpToDate)) {
-                        crate::update_ui::notify(crate::update_ui::UpdateEvent::UpToDate);
+                        crate::settings_link::report_up_to_date();
                     }
                     let _ = sender.send(result);
                     ctx.request_repaint();
@@ -1831,57 +1852,40 @@ impl SettingsApp<'_> {
         }
     }
 
-    /// Renders the "Install update" button and its status line. The install
-    /// runs on a worker thread that wakes the UI when it has a result; on
-    /// success the installer quits GameFrame (closing this window) and starts
-    /// it again.
+    /// Renders the "Install update" button and its status line. The tray
+    /// process runs the install and reports its progress; on success the
+    /// installer quits GameFrame (closing this window) and starts it again.
     fn update_install_row(&mut self, ui: &mut egui::Ui, info: UpdateInfo) {
         self.update_install.expire(Instant::now());
-        if matches!(self.update_install, UpdateInstall::Started(_)) {
+        if matches!(self.update_install, UpdateInstall::Running) {
+            // The progress arrives through the link, which wakes nothing.
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        } else if matches!(self.update_install, UpdateInstall::Started(_)) {
             // Nothing else wakes the UI if the installer never quits GameFrame.
             ui.ctx().request_repaint_after(Duration::from_secs(5));
         }
-        if let UpdateInstall::Running(receiver) = &self.update_install {
-            match receiver.try_recv() {
-                Ok(Ok(())) => {
-                    self.update_install = UpdateInstall::Started(Instant::now());
-                }
-                Ok(Err(e)) => self.update_install = UpdateInstall::Failed(e),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.update_install = UpdateInstall::Lost;
-                }
-            }
+        for progress in crate::settings_link::take_install_progress() {
+            self.update_install.apply(progress, Instant::now());
         }
 
         let busy = matches!(
             self.update_install,
-            UpdateInstall::Running(_) | UpdateInstall::Started(_)
+            UpdateInstall::Running | UpdateInstall::Started(_)
         );
         let label = format!("Install v{}", info.version);
         if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let ctx = ui.ctx().clone();
-            let started = crate::update_ui::spawn_install(info, move |result| {
-                // With the window gone nobody reads the channel; a failure is
-                // then shown in a box so it is never only in the log.
-                if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
-                    crate::message_box::show_warning_box(
-                        &crate::update_install::install_error_message(&e),
-                    );
-                }
-                ctx.request_repaint();
-            });
-            self.update_install = match started {
-                Ok(()) => UpdateInstall::Running(receiver),
-                Err(SpawnError::Busy) => UpdateInstall::Busy,
-                Err(SpawnError::ThreadFailed) => UpdateInstall::NotStarted,
-                Err(SpawnError::Elevated) => UpdateInstall::Failed(UpdateError::ElevatedInstance),
+            // The tray process runs the install, so closing this window never
+            // interrupts it; its progress arrives through the link. Without a
+            // tray process (a standalone debug child) there is nothing to ask.
+            self.update_install = if crate::settings_link::request_install(&info) {
+                UpdateInstall::Running
+            } else {
+                UpdateInstall::NotStarted
             };
         }
         match &self.update_install {
             UpdateInstall::Idle => {}
-            UpdateInstall::Running(_) => {
+            UpdateInstall::Running => {
                 ui.spinner();
                 ui.label("Downloading the update...");
             }
@@ -1894,11 +1898,8 @@ impl SettingsApp<'_> {
                     "The installer didn't finish. Try installing again.",
                 );
             }
-            UpdateInstall::Failed(e) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    crate::update_install::install_error_message(e),
-                );
+            UpdateInstall::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
             }
             UpdateInstall::Busy => {
                 ui.label("An update is already being installed.");
@@ -1907,12 +1908,6 @@ impl SettingsApp<'_> {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     "Couldn't start the update install.",
-                );
-            }
-            UpdateInstall::Lost => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    "Installing the update failed: it ended unexpectedly",
                 );
             }
         }
@@ -2192,6 +2187,44 @@ mod tests {
 
         state.expire(start + INSTALL_QUIT_TIMEOUT);
         assert!(matches!(state, UpdateInstall::TimedOut));
+    }
+
+    #[test]
+    fn the_tray_processs_progress_moves_a_running_install_on() {
+        let now = Instant::now();
+        let progress = |p| {
+            let mut state = UpdateInstall::Running;
+            state.apply(p, now);
+            state
+        };
+        assert!(matches!(
+            progress(InstallProgress::Launched),
+            UpdateInstall::Started(at) if at == now
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Failed("disk full".into())),
+            UpdateInstall::Failed(text) if text == "disk full"
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Busy),
+            UpdateInstall::Busy
+        ));
+        assert!(matches!(
+            progress(InstallProgress::NotStarted),
+            UpdateInstall::NotStarted
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Elevated),
+            UpdateInstall::Failed(text) if text.contains("as administrator")
+        ));
+    }
+
+    #[test]
+    fn progress_of_an_install_this_window_did_not_ask_for_is_ignored() {
+        // E.g. the tray item started one; Settings is idle.
+        let mut state = UpdateInstall::Idle;
+        state.apply(InstallProgress::Launched, Instant::now());
+        assert!(matches!(state, UpdateInstall::Idle));
     }
 
     #[test]

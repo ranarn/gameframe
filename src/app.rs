@@ -56,7 +56,7 @@ use crate::message_box::show_message_box;
 use crate::placement::{self, Outcome, Trigger};
 use crate::profile_store;
 use crate::settings_host::SettingsProcess;
-use crate::settings_link::{ChildKind, ChildMsg, EXIT_ZONE_SAVED, ParentMsg};
+use crate::settings_link::{ChildKind, ChildMsg, EXIT_ZONE_SAVED, InstallProgress, ParentMsg};
 use crate::settings_ui::{self, TickContext};
 use crate::taskbar;
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
@@ -409,12 +409,15 @@ fn run_event_loop(
         // Tray, hotkey and update events.
         loop {
             let settings_context = state.settings.as_ref().map(|s| s.context);
+            let mut install_progress = Vec::new();
             let drained = drain_events(
                 &ctx,
                 &state.hotkeys,
                 &mut state.offered_update,
                 settings_context,
+                &mut install_progress,
             );
+            forward_install_progress(&mut state, install_progress);
             if drained.exit {
                 return;
             }
@@ -486,12 +489,15 @@ struct Drained {
 /// Stops early on an exit request, or on a Settings click while it is closed
 /// (events queued behind it stay in their channels for the next call). With
 /// Settings open, that click focuses the window instead. While the zone editor
-/// is open only the game-cursor hotkey runs (see [`hotkey_allowed`]).
+/// is open only the game-cursor hotkey runs (see [`hotkey_allowed`]). The
+/// progress of installs Settings asked for is appended to `install_progress`,
+/// for [`forward_install_progress`].
 fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
     offered_update: &mut Option<UpdateInfo>,
     settings: Option<TickContext>,
+    install_progress: &mut Vec<InstallProgress>,
 ) -> Drained {
     let Shared {
         tray,
@@ -508,6 +514,7 @@ fn drain_events(
     // Results of the startup update check and of installs started from
     // the tray (posted by worker threads, which wake this pump).
     while let Some(event) = updates.try_recv() {
+        install_progress.extend(InstallProgress::from_event(&event));
         handle_update_event(event, tray, config_dir, offered_update);
     }
 
@@ -953,6 +960,10 @@ trait ChildEffects {
     /// one status line per game that could not be repositioned.
     fn reapply_all(&mut self) -> Vec<String>;
     fn update_event(&mut self, event: UpdateEvent);
+    /// Installs `info` on a worker thread, as the tray's own item would; the
+    /// outcome reaches the child as [`ParentMsg::Install`] (see
+    /// [`route_install_progress`]).
+    fn start_install(&mut self, info: UpdateInfo);
     fn notify(&mut self, text: &str);
 }
 
@@ -967,11 +978,11 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
             effects.forget_config();
             return Some(ParentMsg::ReapplyDone(effects.reapply_all()));
         }
-        ChildMsg::Update(report) => {
-            if let Some(event) = report.into_event() {
-                effects.update_event(event);
-            }
-        }
+        ChildMsg::UpToDate => effects.update_event(UpdateEvent::UpToDate),
+        ChildMsg::Install(request) => match request.into_info() {
+            Some(info) => effects.start_install(info),
+            None => return Some(ParentMsg::Install(InstallProgress::NotStarted)),
+        },
         ChildMsg::Notify(text) => effects.notify(&text),
     }
     None
@@ -1013,10 +1024,55 @@ impl ChildEffects for TrayEffects<'_, '_> {
         );
     }
 
+    fn start_install(&mut self, info: UpdateInfo) {
+        // The install belongs to this process: closing Settings never stops it.
+        start_install(info, Failure::Forward);
+    }
+
     fn notify(&mut self, text: &str) {
         self.ctx.tray.notify(text);
     }
 }
+
+/// Where install progress goes, see [`route_install_progress`].
+#[derive(Debug, PartialEq, Eq)]
+enum InstallRoute {
+    ToSettings(InstallProgress),
+    /// Tell the user in a box.
+    Box(String),
+    Drop,
+}
+
+/// Decides where one piece of install progress goes. An open Settings window
+/// shows it in its status line. Without one, only a failure matters: it is
+/// shown in a box, so a failed install is never only in the log.
+fn route_install_progress(settings_open: bool, progress: InstallProgress) -> InstallRoute {
+    match progress {
+        _ if settings_open => InstallRoute::ToSettings(progress),
+        InstallProgress::Failed(text) => InstallRoute::Box(text),
+        _ => InstallRoute::Drop,
+    }
+}
+
+/// Hands the install progress `drain_events` collected to the Settings child, or
+/// to a box when it is closed.
+fn forward_install_progress(state: &mut LoopState, progress: Vec<InstallProgress>) {
+    for progress in progress {
+        match route_install_progress(state.settings.is_some(), progress) {
+            InstallRoute::ToSettings(progress) => {
+                if let Some(process) = state.settings.as_mut() {
+                    process.send(&ParentMsg::Install(progress));
+                }
+            }
+            // A box blocks, and this is the event loop's thread.
+            InstallRoute::Box(text) => {
+                std::thread::spawn(move || crate::message_box::show_warning_box(&text));
+            }
+            InstallRoute::Drop => {}
+        }
+    }
+}
+
 /// Applies what Settings may have changed, once its window has closed.
 fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
@@ -1106,6 +1162,9 @@ mod tests {
             self.calls
                 .push(format!("update {}", matches!(event, UpdateEvent::UpToDate)));
         }
+        fn start_install(&mut self, info: UpdateInfo) {
+            self.calls.push(format!("install {}", info.version));
+        }
         fn notify(&mut self, text: &str) {
             self.calls.push(format!("notify {text}"));
         }
@@ -1148,9 +1207,7 @@ mod tests {
             (None, vec!["context SettingsCapturing".to_string()])
         );
         assert_eq!(
-            react(ChildMsg::Update(
-                crate::settings_link::UpdateReport::UpToDate
-            )),
+            react(ChildMsg::UpToDate),
             (None, vec!["update true".to_string()])
         );
         assert_eq!(
@@ -1159,11 +1216,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_update_report_with_an_unreadable_version_is_dropped() {
-        let report = crate::settings_link::UpdateReport::InstallStarted("garbage".into());
-        assert_eq!(react(ChildMsg::Update(report)), (None, Vec::new()));
+    fn sample_update() -> UpdateInfo {
+        UpdateInfo {
+            version: crate::updater::Version::parse("1.2.3").unwrap(),
+            download_url: "https://github.com/x/y/Setup.exe".to_string(),
+            sha256: "ab".repeat(32),
+            signature_url: "https://github.com/x/y/Setup.exe.minisig".to_string(),
+        }
     }
+
+    #[test]
+    fn an_install_request_is_run_by_the_tray_process_not_the_child() {
+        let request = crate::settings_link::InstallRequest::new(&sample_update());
+        assert_eq!(
+            react(ChildMsg::Install(request)),
+            (None, vec!["install 1.2.3".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_install_request_with_an_unreadable_version_is_answered_as_not_started() {
+        let mut request = crate::settings_link::InstallRequest::new(&sample_update());
+        request.version = "garbage".to_string();
+        assert_eq!(
+            react(ChildMsg::Install(request)),
+            (
+                Some(ParentMsg::Install(InstallProgress::NotStarted)),
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn install_progress_goes_to_an_open_settings_window_and_a_failure_to_a_box_without_one() {
+        let failed = InstallProgress::Failed("disk full".into());
+        let busy = InstallProgress::Busy;
+        assert_eq!(
+            route_install_progress(true, failed.clone()),
+            InstallRoute::ToSettings(failed.clone())
+        );
+        assert_eq!(
+            route_install_progress(true, busy.clone()),
+            InstallRoute::ToSettings(busy.clone())
+        );
+        assert_eq!(
+            route_install_progress(false, failed),
+            InstallRoute::Box("disk full".to_string())
+        );
+        assert_eq!(route_install_progress(false, busy), InstallRoute::Drop);
+        assert_eq!(
+            route_install_progress(false, InstallProgress::Launched),
+            InstallRoute::Drop
+        );
+    }
+
     #[test]
     fn zone_editor_tick_allows_only_the_cursor_hotkey() {
         use HotkeyAction::*;

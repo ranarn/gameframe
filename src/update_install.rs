@@ -49,8 +49,10 @@ const INSTALLER_ARGS: [&str; 4] = [
 ];
 
 /// The named mutex held for the whole of an install started by
-/// [`spawn_install`], by the tray process and the Settings child alike (#186):
-/// a second install, from either process, finds it taken and reports `Busy`.
+/// [`spawn_install`]: a second install finds it taken and reports `Busy`. Only
+/// the tray process installs (a Settings child asks it to, #186); it is a
+/// named mutex because two tray processes can briefly overlap (an elevated
+/// relaunch).
 const INSTALL_LOCK_NAME: &str =
     "Local\\GameFrame-update-install-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
@@ -202,8 +204,8 @@ fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
 /// when `on_done` returns, so `on_done` can wait for the installer to quit this
 /// instance (which then starts it again) without a second install starting
 /// meanwhile. If the installer fails, this instance keeps running. Starts
-/// nothing while an earlier install is still running, in this process or in the
-/// other GameFrame process (tray and Settings child): `Busy`.
+/// nothing while an earlier install is still running, in this process or in
+/// another GameFrame process: `Busy`.
 pub(crate) fn spawn_install(
     info: UpdateInfo,
     on_start: impl FnOnce() + Send + 'static,
@@ -255,10 +257,16 @@ fn spawn_guarded(
         })?;
     match taken_rx.recv() {
         Ok(true) => Ok(()),
-        Ok(false) => Err(SpawnError::Busy),
+        Ok(false) => {
+            // Normally another install of this user. If it never clears, something
+            // else holds the name: say so rather than block updates silently.
+            log!("update install: the install lock is held by another install or process");
+            Err(SpawnError::Busy)
+        }
         Err(_) => Err(SpawnError::ThreadFailed),
     }
 }
+
 /// Deletes the update folders in `root` except those of the process `own_pid`,
 /// whose install may be writing to its folder right now, and returns how many
 /// could not be deleted (a running installer holds its file open).

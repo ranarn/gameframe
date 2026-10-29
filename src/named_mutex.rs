@@ -7,33 +7,248 @@
 //! that exits or dies leaves the mutex abandoned; the next waiter simply gets it.
 //! Creating the mutex failing is not fatal: the guard then holds nothing
 //! (failing open beats blocking the work).
+//!
+//! Squatting: any process of the session can create a `Local\` name first and
+//! hold it, which would block updates or stall config writes for good. So the
+//! mutex is created with a security descriptor that gives access to the current
+//! user's SID only and a medium mandatory integrity label with no read/write/
+//! execute up, which keeps lower-integrity processes (a sandboxed one) from
+//! opening it. If the name already exists, the object must carry at least that
+//! label, else it was pre-created by a lower-integrity process: it is ignored
+//! (logged) and the guard holds nothing. A same-user, same-integrity process is
+//! out of scope: it can write `config.toml` and run the installer itself.
 
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, SetLastError,
+    WAIT_ABANDONED, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{
+    GetAce, GetKernelObjectSecurity, GetSecurityDescriptorSacl, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
+};
+
+/// The integrity level "medium" (`SECURITY_MANDATORY_MEDIUM_RID`) a mutex of
+/// ours is labelled with; an object without a label counts as this too.
+const MEDIUM_RID: u32 = 0x2000;
+
+/// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`.
+const MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 
 /// Holds a named mutex until dropped. Not `Send`: see the module docs.
 #[must_use]
 pub struct NamedMutexGuard {
-    /// Null when the mutex could not be created (nothing to release).
+    /// Null when the mutex could not be created or was not trusted (nothing to
+    /// release).
     handle: HANDLE,
     held: bool,
 }
 
+impl NamedMutexGuard {
+    /// A guard that holds nothing: the work goes ahead unlocked.
+    fn unlocked() -> Self {
+        Self {
+            handle: std::ptr::null_mut(),
+            held: false,
+        }
+    }
+}
+
+/// The SDDL of a mutex only `user_sid` may use: full access for that SID, and a
+/// medium integrity label that no lower-integrity process may read, write or
+/// execute up to.
+fn mutex_sddl(user_sid: &str) -> String {
+    format!("D:(A;;GA;;;{user_sid})S:(ML;;NWNRNX;;;ME)")
+}
+
+/// The string form of the current user's SID (`S-1-5-21-...`).
+fn current_user_sid() -> Option<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `token` is a valid out-pointer for the call.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let sid = (|| {
+        let mut needed = 0u32;
+        // SAFETY: a size query: no buffer, `needed` is a valid out-pointer.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return None;
+        }
+        // u64 elements keep the buffer aligned for TOKEN_USER.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: the buffer is at least `needed` bytes.
+        let filled = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if filled == 0 {
+            return None;
+        }
+        // SAFETY: the call filled the buffer with a TOKEN_USER.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `user.User.Sid` points into `buffer`, which is alive.
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
+            return None;
+        }
+        // SAFETY: on success `text` is a NUL-terminated string that this
+        // reads and then frees with `LocalFree`, as the API requires.
+        unsafe {
+            let length = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+            LocalFree(text.cast());
+            Some(sid)
+        }
+    })();
+    // SAFETY: `token` was opened above and is not used after this.
+    unsafe { CloseHandle(token) };
+    sid
+}
+
+/// The SDDL of the mutexes this process creates, `None` if the user's SID
+/// can't be read.
+fn own_sddl() -> Option<&'static str> {
+    static SDDL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| current_user_sid().map(|sid| mutex_sddl(&sid)))
+        .as_deref()
+}
+
+/// Creates (or opens) the mutex `wide_name` with the security descriptor
+/// `sddl`. Returns the handle (null on failure) and whether the name already
+/// existed, in which case `sddl` was not applied.
+fn create_mutex(wide_name: &[u16], sddl: &str) -> (HANDLE, bool) {
+    let wide_sddl = crate::wide::encode_wide(sddl);
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_sddl` is a NUL-terminated UTF-16 string; on success the
+    // descriptor is freed below.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return (std::ptr::null_mut(), false);
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `attributes` and `wide_name` (NUL-terminated) outlive the call;
+    // the error is reset first so the read after it is this call's.
+    let (handle, existed) = unsafe {
+        SetLastError(0);
+        let handle = CreateMutexW(&attributes, 0, wide_name.as_ptr());
+        (handle, GetLastError() == ERROR_ALREADY_EXISTS)
+    };
+    // SAFETY: allocated by the conversion above, not used after this.
+    unsafe { LocalFree(descriptor) };
+    (handle, existed)
+}
+
+/// The integrity level of the object `handle`, from its mandatory label
+/// (`MEDIUM_RID` when it has none); `None` if it can't be read.
+fn integrity_rid(handle: HANDLE) -> Option<u32> {
+    let mut needed = 0u32;
+    // SAFETY: a size query: no buffer, `needed` is a valid out-pointer.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    // u64 elements keep the buffer aligned for the descriptor and its ACL.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let descriptor: PSECURITY_DESCRIPTOR = buffer.as_mut_ptr().cast();
+    // SAFETY: the buffer is at least `needed` bytes.
+    let read = unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            LABEL_SECURITY_INFORMATION,
+            descriptor,
+            needed,
+            &mut needed,
+        )
+    };
+    if read == 0 {
+        return None;
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut sacl = std::ptr::null_mut();
+    // SAFETY: `descriptor` is the valid descriptor just read; the out-pointers
+    // are valid.
+    let ok =
+        unsafe { GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted) };
+    if ok == 0 {
+        return None;
+    }
+    let mut ace = std::ptr::null_mut();
+    // SAFETY: `sacl` points into `buffer` when present; GetAce checks the index.
+    if present == 0 || sacl.is_null() || unsafe { GetAce(sacl, 0, &mut ace) } == 0 {
+        return Some(MEDIUM_RID);
+    }
+    let ace = ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>();
+    // SAFETY: `ace` points at an ACE inside `buffer`; its SID follows the mask.
+    unsafe {
+        if (*ace).Header.AceType != MANDATORY_LABEL_ACE_TYPE {
+            return Some(MEDIUM_RID);
+        }
+        let sid = std::ptr::addr_of_mut!((*ace).SidStart).cast();
+        let count = *GetSidSubAuthorityCount(sid);
+        (count > 0).then(|| *GetSidSubAuthority(sid, u32::from(count) - 1))
+    }
+}
+
 /// Takes the mutex `name` (`Local\...`), waiting up to `timeout`. `None` if
 /// another thread or process still holds it after that. The same thread can
-/// take it again while it holds it.
+/// take it again while it holds it. A mutex that can't be created or trusted
+/// gives a guard that holds nothing (see the module docs).
 pub fn lock(name: &str, timeout: Duration) -> Option<NamedMutexGuard> {
+    let Some(sddl) = own_sddl() else {
+        log!("couldn't read the user's SID; continuing without the mutex {name}");
+        return Some(NamedMutexGuard::unlocked());
+    };
+    lock_with(name, sddl, timeout)
+}
+
+/// [`lock`] creating the mutex with `sddl`.
+fn lock_with(name: &str, sddl: &str, timeout: Duration) -> Option<NamedMutexGuard> {
     let wide = crate::wide::encode_wide(name);
-    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call;
-    // null security attributes are valid.
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+    let (handle, existed) = create_mutex(&wide, sddl);
     if handle.is_null() {
         log!("couldn't create the mutex {name}; continuing without it");
-        return Some(NamedMutexGuard {
-            handle,
-            held: false,
-        });
+        return Some(NamedMutexGuard::unlocked());
+    }
+    if existed && integrity_rid(handle).is_none_or(|rid| rid < MEDIUM_RID) {
+        log!(
+            "the mutex {name} was created by a lower-integrity process; ignoring it and continuing without it"
+        );
+        // SAFETY: `handle` is valid and owned by this function.
+        unsafe { CloseHandle(handle) };
+        return Some(NamedMutexGuard::unlocked());
     }
     let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: `handle` is the valid mutex handle just created.
@@ -92,6 +307,43 @@ mod tests {
             std::thread::spawn(move || lock(&name, Duration::from_millis(500)).is_some())
         };
         assert!(again.join().unwrap(), "free after the release");
+    }
+
+    #[test]
+    fn a_mutex_it_creates_is_limited_to_the_user_and_labelled_medium() {
+        let sid = current_user_sid().expect("the user's SID");
+        assert!(sid.starts_with("S-1-"), "{sid}");
+        assert!(mutex_sddl(&sid).contains(&format!("(A;;GA;;;{sid})")));
+
+        let name = unique_name("label");
+        let guard = lock(&name, Duration::ZERO).expect("free");
+        assert_eq!(integrity_rid(guard.handle), Some(MEDIUM_RID));
+    }
+
+    #[test]
+    fn a_name_pre_created_and_held_by_a_lower_integrity_process_does_not_block() {
+        const LOW_INTEGRITY: &str = "D:(A;;GA;;;WD)S:(ML;;NW;;;LW)";
+        let name = unique_name("squatted");
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let squatter = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                // What a sandboxed process could do: create the name first, hold it.
+                let squat = lock_with(&name, LOW_INTEGRITY, Duration::ZERO).expect("free");
+                held_tx.send(()).unwrap();
+                let _ = hold.recv();
+                drop(squat);
+            })
+        };
+        held.recv().unwrap();
+
+        let ours = lock(&name, Duration::from_millis(30));
+
+        release.send(()).unwrap();
+        squatter.join().unwrap();
+        let ours = ours.expect("not blocked by the squatter");
+        assert!(!ours.held, "it proceeds without the mutex it can't trust");
     }
 
     #[test]

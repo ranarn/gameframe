@@ -11,9 +11,10 @@
 //!
 //! Why a thread of its own rather than the tray's message loop: that loop
 //! can be busy for a while (a live re-apply contacting every running game, a
-//! hung window), and the cursor must keep following the mouse regardless. Win32 windows are thread-affine, so the window is
-//! created, moved and destroyed on this one thread; the rest of the app talks
-//! to it only through [`CursorOverlay`]'s shared state.
+//! hung window), and the cursor must keep following the mouse regardless.
+//! Win32 windows are thread-affine, so the window is created, moved and
+//! destroyed on this one thread; the rest of the app talks to it only through
+//! [`CursorOverlay`]'s shared state.
 //!
 //! The thread is per-monitor-DPI-aware (`SetThreadDpiAwarenessContext`), so
 //! cursor positions and the window are in physical pixels on every monitor.

@@ -357,6 +357,34 @@ fn ensure_running(slot: &mut Option<Running>, start: impl FnOnce() -> Option<Run
 /// that is the thread it watches. Idempotent; takes effect at once. Enabling
 /// restarts a watchdog thread that has died.
 pub fn set_enabled(enabled: bool) {
+    set_enabled_for(enabled, Target::TrayProcess);
+}
+
+/// [`set_enabled`] for a Settings / zone-editor child process (#186), whose
+/// main thread has no command window: it pings the child's own window.
+pub fn set_enabled_in_child(enabled: bool) {
+    set_enabled_for(enabled, Target::ChildWindow);
+}
+
+/// Which window the watchdog pings to see whether the main thread pumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The tray process's command window.
+    TrayProcess,
+    /// The Settings or zone-editor window of a child process.
+    ChildWindow,
+}
+
+impl Target {
+    fn window(self) -> Option<windows_sys::Win32::Foundation::HWND> {
+        match self {
+            Self::TrayProcess => crate::instance_channel::command_window(),
+            Self::ChildWindow => crate::instance_channel::find_own_ui_window(),
+        }
+    }
+}
+
+fn set_enabled_for(enabled: bool, target: Target) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if !enabled {
         // Dropping the sender wakes the thread out of its sleep, and it exits.
@@ -373,7 +401,7 @@ pub fn set_enabled(enabled: bool) {
             .name("hang-watchdog".into())
             .spawn(move || {
                 let _alive = AliveGuard(&ALIVE);
-                run(main_thread, rx);
+                run(main_thread, target, rx);
             });
         match spawned {
             Ok(thread) => Some(Running { _stop: tx, thread }),
@@ -405,7 +433,7 @@ fn first_hung_report(hung: bool, logged: &mut bool) -> bool {
     report
 }
 
-fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
+fn run(main_thread: u32, target: Target, stop: mpsc::Receiver<()>) {
     let mut tracker = StallTracker::default();
     let mut errors = ErrorReporter::default();
     let mut warned_no_window = false;
@@ -417,7 +445,7 @@ fn run(main_thread: u32, stop: mpsc::Receiver<()>) {
             // Disconnected (or a message): switched off.
             _ => return,
         }
-        let Some(hwnd) = crate::instance_channel::command_window() else {
+        let Some(hwnd) = target.window() else {
             // Normal around startup and shutdown.
             if !warned_no_window {
                 warned_no_window = true;
