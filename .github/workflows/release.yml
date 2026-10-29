@@ -193,9 +193,17 @@ jobs:
 
           key_file="$RUNNER_TEMP/minisign.key"
           trap 'rm -f "$key_file"' EXIT
-          (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file")
+          # A key file made on Windows has CRLF line endings, which minisign on
+          # Linux cannot decode ("Error while loading the secret key file"), so
+          # the secret and the password are stripped of carriage returns.
+          (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" | tr -d '\r' > "$key_file")
+          if [ "$(grep -c . "$key_file")" -ne 2 ]; then
+            echo "::error::MINISIGN_SECRET_KEY must be the whole key file: the 'untrusted comment:' line and the key line. See SECURITY.md."
+            exit 1
+          fi
           # minisign reads the password of an encrypted key from stdin when it
           # is not a terminal; an unencrypted key ignores it.
+          MINISIGN_PASSWORD="${MINISIGN_PASSWORD%$'\r'}"
           # The trusted comment binds the signature to this release's installer
           # name, so an older signed installer re-published under a newer
           # release is refused by GameFrame (it requires exactly this comment).
