@@ -59,7 +59,7 @@ jobs:
           persist-credentials: false
 
       - id: next
-        uses: ranarn/release-pilot@3ea1793e95926ed237bd8e9e1633987c05763b1b # v1.1.0
+        uses: ranarn/release-pilot@b3df6e8ee723f90850472a6e63d58fc34b129b90 # v1.3.0
         with:
           dry-run: true
           default-bump: none
@@ -79,7 +79,7 @@ jobs:
       # Release Pilot treats breaking changes below 1.0. The previous version
       # is Release Pilot's own previous-version output: it bases the bump on
       # the highest semver tag with the prefix, not the nearest reachable one
-      # (findLatestTag in src/release/tags.ts, ranarn/release-pilot v1.1.0),
+      # (findLatestTag in src/release/tags.ts, ranarn/release-pilot v1.3.0),
       # so this guard compares against exactly what it bumped from.
       - name: Guard against an accidental major bump
         env:
@@ -232,36 +232,43 @@ jobs:
             exit 1
           fi
 
-      # A re-run of this job ("Re-run failed jobs") reuses plan's tag and
-      # build's artifact, but the tag may already exist from the first
-      # attempt. Reuse it when it points at the release commit; refuse when
-      # it points elsewhere.
-      - id: existing
-        name: Detect a tag from an earlier attempt
+      # The real run below pushes its tag before anything can compare it with
+      # the version the installer was built as, so the same inputs are first
+      # run as a dry run on the same checkout. It must land on plan's tag:
+      # either as the new tag, or, on a re-run of this job ("Re-run failed
+      # jobs") after the first attempt pushed it, as the tag already on the
+      # release commit. Anything else (plan's tag pushed to another commit
+      # since, or another release in between) is refused before tagging.
+      - id: check
+        uses: ranarn/release-pilot@b3df6e8ee723f90850472a6e63d58fc34b129b90 # v1.3.0
+        with:
+          dry-run: true
+          default-bump: none
+          bump-minor-pre-major: ${{ inputs.minor-pre-major }}
+          commit-sha: ${{ github.sha }}
+
+      - name: Require plan's tag
         env:
           PLANNED: ${{ needs.plan.outputs.tag }}
+          TAG: ${{ steps.check.outputs.tag }}
+          EXISTING: ${{ steps.check.outputs.existing-tag }}
           SHA: ${{ github.sha }}
         run: |
-          refs=$(git ls-remote --tags origin "refs/tags/$PLANNED" "refs/tags/$PLANNED^{}")
-          # An annotated tag lists its own object and the peeled commit
-          # (^{}); a lightweight tag lists the commit directly.
-          tag_commit=$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"$refs")
-          if [ -z "$tag_commit" ]; then
-            tag_commit=$(awk '{print $1}' <<<"$refs")
-          fi
-          if [ -z "$tag_commit" ]; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          elif [ "$tag_commit" = "$SHA" ]; then
-            echo "Tag $PLANNED already exists at $SHA; reusing it"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ] && [ "$TAG" = "$PLANNED" ]; then
+            echo "Release Pilot will tag $PLANNED"
+          elif [ -z "$TAG" ] && [ "$EXISTING" = "$PLANNED" ]; then
+            echo "$PLANNED already tags $SHA from an earlier attempt; completing its release"
           else
-            echo "::error::Tag $PLANNED already exists at $tag_commit, not at the release commit $SHA"
+            echo "::error::The installer was built as $PLANNED, but Release Pilot would now tag '${TAG}' (tag already on $SHA: '${EXISTING}')"
             exit 1
           fi
 
+      # Creates the draft release and attaches the signed installer and its
+      # .minisig. On a re-run it completes the draft from the earlier
+      # attempt, replacing same-name assets, creates the release if the tag
+      # has none, and fails without touching anything if it is published.
       - id: release
-        if: steps.existing.outputs.exists != 'true'
-        uses: ranarn/release-pilot@3ea1793e95926ed237bd8e9e1633987c05763b1b # v1.1.0
+        uses: ranarn/release-pilot@b3df6e8ee723f90850472a6e63d58fc34b129b90 # v1.3.0
         with:
           default-bump: none
           bump-minor-pre-major: ${{ inputs.minor-pre-major }}
@@ -269,44 +276,4 @@ jobs:
           create-release: true
           release-draft: true
           release-title: GameFrame {{tag}}
-
-      - name: Attach the installer
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PLANNED: ${{ needs.plan.outputs.tag }}
-          TAG: ${{ steps.release.outputs.tag }}
-          REUSED: ${{ steps.existing.outputs.exists }}
-        run: |
-          if [ "$REUSED" = "true" ]; then
-            # Find an existing release by listing, which includes drafts, so
-            # this existence check does not depend on gh's tag-to-draft
-            # fallback (the upload below still finds the draft by tag, and
-            # fails loudly if it can't, rather than creating a duplicate). A
-            # draft may be (re)filled with --clobber, but a published release
-            # must never have its assets replaced, so a re-run against one
-            # fails before uploading. Any lookup failure (network, auth, rate
-            # limit, bad JSON) must fail the job rather than risk a duplicate
-            # draft or an overwrite.
-            if ! releases=$(gh release list --limit 1000 --json tagName,isDraft); then
-              echo "::error::Could not list releases"
-              exit 1
-            fi
-            if ! state=$(jq -r --arg tag "$PLANNED" '[.[] | select(.tagName == $tag)] | if length == 0 then "none" elif any(.[]; .isDraft != true) then "published" else "draft" end' <<<"$releases") || ! [[ "$state" =~ ^(none|draft|published)$ ]]; then
-              echo "::error::Could not parse the release list"
-              exit 1
-            fi
-            if [ "$state" = "published" ]; then
-              echo "::error::Release $PLANNED is already published; refusing to overwrite its assets"
-              exit 1
-            elif [ "$state" = "draft" ]; then
-              echo "Found the existing draft release for $PLANNED"
-            else
-              echo "::warning::No release exists for $PLANNED; creating a draft with generated notes. Review the notes before publishing."
-              gh release create "$PLANNED" --verify-tag --draft --title "GameFrame $PLANNED" --generate-notes
-            fi
-          elif [ "$TAG" != "$PLANNED" ]; then
-            echo "::error::Release Pilot tagged $TAG, but the installer was built as $PLANNED"
-            exit 1
-          fi
-          gh release upload "$PLANNED" dist/* --clobber
+          release-files: dist/*
