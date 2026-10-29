@@ -393,7 +393,14 @@ fn run_event_loop(
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
         // current for the hotkey events below.
-        settings_host::service_settings(&ctx, &mut state);
+        if settings_host::service_settings(
+            ctx.tray,
+            ctx.config_dir,
+            &mut state.settings,
+            &mut state.offered_update,
+        ) {
+            settings_closed(&ctx, &mut state);
+        }
 
         crate::watchdog::step("event loop: second-launch commands");
         // Commands from a second launch (see crate::instance_channel); the
@@ -417,7 +424,7 @@ fn run_event_loop(
                 settings_context,
                 &mut install_progress,
             );
-            settings_host::forward_install_progress(&mut state, install_progress);
+            settings_host::forward_install_progress(&mut state.settings, install_progress);
             if drained.exit {
                 return;
             }
@@ -438,19 +445,19 @@ fn run_event_loop(
 }
 
 /// What the event loop owns and the Settings child's lifecycle touches.
-pub(crate) struct LoopState {
+struct LoopState {
     hotkeys: Option<Hotkeys>,
     hotkey_reports: Vec<BindingReport>,
-    pub(crate) offered_update: Option<UpdateInfo>,
+    offered_update: Option<UpdateInfo>,
     /// The running Settings child, if any. Dropping it closes it.
-    pub(crate) settings: Option<SettingsProcess>,
+    settings: Option<SettingsProcess>,
 }
 
 /// The long-lived handles the event handlers share.
 #[derive(Clone, Copy)]
-pub(crate) struct Shared<'a> {
-    pub(crate) tray: &'a Tray,
-    pub(crate) config_dir: &'a Path,
+struct Shared<'a> {
+    tray: &'a Tray,
+    config_dir: &'a Path,
     cursor_overlay: &'a CursorOverlay,
     updates: &'a UpdateEvents,
 }
@@ -919,7 +926,7 @@ fn show_settings(ctx: &Shared, state: &mut LoopState) {
 }
 
 /// Applies what Settings may have changed, once its window has closed.
-pub(crate) fn settings_closed(ctx: &Shared, state: &mut LoopState) {
+fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
         tray,
         config_dir,

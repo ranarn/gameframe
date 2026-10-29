@@ -68,12 +68,12 @@ fn decide_drift_reapply(
 /// the windows that hit [`DRIFT_REAPPLY_CAP`].
 #[derive(Debug, Default)]
 pub(super) struct DriftAttempts {
-    pub(super) recent: std::collections::BTreeMap<isize, Vec<std::time::Instant>>,
+    recent: std::collections::BTreeMap<isize, Vec<std::time::Instant>>,
     capped: std::collections::BTreeSet<isize>,
     /// Capped windows whose cap is already logged.
     cap_logged: std::collections::BTreeSet<isize>,
     /// Windows whose config/Zone failure on the drift path is already logged.
-    pub(super) failure_logged: std::collections::BTreeSet<isize>,
+    failure_logged: std::collections::BTreeSet<isize>,
 }
 
 impl DriftAttempts {
@@ -87,7 +87,7 @@ impl DriftAttempts {
     }
 
     /// Notes a config/Zone failure on `window`'s drift path. True the first
-    /// time since [`Self::clear_failure`] or [`Self::reset`], so the caller
+    /// time since [`Self::clear_failure`] or [`Self::forget`], so the caller
     /// logs it once instead of once per location-change event.
     pub(super) fn note_failure(&mut self, window: isize) -> bool {
         self.failure_logged.insert(window)
@@ -133,7 +133,7 @@ impl DriftAttempts {
     }
 
     /// Forgets `window`'s attempts and lifts its cap.
-    pub(super) fn reset(&mut self, window: isize) {
+    pub(super) fn forget(&mut self, window: isize) {
         self.recent.remove(&window);
         self.capped.remove(&window);
         self.cap_logged.remove(&window);
@@ -187,7 +187,7 @@ pub(crate) fn clear_drift_failure(hwnd: HWND) {
 /// by [`crate::placement::apply_zone`] for a placement the user asked for (the
 /// hotkey, the tray picker or Settings' live re-apply).
 pub fn reset_drift_cap(hwnd: HWND) {
-    with_placed(|p| p.drift.reset(hwnd as isize));
+    with_placed(|p| p.drift.forget(hwnd as isize));
 }
 
 /// Pure decision: is a window in exclusive fullscreen? `d3d_fullscreen` is
@@ -270,7 +270,7 @@ mod tests {
         assert!(!attempts.note_capped(1));
         assert!(attempts.note_capped(2), "another window has its own line");
 
-        attempts.reset(1);
+        attempts.forget(1);
 
         assert!(attempts.note_capped(1), "a reset window reports a new cap");
     }
@@ -289,7 +289,7 @@ mod tests {
             "a cleared failure is reported anew"
         );
 
-        attempts.reset(1);
+        attempts.forget(1);
         assert!(attempts.note_failure(1), "a destroyed window starts fresh");
     }
 
@@ -320,7 +320,7 @@ mod tests {
             DriftDecision::SkipCapped
         );
 
-        attempts.reset(1);
+        attempts.forget(1);
 
         assert_eq!(
             attempts.decide(1, t0 + std::time::Duration::from_secs(10), true, false),

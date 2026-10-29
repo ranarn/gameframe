@@ -9,7 +9,6 @@
 //! message handling and the install routing are unit tested here. The wire
 //! format and the child's end are tested in [`crate::settings_link`].
 
-use crate::app::{LoopState, Shared, settings_closed};
 use crate::cursor_style::Bitmap;
 use crate::hotkeys::BindingReport;
 use crate::instance_channel::{self, SettingsGuard};
@@ -18,10 +17,12 @@ use crate::settings_link::{
     ChildKind, ChildMsg, InstallProgress, ParentMsg, child_command_line, decode_line,
 };
 use crate::settings_ui::{self, TickContext};
+use crate::tray_ui::Tray;
 use crate::update_ui::{Failure, UpdateEvent, handle_update_event, start_install};
 use crate::updater::UpdateInfo;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
@@ -346,18 +347,27 @@ impl<C: ProcessHandle> Drop for SettingsProcess<C> {
 /// re-applies the Zone to running games (the per-window registry lives here),
 /// forgets its cached config when the child wrote the file, and runs update
 /// events for the tray.
-pub(crate) fn service_settings(ctx: &Shared, state: &mut LoopState) {
-    let Some(process) = state.settings.as_mut() else {
-        return;
+///
+/// Returns `true` when the child has exited (and `settings` is now `None`), so
+/// the caller can apply what Settings may have changed.
+pub(crate) fn service_settings(
+    tray: &Tray,
+    config_dir: &Path,
+    settings: &mut Option<SettingsProcess>,
+    offered_update: &mut Option<UpdateInfo>,
+) -> bool {
+    let Some(process) = settings.as_mut() else {
+        return false;
     };
     let polled = process.poll();
     for msg in polled.messages {
         let reply = react_to_child_message(
             msg,
             &mut TrayEffects {
-                ctx,
+                tray,
+                config_dir,
                 context: &mut process.context,
-                offered_update: &mut state.offered_update,
+                offered_update,
             },
         );
         if let Some(reply) = reply {
@@ -365,12 +375,12 @@ pub(crate) fn service_settings(ctx: &Shared, state: &mut LoopState) {
         }
     }
     if polled.exited {
-        state.settings = None;
+        *settings = None;
         if polled.exit_code != Some(0) {
             log!("the Settings process ended with {:?}", polled.exit_code);
         }
-        settings_closed(ctx, state);
     }
+    polled.exited
 }
 
 /// What the tray process does on a Settings child's behalf; the real one is
@@ -421,25 +431,26 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
 }
 
 /// The tray process's real [`ChildEffects`].
-struct TrayEffects<'a, 'b> {
-    ctx: &'a Shared<'b>,
+struct TrayEffects<'a> {
+    tray: &'a Tray,
+    config_dir: &'a Path,
     context: &'a mut TickContext,
     offered_update: &'a mut Option<UpdateInfo>,
 }
 
-impl ChildEffects for TrayEffects<'_, '_> {
+impl ChildEffects for TrayEffects<'_> {
     fn set_context(&mut self, context: TickContext) {
         *self.context = context;
     }
 
     fn forget_config(&mut self) {
-        profile_store::forget_cached(self.ctx.config_dir);
+        profile_store::forget_cached(self.config_dir);
     }
 
     fn reapply_all(&mut self) -> Vec<String> {
         crate::watchdog::step("settings process: live re-apply");
-        match profile_store::load(self.ctx.config_dir) {
-            Ok(config) => settings_ui::live_reapply_all(self.ctx.config_dir, &config.tracked_games),
+        match profile_store::load(self.config_dir) {
+            Ok(config) => settings_ui::live_reapply_all(self.config_dir, &config.tracked_games),
             Err(e) => {
                 log!("live re-apply: failed to load the config: {e}");
                 vec![format!("couldn't read the settings: {e}")]
@@ -448,12 +459,7 @@ impl ChildEffects for TrayEffects<'_, '_> {
     }
 
     fn update_event(&mut self, event: UpdateEvent) {
-        handle_update_event(
-            event,
-            self.ctx.tray,
-            self.ctx.config_dir,
-            self.offered_update,
-        );
+        handle_update_event(event, self.tray, self.config_dir, self.offered_update);
     }
 
     fn start_install(&mut self, request: u64, info: UpdateInfo) {
@@ -462,7 +468,7 @@ impl ChildEffects for TrayEffects<'_, '_> {
     }
 
     fn notify(&mut self, text: &str) {
-        self.ctx.tray.notify(text);
+        self.tray.notify(text);
     }
 }
 
@@ -489,13 +495,13 @@ fn route_install_progress(settings_open: bool, progress: InstallProgress) -> Ins
 /// Hands the install progress `drain_events` collected to the Settings child, or
 /// to a box when it is closed.
 pub(crate) fn forward_install_progress(
-    state: &mut LoopState,
+    settings: &mut Option<SettingsProcess>,
     progress: Vec<(Option<u64>, InstallProgress)>,
 ) {
     for (request, progress) in progress {
-        match route_install_progress(state.settings.is_some(), progress) {
+        match route_install_progress(settings.is_some(), progress) {
             InstallRoute::ToSettings(progress) => {
-                if let Some(process) = state.settings.as_mut() {
+                if let Some(process) = settings.as_mut() {
                     process.send(&ParentMsg::Install { request, progress });
                 }
             }
