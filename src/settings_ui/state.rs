@@ -584,6 +584,28 @@ mod tests {
     }
 
     #[test]
+    fn every_tab_is_in_the_tab_bar() {
+        // Exhaustive on purpose: a new variant fails to compile here until it
+        // is listed, and then fails the test until it is in `ALL`.
+        let every = |tab: SettingsTab| match tab {
+            SettingsTab::Games
+            | SettingsTab::Cursor
+            | SettingsTab::Zone
+            | SettingsTab::General
+            | SettingsTab::About => tab,
+        };
+        for tab in [
+            SettingsTab::Games,
+            SettingsTab::Cursor,
+            SettingsTab::Zone,
+            SettingsTab::General,
+            SettingsTab::About,
+        ] {
+            assert!(SettingsTab::ALL.contains(&every(tab)), "{tab:?}");
+        }
+    }
+
+    #[test]
     fn settings_opens_on_the_games_tab_when_a_zone_exists() {
         let config = Config {
             zone: Some(Zone {

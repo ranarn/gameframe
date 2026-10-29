@@ -44,7 +44,8 @@ impl SettingsApp<'_> {
         }
     }
 
-    /// Renders the "Zone, hotkeys & taskbar" tab: Zone, global hotkeys and\n    /// taskbar hiding.
+    /// Renders the "Zone, hotkeys & taskbar" tab: Zone, global hotkeys and
+    /// taskbar hiding.
     pub(super) fn zone_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
         self.zone_section(ui);
