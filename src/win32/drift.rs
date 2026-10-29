@@ -1,4 +1,6 @@
 //! The in-game-resize watcher's decisions: when a drifted window is re-applied.
+//! Whether a window has drifted at all (`window_drifted`/`window_has_drifted`)
+//! is a geometry check and lives in `style.rs`.
 
 use super::with_placed;
 use windows_sys::Win32::Foundation::HWND;

@@ -22,7 +22,7 @@
 //!   `HWND`/OS dependency and is fully unit tested in the submodules. [`crate::window_filter`]
 //!   follows the identical pure/OS-facing split for the window-filtering/ranking
 //!   logic.
-//! - The actual Win32 calls further down (`GetForegroundWindow`, `IsIconic`,
+//! - The actual Win32 calls in the submodules (`GetForegroundWindow`, `IsIconic`,
 //!   `SetWindowLongPtrW`, `SetWindowPos`, `DwmSetWindowAttribute`,
 //!   `ShellExecuteW`, `FindWindowW`, `SHAppBarMessage`, `ShowWindow`,
 //!   `EnumWindows`) are OS-facing -- they need a real foreground window, a

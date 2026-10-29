@@ -1,8 +1,13 @@
 //! The tray process's end of the link to a Settings / zone editor child, see
 //! [`crate::settings_link`] for why the windows live in a child process.
 //!
-//! OS-facing (spawns a process, timers, thread messages): checked manually. The
-//! wire format and the child's end are tested in [`crate::settings_link`].
+//! Also handles the child's messages on the tray side (`service_settings`,
+//! `react_to_child_message`) and routes install progress to the child.
+//!
+//! Spawning the process, its timers and thread messages are OS-facing and
+//! checked manually; the process lifecycle (behind `ProcessHandle`), the
+//! message handling and the install routing are unit tested here. The wire
+//! format and the child's end are tested in [`crate::settings_link`].
 
 use crate::app::{LoopState, Shared, settings_closed};
 use crate::cursor_style::Bitmap;
