@@ -84,10 +84,11 @@ system certificate store and proxy settings apply:
   detached from a folder under `%LOCALAPPDATA%\GameFrame\updates`, which the
   next start deletes. That is a fixed, app-owned location that inherits your
   profile's access rules and doesn't depend on a redirectable `%TEMP%`.
-- An elevated (administrator) instance never installs an update: it reports that
-  one exists and asks you to restart GameFrame normally. Setup also does not
-  start GameFrame (neither the update's `/RELAUNCH` nor the "Launch GameFrame"
-  checkbox) when it runs elevated, so an update can't leave GameFrame elevated.
+- An elevated (administrator) instance never installs an update: it reports
+  that one exists and asks you to restart GameFrame normally. Setup also does
+  not start GameFrame (neither the update's `/RELAUNCH` nor the "Launch
+  GameFrame" checkbox) when it runs elevated, so an update can't leave
+  GameFrame elevated.
   If GameFrame cannot read its own token, it counts as elevated. With UAC turned
   off, an administrator's processes are always elevated, so GameFrame never
   installs updates itself there and setup never starts it: install new versions

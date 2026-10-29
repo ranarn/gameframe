@@ -182,8 +182,12 @@ jobs:
           # once it is in use, and a release is always signed with the key
           # PUBLIC_KEY names (during a rotation, release N is signed with the old
           # key, release N+1 has the new key as PUBLIC_KEY). See SECURITY.md.
-          source=$(grep -v '^[[:space:]]*//' src/updater.rs | tr '\n' ' ')
-          pub=$(grep -oP 'const PUBLIC_KEY: &str =\s*"\K[^"]*(?=")' <<<"$source" || true)
+          updater_src=$(grep -v '^[[:space:]]*//' src/updater.rs | tr '\n' ' ')
+          pub=$(grep -oP 'const PUBLIC_KEY: &str =\s*"\K[^"]*(?=")' <<<"$updater_src" || true)
+          if [ -n "$pub" ] && [ "$(wc -l <<<"$pub")" -ne 1 ]; then
+            echo "::error::src/updater.rs defines PUBLIC_KEY more than once; this step expects exactly one. See SECURITY.md."
+            exit 1
+          fi
           if [ -z "$pub" ]; then
             echo "::error::The PUBLIC_KEY constant in src/updater.rs could not be read (renamed, empty or not a plain string literal); this step must be updated to match. See SECURITY.md."
             exit 1

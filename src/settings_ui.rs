@@ -1396,7 +1396,8 @@ impl UpdateInstall {
             InstallProgress::Failed(text) => Self::Failed(text),
             InstallProgress::Busy => Self::Busy,
             InstallProgress::NotStarted => Self::NotStarted,
-            // Advice, not a failure: no "Installing the update failed:" prefix.
+            // Shown on the failure line (the install did not run), but as the
+            // advice itself, without the "Installing the update failed:" prefix.
             InstallProgress::Elevated => {
                 Self::Failed(crate::updater::ELEVATED_UPDATE_ADVICE.into())
             }
