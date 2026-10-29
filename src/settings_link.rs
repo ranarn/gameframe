@@ -272,20 +272,19 @@ impl Inbox {
     /// pending request, or, with none pending, progress of a tray install
     /// (`request` is `None`). Anything else (a tray install that finished
     /// meanwhile, a stale answer) must not become the pending request's result.
-    /// A request unanswered for [`PENDING_INSTALL_TIMEOUT`] at `now` is given up
-    /// on (the link broke mid-request), so it cannot hide tray progress forever.
+    /// A request unanswered for [`PENDING_INSTALL_TIMEOUT`] at `now` stops
+    /// hiding tray progress (the link may have broken mid-request), but its id is
+    /// kept: a slow install's own late answer is still applied.
     fn file_install(&mut self, request: Option<u64>, progress: InstallProgress, now: Instant) {
-        if let Some((_, asked)) = self.pending_install
-            && now.saturating_duration_since(asked) >= PENDING_INSTALL_TIMEOUT
-        {
-            self.pending_install = None;
-        }
-        match (self.pending_install.map(|(id, _)| id), request) {
-            (Some(pending), Some(id)) if pending == id => {
+        let expired = self.pending_install.is_none_or(|(_, asked)| {
+            now.saturating_duration_since(asked) >= PENDING_INSTALL_TIMEOUT
+        });
+        match (self.pending_install, request) {
+            (Some((pending, _)), Some(id)) if pending == id => {
                 self.pending_install = None;
                 self.install.push(progress);
             }
-            (None, None) => self.install.push(progress),
+            (_, None) if expired => self.install.push(progress),
             _ => {}
         }
     }
@@ -763,6 +762,21 @@ mod tests {
             None,
             InstallProgress::Launched,
             asked + PENDING_INSTALL_TIMEOUT,
+        );
+        assert_eq!(inbox.install, vec![InstallProgress::Launched]);
+    }
+
+    #[test]
+    fn the_answer_to_a_slow_install_is_applied_after_the_timeout() {
+        let (link, _to_child, _from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        let mut inbox = link.lock_inbox();
+        let (id, asked) = inbox.pending_install.unwrap();
+
+        inbox.file_install(
+            Some(id),
+            InstallProgress::Launched,
+            asked + PENDING_INSTALL_TIMEOUT + Duration::from_secs(5),
         );
         assert_eq!(inbox.install, vec![InstallProgress::Launched]);
         assert!(inbox.pending_install.is_none());

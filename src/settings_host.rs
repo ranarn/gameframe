@@ -356,11 +356,27 @@ mod tests {
 
     /// A stdin that records what the tray process sent.
     #[derive(Clone, Default)]
-    struct Sent(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct Sent(Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+    impl Sent {
+        /// Blocks (up to a generous bound, only hit on failure) until what was
+        /// sent contains `needle`; returns everything sent so far.
+        fn wait_for(&self, needle: &str) -> String {
+            let (data, written) = &*self.0;
+            let (data, _) = written
+                .wait_timeout_while(data.lock().unwrap(), Duration::from_secs(30), |d| {
+                    !String::from_utf8_lossy(d).contains(needle)
+                })
+                .unwrap();
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    }
 
     impl Write for Sent {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            let (data, written) = &*self.0;
+            data.lock().unwrap().extend_from_slice(buf);
+            written.notify_all();
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -473,12 +489,7 @@ mod tests {
         assert!(!rig.killed.get());
         assert_eq!(*rig.ended.borrow(), vec![4711]);
         // The writer thread delivers it a moment later.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut sent = String::new();
-        while !sent.contains("Close") && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-            sent = String::from_utf8(rig.sent.0.lock().unwrap().clone()).unwrap();
-        }
+        let sent = rig.sent.wait_for("Close");
         assert!(
             sent.contains("Close"),
             "the child is asked to close first: {sent:?}"
@@ -533,6 +544,7 @@ mod tests {
         }
         drop(release_tx); // unblocks the stuck write (recv errs) for teardown
     }
+
     #[test]
     fn a_child_that_ignores_the_close_request_is_killed_after_the_grace_period() {
         let mut rig = rig();

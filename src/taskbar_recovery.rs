@@ -44,11 +44,20 @@ fn child_marker_name(pid: u32) -> String {
     format!("{CHILD_MARKER_PREFIX}{pid}{MARKER_EXTENSION}")
 }
 
-/// Whether `name` is a child process marker (not its `.tmp` file).
 fn is_child_marker_name(name: &str) -> bool {
-    name.strip_prefix(CHILD_MARKER_PREFIX)
-        .and_then(|rest| rest.strip_suffix(MARKER_EXTENSION))
-        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    child_marker_pid(name).is_some()
+}
+
+/// The pid in a child process marker's file name (`None` for any other name,
+/// including its `.tmp` file).
+fn child_marker_pid(name: &str) -> Option<u32> {
+    let pid = name
+        .strip_prefix(CHILD_MARKER_PREFIX)?
+        .strip_suffix(MARKER_EXTENSION)?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 /// The child process markers in `dir`, by file name.
@@ -716,7 +725,9 @@ pub fn recover_on_startup(dir: &Path) {
 /// restoring the taskbar under it would desync it. Its tray restores the marker
 /// when the child ends, or the next startup does. A pid reused by a younger
 /// process (or by this very process) is not the child, so the marker is stale.
-/// A marker whose age can't be read counts as stale too.
+/// A marker whose age can't be read counts as stale too. So does one whose pid
+/// can't be inspected (e.g. access denied on an elevated child): restoring the
+/// taskbar is the safe failure, showing it never leaves it stranded hidden.
 fn orphaned_child_markers(
     dir: &Path,
     own_pid: u32,
@@ -725,10 +736,7 @@ fn orphaned_child_markers(
     child_marker_names(dir)
         .into_iter()
         .filter(|name| {
-            let pid = name
-                .strip_prefix(CHILD_MARKER_PREFIX)
-                .and_then(|rest| rest.strip_suffix(MARKER_EXTENSION))
-                .and_then(|pid| pid.parse::<u32>().ok());
+            let pid = child_marker_pid(name);
             let written = std::fs::metadata(dir.join(name))
                 .and_then(|m| m.modified())
                 .ok();
@@ -754,6 +762,7 @@ fn gameframe_process_created(pid: u32) -> Option<std::time::SystemTime> {
     }
     crate::window_filter::process_creation_time(pid)
 }
+
 fn recover_own_marker(dir: &Path) {
     let marker = read_marker_file(dir);
     if marker == MarkerState::None {
@@ -936,6 +945,7 @@ mod tests {
             ]
         );
     }
+
     #[test]
     fn a_child_marker_is_read_and_cleared_independently_of_the_trays() {
         let dir = tempfile::tempdir().unwrap();
