@@ -1396,9 +1396,11 @@ impl UpdateInstall {
             InstallProgress::Failed(text) => Self::Failed(text),
             InstallProgress::Busy => Self::Busy,
             InstallProgress::NotStarted => Self::NotStarted,
-            InstallProgress::Elevated => Self::Failed(
-                crate::update_install::install_error_message(&UpdateError::ElevatedInstance),
-            ),
+            // Shown on the failure line (the install did not run), but as the
+            // advice itself, without the "Installing the update failed:" prefix.
+            InstallProgress::Elevated => {
+                Self::Failed(crate::updater::ELEVATED_UPDATE_ADVICE.into())
+            }
         };
     }
 
@@ -1816,7 +1818,7 @@ impl SettingsApp<'_> {
                 self.update_check = match started {
                     Ok(()) => UpdateCheck::Running(receiver),
                     Err(SpawnError::Busy) => UpdateCheck::Busy,
-                    Err(SpawnError::ThreadFailed | SpawnError::Elevated) => UpdateCheck::Lost,
+                    Err(SpawnError::ThreadFailed) => UpdateCheck::Lost,
                 };
                 self.update_install = UpdateInstall::Idle;
             }
@@ -2215,7 +2217,7 @@ mod tests {
         ));
         assert!(matches!(
             progress(InstallProgress::Elevated),
-            UpdateInstall::Failed(text) if text.contains("as administrator")
+            UpdateInstall::Failed(text) if text == crate::updater::ELEVATED_UPDATE_ADVICE
         ));
     }
 

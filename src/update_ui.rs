@@ -9,7 +9,9 @@
 use crate::message_box::{show_message_box, show_warning_box};
 use crate::profile_store;
 use crate::tray_ui::Tray;
-use crate::updater::{CheckOutcome, SpawnError, StartupAction, UpdateError, UpdateInfo, Version};
+use crate::updater::{
+    CheckOutcome, InstallStartError, StartupAction, UpdateError, UpdateInfo, Version,
+};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -46,7 +48,7 @@ pub(crate) enum UpdateEvent {
     /// the text is for the user. The tray's own handling is [`Self::InstallFailed`].
     InstallError(String),
     /// An install [`Failure::Forward`]ed to Settings could not start.
-    InstallNotStarted(SpawnError),
+    InstallNotStarted(InstallStartError),
 }
 
 /// Lets worker threads hand an [`UpdateEvent`] to the event loop and wake its
@@ -252,11 +254,11 @@ pub(crate) fn start_install(info: UpdateInfo, failure: Failure) {
 
 /// Tells the user why an install didn't start, from a thread of its own: the
 /// box blocks, and the caller may be the event loop.
-pub(crate) fn show_not_started(why: SpawnError) {
+pub(crate) fn show_not_started(why: InstallStartError) {
     let text = match why {
-        SpawnError::Busy => "An update is already being installed.",
-        SpawnError::ThreadFailed => "Couldn't start the update install.",
-        SpawnError::Elevated => crate::updater::ELEVATED_UPDATE_ADVICE,
+        InstallStartError::Busy => "An update is already being installed.",
+        InstallStartError::ThreadFailed => "Couldn't start the update install.",
+        InstallStartError::Elevated => crate::updater::ELEVATED_UPDATE_ADVICE,
     };
     std::thread::spawn(move || {
         show_message_box(text, MB_OK | MB_ICONINFORMATION);
@@ -275,7 +277,7 @@ pub(crate) fn show_not_started(why: SpawnError) {
 fn spawn_install(
     info: UpdateInfo,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
-) -> Result<(), SpawnError> {
+) -> Result<(), InstallStartError> {
     let version = info.version;
     crate::update_install::spawn_install(
         info,

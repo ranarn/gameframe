@@ -34,16 +34,15 @@ const SIGNATURE_SUFFIX: &str = ".minisig";
 
 /// The Minisign public key (the base64 second line of `gameframe.pub`, key id
 /// E6CE2092F0EE51EE) every installer must be signed with. The release workflow
-/// checks, after signing, that the signature verifies against this exact line
-/// (or [`NEXT_PUBLIC_KEY`]), so keep it on one line as
-/// `pub(crate) const PUBLIC_KEY: &str = "...";`. To rotate it, see SECURITY.md.
+/// reads this constant from the source (a plain string literal, however
+/// rustfmt wraps it) and checks, after signing, that the signature verifies
+/// against it. To rotate it, see SECURITY.md.
 pub(crate) const PUBLIC_KEY: &str = "RWTuUe7wkiDO5jFMnk3TwY6+iUGxIKPqSn70baKHvVFsXwdmCpaK68fS";
 
 /// Second accepted key, empty normally. It only exists to rotate the signing
 /// key: a release signed with the old key sets this to the new public key, so
 /// that installs made by it accept releases signed with the new key (see
-/// SECURITY.md). Keep it on one line as
-/// `pub(crate) const NEXT_PUBLIC_KEY: &str = "...";`.
+/// SECURITY.md). The release workflow does not check it.
 pub(crate) const NEXT_PUBLIC_KEY: &str = "";
 
 /// The keys an installer's signature may verify against.
@@ -122,22 +121,11 @@ pub(crate) enum UpdateError {
     Download(String),
     /// The verified installer could not be started.
     LaunchInstaller(String),
-    /// This instance runs elevated and never installs updates (the installer
-    /// would inherit the elevated token and relaunch GameFrame elevated).
-    ElevatedInstance,
 }
 
-/// What an elevated instance tells the user instead of installing.
+/// What an elevated instance tells the user instead of installing (the
+/// installer would inherit the elevated token and relaunch GameFrame elevated).
 pub(crate) const ELEVATED_UPDATE_ADVICE: &str = "GameFrame is running as administrator, so it doesn't install updates. Restart GameFrame normally (not as administrator) to update.";
-
-/// Refuses an install while this instance runs elevated.
-pub(crate) fn ensure_unelevated(elevated: bool) -> Result<(), UpdateError> {
-    if elevated {
-        Err(UpdateError::ElevatedInstance)
-    } else {
-        Ok(())
-    }
-}
 
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -193,7 +181,6 @@ impl std::fmt::Display for UpdateError {
             }
             UpdateError::Download(e) => write!(f, "downloading the update failed: {e}"),
             UpdateError::LaunchInstaller(e) => write!(f, "couldn't start the installer: {e}"),
-            UpdateError::ElevatedInstance => write!(f, "{ELEVATED_UPDATE_ADVICE}"),
         }
     }
 }
@@ -405,18 +392,33 @@ pub(crate) fn verify_signature(
         }
     }
     // Only the key the signature names accepts it.
-    let mut verifier = match keys.iter().find_map(|k| k.verify_stream(&signature).ok()) {
-        Some(verifier) => verifier,
-        None => {
-            // A parse error is only the cause when no key parsed at all.
-            return Err(if keys.is_empty() {
-                UpdateError::InvalidSignature(
-                    key_error.unwrap_or_else(|| "no public key configured".into()),
-                )
-            } else {
-                UpdateError::SignatureMismatch
-            });
+    let mut legacy = false;
+    let mut verifier = None;
+    for key in &keys {
+        match key.verify_stream(&signature) {
+            Ok(v) => {
+                verifier = Some(v);
+                break;
+            }
+            // Made by a key we trust, but in the legacy (non-prehashed) format:
+            // unreadable, not a signature by someone else.
+            Err(minisign_verify::Error::UnsupportedLegacyMode) => legacy = true,
+            Err(_) => {}
         }
+    }
+    let Some(mut verifier) = verifier else {
+        return Err(if legacy {
+            UpdateError::InvalidSignature(
+                "the signature is in the legacy format, not a pre-hashed one".into(),
+            )
+        } else if keys.is_empty() {
+            // A parse error is only the cause when no key parsed at all.
+            UpdateError::InvalidSignature(
+                key_error.unwrap_or_else(|| "no public key configured".into()),
+            )
+        } else {
+            UpdateError::SignatureMismatch
+        });
     };
     let mut chunk = [0u8; 64 * 1024];
     loop {
@@ -510,6 +512,7 @@ fn fetch_latest_release() -> Result<Option<String>, UpdateError> {
         Ok(body) => Ok(Some(body)),
         Err(HttpError::Status(404)) => Ok(None),
         Err(HttpError::Status(status)) => Err(UpdateError::HttpStatus(status)),
+        Err(HttpError::TooLarge) => Err(UpdateError::Network("the response is too large".into())),
         Err(HttpError::Failed(e)) => Err(UpdateError::Network(e)),
     }
 }
@@ -541,8 +544,29 @@ pub(crate) enum SpawnError {
     Busy,
     /// The operating system refused the thread.
     ThreadFailed,
-    /// An install was asked for by an elevated instance, which never installs.
+}
+
+/// Why an install was not started: a [`SpawnError`], or the instance runs
+/// elevated and never installs. Separate from [`SpawnError`] so that a check,
+/// which can't be refused for elevation, has no arm for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallStartError {
+    /// An earlier install is still running.
+    Busy,
+    /// The operating system refused the thread.
+    ThreadFailed,
+    /// This instance runs elevated: the installer would inherit its token and
+    /// relaunch GameFrame elevated.
     Elevated,
+}
+
+impl From<SpawnError> for InstallStartError {
+    fn from(error: SpawnError) -> Self {
+        match error {
+            SpawnError::Busy => Self::Busy,
+            SpawnError::ThreadFailed => Self::ThreadFailed,
+        }
+    }
 }
 
 /// Runs a check for the running build on a worker thread and hands the
@@ -616,6 +640,14 @@ pub(crate) mod test_signing {
     /// By [`PUBLIC`]'s key, trusted comment `file:GameFrame-Setup-1.2.0.exe`.
     pub(crate) const SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
         RURrGo2Vw3gmNFJujZcPLpNOs/uNSEA368saYb5N7XeK/hw3OsWNCiAjTlHYSHAE09Fgg8mzUEBpADXhwr36cQfwp8dc6eCcfwk=\n\
+        trusted comment: file:GameFrame-Setup-1.2.0.exe\n\
+        WGe2I1VGTUuKZNOoTB+hYf3p2DyI4IxCp3mzO/+13XBRig+fmU9xq5LJ2DRtr2IKEQvBHP7LY+WQ5p829gu8AA==\n";
+    /// [`SIGNATURE`] with its algorithm field changed from `ED` (pre-hashed) to
+    /// `Ed` (legacy), the one thing a legacy signature differs by. Only the
+    /// format check is exercised, which comes before any cryptography, so the
+    /// signature bytes need not be valid for the legacy scheme.
+    pub(crate) const SIGNATURE_LEGACY: &str = "untrusted comment: signature from minisign secret key\n\
+        RWRrGo2Vw3gmNFJujZcPLpNOs/uNSEA368saYb5N7XeK/hw3OsWNCiAjTlHYSHAE09Fgg8mzUEBpADXhwr36cQfwp8dc6eCcfwk=\n\
         trusted comment: file:GameFrame-Setup-1.2.0.exe\n\
         WGe2I1VGTUuKZNOoTB+hYf3p2DyI4IxCp3mzO/+13XBRig+fmU9xq5LJ2DRtr2IKEQvBHP7LY+WQ5p829gu8AA==\n";
     /// By [`PUBLIC`]'s key, trusted comment `file:GameFrame-Setup-1.1.0.exe`.
@@ -1247,6 +1279,21 @@ mod tests {
     }
 
     #[test]
+    fn verify_signature_reports_a_legacy_signature_as_unreadable_not_as_a_mismatch() {
+        let result = verify_signature(SIGNED_CONTENT, SIGNATURE_LEGACY, &[PUBLIC], INSTALLER);
+
+        assert!(
+            matches!(&result, Err(UpdateError::InvalidSignature(e)) if e.contains("legacy")),
+            "{result:?}"
+        );
+        // By a key that isn't ours it is still just not our signature.
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE_LEGACY, &[OTHER_PUBLIC], INSTALLER),
+            Err(UpdateError::SignatureMismatch)
+        );
+    }
+
+    #[test]
     fn verify_signature_accepts_the_next_key_next_to_the_current_one() {
         let keys = [PUBLIC, "", NEXT_PUBLIC];
 
@@ -1370,17 +1417,6 @@ mod tests {
         assert_eq!(
             startup_action(UpdateMode::Auto, true, Ok(CheckOutcome::UpToDate)),
             StartupAction::Nothing
-        );
-    }
-
-    #[test]
-    fn ensure_unelevated_refuses_only_an_elevated_instance() {
-        assert_eq!(ensure_unelevated(false), Ok(()));
-        assert_eq!(ensure_unelevated(true), Err(UpdateError::ElevatedInstance));
-        assert!(
-            UpdateError::ElevatedInstance
-                .to_string()
-                .contains("Restart GameFrame normally")
         );
     }
 

@@ -20,7 +20,7 @@ use crate::cursor_style::Bitmap;
 use crate::hotkeys::BindingReport;
 use crate::settings_ui::TickContext;
 use crate::update_ui::UpdateEvent;
-use crate::updater::{SpawnError, UpdateInfo, Version};
+use crate::updater::{InstallStartError, UpdateInfo, Version};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -195,9 +195,9 @@ impl InstallProgress {
             UpdateEvent::InstallerLaunched(_) => Some(Self::Launched),
             UpdateEvent::InstallError(text) => Some(Self::Failed(text.clone())),
             UpdateEvent::InstallNotStarted(why) => Some(match why {
-                SpawnError::Busy => Self::Busy,
-                SpawnError::ThreadFailed => Self::NotStarted,
-                SpawnError::Elevated => Self::Elevated,
+                InstallStartError::Busy => Self::Busy,
+                InstallStartError::ThreadFailed => Self::NotStarted,
+                InstallStartError::Elevated => Self::Elevated,
             }),
             _ => None,
         }
@@ -596,15 +596,17 @@ mod tests {
             Some(InstallProgress::Failed("disk full".into()))
         );
         assert_eq!(
-            progress(UpdateEvent::InstallNotStarted(SpawnError::Busy)),
+            progress(UpdateEvent::InstallNotStarted(InstallStartError::Busy)),
             Some(InstallProgress::Busy)
         );
         assert_eq!(
-            progress(UpdateEvent::InstallNotStarted(SpawnError::ThreadFailed)),
+            progress(UpdateEvent::InstallNotStarted(
+                InstallStartError::ThreadFailed
+            )),
             Some(InstallProgress::NotStarted)
         );
         assert_eq!(
-            progress(UpdateEvent::InstallNotStarted(SpawnError::Elevated)),
+            progress(UpdateEvent::InstallNotStarted(InstallStartError::Elevated)),
             Some(InstallProgress::Elevated)
         );
         // Progress that needs no window of its own.
