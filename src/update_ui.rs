@@ -221,6 +221,7 @@ pub(crate) fn show_not_started(why: SpawnError) {
     let text = match why {
         SpawnError::Busy => "An update is already being installed.",
         SpawnError::ThreadFailed => "Couldn't start the update install.",
+        SpawnError::Elevated => crate::updater::ELEVATED_UPDATE_ADVICE,
     };
     std::thread::spawn(move || {
         show_message_box(text, MB_OK | MB_ICONINFORMATION);

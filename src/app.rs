@@ -712,7 +712,7 @@ fn check_for_updates_from_tray() {
     let why_not = match started {
         Ok(()) => return,
         Err(SpawnError::Busy) => "An update check is already running. Try again in a moment.",
-        Err(SpawnError::ThreadFailed) => "Couldn't start the update check.",
+        Err(SpawnError::ThreadFailed | SpawnError::Elevated) => "Couldn't start the update check.",
     };
     // The flag went down with the dropped closure; take it again for the box
     // that tells the user why nothing was checked.
@@ -728,6 +728,19 @@ fn check_for_updates_from_tray() {
 /// it on a worker thread: GameFrame then quits and the installer starts it
 /// again. Blocks on the question, so call it from a worker thread.
 fn offer_install(info: crate::updater::UpdateInfo) {
+    // An elevated instance never installs, so don't ask a question whose "yes"
+    // can only fail.
+    if crate::win32::is_process_elevated() {
+        show_message_box(
+            &format!(
+                "{}\n\n{}",
+                CheckOutcome::UpdateAvailable(info).message(),
+                crate::updater::ELEVATED_UPDATE_ADVICE
+            ),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
     let question = format!(
         "{}\n\nInstall it now? GameFrame will close and start again.",
         CheckOutcome::UpdateAvailable(info.clone()).message()

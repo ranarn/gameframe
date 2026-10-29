@@ -377,6 +377,8 @@ pub(crate) enum SpawnError {
     Busy,
     /// The operating system refused the thread.
     ThreadFailed,
+    /// An install was asked for by an elevated instance, which never installs.
+    Elevated,
 }
 
 /// Runs a check for the running build on a worker thread and hands the

@@ -1,7 +1,8 @@
 //! Update install: downloads the installer of an available update into a
-//! fresh folder under `%LOCALAPPDATA%\GameFrame\updates` (never an elevated
-//! instance: it refuses, see [`ensure_unelevated`]), checks it against the release's SHA-256 (a file that
-//! fails is deleted and never run) and starts it silently and detached.
+//! fresh folder under `%LOCALAPPDATA%\GameFrame\updates`, checks it against
+//! the release's SHA-256 (a file that fails is deleted and never run) and
+//! starts it silently and detached. An elevated instance never installs: it
+//! refuses before anything starts, see [`ensure_unelevated`].
 //!
 //! The installer asks the running instance to quit before it replaces files
 //! (the same command as tray Exit) and, because of its `/RELAUNCH` parameter,
@@ -30,7 +31,7 @@ const ASSET_REDIRECT_HOST: &str = "release-assets.githubusercontent.com";
 /// Largest installer a download accepts; the real one is a few MB.
 const MAX_INSTALLER_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Name prefix of the temp folder an install downloads into.
+/// Name prefix of the per-install folder an install downloads into.
 const UPDATE_DIR_PREFIX: &str = "GameFrame-update-";
 
 /// The installer's command line: silent, no restart, and the custom switch
@@ -95,8 +96,9 @@ fn prepare_installer(
 }
 
 /// The folder updates download into: `%LOCALAPPDATA%\GameFrame\updates`, which
-/// inherits the user profile's ACL (the user, SYSTEM and administrators), not
-/// the shared `%TEMP%`. Not created here.
+/// inherits the user profile's ACL (the user, SYSTEM and administrators). A
+/// fixed, app-owned location that doesn't depend on a redirectable `%TEMP%`.
+/// Not created here.
 fn updates_root() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())?;
     Some(PathBuf::from(local).join("GameFrame").join("updates"))
@@ -137,9 +139,6 @@ fn launch_installer(installer: VerifiedInstaller) -> Result<(), UpdateError> {
 /// Downloads, verifies and starts the installer of `info`. On any failure the
 /// download is deleted and nothing has been run.
 fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
-    // The installer inherits this process's token and would relaunch GameFrame
-    // with it, so an elevated instance installs nothing.
-    ensure_unelevated(crate::win32::is_process_elevated())?;
     let dir = fresh_update_dir().map_err(|e| UpdateError::Download(e.to_string()))?;
     let installer = prepare_installer(info, &dir, |file| {
         crate::http::download(
@@ -173,6 +172,12 @@ pub(crate) fn spawn_install(
     on_start: impl FnOnce() + Send + 'static,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), SpawnError> {
+    // Before anything is reported as started: the installer would inherit this
+    // process's token and relaunch GameFrame with it, so an elevated instance
+    // installs nothing.
+    if ensure_unelevated(crate::win32::is_process_elevated()).is_err() {
+        return Err(SpawnError::Elevated);
+    }
     let Some(in_flight) = FlagGuard::acquire(&INSTALL_IN_FLIGHT) else {
         return Err(SpawnError::Busy);
     };
@@ -199,12 +204,12 @@ pub(crate) fn spawn_install(
         })
 }
 
-/// Deletes the update folders in `temp` except those of the process `own_pid`,
+/// Deletes the update folders in `root` except those of the process `own_pid`,
 /// whose install may be writing to its folder right now, and returns how many
 /// could not be deleted (a running installer holds its file open).
-fn remove_stale_update_dirs(temp: &Path, own_pid: u32) -> usize {
+fn remove_stale_update_dirs(root: &Path, own_pid: u32) -> usize {
     let own_prefix = format!("{UPDATE_DIR_PREFIX}{own_pid}-");
-    let Ok(entries) = std::fs::read_dir(temp) else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
     entries

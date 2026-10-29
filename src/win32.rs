@@ -1868,8 +1868,20 @@ pub fn restrict_dll_search_to_system32() -> bool {
 }
 
 /// Whether this process runs with an elevated (full administrator) token.
-/// A failure to read the token counts as not elevated.
+/// Fails closed: a failure to read the token counts as elevated (logged once),
+/// since the only callers use this to refuse risky work.
 pub fn is_process_elevated() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    let elevated = query_token_elevation();
+    if elevated.is_none() && !LOGGED.swap(true, Ordering::Relaxed) {
+        log!("could not read the process token's elevation; treating it as elevated");
+    }
+    elevated.unwrap_or(true)
+}
+
+/// `Some(is_elevated)`, or `None` when the token can't be read.
+fn query_token_elevation() -> Option<bool> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
         GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -1879,7 +1891,7 @@ pub fn is_process_elevated() -> bool {
     // SAFETY: `token` is a valid out pointer; the pseudo-handle from
     // `GetCurrentProcess` needs no closing.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return false;
+        return None;
     }
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut returned = 0u32;
@@ -1896,7 +1908,7 @@ pub fn is_process_elevated() -> bool {
         CloseHandle(token);
         ok
     };
-    ok != 0 && elevation.TokenIsElevated != 0
+    (ok != 0).then_some(elevation.TokenIsElevated != 0)
 }
 
 /// Per-`EnumWindows`-call userdata smuggled through `EnumWindows`'s `LPARAM`
