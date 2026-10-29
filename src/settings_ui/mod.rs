@@ -197,14 +197,9 @@ impl eframe::App for SettingsApp<'_> {
             }
 
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.state.tab, SettingsTab::Games, "Games");
-                ui.selectable_value(&mut self.state.tab, SettingsTab::Cursor, "Cursor");
-                ui.selectable_value(
-                    &mut self.state.tab,
-                    SettingsTab::General,
-                    "Zone, hotkeys & taskbar",
-                );
-                ui.selectable_value(&mut self.state.tab, SettingsTab::About, "About");
+                for tab in SettingsTab::ALL {
+                    ui.selectable_value(&mut self.state.tab, tab, tab.label());
+                }
             });
             ui.separator();
 
@@ -225,8 +220,9 @@ impl eframe::App for SettingsApp<'_> {
                             }
                         });
                     }
+                    SettingsTab::Zone => self.zone_tab(ui),
                     SettingsTab::General => self.general_section(ui),
-                    SettingsTab::About => crate::about_ui::about_section(ui),
+                    SettingsTab::About => self.about_tab(ui),
                 });
         });
     }

@@ -1,4 +1,4 @@
-//! The Games tab and the General tab's section.
+//! The Games, Zone, General and About tabs.
 
 use super::{HotkeyField, SettingsApp};
 use crate::profile_store::{TaskbarHideMode, UpdateMode};
@@ -44,8 +44,9 @@ impl SettingsApp<'_> {
         }
     }
 
-    /// Renders the "Zone, hotkeys & taskbar" tab.
-    pub(super) fn general_section(&mut self, ui: &mut egui::Ui) {
+    /// Renders the "Zone, hotkeys & taskbar" tab: Zone, global hotkeys and
+    /// taskbar hiding.
+    pub(super) fn zone_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
         self.zone_section(ui);
         ui.separator();
@@ -82,10 +83,24 @@ impl SettingsApp<'_> {
             TaskbarHideMode::HoverReveal,
             "Hover to reveal (classic Windows behavior)",
         );
+    }
 
-        ui.separator();
+    /// Renders the "General" tab: Startup and Diagnostics.
+    pub(super) fn general_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Startup");
         ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
+
+        ui.separator();
+        ui.heading("Diagnostics");
+        ui.checkbox(&mut self.state.log_ui_hangs, "Log UI hangs (diagnostics)");
+        ui.label(
+            "Writes a line to the log when GameFrame stops responding for a few seconds. Takes effect when you save and close Settings; Cancel keeps the old state.",
+        );
+    }
+
+    /// Renders the "About" tab: the about info, then the Updates section.
+    pub(super) fn about_tab(&mut self, ui: &mut egui::Ui) {
+        crate::about_ui::about_section(ui);
 
         ui.separator();
         ui.heading("Updates");
@@ -100,12 +115,5 @@ impl SettingsApp<'_> {
             "Ask me (adds a tray item when an update is available)",
         );
         self.update_check_row(ui);
-
-        ui.separator();
-        ui.heading("Diagnostics");
-        ui.checkbox(&mut self.state.log_ui_hangs, "Log UI hangs (diagnostics)");
-        ui.label(
-            "Writes a line to the log when GameFrame stops responding for a few seconds. Takes effect when you save and close Settings; Cancel keeps the old state.",
-        );
     }
 }
