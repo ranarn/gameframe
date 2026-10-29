@@ -393,12 +393,13 @@ fn run_event_loop(
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
         // current for the hotkey events below.
-        if settings_host::service_settings(
+        let child_exited = settings_host::service_settings(
             ctx.tray,
             ctx.config_dir,
             &mut state.settings,
             &mut state.offered_update,
-        ) {
+        );
+        if child_exited {
             settings_closed(&ctx, &mut state);
         }
 

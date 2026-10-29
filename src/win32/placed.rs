@@ -667,7 +667,11 @@ mod tests {
         );
         placed.restore.opted_out.insert(window);
         placed.applied.push((window, 42));
-        placed.drift.record(window, std::time::Instant::now());
+        // More attempts than the drift cap (three a minute), so it is capped.
+        for _ in 0..4 {
+            placed.drift.record(window, std::time::Instant::now());
+        }
+        placed.drift.note_capped(window);
         placed.drift.note_failure(window);
         placed.hung.note(window, true);
         placed.set_recheck(window, RecheckKind::Drift, 7);
@@ -680,6 +684,7 @@ mod tests {
     /// again and the re-apply is not rate limited.
     fn assert_drift_and_hung_forgotten(placed: &mut PlacedWindows, window: isize) {
         assert!(placed.drift.note_failure(window), "failure log re-armed");
+        assert!(placed.drift.note_capped(window), "cap log re-armed");
         assert!(placed.hung.note(window, true), "hung log re-armed");
         assert_eq!(
             placed
