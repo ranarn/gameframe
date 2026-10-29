@@ -83,18 +83,41 @@ pub enum SettingsTab {
     #[default]
     Games,
     Cursor,
-    /// Zone, hotkeys, taskbar hiding, startup and updates.
+    /// Zone, global hotkeys and taskbar hiding.
+    Zone,
+    /// Startup and diagnostics.
     General,
-    /// Version, license, repository and the optional donation link.
+    /// Version, license, repository, the optional donation link and the
+    /// update settings.
     About,
 }
 
 impl SettingsTab {
+    /// Every tab in tab-bar order.
+    pub const ALL: [Self; 5] = [
+        Self::Games,
+        Self::Cursor,
+        Self::Zone,
+        Self::General,
+        Self::About,
+    ];
+
+    /// The tab-bar label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Games => "Games",
+            Self::Cursor => "Cursor",
+            Self::Zone => "Zone, hotkeys & taskbar",
+            Self::General => "General",
+            Self::About => "About",
+        }
+    }
+
     /// The tab Settings opens on: without a Zone the Games and Cursor tabs
     /// are greyed out, so open on the one that lets the user draw it.
     pub fn initial(zone: Option<Zone>) -> Self {
         if zone.is_none() {
-            Self::General
+            Self::Zone
         } else {
             Self::default()
         }
@@ -541,7 +564,23 @@ mod tests {
     fn settings_opens_on_the_zone_tab_when_no_zone_exists() {
         let state = SettingsState::from_config(&Config::default());
 
-        assert_eq!(state.tab, SettingsTab::General);
+        assert_eq!(state.tab, SettingsTab::Zone);
+    }
+
+    #[test]
+    fn tabs_are_ordered_and_labelled() {
+        let labels: Vec<&str> = SettingsTab::ALL.iter().map(|t| t.label()).collect();
+
+        assert_eq!(
+            labels,
+            [
+                "Games",
+                "Cursor",
+                "Zone, hotkeys & taskbar",
+                "General",
+                "About"
+            ]
+        );
     }
 
     #[test]
