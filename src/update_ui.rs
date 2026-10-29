@@ -40,6 +40,8 @@ pub(crate) enum UpdateEvent {
     InstallerLaunched(Version),
     /// An install failed, or the installer never quit this instance.
     InstallFailed,
+    /// An automatic install of this version was refused for its signature.
+    SignatureRefused(Version),
 }
 
 /// Lets worker threads hand an [`UpdateEvent`] to the event loop and wake its
@@ -102,7 +104,8 @@ impl UpdateEvents {
 /// Waits [`STARTUP_UPDATE_CHECK_DELAY`] on its own thread, then runs the
 /// update check (a development build fetches nothing, see
 /// [`crate::updater::check`]) and reports to the event loop. A failed check
-/// is only logged, by `spawn_check`; there is no dialog and no retry.
+/// is only logged, by `spawn_check`, with no retry; except a refused signature,
+/// which the event loop shows as a tray balloon.
 pub(crate) fn schedule_startup_update_check(notifier: UpdateNotifier) {
     let spawned = std::thread::Builder::new()
         .name("update-startup".into())
@@ -129,6 +132,12 @@ pub(crate) fn handle_update_event(
 ) {
     match event {
         UpdateEvent::Checked(result) => {
+            if let Err(e) = &result
+                && e.is_signature_refusal()
+            {
+                log!("startup update check: refused: {e}");
+                tray.notify(&crate::updater::signature_refusal_notice(None));
+            }
             // Read now, not at startup, so a mode saved in Settings in the
             // meantime counts. Without a readable mode nothing is done: an
             // install the user may have declined is worse than a missed one.
@@ -180,6 +189,9 @@ pub(crate) fn handle_update_event(
         UpdateEvent::InstallerLaunched(version) => {
             tray.set_tooltip(&format!("GameFrame - installing update v{version}..."));
         }
+        UpdateEvent::SignatureRefused(version) => {
+            tray.notify(&crate::updater::signature_refusal_notice(Some(version)));
+        }
         UpdateEvent::InstallFailed => {
             tray.set_tooltip(&crate::version::current_tooltip());
             // Ask mode: offer the update again.
@@ -202,10 +214,18 @@ pub(crate) enum Failure {
 /// Starts the install of `info` on a worker thread, see [`spawn_install`].
 /// `failure` says whether the user hears about a failure.
 pub(crate) fn start_install(info: UpdateInfo, failure: Failure) {
-    let started = spawn_install(info, move |result| {
-        if let (Err(e), Failure::Report) = (result, failure) {
+    let version = info.version;
+    let started = spawn_install(info, move |result| match (result, failure) {
+        (Err(e), Failure::Report) => {
             show_warning_box(&crate::update_install::install_error_message(&e));
         }
+        // Nobody asked for this install, but a refused signature is never
+        // left to the log.
+        (Err(e), Failure::LogOnly) if e.is_signature_refusal() => {
+            log!("automatic update to v{version} refused: {e}");
+            notify(UpdateEvent::SignatureRefused(version));
+        }
+        _ => {}
     });
     if let Err(why) = started {
         log!("update install not started: {why:?}");
