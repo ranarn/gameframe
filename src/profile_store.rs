@@ -75,6 +75,7 @@ impl TrackedGame {
         }
     }
 }
+
 /// Finds a tracked game whose `exe_path` matches, or appends a fresh
 /// default-configured one ([`TrackedGame::new_for_cursor_setting`], with
 /// `cursor_enabled` the global cursor feature's state) if none matched --

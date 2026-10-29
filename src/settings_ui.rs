@@ -1031,17 +1031,22 @@ fn apply_saved_changes(
         log_ui_hangs,
     } = edited;
 
-    if zone != opened.zone {
-        on_disk.zone = zone;
+    // The Zone is persisted immediately by the zone editor and "Clear", not by
+    // Save, so Save never writes it (`on_disk.zone` stays as it is).
+    let _ = zone;
+    let HotkeyBindings {
+        toggle_borderless,
+        toggle_taskbar_autohide,
+        toggle_game_cursor,
+    } = hotkeys;
+    if toggle_borderless != opened.hotkeys.toggle_borderless {
+        on_disk.hotkeys.toggle_borderless = toggle_borderless;
     }
-    if hotkeys.toggle_borderless != opened.hotkeys.toggle_borderless {
-        on_disk.hotkeys.toggle_borderless = hotkeys.toggle_borderless;
+    if toggle_taskbar_autohide != opened.hotkeys.toggle_taskbar_autohide {
+        on_disk.hotkeys.toggle_taskbar_autohide = toggle_taskbar_autohide;
     }
-    if hotkeys.toggle_taskbar_autohide != opened.hotkeys.toggle_taskbar_autohide {
-        on_disk.hotkeys.toggle_taskbar_autohide = hotkeys.toggle_taskbar_autohide;
-    }
-    if hotkeys.toggle_game_cursor != opened.hotkeys.toggle_game_cursor {
-        on_disk.hotkeys.toggle_game_cursor = hotkeys.toggle_game_cursor;
+    if toggle_game_cursor != opened.hotkeys.toggle_game_cursor {
+        on_disk.hotkeys.toggle_game_cursor = toggle_game_cursor;
     }
     if tracked_games != opened.tracked_games {
         let merged =
@@ -1125,11 +1130,12 @@ pub enum TickContext {
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
 /// lets the user edit the Zone and hotkey bindings, and -- only if the user
 /// clicks "Save" -- persists the fields the user changed via
-/// [`profile_store::update`] (see [`apply_saved_changes`]) before returning. Closing the window any other way (the "Cancel" button, the
-/// window's own close button) discards the edits -- except the Zone, which
-/// Save/Cancel don't govern: saving in the zone editor overlay (and "Clear")
-/// persists it immediately, so the disk and the windows it was live-applied
-/// to never disagree.
+/// [`profile_store::update`] (see [`apply_saved_changes`]) before returning.
+/// Closing the window any other way (the "Cancel" button, the window's own
+/// close button) discards the edits -- except the Zone, which Save/Cancel
+/// don't govern: saving in the zone editor overlay (and "Clear") persists it
+/// immediately, so the disk and the windows it was live-applied to never
+/// disagree.
 ///
 /// Clicking "Draw Zone"/"Edit Zone" opens the zone-editor overlay
 /// ([`zone_overlay::run_zone_editor_overlay`]) *sequentially* rather than
@@ -2329,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn save_merges_games_and_the_cursor_toggle_from_disk_into_the_edited_config() {
+    fn save_keeps_disk_games_and_cursor_toggle_while_writing_the_users_edit() {
         let opened = Config::default();
         let edited = Config {
             log_ui_hangs: !opened.log_ui_hangs,
@@ -2371,6 +2377,31 @@ mod tests {
         apply_saved_changes(&opened, edited, false, &mut on_disk);
 
         assert_eq!(on_disk, expected);
+    }
+
+    #[test]
+    fn save_never_writes_the_zone_the_editor_already_persisted() {
+        let opened = Config::default();
+        let mut edited = opened.clone();
+        let zone = |width| {
+            Some(Zone {
+                x: 0,
+                y: 0,
+                width,
+                height: 100,
+            })
+        };
+        edited.zone = zone(10);
+        edited.log_ui_hangs = !opened.log_ui_hangs;
+
+        let mut on_disk = opened.clone();
+        on_disk.zone = zone(20);
+        let disk_zone = on_disk.zone;
+
+        apply_saved_changes(&opened, edited, false, &mut on_disk);
+
+        assert_eq!(on_disk.zone, disk_zone);
+        assert_eq!(on_disk.log_ui_hangs, !opened.log_ui_hangs);
     }
 
     #[test]

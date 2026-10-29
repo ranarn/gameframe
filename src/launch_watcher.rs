@@ -317,7 +317,8 @@ struct NextSync {
 /// Pure scheduling decision. A failed hook registration is retried every
 /// [`DRIFT_SYNC_RETRY`]; an unreadable pid likewise, but only
 /// [`DRIFT_UNRESOLVED_RETRY_LIMIT`] runs in a row. Otherwise, while any hook
-/// exists, the run repeats every [`DRIFT_SYNC_SWEEP`]; with none, never.
+/// exists or a pid is still unreadable, the run repeats every
+/// [`DRIFT_SYNC_SWEEP`]; with neither, never.
 fn plan_next_sync(
     register_failed: bool,
     unresolved: bool,
@@ -332,7 +333,7 @@ fn plan_next_sync(
     let retry_unresolved = unresolved && unresolved_runs <= DRIFT_UNRESOLVED_RETRY_LIMIT;
     let after = if register_failed || retry_unresolved {
         Some(DRIFT_SYNC_RETRY)
-    } else if hooks_exist {
+    } else if hooks_exist || unresolved {
         Some(DRIFT_SYNC_SWEEP)
     } else {
         None
@@ -357,17 +358,11 @@ pub fn enable_drift_watcher() {
     sync_drift_hooks();
 }
 
-/// Disarms the watcher, cancels a pending hook-sync retry and unhooks
-/// everything. Call on the message-loop thread.
+/// Disarms the watcher and unhooks everything; the final [`sync_drift_hooks`]
+/// run also cancels the pending retry or sweep timer. Call on the
+/// message-loop thread.
 pub fn disable_drift_watcher() {
     DRIFT_WATCHER_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let timer = DRIFT_SYNC_TIMER.swap(0, std::sync::atomic::Ordering::SeqCst);
-    if timer != 0 {
-        // Safety: `timer` is a thread timer id this module created.
-        unsafe {
-            KillTimer(std::ptr::null_mut(), timer);
-        }
-    }
     sync_drift_hooks();
 }
 
@@ -468,7 +463,7 @@ fn schedule_drift_sync(after: Option<std::time::Duration>) {
     }
 }
 
-/// `TIMERPROC` for the [`sync_drift_hooks`] retry. OS-facing; not unit tested.
+/// `TIMERPROC` for the [`sync_drift_hooks`] retry and sweep. OS-facing; not unit tested.
 unsafe extern "system" fn drift_sync_timer(_hwnd: HWND, _msg: u32, timer: usize, _time: u32) {
     // Safety: `timer` is a thread timer id this module created.
     unsafe {
@@ -650,6 +645,9 @@ mod tests {
         }
         let next = plan_next_sync(false, true, runs, true);
         assert_eq!(next.after, Some(DRIFT_SYNC_SWEEP));
+        // No hook exists (the only window has an unreadable pid): still swept.
+        let no_hook = plan_next_sync(false, true, runs, false);
+        assert_eq!(no_hook.after, Some(DRIFT_SYNC_SWEEP));
         let resolved = plan_next_sync(false, false, next.unresolved_runs, true);
         assert_eq!(resolved.unresolved_runs, 0);
     }
