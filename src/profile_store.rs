@@ -487,6 +487,37 @@ fn write_default_config(config_dir: &Path) -> Result<Config, ProfileStoreError> 
     Ok(default_config)
 }
 
+/// The temp file a save writes before renaming it into place: one name per
+/// process, so two processes never write the same temp file.
+fn temp_file_name() -> String {
+    format!("{CONFIG_FILE_NAME}.{}.tmp", std::process::id())
+}
+
+/// How long a writer waits for another process's write to the config file.
+const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The name of the cross-process lock for `config_dir`'s config file: the tray
+/// process and the Settings child both write it (#186, #216).
+fn config_lock_name(config_dir: &Path) -> String {
+    // FNV-1a: a stable, short stand-in for the path in a kernel object name.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in config_dir.to_string_lossy().to_lowercase().bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("Local\\GameFrame-config-{hash:016x}")
+}
+
+/// Takes the cross-process write lock of `config_dir`'s config. A holder that
+/// does not let go within [`CONFIG_LOCK_TIMEOUT`] is ignored (logged), so a
+/// stuck process can never freeze this one's saves.
+fn lock_config_file(config_dir: &Path) -> Option<crate::named_mutex::NamedMutexGuard> {
+    let guard = crate::named_mutex::lock(&config_lock_name(config_dir), CONFIG_LOCK_TIMEOUT);
+    if guard.is_none() {
+        log!("another GameFrame process held the config lock too long; writing anyway");
+    }
+    guard
+}
+
 pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError> {
     std::fs::create_dir_all(config_dir).map_err(ProfileStoreError::Io)?;
 
@@ -496,10 +527,17 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
     // place, so a crash or power loss mid-write can't leave a
     // truncated/corrupt config file behind.
     let final_path = config_dir.join(CONFIG_FILE_NAME);
-    let temp_path = config_dir.join(format!("{CONFIG_FILE_NAME}.tmp"));
+    let temp_path = config_dir.join(temp_file_name());
 
-    std::fs::write(&temp_path, contents).map_err(ProfileStoreError::Io)?;
-    std::fs::rename(&temp_path, &final_path).map_err(ProfileStoreError::Io)?;
+    // One writer at a time across processes (the lock is re-entrant, so
+    // `update` can hold it around its save).
+    let _write = lock_config_file(config_dir);
+    let result = std::fs::write(&temp_path, contents)
+        .and_then(|()| std::fs::rename(&temp_path, &final_path));
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(ProfileStoreError::Io(e));
+    }
 
     lock_cache().insert(config_dir.to_path_buf(), config.clone());
     Ok(())
@@ -508,11 +546,16 @@ pub fn save(config_dir: &Path, config: &Config) -> Result<(), ProfileStoreError>
 /// Serializes [`update`] calls so two read-modify-writes never interleave.
 static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Read-modify-write of the stored config: loads the current config, applies
-/// `change` to it and saves the result, serialized against other `update`
-/// calls, so concurrent updates (tray, hotkeys, Settings) never overwrite each
-/// other's fields with a stale snapshot. Returns what `change` returned.
-/// (A plain [`save`] does not take that lock.)
+/// Read-modify-write of the stored config: loads the current config from disk,
+/// applies `change` to it and saves the result, serialized against other
+/// `update` calls in this process and, through a named mutex, in the other
+/// GameFrame processes (the Settings child), so concurrent updates (tray,
+/// hotkeys, Settings) never overwrite each other's fields with a stale
+/// snapshot. Returns what `change` returned. (A plain [`save`] does not take
+/// the in-process lock.)
+///
+/// The read always goes to the file, not to the cache: another process may have
+/// written it since this one last did.
 ///
 /// This is the way to change a few fields. [`save`] of a config loaded earlier
 /// is only right when the caller deliberately replaces the whole snapshot.
@@ -524,12 +567,13 @@ pub fn update<R>(
     change: impl FnOnce(&mut Config) -> R,
 ) -> Result<R, ProfileStoreError> {
     let _write = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _other_processes = lock_config_file(config_dir);
+    forget_cached(config_dir);
     let mut config = load(config_dir)?;
     let result = change(&mut config);
     save(config_dir, &config)?;
     Ok(result)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +607,47 @@ mod tests {
         assert!(load(&config_dir).unwrap().cursor.enabled);
     }
 
+    #[test]
+    fn update_starts_from_the_file_even_when_another_process_changed_it_behind_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+        assert!(!load(&config_dir).unwrap().cursor.enabled); // cached
+
+        // The Settings child saves; the tray has not heard about it yet.
+        let mut changed = Config::default();
+        changed.cursor.enabled = true;
+        std::fs::write(
+            config_dir.join(CONFIG_FILE_NAME),
+            toml::to_string_pretty(&changed).unwrap(),
+        )
+        .unwrap();
+
+        // A tray-side update must not write the stale cached copy back.
+        update(&config_dir, |config| config.log_ui_hangs = true).unwrap();
+
+        let stored = load_from_disk(&config_dir).unwrap();
+        assert!(stored.cursor.enabled, "the other process's save survives");
+        assert!(stored.log_ui_hangs);
+    }
+
+    #[test]
+    fn saves_leave_no_temp_file_and_use_a_name_of_this_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("GameFrame");
+        save(&config_dir, &Config::default()).unwrap();
+
+        assert!(temp_file_name().contains(&std::process::id().to_string()));
+        assert!(!config_dir.join(temp_file_name()).exists());
+    }
+
+    #[test]
+    fn each_config_directory_has_its_own_lock_name() {
+        let a = config_lock_name(Path::new("C:\\a\\GameFrame"));
+        assert_eq!(a, config_lock_name(Path::new("c:\\A\\gameframe")));
+        assert_ne!(a, config_lock_name(Path::new("C:\\b\\GameFrame")));
+        assert!(a.starts_with("Local\\"));
+    }
     #[test]
     fn update_applies_the_closure_to_the_stored_config_and_persists_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -968,7 +1053,7 @@ mod tests {
     /// Makes every `save` into `config_dir` fail: its temp file's name is
     /// taken by a directory.
     fn block_saves(config_dir: &Path) {
-        std::fs::create_dir(config_dir.join(format!("{CONFIG_FILE_NAME}.tmp"))).unwrap();
+        std::fs::create_dir(config_dir.join(temp_file_name())).unwrap();
     }
 
     fn backup_files(config_dir: &Path) -> Vec<String> {

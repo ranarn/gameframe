@@ -10,9 +10,8 @@
 //! window, so the "Apply to Window" picker's filter already skips it.
 //!
 //! Why a thread of its own rather than the tray's message loop: that loop
-//! blocks for as long as Settings or the zone editor is open (see
-//! [`crate::app::run_event_loop`]), and the cursor must keep following the
-//! mouse regardless. Win32 windows are thread-affine, so the window is
+//! can be busy for a while (a live re-apply contacting every running game, a
+//! hung window), and the cursor must keep following the mouse regardless. Win32 windows are thread-affine, so the window is
 //! created, moved and destroyed on this one thread; the rest of the app talks
 //! to it only through [`CursorOverlay`]'s shared state.
 //!

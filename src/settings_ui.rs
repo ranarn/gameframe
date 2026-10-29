@@ -101,6 +101,10 @@ pub struct SettingsState {
     /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
     /// [`Self::hotkey_failure`], which hides one once its binding was edited.
     hotkey_failures: Vec<BindingReport>,
+    /// The `cursor.enabled` this session last saw on disk: what it opened with,
+    /// or the last value the game-cursor hotkey reported. Save keeps the value
+    /// on disk when the checkbox still shows this (see [`merge_cursor_enabled`]).
+    cursor_enabled_seen: bool,
 }
 
 /// The Settings window's tabs.
@@ -176,6 +180,7 @@ impl SettingsState {
             log_ui_hangs: config.log_ui_hangs,
             tab: SettingsTab::initial(config.zone),
             hotkey_failures: Vec::new(),
+            cursor_enabled_seen: config.cursor.enabled,
         }
     }
 
@@ -238,6 +243,7 @@ impl SettingsState {
     /// shows it and Save writes it. Other unsaved edits are left alone.
     pub fn apply_external_cursor_enabled(&mut self, enabled: bool) {
         self.cursor.enabled = enabled;
+        self.cursor_enabled_seen = enabled;
     }
 
     /// Replaces the Zone entirely with `zone` -- the result of a completed
@@ -987,7 +993,8 @@ impl std::error::Error for SettingsUiError {
 enum SettingsExit {
     /// The config to persist, plus the "Start with Windows" choice (which
     /// lives in the registry, not in [`Config`]).
-    Saved(Config, bool),
+    /// The `bool` after the config is [`SettingsState::cursor_enabled_seen`].
+    Saved(Config, bool, bool),
     Cancelled,
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`])
@@ -998,9 +1005,45 @@ enum SettingsExit {
     EditZone(SettingsState, Vec<String>),
 }
 
+/// The config Save writes: the user's `edited` config, except that what the
+/// tray changed on disk (`on_disk`) while Settings was open is kept -- games
+/// added through the tray (see [`merge_tracked_games`]) and the game-cursor
+/// toggle (see [`merge_cursor_enabled`]).
+fn merge_saved_config(
+    opened_games: &[TrackedGame],
+    edited: Config,
+    cursor_enabled_seen: bool,
+    on_disk: &Config,
+) -> Config {
+    let tracked_games = merge_tracked_games(
+        opened_games,
+        edited.tracked_games.clone(),
+        &on_disk.tracked_games,
+    );
+    let mut cursor = edited.cursor.clone();
+    cursor.enabled = merge_cursor_enabled(
+        cursor_enabled_seen,
+        edited.cursor.enabled,
+        on_disk.cursor.enabled,
+    );
+    Config {
+        tracked_games,
+        cursor,
+        ..edited
+    }
+}
+
+/// The `cursor.enabled` Save writes. The game-cursor hotkey persists its toggle
+/// straight to disk and tells Settings over the link, which can still be in
+/// flight when Save is clicked. A checkbox that still shows what Settings last
+/// saw (`seen`) was not touched by the user, so the value on disk (the newer
+/// toggle) wins; one the user changed wins over the disk.
+fn merge_cursor_enabled(seen: bool, edited: bool, on_disk: bool) -> bool {
+    if edited == seen { on_disk } else { edited }
+}
 /// The tracked-games list Save writes. Settings edits its own copy
 /// (`edited`), but the tray's "Apply to Window" can add games on disk while
-/// Settings is open (the main loop keeps running meanwhile). A game that is on
+/// Settings is open (the tray process keeps running meanwhile). A game that is on
 /// disk (`on_disk`) but was not in the list Settings opened with (`opened`) was
 /// added in the meantime and is appended to `edited` so Save doesn't lose it.
 /// A game in `opened` but missing from `edited` was removed by the user in
@@ -1056,8 +1099,8 @@ pub enum TickContext {
 /// running. Concretely: the Settings window closes, the overlay runs to
 /// completion, its result (if any) is folded into the in-progress state,
 /// and Settings re-opens with that updated state -- the same
-/// close-then-reopen sequencing already used for "Show Settings" itself
-/// from the tray's message loop (see `app::run_event_loop`).
+/// close-then-reopen sequencing, since the overlay and Settings each own a
+/// native event loop of this child process.
 ///
 /// Also threads the non-blocking live-re-apply status messages across that
 /// same close-then-reopen boundary: `status_messages` starts empty, is
@@ -1072,8 +1115,10 @@ pub enum TickContext {
 /// Runs in the short-lived `--settings` child process (see
 /// [`crate::child_main`]), so the GPU driver dies with the window instead of
 /// staying loaded in the tray process (#186). `on_tick` is how the tray process
-/// is kept informed, and `reapply` live re-applies the saved Zone to the games
-/// given: both go to the tray process, which owns the window state.
+/// is kept informed, and `reapply` live re-applies the saved Zone to the
+/// running tracked games and returns the status lines for the ones that failed:
+/// both go to the tray process, which owns the per-window state (it reads the
+/// games from the config file itself).
 ///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
 /// each iteration and fully drops it before the next (or before returning).
@@ -1082,7 +1127,7 @@ pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
-    reapply: &mut dyn FnMut(&[TrackedGame]) -> Vec<String>,
+    reapply: &mut dyn FnMut() -> Vec<String>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let opened_games = config.tracked_games.clone();
@@ -1095,27 +1140,22 @@ pub fn run_settings_window(
 
     loop {
         match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
-            SettingsExit::Saved(config, start_with_windows) => {
+            SettingsExit::Saved(config, start_with_windows, cursor_seen) => {
                 // Keep what the tray and hotkeys changed on disk while
-                // Settings was open. The merge and the write are serialized
-                // against other `update` calls, so a tray upsert cannot land
-                // between the re-read and the save. A failure (re-read or
-                // write) is surfaced rather than retried unmerged outside
-                // that serialization: if the disk cannot be read it can
-                // hardly be written.
-                profile_store::update(config_dir, |on_disk| {
-                    let tracked_games = merge_tracked_games(
-                        &opened_games,
-                        config.tracked_games.clone(),
-                        &on_disk.tracked_games,
-                    );
-                    *on_disk = Config {
-                        tracked_games,
-                        ..config.clone()
-                    };
+                // Settings was open. The merge and the write run under the
+                // store's cross-process lock (the tray process writes the
+                // file too), and the read behind it always goes to the file.
+                // A failure (re-read or write) is surfaced rather than
+                // retried unmerged outside that lock: if the disk cannot be
+                // read it can hardly be written.
+                let saved = profile_store::update(config_dir, |on_disk| {
+                    *on_disk = merge_saved_config(&opened_games, config, cursor_seen, on_disk);
                 })
-                .map_err(SettingsUiError::Config)?;
-                // Only touch the registry on an actual change, so saving
+                .map_err(SettingsUiError::Config);
+                // Even after a failed write the tray process must not trust
+                // its cached copy.
+                crate::settings_link::config_changed();
+                saved?; // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).
                 if start_with_windows != started_with_windows {
@@ -1135,6 +1175,9 @@ pub fn run_settings_window(
                 // The overlay keeps the tray and hotkeys working too; a
                 // game-cursor toggle made meanwhile is folded into the state.
                 let mut cursor_toggled = None;
+                // Before the overlay opens: the taskbar hotkey must be held
+                // back from the first moment, not from the first tick.
+                crate::settings_link::report_context(TickContext::ZoneEditor);
                 let mut tick = || {
                     if let Some(enabled) = on_tick(TickContext::ZoneEditor) {
                         cursor_toggled = Some(enabled);
@@ -1154,9 +1197,9 @@ pub fn run_settings_window(
                         // the drift and launch re-apply paths) must never
                         // disagree with the Zone the windows are placed in.
                         match persist_zone(config_dir, Some(zone)) {
-                            Ok(saved) => {
+                            Ok(_) => {
                                 latest_state.set_zone(zone);
-                                status_messages = reapply(&saved.tracked_games);
+                                status_messages = reapply();
                             }
                             Err(e) => {
                                 log!("failed to save the zone: {e}");
@@ -1265,10 +1308,11 @@ fn window_icon() -> egui::IconData {
 /// part of this struct, since this struct itself is fully torn down and
 /// reconstructed by [`run_settings_frame`] on each session.
 struct SettingsApp<'a> {
-    /// Called once per frame (at least every [`QUIT_POLL`]) so the main
-    /// loop's tray, hotkey and update events keep being handled while this
-    /// window blocks that loop. Returns the new `cursor.enabled` when a
-    /// hotkey press toggled it during the call.
+    /// Called once per frame (at least every [`QUIT_POLL`]) to keep the tray
+    /// process informed of which window is ticking (see
+    /// [`crate::settings_link::ChildLink::tick`]). Returns the new
+    /// `cursor.enabled` when the tray process's hotkey toggled it since the
+    /// last call.
     on_tick: &'a mut dyn FnMut(TickContext) -> Option<bool>,
     /// Where the Zone is persisted immediately on Clear (the overlay-Save
     /// persist lives in [`run_settings_window`]).
@@ -1382,6 +1426,9 @@ impl SettingsApp<'_> {
                     self.state.cancel_capture();
                 } else {
                     self.state.start_capture(field);
+                    // The tray process must stop running hotkey actions now,
+                    // not with the next frame's tick.
+                    crate::settings_link::report_context(self.state.tick_context());
                     // Steal keyboard focus away from any other focused widget
                     // so the captured key-down isn't also delivered to it as
                     // an Event::Text.
@@ -2024,7 +2071,11 @@ fn save_exit(
     if let Some(enabled) = on_tick(state.tick_context()) {
         state.apply_external_cursor_enabled(enabled);
     }
-    SettingsExit::Saved(state.to_config(), state.start_with_windows)
+    SettingsExit::Saved(
+        state.to_config(),
+        state.start_with_windows,
+        state.cursor_enabled_seen,
+    )
 }
 
 impl eframe::App for SettingsApp<'_> {
@@ -2192,6 +2243,45 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_a_cursor_toggle_the_tray_persisted_but_settings_has_not_heard_of() {
+        // Opened with the cursor off; the hotkey turned it on, the message to
+        // Settings was still in flight at Save: the checkbox shows "off" still.
+        assert!(merge_cursor_enabled(false, false, true));
+        // The user ticked the box themselves: that wins over the disk.
+        assert!(merge_cursor_enabled(false, true, false));
+        assert!(!merge_cursor_enabled(true, false, true));
+        // Nothing happened anywhere.
+        assert!(!merge_cursor_enabled(false, false, false));
+    }
+
+    #[test]
+    fn save_merges_games_and_the_cursor_toggle_from_disk_into_the_edited_config() {
+        let edited = Config {
+            log_ui_hangs: true,
+            ..Config::default()
+        };
+
+        let mut on_disk = Config::default();
+        on_disk.cursor.enabled = true;
+        on_disk.tracked_games = vec![game("b.exe")];
+
+        let merged = merge_saved_config(&[], edited, false, &on_disk);
+
+        assert!(merged.log_ui_hangs, "the user's edit is saved");
+        assert!(merged.cursor.enabled, "the tray's toggle survives");
+        assert_eq!(merged.tracked_games, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn a_cursor_toggle_adopted_from_the_tray_is_the_new_baseline() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.apply_external_cursor_enabled(true);
+        let SettingsExit::Saved(config, _, seen) = save_exit(&mut state, &mut |_| None) else {
+            panic!("save_exit must produce Saved");
+        };
+        assert!(seen && config.cursor.enabled);
+    }
+    #[test]
     fn save_adopts_a_cursor_toggle_reported_by_the_final_tick() {
         let mut state = SettingsState::from_config(&Config::default());
         assert!(!state.cursor.enabled);
@@ -2201,7 +2291,7 @@ mod tests {
             contexts.push(context);
             Some(true)
         };
-        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut on_tick) else {
+        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut on_tick) else {
             panic!("save_exit must produce Saved");
         };
         assert!(config.cursor.enabled);
@@ -2212,7 +2302,7 @@ mod tests {
     fn save_keeps_the_checkbox_when_the_final_tick_reports_nothing() {
         let mut state = SettingsState::from_config(&Config::default());
         state.cursor.enabled = true;
-        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut |_| None) else {
+        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut |_| None) else {
             panic!("save_exit must produce Saved");
         };
         assert!(config.cursor.enabled);

@@ -19,11 +19,10 @@
 
 use crate::http::HttpError;
 use crate::updater::{
-    ASSET_HOST, FlagGuard, SpawnError, TRUSTED_KEYS, UpdateError, UpdateInfo, ensure_unelevated,
+    ASSET_HOST, SpawnError, TRUSTED_KEYS, UpdateError, UpdateInfo, ensure_unelevated,
     installer_name, verify_sha256, verify_signature,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// The host `github.com` redirects a release-asset download to (a 302 whose
@@ -49,8 +48,11 @@ const INSTALLER_ARGS: [&str; 4] = [
     "/RELAUNCH",
 ];
 
-/// Whether an install started by [`spawn_install`] is still running.
-static INSTALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// The named mutex held for the whole of an install started by
+/// [`spawn_install`], by the tray process and the Settings child alike (#186):
+/// a second install, from either process, finds it taken and reports `Busy`.
+const INSTALL_LOCK_NAME: &str =
+    "Local\\GameFrame-update-install-5C28E192-0AB5-4FA5-8874-88144D010E3B";
 
 /// The text shown to the user for a failed install.
 pub(crate) fn install_error_message(error: &UpdateError) -> String {
@@ -200,7 +202,8 @@ fn install(info: &UpdateInfo) -> Result<(), UpdateError> {
 /// when `on_done` returns, so `on_done` can wait for the installer to quit this
 /// instance (which then starts it again) without a second install starting
 /// meanwhile. If the installer fails, this instance keeps running. Starts
-/// nothing while an earlier install is still running.
+/// nothing while an earlier install is still running, in this process or in the
+/// other GameFrame process (tray and Settings child): `Busy`.
 pub(crate) fn spawn_install(
     info: UpdateInfo,
     on_start: impl FnOnce() + Send + 'static,
@@ -212,32 +215,50 @@ pub(crate) fn spawn_install(
     if ensure_unelevated(crate::win32::is_process_elevated()).is_err() {
         return Err(SpawnError::Elevated);
     }
-    let Some(in_flight) = FlagGuard::acquire(&INSTALL_IN_FLIGHT) else {
-        return Err(SpawnError::Busy);
-    };
+    spawn_guarded(INSTALL_LOCK_NAME, move |in_flight| {
+        on_start();
+        match install(&info) {
+            Ok(()) => {
+                on_done(Ok(()));
+                drop(in_flight);
+            }
+            Err(e) => {
+                log!("update install failed: {e}");
+                drop(in_flight);
+                on_done(Err(e));
+            }
+        }
+    })
+}
+
+/// Runs `job` on a worker thread that holds the named mutex `lock_name` for as
+/// long as `job` keeps the guard it is given. The mutex is taken on that thread
+/// (Windows mutexes belong to the thread that took them), and this waits to hear
+/// whether it succeeded: `Busy` when another thread or process holds it.
+fn spawn_guarded(
+    lock_name: &'static str,
+    job: impl FnOnce(crate::named_mutex::NamedMutexGuard) + Send + 'static,
+) -> Result<(), SpawnError> {
+    let (taken_tx, taken_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("update-install".into())
         .spawn(move || {
-            on_start();
-            match install(&info) {
-                Ok(()) => {
-                    on_done(Ok(()));
-                    drop(in_flight);
-                }
-                Err(e) => {
-                    log!("update install failed: {e}");
-                    drop(in_flight);
-                    on_done(Err(e));
-                }
+            let guard = crate::named_mutex::lock(lock_name, Duration::ZERO);
+            let _ = taken_tx.send(guard.is_some());
+            if let Some(guard) = guard {
+                job(guard);
             }
         })
-        .map(drop)
         .map_err(|e| {
             log!("update install: couldn't start the worker thread: {e}");
             SpawnError::ThreadFailed
-        })
+        })?;
+    match taken_rx.recv() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SpawnError::Busy),
+        Err(_) => Err(SpawnError::ThreadFailed),
+    }
 }
-
 /// Deletes the update folders in `root` except those of the process `own_pid`,
 /// whose install may be writing to its folder right now, and returns how many
 /// could not be deleted (a running installer holds its file open).
@@ -298,6 +319,34 @@ mod tests {
     use crate::updater::Version;
     use crate::updater::test_signing::*;
     use sha2::Digest;
+
+    #[test]
+    fn a_second_install_is_busy_while_the_first_holds_the_lock_and_may_start_after() {
+        const LOCK: &str = "Local\\GameFrame-test-install-lock-2f8c1a";
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (running_tx, running) = std::sync::mpsc::channel::<()>();
+        spawn_guarded(LOCK, move |_in_flight| {
+            running_tx.send(()).unwrap();
+            let _ = hold.recv(); // holds the guard until told to go
+        })
+        .expect("the first install starts");
+        running.recv().unwrap();
+
+        assert!(matches!(spawn_guarded(LOCK, |_| {}), Err(SpawnError::Busy)));
+
+        release.send(()).unwrap();
+        // The guard is dropped on the worker thread right after the signal.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match spawn_guarded(LOCK, |_| {}) {
+                Ok(()) => break,
+                Err(SpawnError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the lock should be free again, got {e:?}"),
+            }
+        }
+    }
 
     fn sha_signed() -> String {
         sha2::Sha256::digest(SIGNED_CONTENT)

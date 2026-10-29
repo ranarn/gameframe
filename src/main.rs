@@ -16,6 +16,7 @@ mod instance_channel;
 mod keyboard_hook;
 mod launch_watcher;
 mod message_box;
+mod named_mutex;
 mod notice;
 mod placement;
 mod profile_store;
@@ -57,6 +58,14 @@ fn main() {
         // The Settings window and the first-run zone editor run in a process
         // of their own (#186). It never takes the single-instance mutex: it
         // runs next to the tray process that started it.
+        if !child.allowed_in(cfg!(debug_assertions)) {
+            logging::init(&app::config_dir());
+            log!(
+                "refusing to run a Settings/zone editor window outside the tray process (no --linked)"
+            );
+            logging::flush();
+            std::process::exit(1);
+        }
         std::process::exit(child_main::run(child));
     }
     let wait = single_instance::is_elevated_relaunch(std::env::args())

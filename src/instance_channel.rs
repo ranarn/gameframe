@@ -3,9 +3,9 @@
 //! The running instance owns a hidden **message-only window**; a second launch
 //! finds it by class name and posts one registered window message
 //! ([`Command`] in `wParam`). A window message is dispatched by *any* message
-//! pump on the main thread, so commands arrive even while the modal Settings
-//! window is running its own loop -- which a posted thread message would not
-//! survive.
+//! pump on the main thread, so commands arrive even while a modal loop (a
+//! message box, the first-run zone editor wait) is pumping -- which a posted
+//! thread message would not survive.
 //!
 //! The window procedure never runs commands itself. It either queues them for
 //! the main loop ([`drain`]) or, while Settings is open ([`enter_settings`]),
@@ -174,7 +174,7 @@ pub enum Route {
 }
 
 /// Pure routing decision. `settings_open` is whether the main thread is
-/// currently blocked inside the Settings window.
+/// currently running a Settings child (see [`enter_settings`]).
 pub fn route(command: Command, settings_open: bool) -> Route {
     match command {
         Command::OpenSettings if settings_open => Route::FocusSettings,

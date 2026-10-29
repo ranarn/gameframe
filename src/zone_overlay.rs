@@ -103,8 +103,9 @@ impl std::error::Error for ZoneOverlayError {
 /// docs).
 ///
 /// `on_tick` is called every frame (at least every
-/// [`crate::instance_channel::QUIT_POLL`]) so the main loop's tray, hotkey and
-/// update events keep being handled while this window blocks that loop.
+/// [`crate::instance_channel::QUIT_POLL`]) so the owner of this window can
+/// follow along: the Settings child reports which window is ticking to the
+/// tray process (see [`crate::settings_link`]).
 pub fn run_zone_editor_overlay(
     initial: Option<Zone>,
     mode: TaskbarHideMode,

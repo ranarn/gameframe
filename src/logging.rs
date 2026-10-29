@@ -224,12 +224,29 @@ pub fn write(args: std::fmt::Arguments) {
     }
 }
 
+/// Tags this process's log lines (the Settings child writes the same file as
+/// the tray process), so they can be told apart. First call wins.
+pub fn set_process_tag(tag: &'static str) {
+    let _ = PROCESS_TAG.set(tag);
+}
+
+static PROCESS_TAG: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
 fn thread_name() -> String {
     let thread = std::thread::current();
-    thread
+    let name = thread
         .name()
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{:?}", thread.id()))
+        .unwrap_or_else(|| format!("{:?}", thread.id()));
+    tagged(PROCESS_TAG.get().copied(), &name)
+}
+
+/// `name`, prefixed with the process tag when there is one.
+fn tagged(tag: Option<&str>, name: &str) -> String {
+    match tag {
+        Some(tag) => format!("{tag} {name}"),
+        None => name.to_string(),
+    }
 }
 
 /// Local wall-clock time, `YYYY-MM-DD hh:mm:ss.mmm`.
@@ -341,6 +358,12 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tagged_process_marks_every_thread_name() {
+        assert_eq!(tagged(Some("settings"), "main"), "settings main");
+        assert_eq!(tagged(None, "main"), "main");
+    }
 
     /// Serialises tests that touch the global [`LOG`].
     static GLOBAL_LOG_LOCK: Mutex<()> = Mutex::new(());

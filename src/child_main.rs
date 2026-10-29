@@ -14,7 +14,17 @@ use std::path::Path;
 /// Runs the window `args` asks for and returns the process exit code.
 pub fn run(args: ChildArgs) -> i32 {
     let config_dir = app::config_dir();
+    // Same log file as the tray process: tag the lines of this one.
+    logging::set_process_tag(match args.kind {
+        ChildKind::Settings => "settings",
+        ChildKind::ZoneEditor => "zone-editor",
+    });
     logging::init(&config_dir);
+    // The zone editor can hide the taskbar, and a kill or abort here would
+    // leave it hidden: keep a marker of this process's own (the tray process
+    // restores from it when this process ends) and restore on a panic.
+    crate::taskbar_recovery::init_child(&config_dir);
+    crate::taskbar_recovery::install_panic_hook();
     // The tray process writes the config file while this window is open.
     profile_store::disable_cache();
     let link = args.linked.then(connect_stdio);
@@ -22,6 +32,8 @@ pub fn run(args: ChildArgs) -> i32 {
         ChildKind::Settings => run_settings(&config_dir, link),
         ChildKind::ZoneEditor => run_zone_editor(&config_dir),
     };
+    // Safety net: whatever this process still has hidden, it shows again.
+    crate::taskbar::restore_all_for_exit();
     logging::flush();
     code
 }
@@ -33,9 +45,7 @@ fn run_settings(config_dir: &Path, link: Option<&'static ChildLink>) -> i32 {
     }
     let mut on_tick = |context| link.and_then(|link| link.tick(context));
     // Without a link there is no tray process to re-apply the Zone.
-    let mut reapply = |_games: &[profile_store::TrackedGame]| {
-        link.map(ChildLink::request_reapply).unwrap_or_default()
-    };
+    let mut reapply = || link.map(ChildLink::request_reapply).unwrap_or_default();
     match settings_ui::run_settings_window(config_dir, &hotkey_reports, &mut on_tick, &mut reapply)
     {
         Ok(()) => 0,

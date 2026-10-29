@@ -11,7 +11,7 @@ use crate::settings_link::{ChildKind, ChildMsg, ParentMsg, child_command_line, d
 use crate::settings_ui::TickContext;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -32,6 +32,32 @@ const POLL_MS: u32 = 250;
 /// restores the taskbar, among other things) before ending it.
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
 
+/// What [`SettingsProcess`] needs from the child process: `Child`, or a fake in
+/// the tests.
+pub trait ProcessHandle {
+    fn id(&self) -> u32;
+    /// `Ok(None)` while it runs; `Ok(Some(code))` once it has exited, with its
+    /// exit code when known.
+    fn try_exit(&mut self) -> std::io::Result<Option<Option<i32>>>;
+    /// Ends the process and reaps it.
+    fn kill(&mut self);
+}
+
+impl ProcessHandle for Child {
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+
+    fn try_exit(&mut self) -> std::io::Result<Option<Option<i32>>> {
+        self.try_wait().map(|status| status.map(|s| s.code()))
+    }
+
+    fn kill(&mut self) {
+        let _ = Child::kill(self);
+        let _ = self.wait();
+    }
+}
+
 /// After the child exited: how long to wait for the messages it sent last.
 const EXIT_DRAIN: Duration = Duration::from_millis(200);
 
@@ -42,16 +68,21 @@ enum Event {
 }
 
 /// A running child: the Settings window or the first-run zone editor.
-pub struct SettingsProcess {
-    child: Child,
-    stdin: Option<ChildStdin>,
+pub struct SettingsProcess<C: ProcessHandle = Child> {
+    child: C,
+    stdin: Option<Box<dyn Write + Send>>,
     events: Receiver<Event>,
     reader_done: bool,
     exited: bool,
+    close_grace: Duration,
+    /// Runs once, with the child's id, when it has ended however it ended
+    /// (exit, kill, crash): the tray process undoes what a child killed
+    /// mid-way may have left behind (the taskbar).
+    on_ended: Option<Box<dyn FnOnce(u32)>>,
     /// Which window is ticking now, as the child last reported; decides which
     /// hotkeys still run.
     pub context: TickContext,
-    timer: usize,
+    timer: Option<usize>,
     /// Marks Settings as open for the instance channel (Settings only).
     _modal: Option<SettingsGuard>,
 }
@@ -66,7 +97,7 @@ pub struct Polled {
     pub exit_code: Option<i32>,
 }
 
-impl SettingsProcess {
+impl SettingsProcess<Child> {
     /// Starts a linked child of `kind` and sends it what it cannot find out
     /// itself. Call on the main thread (the reader thread wakes that thread).
     pub fn spawn(
@@ -83,7 +114,10 @@ impl SettingsProcess {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
         let stdout = child.stdout.take();
-        let stdin = child.stdin.take();
+        let stdin = child
+            .stdin
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Write + Send>);
         let pid = child.id();
         // Lets the child's window come to the front.
         // SAFETY: plain Win32 call with a process id.
@@ -126,21 +160,47 @@ impl SettingsProcess {
             ),
             ChildKind::ZoneEditor => (TickContext::ZoneEditor, None),
         };
-        let mut process = Self {
-            child,
-            stdin,
-            events,
-            reader_done: false,
-            exited: false,
-            context,
-            timer,
-            _modal: modal,
-        };
+        let mut process = Self::from_parts(child, stdin, events, context, modal);
+        process.timer = Some(timer);
+        process.on_ended = Some(Box::new(|pid| {
+            crate::taskbar_recovery::recover_child(&crate::app::config_dir(), pid);
+        }));
         process.send(&ParentMsg::Init {
             hotkey_reports,
             game_cursor,
         });
         Ok(process)
+    }
+}
+
+impl<C: ProcessHandle> SettingsProcess<C> {
+    fn from_parts(
+        child: C,
+        stdin: Option<Box<dyn Write + Send>>,
+        events: Receiver<Event>,
+        context: TickContext,
+        modal: Option<SettingsGuard>,
+    ) -> Self {
+        Self {
+            child,
+            stdin,
+            events,
+            reader_done: false,
+            exited: false,
+            close_grace: CLOSE_GRACE,
+            on_ended: None,
+            context,
+            timer: None,
+            _modal: modal,
+        }
+    }
+
+    /// Records that the child has ended and runs the end hook (once).
+    fn end(&mut self) {
+        self.exited = true;
+        if let Some(on_ended) = self.on_ended.take() {
+            on_ended(self.child.id());
+        }
     }
 
     /// Sends `msg`; a failure (the child is gone) is dropped, `poll` reports
@@ -165,15 +225,15 @@ impl SettingsProcess {
         self.drain(&mut messages);
         let mut exit_code = None;
         if !self.exited {
-            match self.child.try_wait() {
+            match self.child.try_exit() {
                 Ok(None) => {}
-                Ok(Some(status)) => {
-                    self.exited = true;
-                    exit_code = status.code();
+                Ok(Some(code)) => {
+                    self.end();
+                    exit_code = code;
                 }
                 Err(e) => {
                     log!("couldn't check the settings process: {e}");
-                    self.exited = true;
+                    self.end();
                 }
             }
             if self.exited {
@@ -214,28 +274,216 @@ impl SettingsProcess {
         self.send(&ParentMsg::Close);
         // Also EOF for the child, should it have missed the message.
         self.stdin = None;
-        let deadline = Instant::now() + CLOSE_GRACE;
+        let deadline = Instant::now() + self.close_grace;
         while Instant::now() < deadline {
-            match self.child.try_wait() {
+            match self.child.try_exit() {
                 Ok(Some(_)) | Err(_) => {
-                    self.exited = true;
+                    self.end();
                     return;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             }
         }
         log!("the settings process did not close in time; ending it");
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.exited = true;
+        self.child.kill();
+        self.end();
     }
 }
 
-impl Drop for SettingsProcess {
+impl<C: ProcessHandle> Drop for SettingsProcess<C> {
     fn drop(&mut self) {
         self.close();
-        // SAFETY: the id `SetTimer` returned for this thread's timer (a failed
-        // call's 0 makes this a harmless no-op).
-        unsafe { KillTimer(std::ptr::null_mut(), self.timer) };
+        if let Some(timer) = self.timer {
+            // SAFETY: the id `SetTimer` returned for this thread's timer (a
+            // failed call's 0 makes this a harmless no-op).
+            unsafe { KillTimer(std::ptr::null_mut(), timer) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::mpsc::Sender;
+
+    /// A child that exits when told to (or never).
+    struct FakeChild {
+        exit_code: Rc<Cell<Option<i32>>>,
+        killed: Rc<Cell<bool>>,
+    }
+
+    impl ProcessHandle for FakeChild {
+        fn id(&self) -> u32 {
+            4711
+        }
+        fn try_exit(&mut self) -> std::io::Result<Option<Option<i32>>> {
+            Ok(self.exit_code.get().map(Some))
+        }
+        fn kill(&mut self) {
+            self.killed.set(true);
+        }
+    }
+
+    /// A stdin that records what the tray process sent.
+    #[derive(Clone, Default)]
+    struct Sent(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Sent {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    use std::sync::Arc;
+
+    struct Rig {
+        process: SettingsProcess<FakeChild>,
+        exit_code: Rc<Cell<Option<i32>>>,
+        killed: Rc<Cell<bool>>,
+        to_tray: Sender<Event>,
+        sent: Sent,
+        ended: Rc<RefCell<Vec<u32>>>,
+    }
+
+    fn rig() -> Rig {
+        let exit_code = Rc::new(Cell::new(None));
+        let killed = Rc::new(Cell::new(false));
+        let (to_tray, events) = channel();
+        let sent = Sent::default();
+        let ended = Rc::new(RefCell::new(Vec::new()));
+        let mut process = SettingsProcess::from_parts(
+            FakeChild {
+                exit_code: Rc::clone(&exit_code),
+                killed: Rc::clone(&killed),
+            },
+            Some(Box::new(sent.clone())),
+            events,
+            TickContext::Settings,
+            None,
+        );
+        process.close_grace = Duration::from_millis(60);
+        let log = Rc::clone(&ended);
+        process.on_ended = Some(Box::new(move |pid| log.borrow_mut().push(pid)));
+        Rig {
+            process,
+            exit_code,
+            killed,
+            to_tray,
+            sent,
+            ended,
+        }
+    }
+
+    #[test]
+    fn a_running_child_hands_over_its_messages_in_order_and_has_not_exited() {
+        let mut rig = rig();
+        rig.to_tray
+            .send(Event::Msg(ChildMsg::ConfigChanged))
+            .unwrap();
+        rig.to_tray.send(Event::Msg(ChildMsg::ReapplyAll)).unwrap();
+
+        let polled = rig.process.poll();
+
+        assert_eq!(
+            polled.messages,
+            vec![ChildMsg::ConfigChanged, ChildMsg::ReapplyAll]
+        );
+        assert!(!polled.exited);
+        assert!(rig.ended.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_exit_is_reported_once_with_its_code_and_runs_the_end_hook() {
+        let mut rig = rig();
+        rig.exit_code.set(Some(10));
+        rig.to_tray.send(Event::Eof).unwrap();
+
+        let polled = rig.process.poll();
+
+        assert!(polled.exited);
+        assert_eq!(polled.exit_code, Some(10));
+        assert_eq!(*rig.ended.borrow(), vec![4711]);
+        let again = rig.process.poll();
+        assert!(again.exited && again.exit_code.is_none());
+        assert_eq!(rig.ended.borrow().len(), 1, "the hook runs once");
+    }
+
+    #[test]
+    fn messages_still_in_the_pipe_when_the_child_exits_are_not_lost() {
+        let mut rig = rig();
+        rig.exit_code.set(Some(0));
+        let late = rig.to_tray.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            late.send(Event::Msg(ChildMsg::ConfigChanged)).unwrap();
+            late.send(Event::Eof).unwrap();
+        });
+
+        let polled = rig.process.poll();
+        sender.join().unwrap();
+
+        assert!(polled.exited);
+        assert_eq!(polled.messages, vec![ChildMsg::ConfigChanged]);
+    }
+
+    #[test]
+    fn closing_asks_the_child_to_close_first_and_does_not_kill_one_that_exits_in_time() {
+        let mut rig = rig();
+        // The fake exits at once, as a child that got the request in time.
+        rig.exit_code.set(Some(0));
+
+        rig.process.close();
+
+        assert!(!rig.killed.get());
+        assert_eq!(*rig.ended.borrow(), vec![4711]);
+        let sent = String::from_utf8(rig.sent.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            sent.contains("Close"),
+            "the child is asked to close first: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_that_ignores_the_close_request_is_killed_after_the_grace_period() {
+        let mut rig = rig();
+
+        rig.process.close();
+
+        assert!(rig.killed.get());
+        assert_eq!(
+            *rig.ended.borrow(),
+            vec![4711],
+            "its leftovers are still recovered"
+        );
+        assert!(rig.process.poll().exited);
+    }
+
+    #[test]
+    fn dropping_the_process_closes_it_and_runs_the_end_hook() {
+        let rig = rig();
+        let killed = Rc::clone(&rig.killed);
+        let ended = Rc::clone(&rig.ended);
+
+        drop(rig.process);
+
+        assert!(killed.get());
+        assert_eq!(*ended.borrow(), vec![4711]);
+    }
+
+    #[test]
+    fn closing_an_exited_child_does_nothing_more() {
+        let mut rig = rig();
+        rig.exit_code.set(Some(0));
+        rig.process.poll();
+        rig.process.close();
+
+        assert!(!rig.killed.get());
+        assert_eq!(rig.ended.borrow().len(), 1);
     }
 }

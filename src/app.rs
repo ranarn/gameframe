@@ -122,7 +122,7 @@ pub fn run() -> Result<(), TrayUiError> {
     launch_watcher::enable_drift_watcher();
 
     // The game cursor runs on its own thread so it keeps following the
-    // mouse while this thread is blocked in Settings or the zone editor.
+    // mouse while this thread is busy (a hotkey, a live re-apply).
     let cursor_overlay = CursorOverlay::start(&config_dir);
 
     // Shortly after startup, off this thread; the result comes back through
@@ -389,7 +389,6 @@ fn run_event_loop(
             DispatchMessageW(&msg);
         }
 
-        crate::watchdog::step("event loop: second-launch commands");
         crate::watchdog::step("event loop: settings process");
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
@@ -453,8 +452,8 @@ struct Shared<'a> {
     updates: &'a UpdateEvents,
 }
 
-/// Whether a hotkey action may run while `context` (the window blocking the
-/// main loop, `None` when none is) is running [`drain_events`].
+/// Whether a hotkey action may run while `context` (the window the Settings
+/// child reports as ticking, `None` when no child is open) is current.
 ///
 /// The zone editor owns the taskbar (its session caches the state and its
 /// guard restores on close), so the taskbar hotkey would desync it; the
@@ -482,14 +481,12 @@ struct Drained {
 
 /// Handles the pending update, tray-icon, tray-menu and hotkey events.
 ///
-/// Shared by [`run_event_loop`] and, through [`show_settings`], the open
-/// Settings window and the zone-editor overlay it launches (the `settings`
-/// parameter says which), whose own loops block the main one: without it
-/// nothing would react until they closed. Stops early on an exit request, or
-/// on a Settings click while it is closed (events queued behind it stay in
-/// their channels for the next call). With Settings open, that click focuses
-/// the window instead. While the zone editor is open only the game-cursor
-/// hotkey runs (see [`hotkey_allowed`]).
+/// Called by [`run_event_loop`] after every pumped message. `settings` is the
+/// window the Settings child last reported (`None` when no child is open).
+/// Stops early on an exit request, or on a Settings click while it is closed
+/// (events queued behind it stay in their channels for the next call). With
+/// Settings open, that click focuses the window instead. While the zone editor
+/// is open only the game-cursor hotkey runs (see [`hotkey_allowed`]).
 fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
@@ -924,29 +921,16 @@ fn service_settings(ctx: &Shared, state: &mut LoopState) {
     };
     let polled = process.poll();
     for msg in polled.messages {
-        match msg {
-            ChildMsg::Context(context) => process.context = context,
-            ChildMsg::ConfigChanged => profile_store::forget_cached(ctx.config_dir),
-            ChildMsg::ReapplyAll => {
-                crate::watchdog::step("settings process: live re-apply");
-                profile_store::forget_cached(ctx.config_dir);
-                let messages = match profile_store::load(ctx.config_dir) {
-                    Ok(config) => {
-                        settings_ui::live_reapply_all(ctx.config_dir, &config.tracked_games)
-                    }
-                    Err(e) => {
-                        log!("live re-apply: failed to load the config: {e}");
-                        vec![format!("couldn't read the settings: {e}")]
-                    }
-                };
-                process.send(&ParentMsg::ReapplyDone(messages));
-            }
-            ChildMsg::Update(report) => {
-                if let Some(event) = report.into_event() {
-                    handle_update_event(event, ctx.tray, ctx.config_dir, &mut state.offered_update);
-                }
-            }
-            ChildMsg::Notify(text) => ctx.tray.notify(&text),
+        let reply = react_to_child_message(
+            msg,
+            &mut TrayEffects {
+                ctx,
+                context: &mut process.context,
+                offered_update: &mut state.offered_update,
+            },
+        );
+        if let Some(reply) = reply {
+            process.send(&reply);
         }
     }
     if polled.exited {
@@ -958,6 +942,81 @@ fn service_settings(ctx: &Shared, state: &mut LoopState) {
     }
 }
 
+/// What the tray process does on a Settings child's behalf; the real one is
+/// [`TrayEffects`], the tests use a fake.
+trait ChildEffects {
+    /// The window now ticking, as the child reports it.
+    fn set_context(&mut self, context: TickContext);
+    /// The child wrote the config file: drop the cached copy.
+    fn forget_config(&mut self);
+    /// Live re-applies the saved Zone to the running tracked games and returns
+    /// one status line per game that could not be repositioned.
+    fn reapply_all(&mut self) -> Vec<String>;
+    fn update_event(&mut self, event: UpdateEvent);
+    fn notify(&mut self, text: &str);
+}
+
+/// Applies one message of the Settings child through `effects`; `Some` is the
+/// answer to send back.
+fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Option<ParentMsg> {
+    match msg {
+        ChildMsg::Context(context) => effects.set_context(context),
+        ChildMsg::ConfigChanged => effects.forget_config(),
+        ChildMsg::ReapplyAll => {
+            // The Zone was just saved by the child, behind this process's cache.
+            effects.forget_config();
+            return Some(ParentMsg::ReapplyDone(effects.reapply_all()));
+        }
+        ChildMsg::Update(report) => {
+            if let Some(event) = report.into_event() {
+                effects.update_event(event);
+            }
+        }
+        ChildMsg::Notify(text) => effects.notify(&text),
+    }
+    None
+}
+
+/// The tray process's real [`ChildEffects`].
+struct TrayEffects<'a, 'b> {
+    ctx: &'a Shared<'b>,
+    context: &'a mut TickContext,
+    offered_update: &'a mut Option<UpdateInfo>,
+}
+
+impl ChildEffects for TrayEffects<'_, '_> {
+    fn set_context(&mut self, context: TickContext) {
+        *self.context = context;
+    }
+
+    fn forget_config(&mut self) {
+        profile_store::forget_cached(self.ctx.config_dir);
+    }
+
+    fn reapply_all(&mut self) -> Vec<String> {
+        crate::watchdog::step("settings process: live re-apply");
+        match profile_store::load(self.ctx.config_dir) {
+            Ok(config) => settings_ui::live_reapply_all(self.ctx.config_dir, &config.tracked_games),
+            Err(e) => {
+                log!("live re-apply: failed to load the config: {e}");
+                vec![format!("couldn't read the settings: {e}")]
+            }
+        }
+    }
+
+    fn update_event(&mut self, event: UpdateEvent) {
+        handle_update_event(
+            event,
+            self.ctx.tray,
+            self.ctx.config_dir,
+            self.offered_update,
+        );
+    }
+
+    fn notify(&mut self, text: &str) {
+        self.ctx.tray.notify(text);
+    }
+}
 /// Applies what Settings may have changed, once its window has closed.
 fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
@@ -1026,6 +1085,85 @@ mod tests {
     use global_hotkey::hotkey::HotKey;
     use windows_sys::Win32::UI::WindowsAndMessaging::IDNO;
 
+    #[derive(Default)]
+    struct FakeEffects {
+        calls: Vec<String>,
+        answer: Vec<String>,
+    }
+
+    impl ChildEffects for FakeEffects {
+        fn set_context(&mut self, context: TickContext) {
+            self.calls.push(format!("context {context:?}"));
+        }
+        fn forget_config(&mut self) {
+            self.calls.push("forget".into());
+        }
+        fn reapply_all(&mut self) -> Vec<String> {
+            self.calls.push("reapply".into());
+            self.answer.clone()
+        }
+        fn update_event(&mut self, event: UpdateEvent) {
+            self.calls
+                .push(format!("update {}", matches!(event, UpdateEvent::UpToDate)));
+        }
+        fn notify(&mut self, text: &str) {
+            self.calls.push(format!("notify {text}"));
+        }
+    }
+
+    fn react(msg: ChildMsg) -> (Option<ParentMsg>, Vec<String>) {
+        let mut effects = FakeEffects {
+            answer: vec!["Game is not responding".to_string()],
+            ..FakeEffects::default()
+        };
+        let reply = react_to_child_message(msg, &mut effects);
+        (reply, effects.calls)
+    }
+
+    #[test]
+    fn a_config_change_drops_the_cache_and_needs_no_answer() {
+        assert_eq!(
+            react(ChildMsg::ConfigChanged),
+            (None, vec!["forget".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_reapply_request_reloads_the_config_first_and_answers_with_the_status_lines() {
+        let (reply, calls) = react(ChildMsg::ReapplyAll);
+
+        assert_eq!(calls, vec!["forget".to_string(), "reapply".to_string()]);
+        assert_eq!(
+            reply,
+            Some(ParentMsg::ReapplyDone(vec![
+                "Game is not responding".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn the_childs_context_update_and_notice_reach_the_tray_side() {
+        assert_eq!(
+            react(ChildMsg::Context(TickContext::SettingsCapturing)),
+            (None, vec!["context SettingsCapturing".to_string()])
+        );
+        assert_eq!(
+            react(ChildMsg::Update(
+                crate::settings_link::UpdateReport::UpToDate
+            )),
+            (None, vec!["update true".to_string()])
+        );
+        assert_eq!(
+            react(ChildMsg::Notify("Hi".into())),
+            (None, vec!["notify Hi".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_update_report_with_an_unreadable_version_is_dropped() {
+        let report = crate::settings_link::UpdateReport::InstallStarted("garbage".into());
+        assert_eq!(react(ChildMsg::Update(report)), (None, Vec::new()));
+    }
     #[test]
     fn zone_editor_tick_allows_only_the_cursor_hotkey() {
         use HotkeyAction::*;

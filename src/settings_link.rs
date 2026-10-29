@@ -32,7 +32,8 @@ pub const SETTINGS_FLAG: &str = "--settings";
 /// Runs the first-run zone editor in this process, then exits.
 pub const ZONE_EDITOR_FLAG: &str = "--zone-editor";
 /// The tray process talks to this child over its stdin/stdout. Without it the
-/// child runs standalone (no live re-apply, no hotkey coordination).
+/// child runs standalone (no live re-apply, no hotkey coordination); only a
+/// debug build allows that, see [`ChildArgs::allowed_in`].
 pub const LINKED_FLAG: &str = "--linked";
 
 /// Exit code of `--zone-editor` when the user saved a Zone.
@@ -56,6 +57,16 @@ pub enum ChildKind {
 pub struct ChildArgs {
     pub kind: ChildKind,
     pub linked: bool,
+}
+
+impl ChildArgs {
+    /// Whether this build may run the window. Only the tray process' own
+    /// (`--linked`) children are meant to exist: a standalone one takes no
+    /// single-instance mutex and writes the config behind the tray's back, so it
+    /// is for debug builds (manual testing) only.
+    pub fn allowed_in(&self, debug_build: bool) -> bool {
+        self.linked || debug_build
+    }
 }
 
 /// Recognizes a child process's arguments (program name first). `None` for a
@@ -252,6 +263,22 @@ impl ChildLink {
         self.inbox.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Tells the tray process at once that `context` is now ticking (instead
+    /// of with the next [`Self::tick`], up to a frame later), for a change that
+    /// must take effect before the next hotkey press: a started capture, the
+    /// zone editor opening.
+    pub fn report_context(&self, context: TickContext) {
+        let changed = {
+            let mut inbox = self.lock_inbox();
+            let changed = inbox.last_context != Some(context);
+            inbox.last_context = Some(context);
+            changed
+        };
+        if changed {
+            self.send(&ChildMsg::Context(context));
+        }
+    }
+
     /// Sends `msg`; a failure (the tray process is gone) is only logged.
     pub fn send(&self, msg: &ChildMsg) {
         let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
@@ -282,15 +309,7 @@ impl ChildLink {
     /// when `context` changed and returns the new `cursor.enabled` if its
     /// hotkey toggled it since the last call.
     pub fn tick(&self, context: TickContext) -> Option<bool> {
-        let changed = {
-            let mut inbox = self.lock_inbox();
-            let changed = inbox.last_context != Some(context);
-            inbox.last_context = Some(context);
-            changed
-        };
-        if changed {
-            self.send(&ChildMsg::Context(context));
-        }
+        self.report_context(context);
         let mut inbox = self.lock_inbox();
         while let Ok(msg) = inbox.rx.try_recv() {
             inbox.file(msg);
@@ -336,6 +355,14 @@ pub fn connect_stdio() -> &'static ChildLink {
 /// standalone child.
 pub fn link() -> Option<&'static ChildLink> {
     LINK.get()
+}
+
+/// Reports `context` to the tray process immediately (no-op without a link),
+/// see [`ChildLink::report_context`].
+pub fn report_context(context: TickContext) {
+    if let Some(link) = link() {
+        link.report_context(context);
+    }
 }
 
 /// Tells the tray process the config file changed (no-op without a link).
@@ -513,6 +540,31 @@ mod tests {
             read_msg(&mut from_child),
             ChildMsg::Context(TickContext::ZoneEditor)
         );
+    }
+
+    #[test]
+    fn a_context_reported_at_once_is_not_repeated_by_the_next_tick() {
+        let (link, _to_child, mut from_child, _closed) = linked_pair();
+        link.report_context(TickContext::SettingsCapturing);
+        link.tick(TickContext::SettingsCapturing);
+        link.tick(TickContext::Settings);
+        assert_eq!(
+            read_msg(&mut from_child),
+            ChildMsg::Context(TickContext::SettingsCapturing)
+        );
+        assert_eq!(
+            read_msg(&mut from_child),
+            ChildMsg::Context(TickContext::Settings)
+        );
+    }
+
+    #[test]
+    fn only_linked_children_run_in_a_release_build() {
+        let linked = parse_child_args(["gameframe.exe", "--settings", "--linked"]).unwrap();
+        let standalone = parse_child_args(["gameframe.exe", "--settings"]).unwrap();
+        assert!(linked.allowed_in(false));
+        assert!(!standalone.allowed_in(false));
+        assert!(standalone.allowed_in(true));
     }
 
     #[test]
