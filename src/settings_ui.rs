@@ -2314,6 +2314,7 @@ mod tests {
         };
         assert!(seen && config.cursor.enabled);
     }
+
     #[test]
     fn save_adopts_a_cursor_toggle_reported_by_the_final_tick() {
         let mut state = SettingsState::from_config(&Config::default());

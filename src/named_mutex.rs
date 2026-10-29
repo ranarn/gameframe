@@ -15,7 +15,10 @@
 //! execute up, which keeps lower-integrity processes (a sandboxed one) from
 //! opening it. If the name already exists, the object must carry at least that
 //! label, else it was pre-created by a lower-integrity process: it is ignored
-//! (logged) and the guard holds nothing. A same-user, same-integrity process is
+//! (logged) and the guard holds nothing. `Local\` names are per session, not
+//! per user, so an existing mutex must also be owned by the current user (ours
+//! set the owner explicitly); one owned by another user of the session is
+//! ignored the same way. A same-user, same-integrity process is
 //! out of scope: it can write `config.toml` and run the installer itself.
 
 use std::time::Duration;
@@ -27,9 +30,10 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    GetAce, GetKernelObjectSecurity, GetSecurityDescriptorSacl, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetAce, GetKernelObjectSecurity, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
@@ -61,11 +65,12 @@ impl NamedMutexGuard {
     }
 }
 
-/// The SDDL of a mutex only `user_sid` may use: full access for that SID, and a
-/// medium integrity label that no lower-integrity process may read, write or
-/// execute up to.
+/// The SDDL of a mutex only `user_sid` may use: owned by that SID, full access
+/// for it, and a medium integrity label that no lower-integrity process may
+/// read, write or execute up to. The explicit owner keeps the mutex of an
+/// elevated instance owned by the user rather than by Administrators.
 fn mutex_sddl(user_sid: &str) -> String {
-    format!("D:(A;;GA;;;{user_sid})S:(ML;;NWNRNX;;;ME)")
+    format!("O:{user_sid}D:(A;;GA;;;{user_sid})S:(ML;;NWNRNX;;;ME)")
 }
 
 /// The string form of the current user's SID (`S-1-5-21-...`).
@@ -118,12 +123,12 @@ fn current_user_sid() -> Option<String> {
     sid
 }
 
-/// The SDDL of the mutexes this process creates, `None` if the user's SID
-/// can't be read.
-fn own_sddl() -> Option<&'static str> {
-    static SDDL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    SDDL.get_or_init(|| current_user_sid().map(|sid| mutex_sddl(&sid)))
-        .as_deref()
+/// The current user's SID and the SDDL of the mutexes this process creates,
+/// `None` if the SID can't be read.
+fn own_sddl() -> Option<&'static (String, String)> {
+    static SDDL: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| current_user_sid().map(|sid| (mutex_sddl(&sid), sid)))
+        .as_ref()
 }
 
 /// Creates (or opens) the mutex `wide_name` with the security descriptor
@@ -222,20 +227,84 @@ fn integrity_rid(handle: HANDLE) -> Option<u32> {
     }
 }
 
+/// The string form of the owner SID of the object `handle`; `None` if it
+/// can't be read.
+fn owner_sid(handle: HANDLE) -> Option<String> {
+    let mut needed = 0u32;
+    // SAFETY: a size query: no buffer, `needed` is a valid out-pointer.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            OWNER_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    // u64 elements keep the buffer aligned for the descriptor.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let descriptor: PSECURITY_DESCRIPTOR = buffer.as_mut_ptr().cast();
+    // SAFETY: the buffer is at least `needed` bytes.
+    let read = unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            OWNER_SECURITY_INFORMATION,
+            descriptor,
+            needed,
+            &mut needed,
+        )
+    };
+    if read == 0 {
+        return None;
+    }
+    let mut owner = std::ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: `descriptor` is the valid descriptor just read; the out-pointers
+    // are valid.
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } == 0
+        || owner.is_null()
+    {
+        return None;
+    }
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `owner` points into `buffer`, which is alive.
+    if unsafe { ConvertSidToStringSidW(owner, &mut text) } == 0 {
+        return None;
+    }
+    // SAFETY: on success `text` is a NUL-terminated string that this reads and
+    // then frees with `LocalFree`, as the API requires.
+    unsafe {
+        let length = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text.cast());
+        Some(sid)
+    }
+}
+
 /// Takes the mutex `name` (`Local\...`), waiting up to `timeout`. `None` if
 /// another thread or process still holds it after that. The same thread can
 /// take it again while it holds it. A mutex that can't be created or trusted
 /// gives a guard that holds nothing (see the module docs).
 pub fn lock(name: &str, timeout: Duration) -> Option<NamedMutexGuard> {
-    let Some(sddl) = own_sddl() else {
+    let Some((sddl, sid)) = own_sddl() else {
         log!("couldn't read the user's SID; continuing without the mutex {name}");
         return Some(NamedMutexGuard::unlocked());
     };
-    lock_with(name, sddl, timeout)
+    lock_with(name, sddl, Some(sid), timeout)
 }
 
-/// [`lock`] creating the mutex with `sddl`.
-fn lock_with(name: &str, sddl: &str, timeout: Duration) -> Option<NamedMutexGuard> {
+/// [`lock`] creating the mutex with `sddl`. An existing mutex is trusted only
+/// when it carries at least a medium label and, with `owner` given, is owned
+/// by that SID.
+fn lock_with(
+    name: &str,
+    sddl: &str,
+    owner: Option<&str>,
+    timeout: Duration,
+) -> Option<NamedMutexGuard> {
     let wide = crate::wide::encode_wide(name);
     let (handle, existed) = create_mutex(&wide, sddl);
     if handle.is_null() {
@@ -246,6 +315,15 @@ fn lock_with(name: &str, sddl: &str, timeout: Duration) -> Option<NamedMutexGuar
         log!(
             "the mutex {name} was created by a lower-integrity process; ignoring it and continuing without it"
         );
+        // SAFETY: `handle` is valid and owned by this function.
+        unsafe { CloseHandle(handle) };
+        return Some(NamedMutexGuard::unlocked());
+    }
+    if existed
+        && let Some(owner) = owner
+        && owner_sid(handle).as_deref() != Some(owner)
+    {
+        log!("the mutex {name} is owned by another user; ignoring it and continuing without it");
         // SAFETY: `handle` is valid and owned by this function.
         unsafe { CloseHandle(handle) };
         return Some(NamedMutexGuard::unlocked());
@@ -318,6 +396,26 @@ mod tests {
         let name = unique_name("label");
         let guard = lock(&name, Duration::ZERO).expect("free");
         assert_eq!(integrity_rid(guard.handle), Some(MEDIUM_RID));
+        assert_eq!(owner_sid(guard.handle), Some(sid));
+    }
+
+    #[test]
+    fn a_name_owned_by_another_user_is_ignored() {
+        let sid = current_user_sid().expect("the user's SID");
+        let name = unique_name("owner");
+        let squat = lock(&name, Duration::ZERO).expect("free");
+
+        // Same object, but it must be owned by "someone else" (LocalSystem).
+        let held = std::thread::spawn({
+            let (name, sddl) = (name.clone(), mutex_sddl(&sid));
+            move || {
+                lock_with(&name, &sddl, Some("S-1-5-18"), Duration::from_millis(30))
+                    .is_some_and(|g| !g.held)
+            }
+        });
+
+        assert!(held.join().unwrap(), "ignored, not waited on");
+        drop(squat);
     }
 
     #[test]
@@ -330,7 +428,7 @@ mod tests {
             let name = name.clone();
             std::thread::spawn(move || {
                 // What a sandboxed process could do: create the name first, hold it.
-                let squat = lock_with(&name, LOW_INTEGRITY, Duration::ZERO).expect("free");
+                let squat = lock_with(&name, LOW_INTEGRITY, None, Duration::ZERO).expect("free");
                 held_tx.send(()).unwrap();
                 let _ = hold.recv();
                 drop(squat);

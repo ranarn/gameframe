@@ -823,6 +823,7 @@ mod tests {
     const FULLY: TaskbarHideRestore = TaskbarHideRestore::FullyHidden;
     const HOVER_FROM_VISIBLE: TaskbarHideRestore = TaskbarHideRestore::HoverReveal(AlwaysVisible);
     const HOVER_FROM_AUTO: TaskbarHideRestore = TaskbarHideRestore::HoverReveal(AutoHidden);
+
     #[test]
     fn a_child_marker_name_carries_the_pid_and_is_told_apart_from_the_trays_and_temp_files() {
         let name = child_marker_name(4242);

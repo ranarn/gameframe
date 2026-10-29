@@ -310,6 +310,7 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::mpsc::Sender;
 
     /// A child that exits when told to (or never).
@@ -348,8 +349,6 @@ mod tests {
             Ok(())
         }
     }
-
-    use std::sync::Arc;
 
     struct Rig {
         process: SettingsProcess<FakeChild>,
