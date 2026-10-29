@@ -204,6 +204,34 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
+impl UpdateError {
+    /// Whether the update was refused for lack of a valid publisher signature,
+    /// the one failure that can mean tampering and so is never left to the log.
+    pub(crate) fn is_signature_refusal(&self) -> bool {
+        matches!(
+            self,
+            UpdateError::MissingSignature
+                | UpdateError::InvalidSignature(_)
+                | UpdateError::SignatureMismatch
+                | UpdateError::SignatureForOtherFile
+        )
+    }
+}
+
+/// What the tray balloon says when an update was refused for its signature
+/// (`version` when known).
+pub(crate) fn signature_refusal_notice(version: Option<Version>) -> String {
+    match version {
+        Some(v) => format!(
+            "The update to v{v} can't be verified and was not installed. \
+             Check for Updates Now in Settings shows why."
+        ),
+        None => "The latest GameFrame update can't be verified and was not installed. \
+                 Check for Updates Now in Settings shows why."
+            .to_string(),
+    }
+}
+
 /// The installer of a newer release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UpdateInfo {
@@ -384,9 +412,13 @@ pub(crate) fn verify_signature(
     let mut verifier = match keys.iter().find_map(|k| k.verify_stream(&signature).ok()) {
         Some(verifier) => verifier,
         None => {
-            return Err(match key_error {
-                Some(e) => UpdateError::InvalidSignature(e),
-                None => UpdateError::SignatureMismatch,
+            // A parse error is only the cause when no key parsed at all.
+            return Err(if keys.is_empty() {
+                UpdateError::InvalidSignature(
+                    key_error.unwrap_or_else(|| "no public key configured".into()),
+                )
+            } else {
+                UpdateError::SignatureMismatch
             });
         }
     };
@@ -1118,6 +1150,33 @@ mod tests {
     }
 
     #[test]
+    fn only_signature_failures_count_as_a_signature_refusal() {
+        for e in [
+            UpdateError::MissingSignature,
+            UpdateError::InvalidSignature("x".into()),
+            UpdateError::SignatureMismatch,
+            UpdateError::SignatureForOtherFile,
+        ] {
+            assert!(e.is_signature_refusal(), "{e:?}");
+        }
+        for e in [
+            UpdateError::DigestMismatch,
+            UpdateError::Network("x".into()),
+            UpdateError::NoMatchingAsset,
+        ] {
+            assert!(!e.is_signature_refusal(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn signature_refusal_notice_names_the_version_when_known() {
+        let v = Version::parse("1.2.3").unwrap();
+
+        assert!(signature_refusal_notice(Some(v)).contains("v1.2.3"));
+        assert!(signature_refusal_notice(None).contains("not installed"));
+    }
+
+    #[test]
     fn verify_signature_accepts_a_file_signed_with_the_key() {
         assert_eq!(
             verify_signature(SIGNED_CONTENT, SIGNATURE, &[PUBLIC], INSTALLER),
@@ -1162,11 +1221,23 @@ mod tests {
     }
 
     #[test]
-    fn verify_signature_rejects_the_unconfigured_placeholder_key() {
+    fn verify_signature_reports_an_invalid_signature_when_no_key_parses() {
+        let placeholder = ["REPLACE_WITH_MINISIGN_PUBLIC_KEY", ""];
+
         assert!(matches!(
-            verify_signature(SIGNED_CONTENT, SIGNATURE, &TRUSTED_KEYS, INSTALLER),
-            Err(UpdateError::InvalidSignature(_)) | Err(UpdateError::SignatureMismatch)
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &placeholder, INSTALLER),
+            Err(UpdateError::InvalidSignature(e)) if e.contains("no usable public key")
         ));
+    }
+
+    #[test]
+    fn verify_signature_reports_a_mismatch_when_one_key_parses_and_another_does_not() {
+        let keys = [OTHER_PUBLIC, "mistyped"];
+
+        assert_eq!(
+            verify_signature(SIGNED_CONTENT, SIGNATURE, &keys, INSTALLER),
+            Err(UpdateError::SignatureMismatch)
+        );
     }
 
     #[test]

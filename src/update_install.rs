@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// The host `github.com` redirects a release-asset download to (a 302 whose
-/// `Location` carries a SIGNED_CONTENT URL).
+/// `Location` carries a signed URL).
 const ASSET_REDIRECT_HOST: &str = "release-assets.githubusercontent.com";
 
 /// Largest installer a download accepts; the real one is a few MB.

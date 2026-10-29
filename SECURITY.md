@@ -37,7 +37,7 @@ GameFrame checks about 20 seconds after it starts (and again when you choose
 ("Install updates automatically at startup") it then installs an available
 update without asking; with "Ask me" it adds a tray item and installs only when
 you choose it. (An elevated instance installs in neither mode, see below.) A
-failed startup check is only logged. The check and the download use HTTPS through Windows' own WinHTTP, so the system certificate
+failed startup check is only logged (except a refused signature, see below). The check and the download use HTTPS through Windows' own WinHTTP, so the system certificate
 store and proxy settings apply:
 
 - The check is a GET of `api.github.com/repos/ranarn/gameframe/releases/latest`.
@@ -56,14 +56,22 @@ store and proxy settings apply:
   it to match the release it is installing, so a genuinely signed older
   installer cannot be re-published as a newer release (replay or downgrade). A
   release with no signature, a signature that does not verify, a signature made
-  for another release, or a key mismatch is refused: the download is deleted, nothing runs, and the Settings update row
-  and the log say why. There is no unsigned fallback. This is what protects you
-  if the GitHub account or release page is compromised, because the signing key
-  is held only as a secret of the protected `release` environment, which
-  requires a reviewer's approval. (The installer is not Authenticode-signed, so
-  Windows SmartScreen and UAC still show an unknown publisher.) Versions up to
-  0.6.0 do not verify signatures; the check applies to every update installed by
-  a version that contains it.
+  for another release, or a key mismatch is refused: the download is deleted and
+  nothing runs. There is no unsigned fallback. The refusal is never only in the
+  log. A check or install you start in Settings shows why in the update row; an
+  automatic install or the startup check shows one tray balloon ("... can't be
+  verified and was not installed"), and the same version is not retried until
+  you restart GameFrame or a newer release appears. Scope of the protection: the
+  signing key is held only as a secret of the protected `release` environment, so
+  someone who can merely change release assets or the release page (a leaked
+  token with write access, another compromised workflow) cannot get a file
+  accepted. It does not protect against a takeover of the maintainer's GitHub
+  account: the maintainer is the sole required reviewer and a repository admin,
+  so whoever controls the account can run the release workflow and approve the
+  signing, or relax the environment's rules. (The installer is not
+  Authenticode-signed, so Windows SmartScreen and UAC still show an unknown
+  publisher.) Releases published before this check was added do not verify
+  signatures; it applies to every update installed by a version that contains it.
 - Integrity: the installer is also hashed and compared with the SHA-256 digest
   the release API reports for it, which catches a corrupted download. The digest
   comes from the same GitHub response as the download URL, so on its own it
