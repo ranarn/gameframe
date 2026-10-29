@@ -62,8 +62,9 @@ store and proxy settings apply:
   off, an administrator's processes are always elevated, so GameFrame never
   installs updates itself there and setup never starts it: install new versions
   by running setup yourself and start GameFrame afterwards.
-- GameFrame restricts DLL loading to System32 (`SetDefaultDllDirectories` first
-  thing in `main`, and `/DEPENDENTLOADFLAG:0x800` at link time).
+- GameFrame's own static imports are resolved from System32 only
+  (`/DEPENDENTLOADFLAG:0x800` at link time), so a DLL planted next to the exe
+  cannot replace them.
 - The installer asks the running instance to quit by posting a `Quit` command to
   the instance's hidden message-only window; `gameframe.exe --quit` sends the
   same command from a second launch. `Quit` travels on a separate registered

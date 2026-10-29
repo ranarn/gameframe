@@ -1856,17 +1856,6 @@ pub fn relaunch_elevated() -> Result<(), Win32Error> {
     Ok(())
 }
 
-/// Restricts DLL loading to System32 for the rest of the process, so a DLL
-/// planted next to the exe or in the working directory is never picked up.
-/// Call it first thing in `main`. Returns whether the call succeeded.
-pub fn restrict_dll_search_to_system32() -> bool {
-    use windows_sys::Win32::System::LibraryLoader::{
-        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
-    };
-    // SAFETY: plain call with a documented flag; no pointers involved.
-    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) != 0 }
-}
-
 /// Whether this process runs with an elevated (full administrator) token.
 /// Fails closed: a failure to read the token counts as elevated (logged once),
 /// since the only callers use this to refuse risky work.

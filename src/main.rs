@@ -38,13 +38,6 @@ mod zone_overlay;
 mod zone_taskbar;
 
 fn main() {
-    // Before anything can load a DLL (see SECURITY.md); the linker flag in
-    // build.rs covers the static imports that load before `main`.
-    if !win32::restrict_dll_search_to_system32() {
-        // Opened only on this rare failure; `init` is idempotent.
-        logging::init(&app::config_dir());
-        log!("SetDefaultDllDirectories failed; DLL search order is unrestricted");
-    }
     if single_instance::is_quit_request(std::env::args()) {
         // Never takes the instance: just asks the running one to exit. One
         // attempt only, so "not running" returns at once.
