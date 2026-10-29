@@ -3,9 +3,9 @@
 //! The running instance owns a hidden **message-only window**; a second launch
 //! finds it by class name and posts one registered window message
 //! ([`Command`] in `wParam`). A window message is dispatched by *any* message
-//! pump on the main thread, so commands arrive even while the modal Settings
-//! window is running its own loop -- which a posted thread message would not
-//! survive.
+//! pump on the main thread, so commands arrive even while a modal loop (a
+//! message box, the first-run zone editor wait) is pumping -- which a posted
+//! thread message would not survive.
 //!
 //! The window procedure never runs commands itself. It either queues them for
 //! the main loop ([`drain`]) or, while Settings is open ([`enter_settings`]),
@@ -43,18 +43,19 @@
 //! either; it falls back to that after its timeout).
 //!
 //! `Quit` while Settings is open ([`Route::CloseSettingsAndQueue`]): the window
-//! procedure posts `WM_CLOSE` to the Settings window and queues the command;
-//! once Settings returns, the main loop sees [`quit_pending`] and exits
-//! through the same path as the tray's Exit item. Unsaved Settings edits are
-//! discarded, as with the window's close button.
+//! procedure posts `WM_CLOSE` to the Settings window (which lives in the
+//! `--settings` child process, see [`enter_settings`]) and queues the command;
+//! the main loop sees it and exits through the same path as the tray's Exit
+//! item, which also closes the child. Unsaved Settings edits are discarded, as
+//! with the window's close button.
 //!
-//! The egui windows that block the main thread (Settings and the zone editor
-//! overlay, from the first-run prompt or from Settings) also poll
-//! [`quit_pending`] every [`QUIT_POLL`] and close themselves on a queued
-//! `Quit`; the overlay ends like Cancel (restoring the taskbar), Settings does
-//! not reopen afterwards, and the main loop checks [`quit_pending`] before it
-//! starts pumping. This also covers a `Quit` that arrives before the Settings
-//! window exists.
+//! The egui windows (Settings and the zone editor overlay, in their child
+//! processes) poll [`quit_pending`] every [`QUIT_POLL`] and close themselves
+//! when it is true. In the tray process that means a queued `Quit`; in a child
+//! it means [`request_close`] (the tray process asked, or went away). The
+//! overlay ends like Cancel (restoring the taskbar), Settings does not reopen
+//! afterwards, and the main loop checks [`quit_pending`] before it starts
+//! pumping. This also covers a `Quit` that arrives before the window exists.
 //!
 //! The installer (`installer/gameframe.iss`) sends `Quit` itself from Pascal,
 //! using the class name, restricted message name and `wParam` code defined
@@ -69,7 +70,7 @@ use crate::wide::encode_wide;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -173,7 +174,7 @@ pub enum Route {
 }
 
 /// Pure routing decision. `settings_open` is whether the main thread is
-/// currently blocked inside the Settings window.
+/// currently running a Settings child (see [`enter_settings`]).
 pub fn route(command: Command, settings_open: bool) -> Route {
     match command {
         Command::OpenSettings if settings_open => Route::FocusSettings,
@@ -232,6 +233,10 @@ pub fn dispatch_commands(
 
 static QUEUE: Mutex<VecDeque<Command>> = Mutex::new(VecDeque::new());
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+/// The process owning the open Settings window (the `--settings` child).
+static SETTINGS_PID: AtomicU32 = AtomicU32::new(0);
+/// See [`request_close`].
+static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Takes every command received since the last call. Call from the main loop.
 pub fn drain() -> Vec<Command> {
@@ -242,23 +247,35 @@ pub fn drain() -> Vec<Command> {
         .collect()
 }
 
-/// Whether a `Quit` is waiting in the queue. The main loop checks this after
-/// Settings returns, since a `Quit` received while Settings was open arrives
-/// in the queue without any further message to wake the loop.
+/// Whether a `Quit` is waiting in the queue. The main loop checks this before
+/// it starts pumping, since a `Quit` that arrived earlier (during the first-run
+/// zone prompt) is in the queue without any further message to wake the loop.
+///
+/// In a Settings or zone-editor child process there is no queue; the tray
+/// process asks it to close instead, and [`request_close`] makes this `true`.
 pub fn quit_pending() -> bool {
-    QUEUE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(&Command::Quit)
+    CLOSE_REQUESTED.load(Ordering::SeqCst)
+        || QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&Command::Quit)
 }
 
-/// Marks the main thread as inside the Settings window for the lifetime of the
+/// Child processes only: the tray process asked this window to close (or went
+/// away), which [`quit_pending`] reports from now on.
+pub fn request_close() {
+    CLOSE_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Marks Settings as open, in the child process `pid`, for the lifetime of the
 /// returned guard.
 #[must_use]
 pub struct SettingsGuard;
 
-/// Flags Settings as open until the returned guard is dropped.
-pub fn enter_settings() -> SettingsGuard {
+/// Flags Settings as open (its window belongs to process `pid`) until the
+/// returned guard is dropped.
+pub fn enter_settings(pid: u32) -> SettingsGuard {
+    SETTINGS_PID.store(pid, Ordering::SeqCst);
     SETTINGS_OPEN.store(true, Ordering::SeqCst);
     SettingsGuard
 }
@@ -266,6 +283,7 @@ pub fn enter_settings() -> SettingsGuard {
 impl Drop for SettingsGuard {
     fn drop(&mut self) {
         SETTINGS_OPEN.store(false, Ordering::SeqCst);
+        SETTINGS_PID.store(0, Ordering::SeqCst);
         // The queue lock is held for the discard, so it is atomic with respect
         // to the window procedure's enqueue.
         discard_open_settings(&mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
@@ -519,12 +537,35 @@ pub fn should_restore_on_end_session(wparam: usize) -> bool {
     wparam != 0
 }
 
-/// This process's Settings window, if it exists yet.
+/// The open Settings window (owned by the process given to
+/// [`enter_settings`], or this one when none was), if it exists yet.
 pub(crate) fn find_settings_window() -> Option<HWND> {
-    let title = encode_wide(SETTINGS_TITLE);
+    let pid = match SETTINGS_PID.load(Ordering::SeqCst) {
+        0 => current_pid(),
+        pid => pid,
+    };
+    find_window_of(SETTINGS_TITLE, pid)
+}
+
+/// In a Settings or zone-editor child: this process's own window (Settings or
+/// the zone editor), if it exists yet. Lets [`crate::watchdog`] ping the
+/// child's main thread.
+pub(crate) fn find_own_ui_window() -> Option<HWND> {
+    let pid = current_pid();
+    find_window_of(SETTINGS_TITLE, pid)
+        .or_else(|| find_window_of(crate::zone_overlay::ZONE_EDITOR_TITLE, pid))
+}
+
+fn current_pid() -> u32 {
+    // SAFETY: no arguments or preconditions.
+    unsafe { GetCurrentProcessId() }
+}
+
+/// The top-level window titled `title` that belongs to process `pid`.
+fn find_window_of(title: &str, pid: u32) -> Option<HWND> {
+    let title = encode_wide(title);
     // SAFETY: plain Win32 calls; `title` outlives them.
     unsafe {
-        let pid = GetCurrentProcessId();
         let mut prev: HWND = std::ptr::null_mut();
         loop {
             let hwnd = FindWindowExW(std::ptr::null_mut(), prev, std::ptr::null(), title.as_ptr());
@@ -541,7 +582,8 @@ pub(crate) fn find_settings_window() -> Option<HWND> {
     }
 }
 
-/// Brings this process's Settings window to the front. `false` if not found.
+/// Brings the open Settings window (the child process's, see
+/// [`enter_settings`]) to the front. `false` if not found.
 pub fn focus_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;
@@ -581,19 +623,8 @@ pub fn command_window() -> Option<HWND> {
     }
 }
 
-/// Queues a `Quit` from inside this process (the tray's Exit item or an
-/// elevated relaunch while Settings is open): the Settings loop closes itself
-/// on [`quit_pending`] and the main loop then exits.
-pub fn queue_quit() {
-    enqueue(
-        &mut QUEUE.lock().unwrap_or_else(|e| e.into_inner()),
-        Command::Quit,
-    );
-}
-
-/// Asks this process's Settings window to close, as its close button would
-/// (the Settings loop then returns and discards unsaved edits). `false` if not
-/// found.
+/// Asks the open Settings window (the child process's) to close, as its close
+/// button would (unsaved edits are discarded). `false` if not found.
 fn close_settings_window() -> bool {
     let Some(hwnd) = find_settings_window() else {
         return false;
@@ -834,7 +865,7 @@ mod tests {
         }
         let _reset = Reset;
 
-        let guard = enter_settings();
+        let guard = enter_settings(0);
         {
             let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             enqueue(&mut q, Command::OpenSettings);

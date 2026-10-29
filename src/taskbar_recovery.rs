@@ -17,6 +17,12 @@
 //! - A **panic hook** ([`install_panic_hook`]) that restores the taskbar and
 //!   clears the marker before the abort, then defers to the previous hook.
 //!
+//! The Settings / zone editor windows run in a child process (#186), whose
+//! zone editor can hide the taskbar too. The child keeps its own record and
+//! marker file ([`init_child`]); the tray process undoes a child's hide the
+//! moment the child ends ([`recover_child`]), and startup recovery sweeps up
+//! the markers of children that died with it.
+//!
 //! Limitation: only the primary taskbar (`Shell_TrayWnd`) is handled;
 //! secondary-monitor taskbars are not touched by GameFrame at all.
 
@@ -26,6 +32,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub const MARKER_FILE: &str = "taskbar-hidden.marker";
+
+/// Name prefix of the marker a Settings / zone editor child process writes
+/// (`taskbar-hidden-child-<pid>.marker`). Its own file, so the child and the
+/// tray process never rewrite one marker from two separate in-memory records.
+const CHILD_MARKER_PREFIX: &str = "taskbar-hidden-child-";
+const MARKER_EXTENSION: &str = ".marker";
+
+/// The marker file name of the child process `pid`.
+fn child_marker_name(pid: u32) -> String {
+    format!("{CHILD_MARKER_PREFIX}{pid}{MARKER_EXTENSION}")
+}
+
+/// Whether `name` is a child process marker (not its `.tmp` file).
+fn is_child_marker_name(name: &str) -> bool {
+    name.strip_prefix(CHILD_MARKER_PREFIX)
+        .and_then(|rest| rest.strip_suffix(MARKER_EXTENSION))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The child process markers in `dir`, by file name.
+fn child_marker_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_child_marker_name(name))
+        .collect();
+    names.sort();
+    names
+}
 
 /// What the marker file said at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,8 +337,13 @@ fn panic_restore_target(
     }
 }
 
-fn marker_path(dir: &Path) -> PathBuf {
-    dir.join(MARKER_FILE)
+/// The marker file name of this process: the tray's, unless [`init_child`] ran.
+fn own_marker_name() -> &'static str {
+    MARKER_NAME.get().map_or(MARKER_FILE, String::as_str)
+}
+
+fn marker_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
 }
 
 fn write_record_file(dir: &Path, text: &str) -> std::io::Result<()> {
@@ -311,13 +353,13 @@ fn write_record_file(dir: &Path, text: &str) -> std::io::Result<()> {
     // new content, never a truncated one. The fixed temp name is safe because
     // every writer holds the `RECORD` lock. `sync_all` before the rename keeps
     // a power loss from leaving a renamed-but-empty marker.
-    let tmp = tmp_marker_path(dir);
+    let tmp = tmp_marker_path(dir, own_marker_name());
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut file, text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, marker_path(dir))
+        std::fs::rename(&tmp, marker_path(dir, own_marker_name()))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -326,12 +368,16 @@ fn write_record_file(dir: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The temp file [`write_record_file`] renames over the marker.
-fn tmp_marker_path(dir: &Path) -> std::path::PathBuf {
-    dir.join(format!("{MARKER_FILE}.tmp"))
+fn tmp_marker_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}.tmp"))
 }
 
 fn read_marker_file(dir: &Path) -> MarkerState {
-    match std::fs::read_to_string(marker_path(dir)) {
+    read_marker_named(dir, own_marker_name())
+}
+
+fn read_marker_named(dir: &Path, name: &str) -> MarkerState {
+    match std::fs::read_to_string(marker_path(dir, name)) {
         Ok(text) => match parse_record(&text) {
             None => MarkerState::Unreadable,
             Some(HideRecord {
@@ -354,9 +400,13 @@ fn read_marker_file(dir: &Path) -> MarkerState {
 }
 
 fn clear_marker_file(dir: &Path) -> std::io::Result<()> {
+    clear_marker_named(dir, own_marker_name())
+}
+
+fn clear_marker_named(dir: &Path, name: &str) -> std::io::Result<()> {
     // A temp file left by a kill between write and rename is stale too.
-    let _ = std::fs::remove_file(tmp_marker_path(dir));
-    match std::fs::remove_file(marker_path(dir)) {
+    let _ = std::fs::remove_file(tmp_marker_path(dir, name));
+    match std::fs::remove_file(marker_path(dir, name)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
@@ -369,6 +419,8 @@ fn clear_marker_file(dir: &Path) -> std::io::Result<()> {
 /// always reach the marker file when the lock is busy.
 static RECORD: Mutex<HideRecord> = Mutex::new(HideRecord::EMPTY);
 static MARKER_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Set in a child process only, see [`init_child`].
+static MARKER_NAME: OnceLock<String> = OnceLock::new();
 /// Set when startup recovery failed and the marker was kept. While set the
 /// marker file is left untouched (a later hide or the exit path would
 /// otherwise destroy the only record of a stranded hide); recovery is retried
@@ -435,6 +487,16 @@ fn persist(rec: HideRecord) {
 /// is written to disk (in-memory tracking still works).
 pub fn init(dir: &Path) {
     let _ = MARKER_DIR.set(dir.to_path_buf());
+}
+
+/// [`init`] for a Settings / zone editor child process: its hide record goes to
+/// a marker file of its own (`taskbar-hidden-child-<pid>.marker`), which the
+/// tray process restores from when the child ends however it ends
+/// ([`recover_child`]) and startup recovery restores from if the tray process
+/// died too ([`recover_on_startup`]).
+pub fn init_child(dir: &Path) {
+    let _ = MARKER_NAME.set(child_marker_name(std::process::id()));
+    init(dir);
 }
 
 /// Undo handle for a [`mark_hidden`] call whose OS hide then failed.
@@ -594,9 +656,10 @@ fn restore_marked_with<E>(
     Ok(())
 }
 
-/// Performs the recovery for `marker` against the real taskbar and clears the
-/// marker. Uses the raw restore calls: no in-memory bookkeeping is involved.
-fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Error> {
+/// Undoes what `marker` records against the real taskbar, by the raw restore
+/// calls: no in-memory bookkeeping is involved. `Err` when the decision could
+/// not be made or carried out (the caller keeps the marker then).
+fn apply_recovery(marker: MarkerState) -> Result<(), win32::Win32Error> {
     let (visible, autohide) = win32::observe_taskbar()?;
     let observed = ObservedTaskbar { visible, autohide };
     let mut undecidable = false;
@@ -621,6 +684,12 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
         // answers again.
         return Err(win32::Win32Error::WindowHung);
     }
+    Ok(())
+}
+
+/// Performs the recovery for the tray's own `marker` and clears it.
+fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Error> {
+    apply_recovery(marker)?;
     RECOVERY_PENDING.store(false, Ordering::SeqCst);
     if let Err(e) = clear_marker_file(dir) {
         log!("could not remove the taskbar marker: {e}");
@@ -632,6 +701,15 @@ fn recover_marker(dir: &Path, marker: MarkerState) -> Result<(), win32::Win32Err
 /// performs [`decide_recovery`]'s action and clears the marker. Call before
 /// anything that can hide the taskbar. OS-facing; the decision is tested.
 pub fn recover_on_startup(dir: &Path) {
+    recover_own_marker(dir);
+    // Markers of Settings / zone editor children that died with the tray
+    // process (or that it never got to clean up).
+    for name in child_marker_names(dir) {
+        recover_named(dir, &name);
+    }
+}
+
+fn recover_own_marker(dir: &Path) {
     let marker = read_marker_file(dir);
     if marker == MarkerState::None {
         return;
@@ -643,6 +721,31 @@ pub fn recover_on_startup(dir: &Path) {
     if let Err(e) = recover_marker(dir, marker) {
         log!("taskbar recovery failed, keeping the marker: {e}");
         RECOVERY_PENDING.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The tray process calls this when its Settings / zone editor child `pid` has
+/// ended, however it ended (clean exit, killed after the grace period, crash):
+/// if the child left a taskbar hide behind, undoes it right away. A clean exit
+/// has removed its marker, which makes this a cheap no-op. A recovery that
+/// fails keeps the marker for the next start.
+pub fn recover_child(dir: &Path, pid: u32) {
+    recover_named(dir, &child_marker_name(pid));
+}
+
+fn recover_named(dir: &Path, name: &str) {
+    let marker = read_marker_named(dir, name);
+    if marker == MarkerState::None {
+        return;
+    }
+    log!("taskbar recovery: a child process left {name} behind");
+    match apply_recovery(marker) {
+        Ok(()) => {
+            if let Err(e) = clear_marker_named(dir, name) {
+                log!("could not remove the taskbar marker {name}: {e}");
+            }
+        }
+        Err(e) => log!("taskbar recovery of {name} failed, keeping the marker: {e}"),
     }
 }
 
@@ -720,6 +823,68 @@ mod tests {
     const FULLY: TaskbarHideRestore = TaskbarHideRestore::FullyHidden;
     const HOVER_FROM_VISIBLE: TaskbarHideRestore = TaskbarHideRestore::HoverReveal(AlwaysVisible);
     const HOVER_FROM_AUTO: TaskbarHideRestore = TaskbarHideRestore::HoverReveal(AutoHidden);
+
+    #[test]
+    fn a_child_marker_name_carries_the_pid_and_is_told_apart_from_the_trays_and_temp_files() {
+        let name = child_marker_name(4242);
+        assert_eq!(name, "taskbar-hidden-child-4242.marker");
+        assert!(is_child_marker_name(&name));
+        assert!(!is_child_marker_name(MARKER_FILE));
+        assert!(!is_child_marker_name(&format!("{name}.tmp")));
+        assert!(!is_child_marker_name("taskbar-hidden-child-.marker"));
+        assert!(!is_child_marker_name("taskbar-hidden-child-abc.marker"));
+    }
+
+    #[test]
+    fn startup_finds_the_child_markers_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            MARKER_FILE,
+            "taskbar-hidden-child-7.marker",
+            "taskbar-hidden-child-7.marker.tmp",
+            "taskbar-hidden-child-12.marker",
+            "config.toml",
+        ] {
+            std::fs::write(dir.path().join(name), "fully-hidden\n").unwrap();
+        }
+        assert_eq!(
+            child_marker_names(dir.path()),
+            vec![
+                "taskbar-hidden-child-12.marker".to_string(),
+                "taskbar-hidden-child-7.marker".to_string()
+            ]
+        );
+        assert!(child_marker_names(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_child_marker_is_read_and_cleared_independently_of_the_trays() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = child_marker_name(99);
+        std::fs::write(dir.path().join(MARKER_FILE), "hover-reveal auto-hidden\n").unwrap();
+        std::fs::write(dir.path().join(&child), "fully-hidden\n").unwrap();
+
+        assert_eq!(
+            read_marker_named(dir.path(), &child),
+            MarkerState::Technique(FULLY)
+        );
+        clear_marker_named(dir.path(), &child).unwrap();
+
+        assert_eq!(read_marker_named(dir.path(), &child), MarkerState::None);
+        assert_eq!(
+            read_marker_file(dir.path()),
+            MarkerState::Technique(HOVER_FROM_AUTO),
+            "the tray's marker is untouched"
+        );
+    }
+
+    #[test]
+    fn a_child_that_ended_cleanly_leaves_nothing_for_the_tray_to_recover() {
+        // No marker: returns before touching the taskbar.
+        let dir = tempfile::tempdir().unwrap();
+        recover_child(dir.path(), 5);
+        assert!(child_marker_names(dir.path()).is_empty());
+    }
 
     fn observed(visible: bool, autohide: TaskbarAutohideState) -> ObservedTaskbar {
         ObservedTaskbar {
@@ -963,11 +1128,11 @@ mod tests {
     #[test]
     fn a_corrupt_marker_file_reads_as_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(marker_path(tmp.path()), "???").unwrap();
+        std::fs::write(marker_path(tmp.path(), MARKER_FILE), "???").unwrap();
         assert_eq!(read_marker_file(tmp.path()), MarkerState::Unreadable);
-        std::fs::write(marker_path(tmp.path()), "fully-hidden\n???\n").unwrap();
+        std::fs::write(marker_path(tmp.path(), MARKER_FILE), "fully-hidden\n???\n").unwrap();
         assert_eq!(read_marker_file(tmp.path()), MarkerState::Unreadable);
-        std::fs::write(marker_path(tmp.path()), "").unwrap();
+        std::fs::write(marker_path(tmp.path(), MARKER_FILE), "").unwrap();
         assert_eq!(read_marker_file(tmp.path()), MarkerState::Unreadable);
     }
 
@@ -1041,7 +1206,7 @@ mod tests {
     fn the_panic_hook_shows_the_taskbar_for_an_unreadable_marker_like_startup_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         for content in ["???", "", "fully-hidden\n???\n"] {
-            std::fs::write(marker_path(tmp.path()), content).unwrap();
+            std::fs::write(marker_path(tmp.path(), MARKER_FILE), content).unwrap();
             assert_eq!(panic_restore_target(None, Some(tmp.path())), vec![FULLY]);
         }
         // Startup recovery shows a hidden taskbar for the same marker.

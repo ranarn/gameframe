@@ -15,7 +15,7 @@ use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::hotkey::HotKey;
 
 /// Actions GameFrame can bind a global hotkey to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::enum_variant_names)] // every action is a toggle
 pub enum HotkeyAction {
     ToggleBorderless,
@@ -60,7 +60,7 @@ pub fn action_for(bindings: &[ResolvedBinding], id: u32) -> Option<HotkeyAction>
 }
 
 /// What happened to one non-empty binding when registering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BindingOutcome {
     Registered,
     /// Human-readable reason, shown in Settings next to the binding.
@@ -69,7 +69,7 @@ pub enum BindingOutcome {
 
 /// The outcome for one non-empty binding, with the binding string it was
 /// for (so Settings can tell whether the user has since changed it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BindingReport {
     pub action: HotkeyAction,
     pub binding: String,

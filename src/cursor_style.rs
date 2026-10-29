@@ -183,7 +183,7 @@ pub fn should_show(settings: &CursorSettings, over_game: bool, cursor_showing: b
 
 /// A premultiplied-alpha RGBA image with the pixel the real cursor position
 /// maps to (`hotspot_x`, `hotspot_y`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Bitmap {
     pub width: u32,
     pub height: u32,

@@ -27,6 +27,7 @@ use crate::profile_store::{
     UpdateMode, Zone,
 };
 use crate::region_calc::{MonitorGeometry, Region, resolve_region};
+use crate::settings_link::InstallProgress;
 use crate::updater::{CheckOutcome, SpawnError, UpdateError, UpdateInfo};
 use crate::win32;
 use crate::zone_editor::pixels_to_points;
@@ -101,6 +102,10 @@ pub struct SettingsState {
     /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
     /// [`Self::hotkey_failure`], which hides one once its binding was edited.
     hotkey_failures: Vec<BindingReport>,
+    /// The `cursor.enabled` this session last saw on disk: what it opened with,
+    /// or the last value the game-cursor hotkey reported. Save keeps the value
+    /// on disk when the checkbox still shows this (see [`merge_cursor_enabled`]).
+    cursor_enabled_seen: bool,
 }
 
 /// The Settings window's tabs.
@@ -176,6 +181,7 @@ impl SettingsState {
             log_ui_hangs: config.log_ui_hangs,
             tab: SettingsTab::initial(config.zone),
             hotkey_failures: Vec::new(),
+            cursor_enabled_seen: config.cursor.enabled,
         }
     }
 
@@ -238,6 +244,7 @@ impl SettingsState {
     /// shows it and Save writes it. Other unsaved edits are left alone.
     pub fn apply_external_cursor_enabled(&mut self, enabled: bool) {
         self.cursor.enabled = enabled;
+        self.cursor_enabled_seen = enabled;
     }
 
     /// Replaces the Zone entirely with `zone` -- the result of a completed
@@ -544,11 +551,15 @@ pub(crate) fn persist_zone(
     config_dir: &Path,
     zone: Option<Zone>,
 ) -> Result<Config, SettingsUiError> {
-    profile_store::update(config_dir, |config| {
+    let saved = profile_store::update(config_dir, |config| {
         *config = config_with_zone(std::mem::take(config), zone);
         config.clone()
     })
-    .map_err(SettingsUiError::Config)
+    .map_err(SettingsUiError::Config)?;
+    // In the Settings child: the tray process caches the config, so it must
+    // learn that the file changed.
+    crate::settings_link::config_changed();
+    Ok(saved)
 }
 
 /// Live re-applies the Zone on disk to every running tracked game in `games`
@@ -565,7 +576,7 @@ pub(crate) fn persist_zone(
 /// OS-facing -- not exercised by this crate's automated tests; the
 /// orchestration is tested in `placement`, and
 /// [`live_apply_failure_message`] is the pure message text.
-fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
+pub(crate) fn live_reapply_all(config_dir: &Path, games: &[TrackedGame]) -> Vec<String> {
     games
         .iter()
         .filter_map(|game| {
@@ -983,7 +994,8 @@ impl std::error::Error for SettingsUiError {
 enum SettingsExit {
     /// The config to persist, plus the "Start with Windows" choice (which
     /// lives in the registry, not in [`Config`]).
-    Saved(Config, bool),
+    /// The `bool` after the config is [`SettingsState::cursor_enabled_seen`].
+    Saved(Config, bool, bool),
     Cancelled,
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`])
@@ -994,9 +1006,45 @@ enum SettingsExit {
     EditZone(SettingsState, Vec<String>),
 }
 
+/// The config Save writes: the user's `edited` config, except that what the
+/// tray changed on disk (`on_disk`) while Settings was open is kept -- games
+/// added through the tray (see [`merge_tracked_games`]) and the game-cursor
+/// toggle (see [`merge_cursor_enabled`]).
+fn merge_saved_config(
+    opened_games: &[TrackedGame],
+    edited: Config,
+    cursor_enabled_seen: bool,
+    on_disk: &Config,
+) -> Config {
+    let tracked_games = merge_tracked_games(
+        opened_games,
+        edited.tracked_games.clone(),
+        &on_disk.tracked_games,
+    );
+    let mut cursor = edited.cursor.clone();
+    cursor.enabled = merge_cursor_enabled(
+        cursor_enabled_seen,
+        edited.cursor.enabled,
+        on_disk.cursor.enabled,
+    );
+    Config {
+        tracked_games,
+        cursor,
+        ..edited
+    }
+}
+
+/// The `cursor.enabled` Save writes. The game-cursor hotkey persists its toggle
+/// straight to disk and tells Settings over the link, which can still be in
+/// flight when Save is clicked. A checkbox that still shows what Settings last
+/// saw (`seen`) was not touched by the user, so the value on disk (the newer
+/// toggle) wins; one the user changed wins over the disk.
+fn merge_cursor_enabled(seen: bool, edited: bool, on_disk: bool) -> bool {
+    if edited == seen { on_disk } else { edited }
+}
 /// The tracked-games list Save writes. Settings edits its own copy
 /// (`edited`), but the tray's "Apply to Window" can add games on disk while
-/// Settings is open (the main loop keeps running meanwhile). A game that is on
+/// Settings is open (the tray process keeps running meanwhile). A game that is on
 /// disk (`on_disk`) but was not in the list Settings opened with (`opened`) was
 /// added in the meantime and is appended to `edited` so Save doesn't lose it.
 /// A game in `opened` but missing from `edited` was removed by the user in
@@ -1024,7 +1072,7 @@ fn merge_tracked_games(
 }
 
 /// Which window's frame loop is ticking the app's event handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TickContext {
     /// The Settings window is open.
     Settings,
@@ -1052,8 +1100,8 @@ pub enum TickContext {
 /// running. Concretely: the Settings window closes, the overlay runs to
 /// completion, its result (if any) is folded into the in-progress state,
 /// and Settings re-opens with that updated state -- the same
-/// close-then-reopen sequencing already used for "Show Settings" itself
-/// from the tray's message loop (see `app::run_event_loop`).
+/// close-then-reopen sequencing, since the overlay and Settings each own a
+/// native event loop of this child process.
 ///
 /// Also threads the non-blocking live-re-apply status messages across that
 /// same close-then-reopen boundary: `status_messages` starts empty, is
@@ -1065,6 +1113,14 @@ pub enum TickContext {
 /// before "Edit Zone" was clicked survives the round trip through
 /// the overlay instead of vanishing with the torn-down `SettingsApp`.
 ///
+/// Runs in the short-lived `--settings` child process (see
+/// [`crate::child_main`]), so the GPU driver dies with the window instead of
+/// staying loaded in the tray process (#186). `on_tick` is how the tray process
+/// is kept informed, and `reapply` live re-applies the saved Zone to the
+/// running tracked games and returns the status lines for the ones that failed:
+/// both go to the tray process, which owns the per-window state (it reads the
+/// games from the config file itself).
+///
 /// OS/GPU-facing: constructs a real egui/wgpu context for the lifetime of
 /// each iteration and fully drops it before the next (or before returning).
 /// Not exercised by this crate's automated tests -- see module docs.
@@ -1072,6 +1128,7 @@ pub fn run_settings_window(
     config_dir: &Path,
     hotkey_reports: &[BindingReport],
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
+    reapply: &mut dyn FnMut() -> Vec<String>,
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let opened_games = config.tracked_games.clone();
@@ -1084,26 +1141,22 @@ pub fn run_settings_window(
 
     loop {
         match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
-            SettingsExit::Saved(config, start_with_windows) => {
+            SettingsExit::Saved(config, start_with_windows, cursor_seen) => {
                 // Keep what the tray and hotkeys changed on disk while
-                // Settings was open. The merge and the write are serialized
-                // against other `update` calls, so a tray upsert cannot land
-                // between the re-read and the save. A failure (re-read or
-                // write) is surfaced rather than retried unmerged outside
-                // that serialization: if the disk cannot be read it can
-                // hardly be written.
-                profile_store::update(config_dir, |on_disk| {
-                    let tracked_games = merge_tracked_games(
-                        &opened_games,
-                        config.tracked_games.clone(),
-                        &on_disk.tracked_games,
-                    );
-                    *on_disk = Config {
-                        tracked_games,
-                        ..config.clone()
-                    };
+                // Settings was open. The merge and the write run under the
+                // store's cross-process lock (the tray process writes the
+                // file too), and the read behind it always goes to the file.
+                // A failure (re-read or write) is surfaced rather than
+                // retried unmerged outside that lock: if the disk cannot be
+                // read it can hardly be written.
+                let saved = profile_store::update(config_dir, |on_disk| {
+                    *on_disk = merge_saved_config(&opened_games, config, cursor_seen, on_disk);
                 })
-                .map_err(SettingsUiError::Config)?;
+                .map_err(SettingsUiError::Config);
+                // Even after a failed write the tray process must not trust
+                // its cached copy.
+                crate::settings_link::config_changed();
+                saved?;
                 // Only touch the registry on an actual change, so saving
                 // unrelated settings never re-points an existing entry at
                 // whichever exe happens to be running (e.g. a dev build).
@@ -1124,6 +1177,9 @@ pub fn run_settings_window(
                 // The overlay keeps the tray and hotkeys working too; a
                 // game-cursor toggle made meanwhile is folded into the state.
                 let mut cursor_toggled = None;
+                // Before the overlay opens: the taskbar hotkey must be held
+                // back from the first moment, not from the first tick.
+                crate::settings_link::report_context(TickContext::ZoneEditor);
                 let mut tick = || {
                     if let Some(enabled) = on_tick(TickContext::ZoneEditor) {
                         cursor_toggled = Some(enabled);
@@ -1143,10 +1199,9 @@ pub fn run_settings_window(
                         // the drift and launch re-apply paths) must never
                         // disagree with the Zone the windows are placed in.
                         match persist_zone(config_dir, Some(zone)) {
-                            Ok(saved) => {
+                            Ok(_) => {
                                 latest_state.set_zone(zone);
-                                status_messages =
-                                    live_reapply_all(config_dir, &saved.tracked_games);
+                                status_messages = reapply();
                             }
                             Err(e) => {
                                 log!("failed to save the zone: {e}");
@@ -1255,10 +1310,11 @@ fn window_icon() -> egui::IconData {
 /// part of this struct, since this struct itself is fully torn down and
 /// reconstructed by [`run_settings_frame`] on each session.
 struct SettingsApp<'a> {
-    /// Called once per frame (at least every [`QUIT_POLL`]) so the main
-    /// loop's tray, hotkey and update events keep being handled while this
-    /// window blocks that loop. Returns the new `cursor.enabled` when a
-    /// hotkey press toggled it during the call.
+    /// Called once per frame (at least every [`QUIT_POLL`]) to keep the tray
+    /// process informed of which window is ticking (see
+    /// [`crate::settings_link::ChildLink::tick`]). Returns the new
+    /// `cursor.enabled` when the tray process's hotkey toggled it since the
+    /// last call.
     on_tick: &'a mut dyn FnMut(TickContext) -> Option<bool>,
     /// Where the Zone is persisted immediately on Clear (the overlay-Save
     /// persist lives in [`run_settings_window`]).
@@ -1306,20 +1362,21 @@ enum UpdateCheck {
 /// Progress of installing the update an `UpdateCheck` found.
 enum UpdateInstall {
     Idle,
-    /// Running on a worker thread, which sends the result here.
-    Running(std::sync::mpsc::Receiver<Result<(), UpdateError>>),
+    /// Asked for; the tray process downloads and verifies it and reports back
+    /// (see [`crate::settings_link::InstallProgress`]).
+    Running,
     /// The installer was started (at this time); it asks GameFrame to quit.
     Started(Instant),
     /// The installer was started but GameFrame wasn't quit within
     /// [`INSTALL_QUIT_TIMEOUT`].
     TimedOut,
-    Failed(UpdateError),
+    /// Failed; the text is the message for the user.
+    Failed(String),
     /// Not started: another install was already running.
     Busy,
-    /// Not started: the worker thread could not be created.
+    /// Not started: the worker thread could not be created, or there is no
+    /// tray process to ask.
     NotStarted,
-    /// The worker ended without sending a result.
-    Lost,
 }
 
 /// How long Settings waits, after the installer started, for it to quit
@@ -1327,6 +1384,24 @@ enum UpdateInstall {
 const INSTALL_QUIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl UpdateInstall {
+    /// Applies what the tray process reported about the install that is
+    /// `Running`; progress that arrives in any other state (an install the tray
+    /// item started) is not this window's business.
+    fn apply(&mut self, progress: InstallProgress, now: Instant) {
+        if !matches!(self, Self::Running) {
+            return;
+        }
+        *self = match progress {
+            InstallProgress::Launched => Self::Started(now),
+            InstallProgress::Failed(text) => Self::Failed(text),
+            InstallProgress::Busy => Self::Busy,
+            InstallProgress::NotStarted => Self::NotStarted,
+            InstallProgress::Elevated => Self::Failed(
+                crate::update_install::install_error_message(&UpdateError::ElevatedInstance),
+            ),
+        };
+    }
+
     /// Moves `Started` to `TimedOut` once [`INSTALL_QUIT_TIMEOUT`] has passed
     /// between its start and `now`.
     fn expire(&mut self, now: Instant) {
@@ -1372,6 +1447,9 @@ impl SettingsApp<'_> {
                     self.state.cancel_capture();
                 } else {
                     self.state.start_capture(field);
+                    // The tray process must stop running hotkey actions now,
+                    // not with the next frame's tick.
+                    crate::settings_link::report_context(self.state.tick_context());
                     // Steal keyboard focus away from any other focused widget
                     // so the captured key-down isn't also delivered to it as
                     // an Event::Text.
@@ -1719,7 +1797,7 @@ impl SettingsApp<'_> {
             // A new check while an install runs would drop the install's result.
             let installing = matches!(
                 self.update_install,
-                UpdateInstall::Running(_) | UpdateInstall::Started(_)
+                UpdateInstall::Running | UpdateInstall::Started(_)
             );
             let enabled = !installing && !matches!(self.update_check, UpdateCheck::Running(_));
             if ui
@@ -1730,7 +1808,7 @@ impl SettingsApp<'_> {
                 let ctx = ui.ctx().clone();
                 let started = crate::updater::spawn_check(move |result| {
                     if matches!(result, Ok(CheckOutcome::UpToDate)) {
-                        crate::update_ui::notify(crate::update_ui::UpdateEvent::UpToDate);
+                        crate::settings_link::report_up_to_date();
                     }
                     let _ = sender.send(result);
                     ctx.request_repaint();
@@ -1774,57 +1852,40 @@ impl SettingsApp<'_> {
         }
     }
 
-    /// Renders the "Install update" button and its status line. The install
-    /// runs on a worker thread that wakes the UI when it has a result; on
-    /// success the installer quits GameFrame (closing this window) and starts
-    /// it again.
+    /// Renders the "Install update" button and its status line. The tray
+    /// process runs the install and reports its progress; on success the
+    /// installer quits GameFrame (closing this window) and starts it again.
     fn update_install_row(&mut self, ui: &mut egui::Ui, info: UpdateInfo) {
         self.update_install.expire(Instant::now());
-        if matches!(self.update_install, UpdateInstall::Started(_)) {
+        if matches!(self.update_install, UpdateInstall::Running) {
+            // The progress arrives through the link, which wakes nothing.
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        } else if matches!(self.update_install, UpdateInstall::Started(_)) {
             // Nothing else wakes the UI if the installer never quits GameFrame.
             ui.ctx().request_repaint_after(Duration::from_secs(5));
         }
-        if let UpdateInstall::Running(receiver) = &self.update_install {
-            match receiver.try_recv() {
-                Ok(Ok(())) => {
-                    self.update_install = UpdateInstall::Started(Instant::now());
-                }
-                Ok(Err(e)) => self.update_install = UpdateInstall::Failed(e),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.update_install = UpdateInstall::Lost;
-                }
-            }
+        for progress in crate::settings_link::take_install_progress() {
+            self.update_install.apply(progress, Instant::now());
         }
 
         let busy = matches!(
             self.update_install,
-            UpdateInstall::Running(_) | UpdateInstall::Started(_)
+            UpdateInstall::Running | UpdateInstall::Started(_)
         );
         let label = format!("Install v{}", info.version);
         if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let ctx = ui.ctx().clone();
-            let started = crate::update_ui::spawn_install(info, move |result| {
-                // With the window gone nobody reads the channel; a failure is
-                // then shown in a box so it is never only in the log.
-                if let Err(std::sync::mpsc::SendError(Err(e))) = sender.send(result) {
-                    crate::message_box::show_warning_box(
-                        &crate::update_install::install_error_message(&e),
-                    );
-                }
-                ctx.request_repaint();
-            });
-            self.update_install = match started {
-                Ok(()) => UpdateInstall::Running(receiver),
-                Err(SpawnError::Busy) => UpdateInstall::Busy,
-                Err(SpawnError::ThreadFailed) => UpdateInstall::NotStarted,
-                Err(SpawnError::Elevated) => UpdateInstall::Failed(UpdateError::ElevatedInstance),
+            // The tray process runs the install, so closing this window never
+            // interrupts it; its progress arrives through the link. Without a
+            // tray process (a standalone debug child) there is nothing to ask.
+            self.update_install = if crate::settings_link::request_install(&info) {
+                UpdateInstall::Running
+            } else {
+                UpdateInstall::NotStarted
             };
         }
         match &self.update_install {
             UpdateInstall::Idle => {}
-            UpdateInstall::Running(_) => {
+            UpdateInstall::Running => {
                 ui.spinner();
                 ui.label("Downloading the update...");
             }
@@ -1837,11 +1898,8 @@ impl SettingsApp<'_> {
                     "The installer didn't finish. Try installing again.",
                 );
             }
-            UpdateInstall::Failed(e) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    crate::update_install::install_error_message(e),
-                );
+            UpdateInstall::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
             }
             UpdateInstall::Busy => {
                 ui.label("An update is already being installed.");
@@ -1850,12 +1908,6 @@ impl SettingsApp<'_> {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     "Couldn't start the update install.",
-                );
-            }
-            UpdateInstall::Lost => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    "Installing the update failed: it ended unexpectedly",
                 );
             }
         }
@@ -2014,7 +2066,11 @@ fn save_exit(
     if let Some(enabled) = on_tick(state.tick_context()) {
         state.apply_external_cursor_enabled(enabled);
     }
-    SettingsExit::Saved(state.to_config(), state.start_with_windows)
+    SettingsExit::Saved(
+        state.to_config(),
+        state.start_with_windows,
+        state.cursor_enabled_seen,
+    )
 }
 
 impl eframe::App for SettingsApp<'_> {
@@ -2134,6 +2190,44 @@ mod tests {
     }
 
     #[test]
+    fn the_tray_processs_progress_moves_a_running_install_on() {
+        let now = Instant::now();
+        let progress = |p| {
+            let mut state = UpdateInstall::Running;
+            state.apply(p, now);
+            state
+        };
+        assert!(matches!(
+            progress(InstallProgress::Launched),
+            UpdateInstall::Started(at) if at == now
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Failed("disk full".into())),
+            UpdateInstall::Failed(text) if text == "disk full"
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Busy),
+            UpdateInstall::Busy
+        ));
+        assert!(matches!(
+            progress(InstallProgress::NotStarted),
+            UpdateInstall::NotStarted
+        ));
+        assert!(matches!(
+            progress(InstallProgress::Elevated),
+            UpdateInstall::Failed(text) if text.contains("as administrator")
+        ));
+    }
+
+    #[test]
+    fn progress_of_an_install_this_window_did_not_ask_for_is_ignored() {
+        // E.g. the tray item started one; Settings is idle.
+        let mut state = UpdateInstall::Idle;
+        state.apply(InstallProgress::Launched, Instant::now());
+        assert!(matches!(state, UpdateInstall::Idle));
+    }
+
+    #[test]
     fn expire_leaves_other_install_states_alone() {
         let mut state = UpdateInstall::Idle;
         state.expire(Instant::now() + INSTALL_QUIT_TIMEOUT * 2);
@@ -2182,6 +2276,46 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_a_cursor_toggle_the_tray_persisted_but_settings_has_not_heard_of() {
+        // Opened with the cursor off; the hotkey turned it on, the message to
+        // Settings was still in flight at Save: the checkbox shows "off" still.
+        assert!(merge_cursor_enabled(false, false, true));
+        // The user ticked the box themselves: that wins over the disk.
+        assert!(merge_cursor_enabled(false, true, false));
+        assert!(!merge_cursor_enabled(true, false, true));
+        // Nothing happened anywhere.
+        assert!(!merge_cursor_enabled(false, false, false));
+    }
+
+    #[test]
+    fn save_merges_games_and_the_cursor_toggle_from_disk_into_the_edited_config() {
+        let edited = Config {
+            log_ui_hangs: true,
+            ..Config::default()
+        };
+
+        let mut on_disk = Config::default();
+        on_disk.cursor.enabled = true;
+        on_disk.tracked_games = vec![game("b.exe")];
+
+        let merged = merge_saved_config(&[], edited, false, &on_disk);
+
+        assert!(merged.log_ui_hangs, "the user's edit is saved");
+        assert!(merged.cursor.enabled, "the tray's toggle survives");
+        assert_eq!(merged.tracked_games, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn a_cursor_toggle_adopted_from_the_tray_is_the_new_baseline() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.apply_external_cursor_enabled(true);
+        let SettingsExit::Saved(config, _, seen) = save_exit(&mut state, &mut |_| None) else {
+            panic!("save_exit must produce Saved");
+        };
+        assert!(seen && config.cursor.enabled);
+    }
+
+    #[test]
     fn save_adopts_a_cursor_toggle_reported_by_the_final_tick() {
         let mut state = SettingsState::from_config(&Config::default());
         assert!(!state.cursor.enabled);
@@ -2191,7 +2325,7 @@ mod tests {
             contexts.push(context);
             Some(true)
         };
-        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut on_tick) else {
+        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut on_tick) else {
             panic!("save_exit must produce Saved");
         };
         assert!(config.cursor.enabled);
@@ -2202,7 +2336,7 @@ mod tests {
     fn save_keeps_the_checkbox_when_the_final_tick_reports_nothing() {
         let mut state = SettingsState::from_config(&Config::default());
         state.cursor.enabled = true;
-        let SettingsExit::Saved(config, _) = save_exit(&mut state, &mut |_| None) else {
+        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut |_| None) else {
             panic!("save_exit must produce Saved");
         };
         assert!(config.cursor.enabled);

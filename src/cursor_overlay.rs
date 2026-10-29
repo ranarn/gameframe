@@ -10,11 +10,11 @@
 //! window, so the "Apply to Window" picker's filter already skips it.
 //!
 //! Why a thread of its own rather than the tray's message loop: that loop
-//! blocks for as long as Settings or the zone editor is open (see
-//! [`crate::app::run_event_loop`]), and the cursor must keep following the
-//! mouse regardless. Win32 windows are thread-affine, so the window is
-//! created, moved and destroyed on this one thread; the rest of the app talks
-//! to it only through [`CursorOverlay`]'s shared state.
+//! can be busy for a while (a live re-apply contacting every running game, a
+//! hung window), and the cursor must keep following the mouse regardless.
+//! Win32 windows are thread-affine, so the window is created, moved and
+//! destroyed on this one thread; the rest of the app talks to it only through
+//! [`CursorOverlay`]'s shared state.
 //!
 //! The thread is per-monitor-DPI-aware (`SetThreadDpiAwarenessContext`), so
 //! cursor positions and the window are in physical pixels on every monitor.
@@ -464,6 +464,12 @@ fn window_under(x: i32, y: i32) -> HWND {
 /// The last cursor image read over a game, for the Settings preview of
 /// [`CursorShape::GameOwn`].
 static LAST_GAME_CURSOR: Mutex<Option<Bitmap>> = Mutex::new(None);
+
+/// Seeds [`last_game_cursor`] in the Settings child process, which has no
+/// overlay of its own: the tray process hands over the image it last read.
+pub fn set_last_game_cursor(image: Bitmap) {
+    *LAST_GAME_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+}
 
 /// The last cursor image read over a game, if any yet.
 pub fn last_game_cursor() -> Option<Bitmap> {
