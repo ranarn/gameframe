@@ -70,11 +70,11 @@ enum Event {
 /// Writes the queued lines to the child's stdin on a thread of its own, so a
 /// large message or a child that never reads cannot stall the caller. The
 /// thread ends when the sender is dropped, or when a write fails (the child
-/// is gone, which also unblocks a write stuck on a full pipe). `None` if the
-/// thread could not be created.
+/// is gone, which also unblocks a write stuck on a full pipe). `None` (logged)
+/// if the thread could not be created; every later send is then dropped.
 fn spawn_writer(mut stdin: Box<dyn Write + Send>) -> Option<Sender<Vec<u8>>> {
     let (tx, rx) = channel::<Vec<u8>>();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("settings-link-out".into())
         .spawn(move || {
             for line in rx {
@@ -82,8 +82,13 @@ fn spawn_writer(mut stdin: Box<dyn Write + Send>) -> Option<Sender<Vec<u8>>> {
                     break;
                 }
             }
-        })
-        .ok()?;
+        });
+    if let Err(e) = spawned {
+        log!(
+            "settings link: couldn't start the writer thread ({e}); messages to the child are dropped"
+        );
+        return None;
+    }
     Some(tx)
 }
 

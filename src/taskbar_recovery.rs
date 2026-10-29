@@ -44,6 +44,8 @@ fn child_marker_name(pid: u32) -> String {
     format!("{CHILD_MARKER_PREFIX}{pid}{MARKER_EXTENSION}")
 }
 
+/// Whether `name` is a child process marker (not the tray's own marker or a
+/// `.tmp` file).
 fn is_child_marker_name(name: &str) -> bool {
     child_marker_pid(name).is_some()
 }
