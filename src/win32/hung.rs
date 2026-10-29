@@ -11,7 +11,7 @@ const HUNG_LOG_CAP: usize = 64;
 /// line, not one per foreground event.
 #[derive(Debug, Default)]
 pub(super) struct HungSkipLog {
-    pub(super) logged: std::collections::BTreeSet<isize>,
+    logged: std::collections::BTreeSet<isize>,
 }
 
 impl HungSkipLog {
@@ -36,6 +36,11 @@ impl HungSkipLog {
             self.logged.remove(&window);
             false
         }
+    }
+
+    /// Drops `window` (it is gone), so a reused handle logs afresh.
+    pub(super) fn forget(&mut self, window: isize) {
+        self.logged.remove(&window);
     }
 }
 

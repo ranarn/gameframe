@@ -134,8 +134,8 @@ impl PlacedWindows {
     fn forget(&mut self, window: isize) -> Vec<usize> {
         self.restore.forget(window);
         self.applied.retain(|(h, _)| *h != window);
-        self.drift.reset(window);
-        self.hung.logged.remove(&window);
+        self.drift.forget(window);
+        self.hung.forget(window);
         let mut timers = Vec::new();
         for kind in [RecheckKind::Drift, RecheckKind::AutoApply] {
             timers.extend(self.rechecks.remove(&(window, kind)));
@@ -386,7 +386,7 @@ pub fn forget_window(hwnd: HWND) {
 /// drift attempt time.
 pub(super) fn unmark_applied_window(hwnd: HWND) {
     with_placed(|p| {
-        p.drift.reset(hwnd as isize);
+        p.drift.forget(hwnd as isize);
         p.applied.retain(|(h, _)| *h != hwnd as isize);
     });
     crate::launch_watcher::sync_drift_hooks();
@@ -667,12 +667,32 @@ mod tests {
         );
         placed.restore.opted_out.insert(window);
         placed.applied.push((window, 42));
-        placed.drift.record(window, std::time::Instant::now());
+        // More attempts than the drift cap (three a minute), so it is capped.
+        for _ in 0..4 {
+            placed.drift.record(window, std::time::Instant::now());
+        }
+        placed.drift.note_capped(window);
         placed.drift.note_failure(window);
         placed.hung.note(window, true);
         placed.set_recheck(window, RecheckKind::Drift, 7);
         placed.set_recheck(window, RecheckKind::AutoApply, 8);
         placed
+    }
+
+    /// Observes through the public behavior that `window`'s drift attempts,
+    /// drift failure log and hung log were forgotten: each reports "first time"
+    /// again and the re-apply is not rate limited.
+    fn assert_drift_and_hung_forgotten(placed: &mut PlacedWindows, window: isize) {
+        assert!(placed.drift.note_failure(window), "failure log re-armed");
+        assert!(placed.drift.note_capped(window), "cap log re-armed");
+        assert!(placed.hung.note(window, true), "hung log re-armed");
+        assert_eq!(
+            placed
+                .drift
+                .decide(window, std::time::Instant::now(), true, false),
+            crate::win32::DriftDecision::Reapply,
+            "no remembered attempt"
+        );
     }
 
     #[test]
@@ -694,9 +714,7 @@ mod tests {
         assert!(placed.restore.get(1).is_none());
         assert!(placed.restore.opted_out.is_empty());
         assert!(placed.applied.is_empty());
-        assert!(placed.drift.recent.is_empty());
-        assert!(placed.drift.failure_logged.is_empty());
-        assert!(placed.hung.logged.is_empty());
+        assert_drift_and_hung_forgotten(&mut placed, 1);
         assert!(!placed.has_recheck(1, RecheckKind::Drift));
         assert!(!placed.has_recheck(1, RecheckKind::AutoApply));
         assert!(placed.restore.get(2).is_some(), "other windows are kept");
@@ -731,8 +749,7 @@ mod tests {
         assert_eq!(timers, [7, 8]);
         assert!(placed.restore.get(1).is_none());
         assert!(placed.restore.opted_out.is_empty());
-        assert!(placed.drift.recent.is_empty());
-        assert!(placed.hung.logged.is_empty());
+        assert_drift_and_hung_forgotten(&mut placed, 1);
         assert_eq!(placed.applied, [(2, 43)]);
     }
 }
