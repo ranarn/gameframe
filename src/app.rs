@@ -55,9 +55,9 @@ use crate::launch_watcher;
 use crate::message_box::show_message_box;
 use crate::placement::{self, Outcome, Trigger};
 use crate::profile_store;
-use crate::settings_host::SettingsProcess;
-use crate::settings_link::{ChildKind, ChildMsg, EXIT_ZONE_SAVED, InstallProgress, ParentMsg};
-use crate::settings_ui::{self, TickContext};
+use crate::settings_host::{self, SettingsProcess};
+use crate::settings_link::{ChildKind, EXIT_ZONE_SAVED, InstallProgress, ParentMsg};
+use crate::settings_ui::TickContext;
 use crate::taskbar;
 use crate::tray_ui::{self, Tray, TrayAction, TrayUiError};
 use crate::update_ui::{
@@ -337,7 +337,7 @@ fn register_hotkeys(config_dir: &Path) -> (Option<Hotkeys>, Vec<BindingReport>) 
 ///
 /// The Settings window runs in a child process (#186), so this loop never
 /// blocks in it: tray, hotkeys, hooks and a second launch's commands keep being
-/// handled as usual, and [`service_settings`] picks up the child's messages.
+/// handled as usual, and [`settings_host::service_settings`] picks up the child's messages.
 fn run_event_loop(
     tray: &Tray,
     hotkeys: Option<Hotkeys>,
@@ -393,7 +393,7 @@ fn run_event_loop(
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
         // current for the hotkey events below.
-        service_settings(&ctx, &mut state);
+        settings_host::service_settings(&ctx, &mut state);
 
         crate::watchdog::step("event loop: second-launch commands");
         // Commands from a second launch (see crate::instance_channel); the
@@ -417,7 +417,7 @@ fn run_event_loop(
                 settings_context,
                 &mut install_progress,
             );
-            forward_install_progress(&mut state, install_progress);
+            settings_host::forward_install_progress(&mut state, install_progress);
             if drained.exit {
                 return;
             }
@@ -438,19 +438,19 @@ fn run_event_loop(
 }
 
 /// What the event loop owns and the Settings child's lifecycle touches.
-struct LoopState {
+pub(crate) struct LoopState {
     hotkeys: Option<Hotkeys>,
     hotkey_reports: Vec<BindingReport>,
-    offered_update: Option<UpdateInfo>,
+    pub(crate) offered_update: Option<UpdateInfo>,
     /// The running Settings child, if any. Dropping it closes it.
-    settings: Option<SettingsProcess>,
+    pub(crate) settings: Option<SettingsProcess>,
 }
 
 /// The long-lived handles the event handlers share.
 #[derive(Clone, Copy)]
-struct Shared<'a> {
-    tray: &'a Tray,
-    config_dir: &'a Path,
+pub(crate) struct Shared<'a> {
+    pub(crate) tray: &'a Tray,
+    pub(crate) config_dir: &'a Path,
     cursor_overlay: &'a CursorOverlay,
     updates: &'a UpdateEvents,
 }
@@ -491,7 +491,7 @@ struct Drained {
 /// Settings open, that click focuses the window instead. While the zone editor
 /// is open only the game-cursor hotkey runs (see [`hotkey_allowed`]). The
 /// progress of installs Settings asked for is appended to `install_progress` as
-/// (request id, progress), for [`forward_install_progress`].
+/// (request id, progress), for [`settings_host::forward_install_progress`].
 fn drain_events(
     ctx: &Shared,
     hotkeys: &Option<Hotkeys>,
@@ -894,7 +894,7 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
 
 /// Opens Settings (what the tray item and a second launch both do): starts the
 /// Settings child process, or brings the open one to the front. Returns at
-/// once; [`service_settings`] follows the child from here.
+/// once; [`settings_host::service_settings`] follows the child from here.
 fn show_settings(ctx: &Shared, state: &mut LoopState) {
     if state.settings.is_some() {
         instance_channel::focus_settings_window();
@@ -918,173 +918,8 @@ fn show_settings(ctx: &Shared, state: &mut LoopState) {
     }
 }
 
-/// Handles what the Settings child sent since the last pass, and its exit.
-///
-/// The child owns the window, the tray process owns everything else: it
-/// re-applies the Zone to running games (the per-window registry lives here),
-/// forgets its cached config when the child wrote the file, and runs update
-/// events for the tray.
-fn service_settings(ctx: &Shared, state: &mut LoopState) {
-    let Some(process) = state.settings.as_mut() else {
-        return;
-    };
-    let polled = process.poll();
-    for msg in polled.messages {
-        let reply = react_to_child_message(
-            msg,
-            &mut TrayEffects {
-                ctx,
-                context: &mut process.context,
-                offered_update: &mut state.offered_update,
-            },
-        );
-        if let Some(reply) = reply {
-            process.send(&reply);
-        }
-    }
-    if polled.exited {
-        state.settings = None;
-        if polled.exit_code != Some(0) {
-            log!("the Settings process ended with {:?}", polled.exit_code);
-        }
-        settings_closed(ctx, state);
-    }
-}
-
-/// What the tray process does on a Settings child's behalf; the real one is
-/// [`TrayEffects`], the tests use a fake.
-trait ChildEffects {
-    /// The window now ticking, as the child reports it.
-    fn set_context(&mut self, context: TickContext);
-    /// The child wrote the config file: drop the cached copy.
-    fn forget_config(&mut self);
-    /// Live re-applies the saved Zone to the running tracked games and returns
-    /// one status line per game that could not be repositioned.
-    fn reapply_all(&mut self) -> Vec<String>;
-    fn update_event(&mut self, event: UpdateEvent);
-    /// Installs `info` on a worker thread, as the tray's own item would; the
-    /// outcome reaches the child as [`ParentMsg::Install`] (see
-    /// [`route_install_progress`]).
-    fn start_install(&mut self, request: u64, info: UpdateInfo);
-    fn notify(&mut self, text: &str);
-}
-
-/// Applies one message of the Settings child through `effects`; `Some` is the
-/// answer to send back.
-fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Option<ParentMsg> {
-    match msg {
-        ChildMsg::Context(context) => effects.set_context(context),
-        ChildMsg::ConfigChanged => effects.forget_config(),
-        ChildMsg::ReapplyAll => {
-            // The Zone was just saved by the child, behind this process's cache.
-            effects.forget_config();
-            return Some(ParentMsg::ReapplyDone(effects.reapply_all()));
-        }
-        ChildMsg::UpToDate => effects.update_event(UpdateEvent::UpToDate),
-        ChildMsg::Install(request) => {
-            let id = request.id;
-            match request.into_info() {
-                Some(info) => effects.start_install(id, info),
-                None => {
-                    return Some(ParentMsg::Install {
-                        request: Some(id),
-                        progress: InstallProgress::NotStarted,
-                    });
-                }
-            }
-        }
-        ChildMsg::Notify(text) => effects.notify(&text),
-    }
-    None
-}
-
-/// The tray process's real [`ChildEffects`].
-struct TrayEffects<'a, 'b> {
-    ctx: &'a Shared<'b>,
-    context: &'a mut TickContext,
-    offered_update: &'a mut Option<UpdateInfo>,
-}
-
-impl ChildEffects for TrayEffects<'_, '_> {
-    fn set_context(&mut self, context: TickContext) {
-        *self.context = context;
-    }
-
-    fn forget_config(&mut self) {
-        profile_store::forget_cached(self.ctx.config_dir);
-    }
-
-    fn reapply_all(&mut self) -> Vec<String> {
-        crate::watchdog::step("settings process: live re-apply");
-        match profile_store::load(self.ctx.config_dir) {
-            Ok(config) => settings_ui::live_reapply_all(self.ctx.config_dir, &config.tracked_games),
-            Err(e) => {
-                log!("live re-apply: failed to load the config: {e}");
-                vec![format!("couldn't read the settings: {e}")]
-            }
-        }
-    }
-
-    fn update_event(&mut self, event: UpdateEvent) {
-        handle_update_event(
-            event,
-            self.ctx.tray,
-            self.ctx.config_dir,
-            self.offered_update,
-        );
-    }
-
-    fn start_install(&mut self, request: u64, info: UpdateInfo) {
-        // The install belongs to this process: closing Settings never stops it.
-        start_install(info, Failure::Forward(request));
-    }
-
-    fn notify(&mut self, text: &str) {
-        self.ctx.tray.notify(text);
-    }
-}
-
-/// Where install progress goes, see [`route_install_progress`].
-#[derive(Debug, PartialEq, Eq)]
-enum InstallRoute {
-    ToSettings(InstallProgress),
-    /// Tell the user in a box.
-    Box(String),
-    Drop,
-}
-
-/// Decides where one piece of install progress goes. An open Settings window
-/// shows it in its status line. Without one, only a failure matters: it is
-/// shown in a box, so a failed install is never only in the log.
-fn route_install_progress(settings_open: bool, progress: InstallProgress) -> InstallRoute {
-    match progress {
-        _ if settings_open => InstallRoute::ToSettings(progress),
-        InstallProgress::Failed(text) => InstallRoute::Box(text),
-        _ => InstallRoute::Drop,
-    }
-}
-
-/// Hands the install progress `drain_events` collected to the Settings child, or
-/// to a box when it is closed.
-fn forward_install_progress(state: &mut LoopState, progress: Vec<(Option<u64>, InstallProgress)>) {
-    for (request, progress) in progress {
-        match route_install_progress(state.settings.is_some(), progress) {
-            InstallRoute::ToSettings(progress) => {
-                if let Some(process) = state.settings.as_mut() {
-                    process.send(&ParentMsg::Install { request, progress });
-                }
-            }
-            // A box blocks, and this is the event loop's thread.
-            InstallRoute::Box(text) => {
-                std::thread::spawn(move || crate::message_box::show_warning_box(&text));
-            }
-            InstallRoute::Drop => {}
-        }
-    }
-}
-
 /// Applies what Settings may have changed, once its window has closed.
-fn settings_closed(ctx: &Shared, state: &mut LoopState) {
+pub(crate) fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
         tray,
         config_dir,
@@ -1150,139 +985,6 @@ mod tests {
     use crate::hotkeys::register_each;
     use global_hotkey::hotkey::HotKey;
     use windows_sys::Win32::UI::WindowsAndMessaging::IDNO;
-
-    #[derive(Default)]
-    struct FakeEffects {
-        calls: Vec<String>,
-        answer: Vec<String>,
-    }
-
-    impl ChildEffects for FakeEffects {
-        fn set_context(&mut self, context: TickContext) {
-            self.calls.push(format!("context {context:?}"));
-        }
-        fn forget_config(&mut self) {
-            self.calls.push("forget".into());
-        }
-        fn reapply_all(&mut self) -> Vec<String> {
-            self.calls.push("reapply".into());
-            self.answer.clone()
-        }
-        fn update_event(&mut self, event: UpdateEvent) {
-            self.calls
-                .push(format!("update {}", matches!(event, UpdateEvent::UpToDate)));
-        }
-        fn start_install(&mut self, request: u64, info: UpdateInfo) {
-            self.calls
-                .push(format!("install {} #{request}", info.version));
-        }
-        fn notify(&mut self, text: &str) {
-            self.calls.push(format!("notify {text}"));
-        }
-    }
-
-    fn react(msg: ChildMsg) -> (Option<ParentMsg>, Vec<String>) {
-        let mut effects = FakeEffects {
-            answer: vec!["Game is not responding".to_string()],
-            ..FakeEffects::default()
-        };
-        let reply = react_to_child_message(msg, &mut effects);
-        (reply, effects.calls)
-    }
-
-    #[test]
-    fn a_config_change_drops_the_cache_and_needs_no_answer() {
-        assert_eq!(
-            react(ChildMsg::ConfigChanged),
-            (None, vec!["forget".to_string()])
-        );
-    }
-
-    #[test]
-    fn a_reapply_request_reloads_the_config_first_and_answers_with_the_status_lines() {
-        let (reply, calls) = react(ChildMsg::ReapplyAll);
-
-        assert_eq!(calls, vec!["forget".to_string(), "reapply".to_string()]);
-        assert_eq!(
-            reply,
-            Some(ParentMsg::ReapplyDone(vec![
-                "Game is not responding".to_string()
-            ]))
-        );
-    }
-
-    #[test]
-    fn the_childs_context_update_and_notice_reach_the_tray_side() {
-        assert_eq!(
-            react(ChildMsg::Context(TickContext::SettingsCapturing)),
-            (None, vec!["context SettingsCapturing".to_string()])
-        );
-        assert_eq!(
-            react(ChildMsg::UpToDate),
-            (None, vec!["update true".to_string()])
-        );
-        assert_eq!(
-            react(ChildMsg::Notify("Hi".into())),
-            (None, vec!["notify Hi".to_string()])
-        );
-    }
-
-    fn sample_update() -> UpdateInfo {
-        UpdateInfo {
-            version: crate::updater::Version::parse("1.2.3").unwrap(),
-            download_url: "https://github.com/x/y/Setup.exe".to_string(),
-            sha256: "ab".repeat(32),
-            signature_url: "https://github.com/x/y/Setup.exe.minisig".to_string(),
-        }
-    }
-
-    #[test]
-    fn an_install_request_is_run_by_the_tray_process_not_the_child() {
-        let request = crate::settings_link::InstallRequest::new(5, &sample_update());
-        assert_eq!(
-            react(ChildMsg::Install(request)),
-            (None, vec!["install 1.2.3 #5".to_string()])
-        );
-    }
-
-    #[test]
-    fn an_install_request_with_an_unreadable_version_is_answered_as_not_started() {
-        let mut request = crate::settings_link::InstallRequest::new(5, &sample_update());
-        request.version = "garbage".to_string();
-        assert_eq!(
-            react(ChildMsg::Install(request)),
-            (
-                Some(ParentMsg::Install {
-                    request: Some(5),
-                    progress: InstallProgress::NotStarted
-                }),
-                Vec::new()
-            )
-        );
-    }
-
-    #[test]
-    fn install_progress_goes_to_an_open_settings_window_and_a_failure_to_a_box_without_one() {
-        let failed = InstallProgress::Failed("disk full".into());
-        let busy = InstallProgress::Busy;
-        assert_eq!(
-            route_install_progress(true, failed.clone()),
-            InstallRoute::ToSettings(failed.clone())
-        );
-        assert_eq!(
-            route_install_progress(true, busy.clone()),
-            InstallRoute::ToSettings(busy.clone())
-        );
-        assert_eq!(
-            route_install_progress(false, failed),
-            InstallRoute::Box("disk full".to_string())
-        );
-        assert_eq!(route_install_progress(false, busy), InstallRoute::Drop);
-        assert_eq!(
-            route_install_progress(false, InstallProgress::Launched),
-            InstallRoute::Drop
-        );
-    }
 
     #[test]
     fn zone_editor_tick_allows_only_the_cursor_hotkey() {
