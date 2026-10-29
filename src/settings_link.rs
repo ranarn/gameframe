@@ -23,6 +23,7 @@ use crate::update_ui::UpdateEvent;
 use crate::updater::{InstallStartError, UpdateInfo, Version};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,6 +45,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the child waits for the tray process to live re-apply the Zone
 /// (it contacts every running tracked game, which can take a few seconds).
 const REAPPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an install request may stay unanswered before later progress of a
+/// tray install is shown again (matches the installer's own fallback).
+const PENDING_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Which window a child process shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +139,13 @@ pub enum ParentMsg {
     /// The answer to [`ChildMsg::ReapplyAll`]: one status line per game that
     /// could not be repositioned.
     ReapplyDone(Vec<String>),
-    /// How the install asked for with [`ChildMsg::Install`] is going.
-    Install(InstallProgress),
+    /// How an install is going. `request` is the id of the
+    /// [`ChildMsg::Install`] it answers; `None` for an install the tray
+    /// started itself.
+    Install {
+        request: Option<u64>,
+        progress: InstallProgress,
+    },
     /// Close the window (discarding unsaved edits) and exit.
     Close,
 }
@@ -145,6 +154,8 @@ pub enum ParentMsg {
 /// the digest and the signature itself, so it trusts nothing in here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallRequest {
+    /// Tags the answering [`ParentMsg::Install`] messages.
+    pub(crate) id: u64,
     pub(crate) version: String,
     download_url: String,
     sha256: String,
@@ -152,8 +163,9 @@ pub struct InstallRequest {
 }
 
 impl InstallRequest {
-    pub(crate) fn new(info: &UpdateInfo) -> Self {
+    pub(crate) fn new(id: u64, info: &UpdateInfo) -> Self {
         Self {
+            id,
             version: info.version.to_string(),
             download_url: info.download_url.clone(),
             sha256: info.sha256.clone(),
@@ -189,16 +201,20 @@ pub enum InstallProgress {
 }
 
 impl InstallProgress {
-    /// What `event` means for an open Settings window; `None` if nothing.
-    pub(crate) fn from_event(event: &UpdateEvent) -> Option<Self> {
+    /// What `event` means for an open Settings window, with the id of the
+    /// request it answers (`None`: a tray install); `None` if nothing.
+    pub(crate) fn from_event(event: &UpdateEvent) -> Option<(Option<u64>, Self)> {
         match event {
-            UpdateEvent::InstallerLaunched(_) => Some(Self::Launched),
-            UpdateEvent::InstallError(text) => Some(Self::Failed(text.clone())),
-            UpdateEvent::InstallNotStarted(why) => Some(match why {
-                InstallStartError::Busy => Self::Busy,
-                InstallStartError::ThreadFailed => Self::NotStarted,
-                InstallStartError::Elevated => Self::Elevated,
-            }),
+            UpdateEvent::InstallerLaunched(_, request) => Some((*request, Self::Launched)),
+            UpdateEvent::InstallError(text, id) => Some((Some(*id), Self::Failed(text.clone()))),
+            UpdateEvent::InstallNotStarted(why, id) => Some((
+                Some(*id),
+                match why {
+                    InstallStartError::Busy => Self::Busy,
+                    InstallStartError::ThreadFailed => Self::NotStarted,
+                    InstallStartError::Elevated => Self::Elevated,
+                },
+            )),
             _ => None,
         }
     }
@@ -227,6 +243,9 @@ struct Inbox {
     init: Option<(Vec<BindingReport>, Option<Bitmap>)>,
     /// Install progress not taken yet, oldest first.
     install: Vec<InstallProgress>,
+    /// The id of the install request this window made and has no answer to yet,
+    /// and when it was made. Given up on after [`PENDING_INSTALL_TIMEOUT`].
+    pending_install: Option<(u64, Instant)>,
     /// The last context reported, so only changes are sent.
     last_context: Option<TickContext>,
 }
@@ -240,10 +259,33 @@ impl Inbox {
                 game_cursor,
             } => self.init = Some((hotkey_reports, game_cursor)),
             ParentMsg::CursorEnabled(enabled) => self.cursor_enabled = Some(enabled),
-            ParentMsg::Install(progress) => self.install.push(progress),
+            ParentMsg::Install { request, progress } => {
+                self.file_install(request, progress, Instant::now());
+            }
             // A stray answer (its request timed out) or `Close`, which the
             // reader thread already turned into `on_close`.
             ParentMsg::ReapplyDone(_) | ParentMsg::Close => {}
+        }
+    }
+
+    /// Keeps `progress` only if it is for this window: the answer to the
+    /// pending request, or, with none pending, progress of a tray install
+    /// (`request` is `None`). Anything else (a tray install that finished
+    /// meanwhile, a stale answer) must not become the pending request's result.
+    /// A request unanswered for [`PENDING_INSTALL_TIMEOUT`] at `now` stops
+    /// hiding tray progress (the link may have broken mid-request), but its id is
+    /// kept: a slow install's own late answer is still applied.
+    fn file_install(&mut self, request: Option<u64>, progress: InstallProgress, now: Instant) {
+        let expired = self.pending_install.is_none_or(|(_, asked)| {
+            now.saturating_duration_since(asked) >= PENDING_INSTALL_TIMEOUT
+        });
+        match (self.pending_install, request) {
+            (Some((pending, _)), Some(id)) if pending == id => {
+                self.pending_install = None;
+                self.install.push(progress);
+            }
+            (_, None) if expired => self.install.push(progress),
+            _ => {}
         }
     }
 }
@@ -252,6 +294,8 @@ impl Inbox {
 pub struct ChildLink {
     out: Mutex<Box<dyn Write + Send>>,
     inbox: Mutex<Inbox>,
+    /// The id of the next [`InstallRequest`].
+    next_request: AtomicU64,
 }
 
 impl ChildLink {
@@ -291,8 +335,10 @@ impl ChildLink {
                 cursor_enabled: None,
                 init: None,
                 install: Vec::new(),
+                pending_install: None,
                 last_context: None,
             }),
+            next_request: AtomicU64::new(1),
         }
     }
 
@@ -363,8 +409,10 @@ impl ChildLink {
             inbox.file(msg);
         }
         inbox.install.clear();
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        inbox.pending_install = Some((id, Instant::now()));
         drop(inbox);
-        self.send(&ChildMsg::Install(InstallRequest::new(info)));
+        self.send(&ChildMsg::Install(InstallRequest::new(id, info)));
     }
 
     /// The install progress the tray process reported since the last call.
@@ -462,7 +510,7 @@ mod tests {
     use crate::hotkeys::{BindingOutcome, HotkeyAction};
     use std::io::pipe;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     /// A link whose far end the test drives: `(link, to_child, from_child, closed)`.
     fn linked_pair() -> (
@@ -572,13 +620,14 @@ mod tests {
     #[test]
     fn an_install_request_survives_the_wire_and_a_bad_version_is_refused() {
         let info = sample_update();
-        let line = encode_line(&ChildMsg::Install(InstallRequest::new(&info)));
+        let line = encode_line(&ChildMsg::Install(InstallRequest::new(4, &info)));
         let Some(ChildMsg::Install(request)) = decode_line::<ChildMsg>(&line) else {
             panic!("an install request");
         };
+        assert_eq!(request.id, 4);
         assert_eq!(request.into_info(), Some(info));
 
-        let mut bad = InstallRequest::new(&sample_update());
+        let mut bad = InstallRequest::new(1, &sample_update());
         bad.version = "garbage".to_string();
         assert_eq!(bad.into_info(), None);
     }
@@ -588,26 +637,34 @@ mod tests {
         let version = Version::parse("1.2.3").unwrap();
         let progress = |event| InstallProgress::from_event(&event);
         assert_eq!(
-            progress(UpdateEvent::InstallerLaunched(version)),
-            Some(InstallProgress::Launched)
+            progress(UpdateEvent::InstallerLaunched(version, None)),
+            Some((None, InstallProgress::Launched))
         );
         assert_eq!(
-            progress(UpdateEvent::InstallError("disk full".into())),
-            Some(InstallProgress::Failed("disk full".into()))
+            progress(UpdateEvent::InstallerLaunched(version, Some(3))),
+            Some((Some(3), InstallProgress::Launched))
         );
         assert_eq!(
-            progress(UpdateEvent::InstallNotStarted(InstallStartError::Busy)),
-            Some(InstallProgress::Busy)
+            progress(UpdateEvent::InstallError("disk full".into(), 3)),
+            Some((Some(3), InstallProgress::Failed("disk full".into())))
+        );
+        assert_eq!(
+            progress(UpdateEvent::InstallNotStarted(InstallStartError::Busy, 3)),
+            Some((Some(3), InstallProgress::Busy))
         );
         assert_eq!(
             progress(UpdateEvent::InstallNotStarted(
-                InstallStartError::ThreadFailed
+                InstallStartError::ThreadFailed,
+                3
             )),
-            Some(InstallProgress::NotStarted)
+            Some((Some(3), InstallProgress::NotStarted))
         );
         assert_eq!(
-            progress(UpdateEvent::InstallNotStarted(InstallStartError::Elevated)),
-            Some(InstallProgress::Elevated)
+            progress(UpdateEvent::InstallNotStarted(
+                InstallStartError::Elevated,
+                3
+            )),
+            Some((Some(3), InstallProgress::Elevated))
         );
         // Progress that needs no window of its own.
         assert_eq!(progress(UpdateEvent::InstallStarted(version)), None);
@@ -619,38 +676,116 @@ mod tests {
     fn an_install_request_goes_to_the_tray_process_and_its_progress_comes_back() {
         let (link, mut to_child, mut from_child, _closed) = linked_pair();
         link.request_install(&sample_update());
-        assert_eq!(
-            read_msg(&mut from_child),
-            ChildMsg::Install(InstallRequest::new(&sample_update()))
-        );
+        let ChildMsg::Install(request) = read_msg(&mut from_child) else {
+            panic!("an install request");
+        };
+        assert_eq!(request, InstallRequest::new(request.id, &sample_update()));
 
         write_msg(
             &mut to_child,
-            &ParentMsg::Install(InstallProgress::Launched),
-        );
-        write_msg(
-            &mut to_child,
-            &ParentMsg::Install(InstallProgress::Failed("no".into())),
+            &answer(Some(request.id), InstallProgress::Busy),
         );
         let mut seen = Vec::new();
         wait_until(|| {
             seen.extend(link.take_install_progress());
-            seen.len() == 2
+            !seen.is_empty()
         });
-        assert_eq!(
-            seen,
-            vec![
-                InstallProgress::Launched,
-                InstallProgress::Failed("no".into())
-            ]
-        );
+        assert_eq!(seen, vec![InstallProgress::Busy]);
         assert!(link.take_install_progress().is_empty(), "taken once");
+    }
+
+    fn answer(request: Option<u64>, progress: InstallProgress) -> ParentMsg {
+        ParentMsg::Install { request, progress }
+    }
+
+    #[test]
+    fn progress_of_a_tray_install_queued_ahead_of_the_answer_is_not_the_requests_result() {
+        let (link, mut to_child, mut from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        let ChildMsg::Install(request) = read_msg(&mut from_child) else {
+            panic!("an install request");
+        };
+
+        // The tray's own install launched first; the request was refused as busy.
+        write_msg(&mut to_child, &answer(None, InstallProgress::Launched));
+        write_msg(
+            &mut to_child,
+            &answer(Some(request.id), InstallProgress::Busy),
+        );
+        let mut seen = Vec::new();
+        wait_until(|| {
+            seen.extend(link.take_install_progress());
+            !seen.is_empty()
+        });
+        // Whatever else is still on the way is not for this request either.
+        write_msg(
+            &mut to_child,
+            &answer(Some(request.id + 7), InstallProgress::Launched),
+        );
+        write_msg(
+            &mut to_child,
+            &answer(Some(request.id), InstallProgress::Launched),
+        );
+        write_msg(&mut to_child, &ParentMsg::CursorEnabled(true));
+        wait_until(|| link.tick(TickContext::Settings) == Some(true));
+
+        assert_eq!(seen, vec![InstallProgress::Busy]);
+        assert!(link.take_install_progress().is_empty());
+    }
+
+    #[test]
+    fn progress_of_a_tray_install_shows_while_no_request_is_pending() {
+        let (link, mut to_child, _from_child, _closed) = linked_pair();
+        write_msg(&mut to_child, &answer(None, InstallProgress::Launched));
+        write_msg(&mut to_child, &answer(Some(9), InstallProgress::Busy));
+        write_msg(&mut to_child, &ParentMsg::CursorEnabled(true));
+        wait_until(|| link.tick(TickContext::Settings) == Some(true));
+
+        assert_eq!(
+            link.take_install_progress(),
+            vec![InstallProgress::Launched]
+        );
+    }
+
+    #[test]
+    fn an_unanswered_install_request_stops_hiding_tray_progress_after_the_timeout() {
+        let (link, _to_child, _from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        let mut inbox = link.lock_inbox();
+        let asked = inbox.pending_install.unwrap().1;
+
+        let soon = asked + Duration::from_secs(1);
+        inbox.file_install(None, InstallProgress::Launched, soon);
+        assert!(inbox.install.is_empty(), "still pending: not shown");
+
+        inbox.file_install(
+            None,
+            InstallProgress::Launched,
+            asked + PENDING_INSTALL_TIMEOUT,
+        );
+        assert_eq!(inbox.install, vec![InstallProgress::Launched]);
+    }
+
+    #[test]
+    fn the_answer_to_a_slow_install_is_applied_after_the_timeout() {
+        let (link, _to_child, _from_child, _closed) = linked_pair();
+        link.request_install(&sample_update());
+        let mut inbox = link.lock_inbox();
+        let (id, asked) = inbox.pending_install.unwrap();
+
+        inbox.file_install(
+            Some(id),
+            InstallProgress::Launched,
+            asked + PENDING_INSTALL_TIMEOUT + Duration::from_secs(5),
+        );
+        assert_eq!(inbox.install, vec![InstallProgress::Launched]);
+        assert!(inbox.pending_install.is_none());
     }
 
     #[test]
     fn a_new_install_request_drops_progress_left_over_from_the_last_one() {
         let (link, mut to_child, _from_child, _closed) = linked_pair();
-        write_msg(&mut to_child, &ParentMsg::Install(InstallProgress::Busy));
+        write_msg(&mut to_child, &answer(None, InstallProgress::Busy));
         // The stale line is read by the link before the new request clears it.
         wait_until(|| {
             let mut inbox = link.lock_inbox();

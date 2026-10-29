@@ -1171,6 +1171,7 @@ mod tests {
             Some(Target::Resize(Handle::Nw))
         );
     }
+
     #[test]
     fn hit_test_finds_each_corner() {
         let z = big_zone();

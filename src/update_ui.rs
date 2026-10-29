@@ -39,16 +39,20 @@ pub(crate) enum UpdateEvent {
     /// An install started: it downloads this version.
     InstallStarted(Version),
     /// The installer of this version was started; it should quit GameFrame.
-    InstallerLaunched(Version),
+    /// The id is of the Settings request ([`Failure::Forward`]) that started
+    /// it, `None` for the tray's own installs.
+    InstallerLaunched(Version, Option<u64>),
     /// An install failed, or the installer never quit this instance.
     InstallFailed,
     /// An automatic install of this version was refused for its signature.
     SignatureRefused(Version),
     /// An install [`Failure::Forward`]ed to an open Settings window failed;
     /// the text is for the user. The tray's own handling is [`Self::InstallFailed`].
-    InstallError(String),
-    /// An install [`Failure::Forward`]ed to Settings could not start.
-    InstallNotStarted(InstallStartError),
+    /// The id is of the Settings request.
+    InstallError(String, u64),
+    /// An install [`Failure::Forward`]ed to Settings could not start. The id
+    /// is of the Settings request.
+    InstallNotStarted(InstallStartError, u64),
 }
 
 /// Lets worker threads hand an [`UpdateEvent`] to the event loop and wake its
@@ -191,7 +195,7 @@ pub(crate) fn handle_update_event(
             tray.hide_update_item();
             tray.set_tooltip(&format!("GameFrame - downloading update v{version}..."));
         }
-        UpdateEvent::InstallerLaunched(version) => {
+        UpdateEvent::InstallerLaunched(version, _) => {
             tray.set_tooltip(&format!("GameFrame - installing update v{version}..."));
         }
         UpdateEvent::SignatureRefused(version) => {
@@ -205,7 +209,7 @@ pub(crate) fn handle_update_event(
             }
         }
         // For the Settings window, see `crate::app`.
-        UpdateEvent::InstallError(_) | UpdateEvent::InstallNotStarted(_) => {}
+        UpdateEvent::InstallError(..) | UpdateEvent::InstallNotStarted(..) => {}
     }
 }
 
@@ -216,37 +220,51 @@ pub(crate) enum Failure {
     Report,
     /// Only log: the automatic startup install.
     LogOnly,
-    /// Settings asked for it (#186): the failure, or a refusal to start, goes
-    /// back to its window as an [`UpdateEvent`], and to a box if it is closed.
-    Forward,
+    /// Settings asked for it (#186) with this request id: the failure, or a
+    /// refusal to start, goes back to its window as an [`UpdateEvent`], and to
+    /// a box if it is closed.
+    Forward(u64),
+}
+
+impl Failure {
+    /// The Settings request this install answers, if any.
+    fn request(self) -> Option<u64> {
+        match self {
+            Self::Forward(id) => Some(id),
+            Self::Report | Self::LogOnly => None,
+        }
+    }
 }
 
 /// Starts the install of `info` on a worker thread, see [`spawn_install`].
 /// `failure` says whether the user hears about a failure.
 pub(crate) fn start_install(info: UpdateInfo, failure: Failure) {
     let version = info.version;
-    let started = spawn_install(info, move |result| match (result, failure) {
-        (Err(e), Failure::Report) => {
-            show_warning_box(&crate::update_install::install_error_message(&e));
+    let started = spawn_install(info, failure.request(), move |result| {
+        match (result, failure) {
+            (Err(e), Failure::Report) => {
+                show_warning_box(&crate::update_install::install_error_message(&e));
+            }
+            // Nobody asked for this install, but a refused signature is never
+            // left to the log.
+            (Err(e), Failure::LogOnly) if e.is_signature_refusal() => {
+                log!("automatic update to v{version} refused: {e}");
+                notify(UpdateEvent::SignatureRefused(version));
+            }
+            (Err(e), Failure::Forward(id)) => {
+                notify(UpdateEvent::InstallError(
+                    crate::update_install::install_error_message(&e),
+                    id,
+                ));
+            }
+            _ => {}
         }
-        // Nobody asked for this install, but a refused signature is never
-        // left to the log.
-        (Err(e), Failure::LogOnly) if e.is_signature_refusal() => {
-            log!("automatic update to v{version} refused: {e}");
-            notify(UpdateEvent::SignatureRefused(version));
-        }
-        (Err(e), Failure::Forward) => {
-            notify(UpdateEvent::InstallError(
-                crate::update_install::install_error_message(&e),
-            ));
-        }
-        _ => {}
     });
     if let Err(why) = started {
         log!("update install not started: {why:?}");
         match failure {
             Failure::Report => show_not_started(why),
-            Failure::Forward => notify(UpdateEvent::InstallNotStarted(why)),
+            Failure::Forward(id) => notify(UpdateEvent::InstallNotStarted(why, id)),
             Failure::LogOnly => {}
         }
     }
@@ -272,10 +290,12 @@ pub(crate) fn show_not_started(why: InstallStartError) {
 /// the installer quits GameFrame; if it hasn't within
 /// [`INSTALLER_QUIT_TIMEOUT`] the tray is restored as after a failure. The
 /// install stays "in flight" for that whole wait, so no second one starts
-/// while the first installer may still be running. `on_done` gets the result
-/// on the worker thread.
+/// while the first installer may still be running. `request` is the Settings
+/// request the install answers, carried by [`UpdateEvent::InstallerLaunched`].
+/// `on_done` gets the result on the worker thread.
 fn spawn_install(
     info: UpdateInfo,
+    request: Option<u64>,
     on_done: impl FnOnce(Result<(), UpdateError>) + Send + 'static,
 ) -> Result<(), InstallStartError> {
     let version = info.version;
@@ -285,7 +305,7 @@ fn spawn_install(
         move |result| match result {
             Ok(()) => {
                 on_done(Ok(()));
-                notify(UpdateEvent::InstallerLaunched(version));
+                notify(UpdateEvent::InstallerLaunched(version, request));
                 // Normally the installer quits this process long before this.
                 std::thread::sleep(INSTALLER_QUIT_TIMEOUT);
                 log!("update install: the installer didn't quit GameFrame; carrying on");

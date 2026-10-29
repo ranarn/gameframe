@@ -12,7 +12,7 @@ use crate::settings_ui::TickContext;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -67,10 +67,37 @@ enum Event {
     Eof,
 }
 
+/// Writes the queued lines to the child's stdin on a thread of its own, so a
+/// large message or a child that never reads cannot stall the caller. The
+/// thread ends when the sender is dropped, or when a write fails (the child
+/// is gone, which also unblocks a write stuck on a full pipe). `None` (logged)
+/// if the thread could not be created; every later send is then dropped.
+fn spawn_writer(mut stdin: Box<dyn Write + Send>) -> Option<Sender<Vec<u8>>> {
+    let (tx, rx) = channel::<Vec<u8>>();
+    let spawned = std::thread::Builder::new()
+        .name("settings-link-out".into())
+        .spawn(move || {
+            for line in rx {
+                if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log!(
+            "settings link: couldn't start the writer thread ({e}); messages to the child are dropped"
+        );
+        return None;
+    }
+    Some(tx)
+}
+
 /// A running child: the Settings window or the first-run zone editor.
 pub struct SettingsProcess<C: ProcessHandle = Child> {
     child: C,
-    stdin: Option<Box<dyn Write + Send>>,
+    /// Lines for the writer thread (see [`spawn_writer`]); `None` once the
+    /// pipe failed or was closed.
+    stdin: Option<Sender<Vec<u8>>>,
     events: Receiver<Event>,
     reader_done: bool,
     exited: bool,
@@ -183,7 +210,7 @@ impl<C: ProcessHandle> SettingsProcess<C> {
     ) -> Self {
         Self {
             child,
-            stdin,
+            stdin: stdin.and_then(spawn_writer),
             events,
             reader_done: false,
             exited: false,
@@ -203,18 +230,15 @@ impl<C: ProcessHandle> SettingsProcess<C> {
         }
     }
 
-    /// Sends `msg`; a failure (the child is gone) is dropped, `poll` reports
-    /// the exit.
+    /// Queues `msg` for the child; never blocks (the writer thread does the
+    /// pipe write, which stalls while a child does not read). A failure (the
+    /// child is gone) is dropped, `poll` reports the exit.
     pub fn send(&mut self, msg: &ParentMsg) {
-        let Some(stdin) = self.stdin.as_mut() else {
+        let Some(stdin) = self.stdin.as_ref() else {
             return;
         };
         let line = crate::settings_link::encode_line(msg);
-        if stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-            .is_err()
-        {
+        if stdin.send(line.into_bytes()).is_err() {
             self.stdin = None;
         }
     }
@@ -311,7 +335,6 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::mpsc::Sender;
 
     /// A child that exits when told to (or never).
     struct FakeChild {
@@ -338,11 +361,27 @@ mod tests {
 
     /// A stdin that records what the tray process sent.
     #[derive(Clone, Default)]
-    struct Sent(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct Sent(Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+    impl Sent {
+        /// Blocks (up to a generous bound, only hit on failure) until what was
+        /// sent contains `needle`; returns everything sent so far.
+        fn wait_for(&self, needle: &str) -> String {
+            let (data, written) = &*self.0;
+            let (data, _) = written
+                .wait_timeout_while(data.lock().unwrap(), Duration::from_secs(30), |d| {
+                    !String::from_utf8_lossy(d).contains(needle)
+                })
+                .unwrap();
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    }
 
     impl Write for Sent {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            let (data, written) = &*self.0;
+            data.lock().unwrap().extend_from_slice(buf);
+            written.notify_all();
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -454,11 +493,61 @@ mod tests {
 
         assert!(!rig.killed.get());
         assert_eq!(*rig.ended.borrow(), vec![4711]);
-        let sent = String::from_utf8(rig.sent.0.lock().unwrap().clone()).unwrap();
+        // The writer thread delivers it a moment later.
+        let sent = rig.sent.wait_for("Close");
         assert!(
             sent.contains("Close"),
             "the child is asked to close first: {sent:?}"
         );
+    }
+
+    /// A stdin whose pipe is full: the first write announces itself on
+    /// `entered`, then blocks until `release` yields.
+    struct StuckStdin {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Write for StuckStdin {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sending_never_blocks_on_a_child_that_does_not_read() {
+        let (entered_tx, entered) = channel();
+        let (release_tx, release) = channel();
+        let (_to_tray, events) = channel();
+        let mut process = SettingsProcess::from_parts(
+            FakeChild {
+                exit_code: Rc::new(Cell::new(None)),
+                killed: Rc::new(Cell::new(false)),
+                check_fails: Rc::new(Cell::new(false)),
+            },
+            Some(Box::new(StuckStdin {
+                entered: entered_tx,
+                release,
+            })),
+            events,
+            TickContext::Settings,
+            None,
+        );
+        process.close_grace = Duration::from_millis(10);
+
+        process.send(&ParentMsg::CursorEnabled(true));
+        // The writer thread is now provably stuck inside the pipe write.
+        entered.recv().unwrap();
+        // Were `send` to write itself, it would block here forever.
+        for _ in 0..1000 {
+            process.send(&ParentMsg::CursorEnabled(true));
+        }
+        drop(release_tx); // unblocks the stuck write (recv errs) for teardown
     }
 
     #[test]
