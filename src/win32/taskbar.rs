@@ -173,12 +173,18 @@ fn resend_appbar_state(read: impl FnOnce() -> u32, send: impl FnOnce(isize)) {
 /// applies from the next session), and whenever the taskbar is `WS_VISIBLE`
 /// (any verdict but `NotVisible`) -- on top, covered by the returning game,
 /// or off its monitor. The session's restore value is never touched.
+///
+/// `user_shown` (the hotkey showed the taskbar) suppresses the re-hide for an
+/// automatic join; an `explicit` join ignores it.
 pub(crate) fn should_rehide_on_join(
     session: Option<TaskbarHideRestore>,
     judged_hidden: Option<TaskbarHiddenReason>,
+    user_shown: bool,
+    explicit: bool,
 ) -> bool {
     session == Some(TaskbarHideRestore::FullyHidden)
         && judged_hidden != Some(TaskbarHiddenReason::NotVisible)
+        && !(user_shown && !explicit)
 }
 
 /// `ShowWindow(taskbar, SW_HIDE)` -- the `FullyHidden` mode's technique:
@@ -701,18 +707,24 @@ mod tests {
     #[test]
     fn should_rehide_on_join_for_a_fully_hidden_session_whenever_the_taskbar_is_still_ws_visible() {
         let session = Some(TaskbarHideRestore::FullyHidden);
-        assert!(should_rehide_on_join(session, None));
+        assert!(should_rehide_on_join(session, None, false, false));
         assert!(should_rehide_on_join(
             session,
-            Some(TaskbarHiddenReason::Covered)
+            Some(TaskbarHiddenReason::Covered),
+            false,
+            false
         ));
         assert!(should_rehide_on_join(
             session,
-            Some(TaskbarHiddenReason::OffMonitor)
+            Some(TaskbarHiddenReason::OffMonitor),
+            false,
+            false
         ));
         assert!(!should_rehide_on_join(
             session,
-            Some(TaskbarHiddenReason::NotVisible)
+            Some(TaskbarHiddenReason::NotVisible),
+            false,
+            false
         ));
     }
 
@@ -729,13 +741,29 @@ mod tests {
             Some(TaskbarHiddenReason::OffMonitor),
             Some(TaskbarHiddenReason::NotVisible),
         ] {
-            assert!(!should_rehide_on_join(session, verdict));
+            assert!(!should_rehide_on_join(session, verdict, false, false));
         }
     }
 
     #[test]
+    fn should_rehide_on_join_skips_a_user_shown_taskbar_only_for_an_automatic_join() {
+        let session = Some(TaskbarHideRestore::FullyHidden);
+        assert!(!should_rehide_on_join(session, None, true, false));
+        assert!(should_rehide_on_join(session, None, true, true));
+        assert!(should_rehide_on_join(session, None, false, false));
+    }
+
+    #[test]
+    fn should_rehide_on_join_never_for_hover_reveal_with_the_override_set() {
+        let session = Some(TaskbarHideRestore::HoverReveal(
+            TaskbarAutohideState::AlwaysVisible,
+        ));
+        assert!(!should_rehide_on_join(session, None, true, true));
+    }
+
+    #[test]
     fn should_rehide_on_join_never_without_a_session() {
-        assert!(!should_rehide_on_join(None, None));
+        assert!(!should_rehide_on_join(None, None, false, false));
     }
 
     #[test]

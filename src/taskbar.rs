@@ -178,9 +178,27 @@ static ARMED_TASKBAR_RESTORE: std::sync::Mutex<Option<ArmedTaskbarWindows>> =
 struct ArmedTaskbarWindows {
     windows: std::collections::HashSet<isize>,
     restore: Option<TaskbarHideRestore>,
+    /// The taskbar hotkey showed the taskbar during this session: an automatic
+    /// join must not re-hide it. In-memory only, and cleared with the session.
+    user_shown: bool,
 }
 
 impl ArmedTaskbarWindows {
+    /// Sets or clears the hotkey-show override; a no-op without an active
+    /// session, so a stray show can never leak into the next session.
+    fn set_user_shown(&mut self, shown: bool) {
+        self.user_shown = shown && self.is_active();
+    }
+
+    /// Joins for an apply: an explicit apply (Zone hotkey, tray) also clears
+    /// the override, since it re-hides as before.
+    fn join_for_apply(&mut self, hwnd_id: isize, explicit: bool) {
+        self.join(hwnd_id);
+        if explicit {
+            self.user_shown = false;
+        }
+    }
+
     /// True if a hidden session is currently active, i.e. at least one
     /// window is currently armed.
     fn is_active(&self) -> bool {
@@ -208,6 +226,7 @@ impl ArmedTaskbarWindows {
     fn start(&mut self, hwnd_id: isize, restore: TaskbarHideRestore) {
         self.windows.insert(hwnd_id);
         self.restore = Some(restore);
+        self.user_shown = false;
     }
 
     /// Joins an already-active hidden session: arms `hwnd_id` without
@@ -228,6 +247,7 @@ impl ArmedTaskbarWindows {
     fn leave(&mut self, hwnd_id: isize) -> Option<TaskbarHideRestore> {
         self.windows.remove(&hwnd_id);
         if self.windows.is_empty() {
+            self.user_shown = false;
             self.restore.take()
         } else {
             None
@@ -241,6 +261,7 @@ impl ArmedTaskbarWindows {
     /// the rest" doesn't apply.
     fn take_all(&mut self) -> Option<TaskbarHideRestore> {
         self.windows.clear();
+        self.user_shown = false;
         self.restore.take()
     }
 }
@@ -280,8 +301,8 @@ fn start_taskbar_hide_session(hwnd: HWND, restore: TaskbarHideRestore) {
 /// remembered restore value. Called only by
 /// [`set_taskbar_hide_absolute_armed`]'s `hide == true` path when
 /// a session was already active ([`ArmedTaskbarWindows::is_active`]).
-fn join_taskbar_hide_session(hwnd: HWND) {
-    with_armed_taskbar_windows(|state| state.join(hwnd as isize));
+fn join_taskbar_hide_session(hwnd: HWND, explicit: bool) {
+    with_armed_taskbar_windows(|state| state.join_for_apply(hwnd as isize, explicit));
 }
 
 /// Takes (removes and returns) the armed restore if -- and only if --
@@ -421,17 +442,23 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 /// (via a subsequent close or tray Exit) on top of an OS call that's
 /// already known to have failed would only compound the failure.
 ///
+/// `explicit` is the apply's `Trigger::is_explicit()`: an automatic join leaves
+/// a taskbar the hotkey showed alone (the user-shown override); an explicit one
+/// clears the override and re-hides.
+///
 /// OS-facing (delegates to [`hide_taskbar`]/[`set_taskbar_hide_absolute`]).
 /// Not exercised by this crate's automated tests -- see the `win32` module docs.
 pub fn set_taskbar_hide_absolute_armed(
     hwnd: HWND,
     hide: bool,
     mode: TaskbarHideMode,
+    explicit: bool,
 ) -> Result<(), Win32Error> {
     if hide {
-        // One lock for both reads, so the session can't drain in between.
-        let (active, session) =
-            with_armed_taskbar_windows(|state| (state.is_active(), state.session_restore()));
+        // One lock for all reads, so the session can't drain in between.
+        let (active, session, user_shown) = with_armed_taskbar_windows(|state| {
+            (state.is_active(), state.session_restore(), state.user_shown)
+        });
         if active {
             // A taskbar the hotkey showed in the meantime goes away again
             // when the game is returned to. `mark_and_hide_taskbar_window`
@@ -440,16 +467,16 @@ pub fn set_taskbar_hide_absolute_armed(
             let judgement = find_taskbar_window().ok().map(gather_taskbar_judgement);
             let rehide = judgement
                 .as_ref()
-                .is_some_and(|j| should_rehide_on_join(session, j.verdict));
+                .is_some_and(|j| should_rehide_on_join(session, j.verdict, user_shown, explicit));
             log!(
-                "taskbar hide for {hwnd:?}: joining the active session (session={session:?}, re-hide={rehide}); {}",
+                "taskbar hide for {hwnd:?}: joining the active session (session={session:?}, user_shown={user_shown}, explicit={explicit}, re-hide={rehide}); {}",
                 judgement
                     .as_ref()
                     .map_or_else(|| "Shell_TrayWnd not found".to_string(), describe_taskbar)
             );
             // Join first: the re-hide is best-effort and must not leave
             // `hwnd` out of the armed set.
-            join_taskbar_hide_session(hwnd);
+            join_taskbar_hide_session(hwnd, explicit);
             // Best-effort: a hung Explorer skips the re-hide.
             if rehide && let Some(j) = judgement {
                 let _ = mark_and_hide_taskbar_window(j.taskbar);
@@ -547,6 +574,10 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
         .verdict
         .filter(|_| mode == TaskbarHideMode::FullyHidden);
     let result = set_taskbar_hide_absolute(!hidden, mode);
+    if result.is_ok() {
+        // Showing during a session sticks until the next hotkey hide.
+        with_armed_taskbar_windows(|state| state.set_user_shown(hidden));
+    }
     log!(
         "taskbar hotkey: judged hidden={hidden} (reason={reason:?}), so {} -> {result:?}; after: {}",
         if hidden { "showing" } else { "hiding" },

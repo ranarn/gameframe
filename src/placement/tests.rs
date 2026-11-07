@@ -167,7 +167,13 @@ impl PlacementOps for FakeOps {
     fn allow_auto_apply(&self, _: HWND) {
         self.note("allow_auto_apply");
     }
-    fn set_taskbar(&self, _: HWND, hide: bool, _: TaskbarHideMode) -> Result<(), Win32Error> {
+    fn set_taskbar(
+        &self,
+        _: HWND,
+        hide: bool,
+        _: TaskbarHideMode,
+        _: bool,
+    ) -> Result<(), Win32Error> {
         self.note(if hide { "taskbar_hide" } else { "taskbar_show" });
         (self.taskbar_result)()
     }
