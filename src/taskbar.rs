@@ -185,7 +185,10 @@ struct ArmedTaskbarWindows {
 
 impl ArmedTaskbarWindows {
     /// Sets or clears the hotkey-show override; a no-op without an active
-    /// session, so a stray show can never leak into the next session.
+    /// session, so a stray show can never leak into the next session. It is
+    /// also set during a HoverReveal session, where it is inert (that mode
+    /// never re-hides on join, see `should_rehide_on_join`) and clears with
+    /// the session.
     fn set_user_shown(&mut self, shown: bool) {
         self.user_shown = shown && self.is_active();
     }
@@ -448,6 +451,9 @@ pub fn set_taskbar_hide_absolute(hide: bool, mode: TaskbarHideMode) -> Result<()
 ///
 /// OS-facing (delegates to [`hide_taskbar`]/[`set_taskbar_hide_absolute`]).
 /// Not exercised by this crate's automated tests -- see the `win32` module docs.
+/// The decision it wires up (`should_rehide_on_join`, `join_for_apply`) is pure
+/// and unit tested; the wiring itself (reading `user_shown`, passing `explicit`)
+/// needs a real taskbar and is verified by hand.
 pub fn set_taskbar_hide_absolute_armed(
     hwnd: HWND,
     hide: bool,
@@ -573,10 +579,18 @@ pub fn toggle_taskbar_hide(mode: TaskbarHideMode) -> Result<(), Win32Error> {
     let reason = judgement
         .verdict
         .filter(|_| mode == TaskbarHideMode::FullyHidden);
+    // Showing during a session sticks until the next hotkey hide. The override
+    // is set *before* the show, so an automatic join landing while the OS call
+    // is in flight already sees it and cannot re-hide the taskbar; a failed
+    // call puts it back.
+    let previous = with_armed_taskbar_windows(|state| {
+        let previous = state.user_shown;
+        state.set_user_shown(hidden);
+        previous
+    });
     let result = set_taskbar_hide_absolute(!hidden, mode);
-    if result.is_ok() {
-        // Showing during a session sticks until the next hotkey hide.
-        with_armed_taskbar_windows(|state| state.set_user_shown(hidden));
+    if result.is_err() {
+        with_armed_taskbar_windows(|state| state.set_user_shown(previous));
     }
     log!(
         "taskbar hotkey: judged hidden={hidden} (reason={reason:?}), so {} -> {result:?}; after: {}",
