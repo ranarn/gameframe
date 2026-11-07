@@ -135,6 +135,43 @@ fn armed_taskbar_windows_take_all_returns_none_when_nothing_is_armed() {
     assert_eq!(state.take_all(), None);
 }
 
+#[test]
+fn user_shown_override_is_set_only_in_a_session_and_cleared_when_it_ends_or_the_hotkey_hides() {
+    let mut state = ArmedTaskbarWindows::default();
+    state.set_user_shown(true);
+    assert!(!state.user_shown, "no session: nothing to override");
+
+    state.start(1, TaskbarHideRestore::FullyHidden);
+    state.set_user_shown(true);
+    assert!(state.user_shown);
+    state.set_user_shown(false);
+    assert!(!state.user_shown, "hotkey hide clears it");
+
+    state.set_user_shown(true);
+    state.leave(1);
+    assert!(!state.user_shown, "last window leaving ends the session");
+    state.start(2, TaskbarHideRestore::FullyHidden);
+    assert!(!state.user_shown, "a new session starts without it");
+
+    state.set_user_shown(true);
+    state.join(3);
+    state.take_all();
+    assert!(!state.user_shown, "take_all clears it");
+}
+
+#[test]
+fn user_shown_override_survives_an_automatic_join_but_an_explicit_join_clears_it() {
+    let mut state = ArmedTaskbarWindows::default();
+    state.start(1, TaskbarHideRestore::FullyHidden);
+    state.set_user_shown(true);
+
+    state.join_for_apply(2, false);
+    assert!(state.user_shown);
+
+    state.join_for_apply(3, true);
+    assert!(!state.user_shown);
+}
+
 /// Manual, real-OS verification for the `FullyHidden` mode (the taskbar
 /// must not reappear when the mouse hovers near the bottom of the screen
 /// while hidden -- not scriptable without OS-level screen/window-state
@@ -215,7 +252,7 @@ fn set_taskbar_hide_absolute_armed_then_take_armed_taskbar_restore_for_window_re
     // never dereferenced, only compared (see doc comment above).
     let fake_game_hwnd = 0xDEAD_usize as HWND;
 
-    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden, true)
         .expect("hide should succeed on a real desktop session");
     let visible_while_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
@@ -257,7 +294,7 @@ fn take_armed_taskbar_restore_for_window_leaves_an_unrelated_windows_hide_untouc
     let armed_hwnd = 0xDEAD_usize as HWND;
     let unrelated_hwnd = 0xBEEF_usize as HWND;
 
-    set_taskbar_hide_absolute_armed(armed_hwnd, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(armed_hwnd, true, TaskbarHideMode::FullyHidden, true)
         .expect("hide should succeed on a real desktop session");
 
     assert!(
@@ -306,9 +343,9 @@ fn set_taskbar_hide_absolute_armed_keeps_the_real_taskbar_hidden_until_the_last_
     let window_a = 0x1111_usize as HWND;
     let window_b = 0x2222_usize as HWND;
 
-    set_taskbar_hide_absolute_armed(window_a, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(window_a, true, TaskbarHideMode::FullyHidden, true)
         .expect("hiding for window A should succeed on a real desktop session");
-    set_taskbar_hide_absolute_armed(window_b, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(window_b, true, TaskbarHideMode::FullyHidden, true)
         .expect("hiding for window B (joining the already-active session) should succeed");
     let visible_while_both_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
@@ -362,7 +399,7 @@ fn take_any_armed_taskbar_restore_then_restore_taskbar_restores_the_real_taskbar
         find_taskbar_window().expect("Shell_TrayWnd must exist on a real desktop session");
     let fake_game_hwnd = 0xCAFE_usize as HWND;
 
-    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden, true)
         .expect("hide should succeed on a real desktop session");
     let visible_while_hidden = window_visible(taskbar_hwnd);
     assert_eq!(
@@ -409,7 +446,7 @@ fn toggle_taskbar_hide_reflects_the_real_state_regardless_of_who_hid_it_last() {
 
     // Simulate a tracked game's launch-detection auto-hide -- a call
     // site `toggle_taskbar_hide` never reads or writes state for.
-    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden)
+    set_taskbar_hide_absolute_armed(fake_game_hwnd, true, TaskbarHideMode::FullyHidden, true)
         .expect("hide should succeed on a real desktop session");
     assert_eq!(
         window_visible(taskbar_hwnd),

@@ -210,7 +210,13 @@ pub(crate) trait PlacementOps {
     fn remember_applied(&self, hwnd: HWND);
     fn reset_drift_cap(&self, hwnd: HWND);
     fn allow_auto_apply(&self, hwnd: HWND);
-    fn set_taskbar(&self, hwnd: HWND, hide: bool, mode: TaskbarHideMode) -> Result<(), Win32Error>;
+    fn set_taskbar(
+        &self,
+        hwnd: HWND,
+        hide: bool,
+        mode: TaskbarHideMode,
+        explicit: bool,
+    ) -> Result<(), Win32Error>;
 }
 
 /// The tracked game for `exe_path` and the configured Zone -- `None` for an
@@ -418,8 +424,12 @@ pub(crate) fn apply_zone_with(ops: &impl PlacementOps, hwnd: HWND, trigger: Trig
         ops.allow_auto_apply(hwnd);
     }
     if trigger.sets_taskbar()
-        && let Err(e) =
-            ops.set_taskbar(hwnd, config.hide_taskbar_on_apply, config.taskbar_hide_mode)
+        && let Err(e) = ops.set_taskbar(
+            hwnd,
+            config.hide_taskbar_on_apply,
+            config.taskbar_hide_mode,
+            trigger.is_explicit(),
+        )
         && !e.is_window_hung()
     {
         log!(
@@ -548,9 +558,15 @@ impl PlacementOps for SystemOps<'_> {
         win32::allow_auto_apply(hwnd);
     }
 
-    fn set_taskbar(&self, hwnd: HWND, hide: bool, mode: TaskbarHideMode) -> Result<(), Win32Error> {
+    fn set_taskbar(
+        &self,
+        hwnd: HWND,
+        hide: bool,
+        mode: TaskbarHideMode,
+        explicit: bool,
+    ) -> Result<(), Win32Error> {
         // Armed, so closing `hwnd` later restores the taskbar with no hotkey.
-        taskbar::set_taskbar_hide_absolute_armed(hwnd, hide, mode)
+        taskbar::set_taskbar_hide_absolute_armed(hwnd, hide, mode, explicit)
     }
 }
 
