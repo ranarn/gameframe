@@ -4,10 +4,34 @@ use super::{HotkeyField, SettingsApp};
 use crate::profile_store::{TaskbarHideMode, UpdateMode};
 use crate::ui_helpers::section_separator;
 
+/// Games table geometry, in points.
+const ICON_SIZE: f32 = 24.0;
+const AUTO_APPLY_WIDTH: f32 = 100.0;
+const GAME_CURSOR_WIDTH: f32 = 110.0;
+const REMOVE_WIDTH: f32 = 70.0;
+const ROW_SPACING: f32 = 8.0;
+
+/// Stand-in for an exe whose icon couldn't be read: a rounded outline.
+fn paint_generic_icon(ui: &egui::Ui, rect: egui::Rect) {
+    let stroke = egui::Stroke::new(1.5, ui.visuals().weak_text_color());
+    let frame = rect.shrink(2.0);
+    ui.painter()
+        .rect_stroke(frame, 3.0, stroke, egui::StrokeKind::Inside);
+    // A title bar line makes it read as a window.
+    let bar_y = frame.top() + frame.height() * 0.3;
+    ui.painter().line_segment(
+        [
+            egui::pos2(frame.left(), bar_y),
+            egui::pos2(frame.right(), bar_y),
+        ],
+        stroke,
+    );
+}
+
 impl SettingsApp<'_> {
-    /// Renders the "Games" section: one row per tracked game with its
-    /// display name, an auto-apply checkbox,
-    /// and an immediate no-confirmation "Remove" button (see
+    /// Renders the "Games" section: a striped table with one row per tracked
+    /// game -- exe icon, display name, an auto-apply checkbox, a game cursor
+    /// checkbox, and an immediate no-confirmation "Remove" button (see
     /// [`super::SettingsState::remove_tracked_game`]).
     ///
     /// Removal is deferred until after the loop (rather than mutating
@@ -22,23 +46,56 @@ impl SettingsApp<'_> {
         }
 
         let mut to_remove: Option<usize> = None;
-        let last_index = self.state.tracked_games.len() - 1;
-        for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(&game.display_name);
+        let spacing = ui.spacing().item_spacing;
+        let name_width = (ui.available_width()
+            - ICON_SIZE
+            - AUTO_APPLY_WIDTH
+            - GAME_CURSOR_WIDTH
+            - REMOVE_WIDTH
+            - 4.0 * spacing.x)
+            .max(60.0);
+        let ctx = ui.ctx().clone();
+        egui::Grid::new("games_table")
+            .striped(true)
+            .num_columns(5)
+            .spacing([spacing.x, ROW_SPACING])
+            .show(ui, |ui| {
+                for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
+                    let icon_rect = ui
+                        .allocate_exact_size(egui::Vec2::splat(ICON_SIZE), egui::Sense::hover())
+                        .0;
+                    match self.exe_icons.get(&ctx, &game.exe_path) {
+                        Some(texture) => {
+                            egui::Image::new((texture.id(), egui::Vec2::splat(ICON_SIZE)))
+                                .paint_at(ui, icon_rect);
+                        }
+                        None => paint_generic_icon(ui, icon_rect),
+                    }
 
-                ui.checkbox(&mut game.auto_apply, "Auto-apply");
-                ui.checkbox(&mut game.game_cursor, "Game cursor");
+                    ui.scope(|ui| {
+                        ui.set_width(name_width);
+                        ui.add(egui::Label::new(&game.display_name).truncate())
+                            .on_hover_text(game.exe_path.display().to_string());
+                    });
 
-                if ui.button("Remove").clicked() {
-                    to_remove = Some(index);
+                    ui.scope(|ui| {
+                        ui.set_width(AUTO_APPLY_WIDTH);
+                        ui.checkbox(&mut game.auto_apply, "Auto-apply");
+                    });
+                    ui.scope(|ui| {
+                        ui.set_width(GAME_CURSOR_WIDTH);
+                        ui.checkbox(&mut game.game_cursor, "Game cursor");
+                    });
+
+                    if ui
+                        .add_sized([REMOVE_WIDTH, 0.0], egui::Button::new("Remove"))
+                        .clicked()
+                    {
+                        to_remove = Some(index);
+                    }
+                    ui.end_row();
                 }
             });
-
-            if index != last_index {
-                ui.separator();
-            }
-        }
 
         if let Some(index) = to_remove {
             self.state.remove_tracked_game(index);

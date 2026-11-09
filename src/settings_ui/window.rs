@@ -309,6 +309,7 @@ fn run_settings_frame(
                 cursor_previews: None,
                 update_check: UpdateCheck::Idle,
                 update_install: UpdateInstall::Idle,
+                exe_icons: Default::default(),
                 on_tick,
             }))
         }),

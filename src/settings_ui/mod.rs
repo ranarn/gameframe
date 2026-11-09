@@ -22,6 +22,7 @@
 //! General sections).
 
 mod cursor;
+mod exe_icon;
 mod hotkeys;
 mod save;
 mod state;
@@ -146,6 +147,8 @@ struct SettingsApp<'a> {
     update_check: UpdateCheck,
     /// The "Install update" button's state, once a check found an update.
     update_install: UpdateInstall,
+    /// Games tab icons, extracted once per exe path.
+    exe_icons: exe_icon::ExeIcons,
 }
 
 /// Size of the Save and Exit / Apply / Close buttons, in points.
