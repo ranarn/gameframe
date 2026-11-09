@@ -115,6 +115,8 @@ Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]
 var
+  // Uninstall only: the answer to "also remove settings and data?".
+  RemoveUserData: Boolean;
   // Captured when the wizard opens, before this run touches the registry.
   WasInstalled: Boolean;
   // The real Run value at that moment: what the app's toggle last set. It is
@@ -556,11 +558,26 @@ function InitializeUninstall: Boolean;
 begin
   Result := EnsureGameFrameStopped(UninstallSilent);
   if not Result then
-    Log('Uninstall aborted: GameFrame still running');
+    Log('Uninstall aborted: GameFrame still running')
+  else if not UninstallSilent then
+    // Asked once the stop prompt is past, so a cancel there leaves no
+    // half-answered state. Silent/very silent (what updates use) never asks
+    // and never deletes, so an update can never wipe the user's config.
+    RemoveUserData := MsgBox('Also remove GameFrame''s settings, tracked games and logs?',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
+  if (CurUninstallStep = usPostUninstall) and RemoveUserData then
+  begin
+    // After the program files are gone. A failed delete (file in use,
+    // permissions) is logged and ignored; it never aborts the uninstall.
+    if not DelTree(ExpandConstant('{userappdata}\GameFrame'), True, True, True) then
+      Log('Could not fully remove {userappdata}\GameFrame');
+    if not DelTree(ExpandConstant('{localappdata}\GameFrame'), True, True, True) then
+      Log('Could not fully remove {localappdata}\GameFrame');
+  end;
   if CurUninstallStep = usUninstall then
   begin
     // Backstop: GameFrame may have been started after InitializeUninstall.
