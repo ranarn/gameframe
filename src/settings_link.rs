@@ -127,6 +127,10 @@ pub enum ChildMsg {
     Install(InstallRequest),
     /// Show this text as a tray notification.
     Notify(String),
+    /// The user picked this window (an `HWND`) in the Games tab's "Apply to
+    /// Window" list: do what the tray submenu's click does (track the game and
+    /// apply the Zone), then answer with [`ParentMsg::TrackedGamesChanged`].
+    ApplyToWindow(isize),
 }
 
 /// What the tray process tells a child.
@@ -148,6 +152,13 @@ pub enum ParentMsg {
     Install {
         request: Option<u64>,
         progress: InstallProgress,
+    },
+    /// The tracked games on disk may have changed (a [`ChildMsg::ApplyToWindow`]
+    /// was handled): reload them and merge new ones into the visible list.
+    TrackedGamesChanged {
+        /// The executable of the window just picked, when it could be read: the
+        /// child shows that game even if the user removed it from the list earlier.
+        picked: Option<std::path::PathBuf>,
     },
     /// Close the window (discarding unsaved edits) and exit.
     Close,
@@ -251,6 +262,8 @@ struct Inbox {
     pending_install: Option<(u64, Instant)>,
     /// The last context reported, so only changes are sent.
     last_context: Option<TickContext>,
+    /// A [`ParentMsg::TrackedGamesChanged`] not taken yet.
+    tracked_games_changed: Option<Vec<std::path::PathBuf>>,
 }
 
 impl Inbox {
@@ -262,6 +275,11 @@ impl Inbox {
                 game_cursor,
             } => self.init = Some((hotkey_reports, game_cursor)),
             ParentMsg::CursorEnabled(enabled) => self.cursor_enabled = Some(enabled),
+            ParentMsg::TrackedGamesChanged { picked } => {
+                self.tracked_games_changed
+                    .get_or_insert_with(Vec::new)
+                    .extend(picked);
+            }
             ParentMsg::Install { request, progress } => {
                 self.file_install(request, progress, Instant::now());
             }
@@ -340,6 +358,7 @@ impl ChildLink {
                 install: Vec::new(),
                 pending_install: None,
                 last_context: None,
+                tracked_games_changed: None,
             }),
             next_request: AtomicU64::new(1),
         }
@@ -427,6 +446,23 @@ impl ChildLink {
         std::mem::take(&mut inbox.install)
     }
 
+    /// Asks the tray process to track and apply the Zone to `window` (an
+    /// `HWND`), as a click on the tray submenu does. The answer arrives as
+    /// [`Self::take_tracked_games_changed`].
+    pub fn request_apply_to_window(&self, window: isize) {
+        self.send(&ChildMsg::ApplyToWindow(window));
+    }
+
+    /// `Some` when the tray process reported changed tracked games since the last
+    /// call, carrying the executables of the windows picked meanwhile (if known).
+    pub fn take_tracked_games_changed(&self) -> Option<Vec<std::path::PathBuf>> {
+        let mut inbox = self.lock_inbox();
+        while let Ok(msg) = inbox.rx.try_recv() {
+            inbox.file(msg);
+        }
+        std::mem::take(&mut inbox.tracked_games_changed)
+    }
+
     /// Asks the tray process to live re-apply the saved Zone and waits for its
     /// status lines. Empty if it does not answer in time.
     pub fn request_reapply(&self) -> Vec<String> {
@@ -480,6 +516,19 @@ pub fn config_changed() {
     if let Some(link) = link() {
         link.send(&ChildMsg::ConfigChanged);
     }
+}
+
+/// Asks the tray process to track and apply the Zone to `window` (an `HWND`)
+/// (no-op without a link), see [`ChildLink::request_apply_to_window`].
+pub fn request_apply_to_window(window: isize) {
+    if let Some(link) = link() {
+        link.request_apply_to_window(window);
+    }
+}
+
+/// See [`ChildLink::take_tracked_games_changed`] (always `None` without a link).
+pub fn take_tracked_games_changed() -> Option<Vec<std::path::PathBuf>> {
+    link().and_then(ChildLink::take_tracked_games_changed)
 }
 
 /// Tells the tray process Settings applied its changes (no-op without a link).
@@ -606,6 +655,57 @@ mod tests {
             game_cursor: Some(Bitmap::blank(2, 2, 1, 1)),
         };
         assert_eq!(decode_line::<ParentMsg>(&encode_line(&down)), Some(down));
+    }
+
+    #[test]
+    fn the_apply_to_window_messages_round_trip() {
+        let up = ChildMsg::ApplyToWindow(0x0001_02F4);
+        assert_eq!(decode_line::<ChildMsg>(&encode_line(&up)), Some(up));
+
+        let down = ParentMsg::TrackedGamesChanged {
+            picked: Some("C:\\Games\\a.exe".into()),
+        };
+        assert_eq!(decode_line::<ParentMsg>(&encode_line(&down)), Some(down));
+
+        let unreadable = ParentMsg::TrackedGamesChanged { picked: None };
+        assert_eq!(
+            decode_line::<ParentMsg>(&encode_line(&unreadable)),
+            Some(unreadable)
+        );
+    }
+
+    #[test]
+    fn a_change_without_a_readable_exe_still_asks_for_a_reload() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut inbox = Inbox {
+            rx,
+            cursor_enabled: None,
+            init: None,
+            install: Vec::new(),
+            pending_install: None,
+            last_context: None,
+            tracked_games_changed: None,
+        };
+        inbox.file(ParentMsg::TrackedGamesChanged { picked: None });
+        assert_eq!(inbox.tracked_games_changed, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_picked_window_goes_to_the_tray_process_and_its_answer_is_taken_once() {
+        let (link, mut to_child, mut from_child, _closed) = linked_pair();
+
+        link.request_apply_to_window(1234);
+        assert_eq!(read_msg(&mut from_child), ChildMsg::ApplyToWindow(1234));
+
+        assert_eq!(link.take_tracked_games_changed(), None);
+        write_msg(
+            &mut to_child,
+            &ParentMsg::TrackedGamesChanged {
+                picked: Some("C:\\Games\\a.exe".into()),
+            },
+        );
+        wait_until(|| link.take_tracked_games_changed().is_some());
+        assert_eq!(link.take_tracked_games_changed(), None, "taken once");
     }
 
     #[test]

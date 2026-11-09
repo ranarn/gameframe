@@ -362,6 +362,7 @@ pub(crate) fn service_settings(
     };
     let polled = process.poll();
     let mut applied = false;
+    let mut games_changed = false;
     for msg in polled.messages {
         let reply = react_to_child_message(
             msg,
@@ -371,6 +372,7 @@ pub(crate) fn service_settings(
                 context: &mut process.context,
                 offered_update,
                 applied: &mut applied,
+                games_changed: &mut games_changed,
             },
         );
         if let Some(reply) = reply {
@@ -385,6 +387,7 @@ pub(crate) fn service_settings(
     }
     SettingsService {
         applied,
+        games_changed,
         exited: polled.exited,
     }
 }
@@ -394,6 +397,8 @@ pub(crate) fn service_settings(
 pub(crate) struct SettingsService {
     /// The child applied its settings since the last pass.
     pub applied: bool,
+    /// A window picked in Settings was handled: a game may have been tracked.
+    pub games_changed: bool,
     /// The child has exited.
     pub exited: bool,
 }
@@ -417,6 +422,10 @@ trait ChildEffects {
     /// [`route_install_progress`]).
     fn start_install(&mut self, request: u64, info: UpdateInfo);
     fn notify(&mut self, text: &str);
+    /// Does what a click on the tray submenu's entry for `window` (an `HWND`)
+    /// does: tracks the game and applies the Zone, telling the user of a failure.
+    /// Returns the window's executable, when it could be read.
+    fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf>;
 }
 
 /// Applies one message of the Settings child through `effects`; `Some` is the
@@ -445,6 +454,11 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
             }
         }
         ChildMsg::Notify(text) => effects.notify(&text),
+        ChildMsg::ApplyToWindow(window) => {
+            let picked = effects.apply_to_window(window);
+            // Whether or not it worked: the child reloads and merges what is new.
+            return Some(ParentMsg::TrackedGamesChanged { picked });
+        }
     }
     None
 }
@@ -456,6 +470,8 @@ struct TrayEffects<'a> {
     context: &'a mut TickContext,
     offered_update: &'a mut Option<UpdateInfo>,
     applied: &'a mut bool,
+    /// Set when a window was picked in Settings: the game cursor must be reloaded.
+    games_changed: &'a mut bool,
 }
 
 impl ChildEffects for TrayEffects<'_> {
@@ -493,6 +509,15 @@ impl ChildEffects for TrayEffects<'_> {
 
     fn notify(&mut self, text: &str) {
         self.tray.notify(text);
+    }
+
+    fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf> {
+        crate::watchdog::step("settings process: apply to window");
+        // Read before the apply: the window may be gone after it.
+        let exe = crate::window_filter::exe_path_for_window(window as _);
+        crate::app::apply_picked_window(self.config_dir, window, self.tray);
+        *self.games_changed = true;
+        exe
     }
 }
 
@@ -840,6 +865,10 @@ mod tests {
         fn notify(&mut self, text: &str) {
             self.calls.push(format!("notify {text}"));
         }
+        fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf> {
+            self.calls.push(format!("apply window {window}"));
+            Some("C:\\Games\\g.exe".into())
+        }
     }
 
     fn react(msg: ChildMsg) -> (Option<ParentMsg>, Vec<String>) {
@@ -893,6 +922,19 @@ mod tests {
         assert_eq!(
             react(ChildMsg::Notify("Hi".into())),
             (None, vec!["notify Hi".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_picked_window_is_applied_by_the_tray_side_and_the_child_is_told_to_reload() {
+        assert_eq!(
+            react(ChildMsg::ApplyToWindow(77)),
+            (
+                Some(ParentMsg::TrackedGamesChanged {
+                    picked: Some("C:\\Games\\g.exe".into())
+                }),
+                vec!["apply window 77".to_string()]
+            )
         );
     }
 

@@ -7,7 +7,7 @@ use crate::placement;
 use crate::profile_store;
 use crate::profile_store::{Config, HotkeyBindings, TrackedGame, Zone};
 use crate::win32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The non-blocking status-line message shown for a tracked game whose live
 /// re-apply attempt failed -- e.g. the window couldn't be
@@ -219,6 +219,40 @@ fn merge_tracked_games(
     edited
 }
 
+/// Shows the games tracked on disk since Settings opened in the visible list
+/// (`visible`, with the user's unsaved edits) while it is open: the same rule as
+/// [`merge_tracked_games`], so edits to existing rows survive and a game
+/// removed in Settings stays removed -- except the `picked` ones (executables
+/// of windows the user just chose in "Apply to Window", an explicit action):
+/// those reappear with their on-disk settings. A new game is also recorded in
+/// `baseline_games` (the baseline's tracked games): it is on disk already, so a
+/// later Apply writes nothing for it and Close leaves it alone, and neither
+/// duplicates nor drops it.
+pub(super) fn adopt_games_added_on_disk(
+    baseline_games: &mut Vec<TrackedGame>,
+    visible: &mut Vec<TrackedGame>,
+    on_disk: &[TrackedGame],
+    picked: &[PathBuf],
+) {
+    let shown = visible.len();
+    *visible = merge_tracked_games(baseline_games, std::mem::take(visible), on_disk);
+    baseline_games.extend(visible[shown..].iter().cloned());
+
+    for exe in picked {
+        if visible.iter().any(|g| &g.exe_path == exe) {
+            continue;
+        }
+        let Some(game) = on_disk.iter().find(|g| &g.exe_path == exe) else {
+            continue;
+        };
+        visible.push(game.clone());
+        match baseline_games.iter_mut().find(|g| &g.exe_path == exe) {
+            Some(known) => *known = game.clone(),
+            None => baseline_games.push(game.clone()),
+        }
+    }
+}
+
 /// What Settings compares the user's edits against: the config and the
 /// "Start with Windows" choice as of Settings opening or, later, its last
 /// successful Apply (see [`apply_settings`]).
@@ -313,6 +347,103 @@ mod tests {
         let merged = merge_tracked_games(&opened, edited, &on_disk);
 
         assert_eq!(merged, vec![game("a.exe"), game("b.exe")]);
+    }
+
+    #[test]
+    fn a_game_added_on_disk_shows_up_and_unsaved_edits_to_other_rows_survive() {
+        let mut baseline = vec![game("a.exe")];
+        let mut edited_a = game("a.exe");
+        edited_a.auto_apply = !edited_a.auto_apply;
+        let mut visible = vec![edited_a.clone()];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe"), game("b.exe")],
+            &[],
+        );
+
+        assert_eq!(visible, vec![edited_a, game("b.exe")]);
+        assert_eq!(baseline, vec![game("a.exe"), game("b.exe")]);
+    }
+
+    #[test]
+    fn refreshing_twice_adds_a_game_once() {
+        let mut baseline = Vec::new();
+        let mut visible = Vec::new();
+        let on_disk = [game("b.exe")];
+
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+
+        assert_eq!(visible, vec![game("b.exe")]);
+        assert_eq!(baseline, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn a_refresh_leaves_a_game_the_user_removed_but_did_not_pick_removed() {
+        let mut baseline = vec![game("a.exe"), game("b.exe")];
+        let mut visible = vec![game("a.exe")];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe"), game("b.exe")],
+            &[],
+        );
+
+        assert_eq!(visible, vec![game("a.exe")]);
+    }
+
+    #[test]
+    fn a_game_removed_then_picked_again_reappears_and_the_next_apply_keeps_it() {
+        let mut baseline = vec![game("a.exe"), game("b.exe")];
+        let mut visible = vec![game("a.exe")];
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &on_disk,
+            &[PathBuf::from("b.exe")],
+        );
+
+        assert_eq!(visible, vec![game("a.exe"), game("b.exe")]);
+        assert_eq!(baseline, on_disk);
+        let merged = merge_tracked_games(&baseline, visible, &on_disk);
+        assert_eq!(merged, on_disk);
+    }
+
+    #[test]
+    fn picking_a_game_already_shown_keeps_the_users_edits_to_it() {
+        let mut edited_a = game("a.exe");
+        edited_a.auto_apply = !edited_a.auto_apply;
+        let mut baseline = vec![game("a.exe")];
+        let mut visible = vec![edited_a.clone()];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe")],
+            &[PathBuf::from("a.exe")],
+        );
+
+        assert_eq!(visible, vec![edited_a]);
+    }
+
+    #[test]
+    fn an_apply_after_a_refresh_neither_duplicates_nor_drops_the_new_game() {
+        let mut baseline = vec![game("a.exe")];
+        let mut visible = vec![game("a.exe")];
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+        let mut edited_a = visible[0].clone();
+        edited_a.game_cursor = !edited_a.game_cursor;
+        visible[0] = edited_a.clone();
+
+        let merged = merge_tracked_games(&baseline, visible, &on_disk);
+
+        assert_eq!(merged, vec![edited_a, game("b.exe")]);
     }
 
     #[test]

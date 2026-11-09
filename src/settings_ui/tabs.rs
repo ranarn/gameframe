@@ -38,9 +38,14 @@ impl SettingsApp<'_> {
     /// `self.state.tracked_games` while iterating it) to avoid mutating the
     /// `Vec` out from under `iter_mut`'s in-progress borrow.
     pub(super) fn games_section(&mut self, ui: &mut egui::Ui) {
+        if let Some(window) = self.window_chooser.show(ui, &self.config_dir) {
+            crate::settings_link::request_apply_to_window(window);
+        }
+        ui.add_space(ROW_SPACING);
+
         if self.state.tracked_games.is_empty() {
             ui.label(
-                "No tracked games yet -- use \"Apply to Window\" from the tray menu to add one.",
+                "No tracked games yet -- use the \"Apply to Window\" button above or the tray menu to add one.",
             );
             return;
         }

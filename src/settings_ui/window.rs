@@ -310,6 +310,7 @@ fn run_settings_frame(
                 update_check: UpdateCheck::Idle,
                 update_install: UpdateInstall::Idle,
                 exe_icons: Default::default(),
+                window_chooser: Default::default(),
                 on_tick,
             }))
         }),

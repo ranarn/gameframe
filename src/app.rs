@@ -70,6 +70,7 @@ use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
     PM_REMOVE, PeekMessageW, PostQuitMessage, TranslateMessage, WM_QUIT,
@@ -402,6 +403,10 @@ fn run_event_loop(
         // Apply (window stays open) and close refresh the same things.
         if service.applied || service.exited {
             settings_closed(&ctx, &mut state);
+        } else if service.games_changed {
+            // A window picked in Settings may have become a tracked game: it gets
+            // the game cursor right away, as from the tray.
+            ctx.cursor_overlay.reload(ctx.config_dir);
         }
 
         crate::watchdog::step("event loop: second-launch commands");
@@ -584,10 +589,7 @@ fn drain_events(
     crate::watchdog::step("drain_events: tray menu events");
     while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
-            let outcome = placement::apply_zone(config_dir, target_hwnd, Trigger::Tray);
-            if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
-                tray.notify(&notice);
-            }
+            apply_picked_window(config_dir, target_hwnd as isize, tray);
             // A newly tracked game gets the game cursor right away.
             cursor_overlay.reload(config_dir);
             continue;
@@ -899,6 +901,17 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
         cursor_overlay.pulse();
     }
     Some(enabled)
+}
+
+/// What choosing a window in "Apply to Window" does, whether in the tray submenu
+/// or in Settings' Games tab: tracks its game and applies the Zone, telling the
+/// user why if that did not work. `window` is an `HWND`; one that has gone since
+/// it was listed is an ordinary failure of the apply.
+pub(crate) fn apply_picked_window(config_dir: &Path, window: isize, tray: &Tray) {
+    let outcome = placement::apply_zone(config_dir, window as HWND, Trigger::Tray);
+    if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
+        tray.notify(&notice);
+    }
 }
 
 /// Opens Settings (what the tray item and a second launch both do): starts the

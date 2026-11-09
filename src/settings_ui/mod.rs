@@ -29,6 +29,7 @@ mod state;
 mod tabs;
 mod updates;
 mod window;
+mod window_chooser;
 mod zone;
 
 use cursor::*;
@@ -149,6 +150,8 @@ struct SettingsApp<'a> {
     update_install: UpdateInstall,
     /// Games tab icons, extracted once per exe path.
     exe_icons: exe_icon::ExeIcons,
+    /// The Games tab's "Apply to Window" button and its popup.
+    window_chooser: window_chooser::WindowChooser,
 }
 
 /// Size of the Save and Exit / Apply / Close buttons, in points.
@@ -163,6 +166,21 @@ impl SettingsApp<'_> {
         let baseline = self.baseline.borrow();
         self.state.to_config() != baseline.config
             || self.state.start_with_windows != baseline.start_with_windows
+    }
+
+    /// Adds the games tracked on disk since Settings opened to the table (see
+    /// [`save::adopt_games_added_on_disk`]). A failed read is logged; the table
+    /// stays as it is.
+    fn refresh_tracked_games(&mut self, picked: &[std::path::PathBuf]) {
+        match crate::profile_store::load(&self.config_dir) {
+            Ok(on_disk) => save::adopt_games_added_on_disk(
+                &mut self.baseline.borrow_mut().config.tracked_games,
+                &mut self.state.tracked_games,
+                &on_disk.tracked_games,
+                picked,
+            ),
+            Err(e) => log!("couldn't refresh the tracked games: {e}"),
+        }
     }
 
     /// Apply: persists the edits (see [`apply_settings`]) and tells the tray
@@ -215,6 +233,12 @@ impl eframe::App for SettingsApp<'_> {
         // `cursor.enabled` on disk: show it in the checkbox so Save keeps it.
         if let Some(enabled) = (self.on_tick)(self.state.tick_context()) {
             self.state.apply_external_cursor_enabled(enabled);
+        }
+
+        // The tray process handled a window picked in the Games tab: show the
+        // game it tracked without closing Settings.
+        if let Some(picked) = crate::settings_link::take_tracked_games_changed() {
+            self.refresh_tracked_games(&picked);
         }
 
         // A Quit (installer/updater) closes Settings as Cancel does. Polled
