@@ -115,6 +115,9 @@ pub enum ChildMsg {
     ReapplyAll,
     /// The child changed the config file; drop the cached copy.
     ConfigChanged,
+    /// Settings applied its changes and stays open: re-register the hotkeys
+    /// and reload the game cursor, as on close.
+    SettingsApplied,
     /// A manual update check found no newer release (the tray hides its
     /// "Update to" item).
     UpToDate,
@@ -476,6 +479,13 @@ pub fn report_context(context: TickContext) {
 pub fn config_changed() {
     if let Some(link) = link() {
         link.send(&ChildMsg::ConfigChanged);
+    }
+}
+
+/// Tells the tray process Settings applied its changes (no-op without a link).
+pub fn settings_applied() {
+    if let Some(link) = link() {
+        link.send(&ChildMsg::SettingsApplied);
     }
 }
 

@@ -142,7 +142,7 @@ impl SettingsApp<'_> {
                     };
                     if ui.button(label).clicked() {
                         *self.exit.borrow_mut() = Some(SettingsExit::EditZone(
-                            self.state.clone(),
+                            Box::new(self.state.clone()),
                             self.pending_status_messages.clone(),
                         ));
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

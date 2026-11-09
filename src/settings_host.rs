@@ -348,18 +348,20 @@ impl<C: ProcessHandle> Drop for SettingsProcess<C> {
 /// forgets its cached config when the child wrote the file, and runs update
 /// events for the tray.
 ///
-/// Returns `true` when the child has exited (and `settings` is now `None`), so
-/// the caller can apply what Settings may have changed.
+/// Reports whether the child applied its settings (still open) and whether it
+/// has exited (and `settings` is now `None`), so the caller can apply what
+/// Settings may have changed.
 pub(crate) fn service_settings(
     tray: &Tray,
     config_dir: &Path,
     settings: &mut Option<SettingsProcess>,
     offered_update: &mut Option<UpdateInfo>,
-) -> bool {
+) -> SettingsService {
     let Some(process) = settings.as_mut() else {
-        return false;
+        return SettingsService::default();
     };
     let polled = process.poll();
+    let mut applied = false;
     for msg in polled.messages {
         let reply = react_to_child_message(
             msg,
@@ -368,6 +370,7 @@ pub(crate) fn service_settings(
                 config_dir,
                 context: &mut process.context,
                 offered_update,
+                applied: &mut applied,
             },
         );
         if let Some(reply) = reply {
@@ -380,7 +383,19 @@ pub(crate) fn service_settings(
             log!("the Settings process ended with {:?}", polled.exit_code);
         }
     }
-    polled.exited
+    SettingsService {
+        applied,
+        exited: polled.exited,
+    }
+}
+
+/// What [`service_settings`] found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsService {
+    /// The child applied its settings since the last pass.
+    pub applied: bool,
+    /// The child has exited.
+    pub exited: bool,
 }
 
 /// What the tray process does on a Settings child's behalf; the real one is
@@ -390,6 +405,9 @@ trait ChildEffects {
     fn set_context(&mut self, context: TickContext);
     /// The child wrote the config file: drop the cached copy.
     fn forget_config(&mut self);
+    /// The child applied its settings and keeps running: the hotkeys and the
+    /// game cursor must follow the saved config now, as they do on close.
+    fn settings_applied(&mut self);
     /// Live re-applies the saved Zone to the running tracked games and returns
     /// one status line per game that could not be repositioned.
     fn reapply_all(&mut self) -> Vec<String>;
@@ -407,6 +425,7 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
     match msg {
         ChildMsg::Context(context) => effects.set_context(context),
         ChildMsg::ConfigChanged => effects.forget_config(),
+        ChildMsg::SettingsApplied => effects.settings_applied(),
         ChildMsg::ReapplyAll => {
             // The Zone was just saved by the child, behind this process's cache.
             effects.forget_config();
@@ -436,11 +455,16 @@ struct TrayEffects<'a> {
     config_dir: &'a Path,
     context: &'a mut TickContext,
     offered_update: &'a mut Option<UpdateInfo>,
+    applied: &'a mut bool,
 }
 
 impl ChildEffects for TrayEffects<'_> {
     fn set_context(&mut self, context: TickContext) {
         *self.context = context;
+    }
+
+    fn settings_applied(&mut self) {
+        *self.applied = true;
     }
 
     fn forget_config(&mut self) {
@@ -798,6 +822,9 @@ mod tests {
         fn forget_config(&mut self) {
             self.calls.push("forget".into());
         }
+        fn settings_applied(&mut self) {
+            self.calls.push("applied".into());
+        }
         fn reapply_all(&mut self) -> Vec<String> {
             self.calls.push("reapply".into());
             self.answer.clone()
@@ -829,6 +856,14 @@ mod tests {
         assert_eq!(
             react(ChildMsg::ConfigChanged),
             (None, vec!["forget".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_apply_in_the_open_settings_window_reaches_the_tray_side_without_an_answer() {
+        assert_eq!(
+            react(ChildMsg::SettingsApplied),
+            (None, vec!["applied".to_string()])
         );
     }
 

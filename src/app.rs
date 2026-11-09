@@ -393,13 +393,14 @@ fn run_event_loop(
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
         // current for the hotkey events below.
-        let child_exited = settings_host::service_settings(
+        let service = settings_host::service_settings(
             ctx.tray,
             ctx.config_dir,
             &mut state.settings,
             &mut state.offered_update,
         );
-        if child_exited {
+        // Apply (window stays open) and close refresh the same things.
+        if service.applied || service.exited {
             settings_closed(&ctx, &mut state);
         }
 
@@ -926,7 +927,8 @@ fn show_settings(ctx: &Shared, state: &mut LoopState) {
     }
 }
 
-/// Applies what Settings may have changed, once its window has closed.
+/// Applies what Settings may have changed, once its window has closed or it
+/// applied its changes while staying open.
 fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
         tray,
@@ -934,11 +936,11 @@ fn settings_closed(ctx: &Shared, state: &mut LoopState) {
         cursor_overlay,
         ..
     } = *ctx;
-    crate::watchdog::step("settings: closed, re-registering hotkeys");
-    // The child wrote the config file (Save) behind this process's cache.
+    crate::watchdog::step("settings: applied or closed, re-registering hotkeys");
+    // The child wrote the config file behind this process's cache.
     profile_store::forget_cached(config_dir);
 
-    // Settings may have changed the hotkey bindings on disk (Save persists via
+    // Settings may have changed the hotkey bindings on disk (Apply persists via
     // `profile_store`) -- re-register from the freshly saved config so a newly
     // bound/changed/removed hotkey takes effect immediately, without requiring
     // a full app restart. The old `Hotkeys` must be dropped *before*
@@ -949,7 +951,7 @@ fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     drop(state.hotkeys.take());
     let previous_reports = std::mem::take(&mut state.hotkey_reports);
     (state.hotkeys, state.hotkey_reports) = register_hotkeys(config_dir);
-    // Right after Save, not only on reopening Settings: one notice for the
+    // Right after Apply, not only on reopening Settings: one notice for the
     // bindings that just started failing (not for ones already reported).
     if let Some(notice) =
         crate::hotkeys::new_failure_notice(&previous_reports, &state.hotkey_reports)

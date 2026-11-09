@@ -2,14 +2,12 @@
 //! session and the exit the user chose.
 
 use super::{
-    SettingsApp, SettingsState, SettingsUiError, UpdateCheck, UpdateInstall, apply_saved_changes,
-    persist_zone,
+    Baseline, SettingsApp, SettingsState, SettingsUiError, UpdateCheck, UpdateInstall, persist_zone,
 };
 use crate::autostart;
 use crate::hotkeys::BindingReport;
 use crate::instance_channel::SETTINGS_TITLE;
 use crate::profile_store;
-use crate::profile_store::Config;
 use crate::region_calc::MonitorGeometry;
 use crate::zone_editor::pixels_to_points;
 use crate::zone_overlay;
@@ -94,9 +92,9 @@ fn primary_work_area() -> MonitorGeometry {
     }
 }
 
-/// What closed the Settings window: a completed Save (carrying the
-/// [`Config`] to persist), a Cancel/close-without-saving, or a request to
-/// open the zone-editor overlay for the Zone (carrying the current
+/// What closed the Settings window: Close (also Save and Exit, which has
+/// already applied its edits by then, and the window's own close button), or a
+/// request to open the zone-editor overlay for the Zone (carrying the current
 /// in-progress [`SettingsState`], plus this session's current pending
 /// live-re-apply status messages ([`SettingsApp::pending_status_messages`])
 /// so neither is lost while the overlay is open).
@@ -106,18 +104,15 @@ fn primary_work_area() -> MonitorGeometry {
 /// status messages, folded back in) rather than ending the session, since
 /// opening the zone editor is not itself a decision to close Settings.
 pub(super) enum SettingsExit {
-    /// The config to persist, plus the "Start with Windows" choice (which
-    /// lives in the registry, not in [`Config`]).
-    /// The `bool` after the config is [`SettingsState::cursor_enabled_seen`].
-    Saved(Config, bool, bool),
-    Cancelled,
+    /// Edits since the last Apply are discarded.
+    Closed,
     /// Carries the in-progress [`SettingsState`] plus this session's current
     /// pending live-re-apply status messages ([`SettingsApp::pending_status_messages`])
     /// -- so a message surfaced by a Zone commit made
     /// just before "Edit Zone" was clicked isn't lost when this
     /// session's `SettingsApp` is torn down; [`run_settings_window`] carries
     /// it forward as the next session's initial status messages.
-    EditZone(SettingsState, Vec<String>),
+    EditZone(Box<SettingsState>, Vec<String>),
 }
 
 /// Which window's frame loop is ticking the app's event handling.
@@ -134,14 +129,14 @@ pub enum TickContext {
 /// Opens the Settings window, blocking until it's closed, then returns.
 ///
 /// Loads the current config from `config_dir` (via [`profile_store::load`]),
-/// lets the user edit the Zone and hotkey bindings, and -- only if the user
-/// clicks "Save" -- persists the fields the user changed via
-/// [`profile_store::update`] (see [`apply_saved_changes`]) before returning.
-/// Closing the window any other way (the "Cancel" button, the window's own
-/// close button) discards the edits -- except the Zone, which Save/Cancel
-/// don't govern: saving in the zone editor overlay (and "Clear") persists it
-/// immediately, so the disk and the windows it was live-applied to never
-/// disagree.
+/// lets the user edit the Zone and hotkey bindings, and -- only when the user
+/// clicks "Apply" or "Save and Exit" -- persists the fields the user changed
+/// via [`profile_store::update`] (see [`apply_saved_changes`]). Apply keeps the
+/// window open and moves the baseline the next Apply compares against; closing
+/// the window ("Close", its own close button) discards the edits made since
+/// the last Apply -- except the Zone, which Apply/Close don't govern: saving
+/// in the zone editor overlay (and "Clear") persists it immediately, so the
+/// disk and the windows it was live-applied to never disagree.
 ///
 /// Clicking "Draw Zone"/"Edit Zone" opens the zone-editor overlay
 /// ([`zone_overlay::run_zone_editor_overlay`]) *sequentially* rather than
@@ -182,42 +177,28 @@ pub fn run_settings_window(
 ) -> Result<(), SettingsUiError> {
     let config = profile_store::load(config_dir).map_err(SettingsUiError::Config)?;
     let mut state = SettingsState::from_config(&config);
-    // What Save compares the user's edits against (see [`apply_saved_changes`]).
-    let opened = config;
     state.set_hotkey_reports(hotkey_reports);
-    let started_with_windows = autostart::is_enabled();
-    state.start_with_windows = started_with_windows;
+    state.start_with_windows = autostart::is_enabled();
+    // What Apply compares the user's edits against (see
+    // [`apply_saved_changes`]); shared with the window, which moves it on
+    // each Apply and keeps it across the zone editor's close-then-reopen.
+    let baseline = Rc::new(RefCell::new(Baseline {
+        config,
+        start_with_windows: state.start_with_windows,
+    }));
     let monitor = crate::win32::primary_monitor_geometry();
     let mut status_messages: Vec<String> = Vec::new();
 
     loop {
-        match run_settings_frame(config_dir, state, monitor, status_messages, &mut *on_tick)? {
-            SettingsExit::Saved(config, start_with_windows, cursor_seen) => {
-                // Keep what the tray and hotkeys changed on disk while
-                // Settings was open. The merge and the write run under the
-                // store's cross-process lock (the tray process writes the
-                // file too), and the read behind it always goes to the file.
-                // A failure (re-read or write) is surfaced rather than
-                // retried unmerged outside that lock: if the disk cannot be
-                // read it can hardly be written.
-                let saved = profile_store::update(config_dir, |on_disk| {
-                    apply_saved_changes(&opened, config, cursor_seen, on_disk);
-                })
-                .map_err(SettingsUiError::Config);
-                // Even after a failed write the tray process must not trust
-                // its cached copy.
-                crate::settings_link::config_changed();
-                saved?;
-                // Only touch the registry on an actual change, so saving
-                // unrelated settings never re-points an existing entry at
-                // whichever exe happens to be running (e.g. a dev build).
-                if start_with_windows != started_with_windows {
-                    autostart::set_enabled(start_with_windows)
-                        .map_err(SettingsUiError::Autostart)?;
-                }
-                return Ok(());
-            }
-            SettingsExit::Cancelled => return Ok(()),
+        match run_settings_frame(
+            config_dir,
+            state,
+            monitor,
+            status_messages,
+            Rc::clone(&baseline),
+            &mut *on_tick,
+        )? {
+            SettingsExit::Closed => return Ok(()),
             SettingsExit::EditZone(mut latest_state, latest_status_messages) => {
                 // Carried forward as-is unless the overlay actually commits a
                 // new zone below (a live re-apply only fires on an accepted
@@ -268,7 +249,7 @@ pub fn run_settings_window(
                 if crate::instance_channel::quit_pending() {
                     return Ok(());
                 }
-                state = latest_state;
+                state = *latest_state;
             }
         }
     }
@@ -283,15 +264,15 @@ pub fn run_settings_window(
 /// [`SettingsApp::pending_status_messages`] -- carried over from
 /// the previous session's [`SettingsExit::EditZone`], or empty on the
 /// very first call from [`run_settings_window`]. Any close other than an
-/// explicit Save, Cancel, or "Draw Zone"/"Edit Zone" click -- concretely, the
-/// window's own close button -- is treated as [`SettingsExit::Cancelled`]:
-/// this function's documented "discards the edits" contract for any
-/// non-Save close.
+/// explicit Save and Exit, Close, or "Draw Zone"/"Edit Zone" click --
+/// concretely, the window's own close button -- is treated as
+/// [`SettingsExit::Closed`].
 fn run_settings_frame(
     config_dir: &Path,
     state: SettingsState,
     monitor: MonitorGeometry,
     initial_status_messages: Vec<String>,
+    baseline: Rc<RefCell<Baseline>>,
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
 ) -> Result<SettingsExit, SettingsUiError> {
     let exit: Rc<RefCell<Option<SettingsExit>>> = Rc::new(RefCell::new(None));
@@ -320,6 +301,9 @@ fn run_settings_frame(
                 state,
                 monitor,
                 exit: exit_for_app,
+                baseline,
+                applied_note: false,
+                apply_error: None,
                 pending_status_messages: initial_status_messages,
                 keyboard_hook: None,
                 cursor_previews: None,
@@ -331,11 +315,10 @@ fn run_settings_frame(
     )
     .map_err(SettingsUiError::Window)?;
 
-    // A close via the window's own close button (rather than Save/Cancel/Edit
-    // zone) leaves `exit` empty -- treat that the same as an explicit
-    // Cancel, matching this function's documented "discards the edits"
-    // contract for any non-Save close.
-    Ok(exit.borrow_mut().take().unwrap_or(SettingsExit::Cancelled))
+    // A close via the window's own close button (rather than Save and
+    // Exit/Close/Edit zone) leaves `exit` empty -- treat that the same as an
+    // explicit Close.
+    Ok(exit.borrow_mut().take().unwrap_or(SettingsExit::Closed))
 }
 
 /// GameFrame's corner-bracket mark from [`gameframe::icon`], rendered at

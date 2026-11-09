@@ -94,7 +94,7 @@ impl SettingsApp<'_> {
         ui.heading("Diagnostics");
         ui.checkbox(&mut self.state.log_ui_hangs, "Log UI hangs (diagnostics)");
         ui.label(
-            "Writes a line to the log when GameFrame stops responding for a few seconds. Takes effect when you save and close Settings; Cancel keeps the old state.",
+            "Writes a line to the log when GameFrame stops responding for a few seconds. Takes effect when you apply or save your changes; Close keeps the old state.",
         );
     }
 
