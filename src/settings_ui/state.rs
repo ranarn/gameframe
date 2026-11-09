@@ -368,6 +368,19 @@ impl SettingsState {
             self.cancel_capture();
         }
     }
+
+    /// See [`taskbar_hotkey_warning`].
+    pub fn missing_taskbar_hotkey_warning(&self) -> bool {
+        taskbar_hotkey_warning(self.hide_taskbar_on_apply, &self.toggle_taskbar_autohide)
+    }
+}
+
+/// Whether to warn that taskbar hiding is on but no hotkey can bring the
+/// taskbar back: `hide_on_apply` is set and `taskbar_binding` (the "Toggle
+/// taskbar auto-hide" binding string) is empty or only whitespace. Takes plain
+/// values so the zone editor, which has no [`SettingsState`], can reuse it.
+pub fn taskbar_hotkey_warning(hide_on_apply: bool, taskbar_binding: &str) -> bool {
+    hide_on_apply && taskbar_binding.trim().is_empty()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -397,6 +410,20 @@ mod tests {
         let mut state = state;
         state.hide_taskbar_on_apply = false;
         assert!(!state.to_config().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn taskbar_hotkey_warning_fires_only_when_hiding_is_on_and_no_binding() {
+        assert!(taskbar_hotkey_warning(true, ""));
+        assert!(taskbar_hotkey_warning(true, "   "));
+        assert!(!taskbar_hotkey_warning(false, ""));
+        assert!(!taskbar_hotkey_warning(true, "Ctrl+Alt+T"));
+
+        let mut state = SettingsState::from_config(&Config::default());
+        state.hide_taskbar_on_apply = true;
+        assert!(state.missing_taskbar_hotkey_warning());
+        state.toggle_taskbar_autohide = "Ctrl+Alt+T".to_string();
+        assert!(!state.missing_taskbar_hotkey_warning());
     }
 
     #[test]

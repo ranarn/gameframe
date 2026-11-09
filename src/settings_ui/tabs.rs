@@ -2,6 +2,7 @@
 
 use super::{HotkeyField, SettingsApp};
 use crate::profile_store::{TaskbarHideMode, UpdateMode};
+use crate::ui_helpers::section_separator;
 
 impl SettingsApp<'_> {
     /// Renders the "Games" section: one row per tracked game with its
@@ -49,9 +50,9 @@ impl SettingsApp<'_> {
     pub(super) fn zone_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Zone");
         self.zone_section(ui);
-        ui.separator();
+        section_separator(ui);
         ui.heading("Global hotkeys");
-        self.hotkey_row(ui, "Toggle borderless:", HotkeyField::ToggleBorderless);
+        self.hotkey_row(ui, "Apply / restore Zone:", HotkeyField::ToggleBorderless);
         self.hotkey_row(
             ui,
             "Toggle taskbar auto-hide:",
@@ -67,22 +68,35 @@ impl SettingsApp<'_> {
         // shortcut.
         self.sync_keyboard_hook();
 
-        ui.separator();
+        section_separator(ui);
         ui.heading("Taskbar hiding");
         ui.checkbox(
             &mut self.state.hide_taskbar_on_apply,
             "Hide taskbar when the Zone is applied",
         );
-        ui.radio_value(
-            &mut self.state.taskbar_hide_mode,
-            TaskbarHideMode::FullyHidden,
-            "Fully hidden (no hover-reveal)",
-        );
-        ui.radio_value(
-            &mut self.state.taskbar_hide_mode,
-            TaskbarHideMode::HoverReveal,
-            "Hover to reveal (classic Windows behavior)",
-        );
+        if self.state.missing_taskbar_hotkey_warning() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "No hotkey set for Toggle taskbar auto-hide \u{2014} set one so you can always bring the taskbar back",
+                    )
+                    .color(ui.visuals().warn_fg_color),
+                )
+                .wrap(),
+            );
+        }
+        ui.add_enabled_ui(self.state.hide_taskbar_on_apply, |ui| {
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::FullyHidden,
+                "Fully hidden (no hover-reveal)",
+            );
+            ui.radio_value(
+                &mut self.state.taskbar_hide_mode,
+                TaskbarHideMode::HoverReveal,
+                "Hover to reveal (classic Windows behavior)",
+            );
+        });
     }
 
     /// Renders the "General" tab: Startup and Diagnostics.
@@ -90,7 +104,7 @@ impl SettingsApp<'_> {
         ui.heading("Startup");
         ui.checkbox(&mut self.state.start_with_windows, "Start with Windows");
 
-        ui.separator();
+        section_separator(ui);
         ui.heading("Diagnostics");
         ui.checkbox(&mut self.state.log_ui_hangs, "Log UI hangs (diagnostics)");
         ui.label(
@@ -102,7 +116,7 @@ impl SettingsApp<'_> {
     pub(super) fn about_tab(&mut self, ui: &mut egui::Ui) {
         crate::about_ui::about_section(ui);
 
-        ui.separator();
+        section_separator(ui);
         ui.heading("Updates");
         ui.radio_value(
             &mut self.state.update_mode,

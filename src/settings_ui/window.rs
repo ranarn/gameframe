@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 /// The Settings window's preferred inner size in points; [`settings_viewport`]
 /// shrinks it to fit a small work area and centres it.
-const SETTINGS_WINDOW_SIZE: [f32; 2] = [560.0, 800.0];
+const SETTINGS_WINDOW_SIZE: [f32; 2] = [640.0, 700.0];
 
 /// Points reserved below the window's inner size for the title bar and frame,
 /// so the whole outer window fits in the work area.
@@ -370,8 +370,8 @@ mod tests {
     fn settings_viewport_at_100_percent_keeps_the_full_size_and_centers() {
         let view = settings_viewport(&work_area_1440p(), 1.0);
 
-        assert_eq!(view.size, [560.0, 800.0]);
-        assert_eq!(view.position, [1000.0, 272.0]);
+        assert_eq!(view.size, [640.0, 700.0]);
+        assert_eq!(view.position, [960.0, 322.0]);
         assert_fits(view, &work_area_1440p(), 1.0);
     }
 
@@ -385,13 +385,13 @@ mod tests {
 
     #[test]
     fn settings_viewport_fits_at_150_percent_and_shrinks_at_200_percent_on_1440p() {
-        // 1392 px / 1.5 = 928 pt of work area; 800 pt + chrome still fits.
+        // 1392 px / 1.5 = 928 pt of work area; 700 pt + chrome still fits.
         let view = settings_viewport(&work_area_1440p(), 1.5);
-        assert_eq!(view.size, [560.0, 800.0]);
+        assert_eq!(view.size, [640.0, 700.0]);
 
         // At 200 %: 696 pt of work area -> height shrinks to 648.
         let view = settings_viewport(&work_area_1440p(), 2.0);
-        assert_eq!(view.size, [560.0, 648.0]);
+        assert_eq!(view.size, [640.0, 648.0]);
     }
 
     #[test]

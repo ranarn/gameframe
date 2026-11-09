@@ -711,7 +711,7 @@ fn drain_events(
 /// user through `tray`, at most once per press).
 fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
     let Some(fg_hwnd) = win32::foreground_window() else {
-        log!("borderless toggle: no foreground window; ignoring");
+        log!("apply / restore Zone: no foreground window; ignoring");
         return false;
     };
 
@@ -720,7 +720,7 @@ fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
             Ok(()) => return false,
             Err(e) => {
                 if !e.is_access_denied() && !e.is_window_hung() {
-                    log!("borderless toggle failed: {e}");
+                    log!("apply / restore Zone failed: {e}");
                 }
                 if let Some(notice) = restore_failure_notice(&e) {
                     tray.notify(&notice);
@@ -741,7 +741,7 @@ fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
     };
 
     if error.is_access_denied() {
-        log!("borderless toggle failed (access denied); requesting elevation");
+        log!("apply / restore Zone failed (access denied); requesting elevation");
         match win32::relaunch_elevated() {
             Ok(()) => return true,
             Err(relaunch_err) => {

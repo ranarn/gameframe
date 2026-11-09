@@ -28,6 +28,7 @@ mod single_instance;
 mod taskbar;
 mod taskbar_recovery;
 mod tray_ui;
+mod ui_helpers;
 mod update_install;
 mod update_ui;
 mod updater;

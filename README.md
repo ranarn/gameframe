@@ -28,7 +28,7 @@ Uninstall from Settings > Apps.
    launches.
 
 The game must run in windowed or borderless-windowed mode; exclusive fullscreen can't be placed.
-The **Toggle borderless** hotkey only works on tracked games.
+The **Apply / restore Zone** hotkey only works on tracked games.
 
 ## Features
 
@@ -43,7 +43,7 @@ The **Toggle borderless** hotkey only works on tracked games.
   several shapes, or an enlarged copy of the game's own cursor, with size, color, opacity, border
   and glow. Shown only over tracked games; shake the mouse to make it pulse. It never touches the
   game process.
-- **Global hotkeys** — bind keys in Settings to toggle borderless on the foreground window, toggle
+- **Global hotkeys** — bind keys in Settings to apply or restore the Zone on the foreground window, toggle
   taskbar auto-hide, and toggle the game cursor. No hotkeys are bound by default.
 - **Start with Windows** — from the tray menu, Settings or the installer.
 

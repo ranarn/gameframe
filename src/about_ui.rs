@@ -39,6 +39,8 @@ fn donation_url() -> Option<String> {
     funding_custom_url(FUNDING_YML)
 }
 
+use crate::ui_helpers::section_separator;
+
 /// Renders the About tab: version, license, source link and the
 /// voluntary donation link.
 pub(crate) fn about_section(ui: &mut egui::Ui) {
@@ -46,7 +48,7 @@ pub(crate) fn about_section(ui: &mut egui::Ui) {
     ui.label(crate::version::current_label());
     ui.label(format!("License: {LICENSE}"));
     ui.hyperlink_to("Source code", env!("CARGO_PKG_REPOSITORY"));
-    ui.separator();
+    section_separator(ui);
     ui.heading("Support");
     ui.label("GameFrame is free. Donating is entirely optional.");
     match donation_url() {
