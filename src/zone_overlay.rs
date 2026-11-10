@@ -685,18 +685,13 @@ impl OverlayApp<'_> {
                         };
                         let hide = self.hide_choice.get();
                         ui.horizontal_top(|ui| {
-                            let save_button = control_button(
-                                "Save and Exit",
-                                egui::Color32::from_rgb(34, 160, 60),
-                            );
-                            if ui.add_enabled(can_save, save_button).clicked()
+                            let (save, cancel) = save_cancel_buttons(ui, can_save);
+                            if save.clicked()
                                 && let Some(outcome) = self.state.apply(Action::Save)
                             {
                                 *self.outcome.borrow_mut() = Some(outcome);
                             }
-                            let cancel_button =
-                                control_button("Cancel", egui::Color32::from_rgb(214, 69, 33));
-                            if ui.add(cancel_button).clicked()
+                            if cancel.clicked()
                                 && let Some(outcome) = self.state.apply(Action::Cancel)
                             {
                                 *self.outcome.borrow_mut() = Some(outcome);
@@ -772,6 +767,25 @@ impl OverlayApp<'_> {
                     });
             });
     }
+}
+
+/// Lays out the Save and Cancel buttons and returns their responses.
+///
+/// The nested centre-aligned `horizontal` keeps each label centred in its
+/// button even when the caller's row is top-aligned.
+fn save_cancel_buttons(ui: &mut egui::Ui, can_save: bool) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        let save = ui.add_enabled(
+            can_save,
+            control_button("Save and Exit", egui::Color32::from_rgb(34, 160, 60)),
+        );
+        let cancel = ui.add(control_button(
+            "Cancel",
+            egui::Color32::from_rgb(214, 69, 33),
+        ));
+        (save, cancel)
+    })
+    .inner
 }
 
 /// Builds a Save/Cancel control button with the enlarged size and
@@ -866,6 +880,71 @@ fn handle_center(zone: &Zone, handle: Handle, scale: f32) -> egui::Pos2 {
 #[cfg(test)]
 mod editor_ui_tests {
     use super::*;
+
+    /// Paints `add_buttons` in a top-aligned row beside a tall sibling and
+    /// returns each "Save and Exit" / "Cancel" label's vertical offset from the
+    /// centre of its button, and each button's top relative to the row's top.
+    fn label_offsets(
+        add_buttons: impl Fn(&mut egui::Ui) -> (egui::Response, egui::Response),
+    ) -> ([f32; 2], [f32; 2]) {
+        fn text_center_y(shape: &egui::Shape, text: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()).center().y)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| text_center_y(s, text)),
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut rects = None;
+        let mut output = None;
+        let mut row_top = 0.0;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let mut out: egui::FullOutput = ctx.run_ui(input, |ui| {
+                ui.horizontal_top(|ui| {
+                    row_top = ui.cursor().top();
+                    let (save, cancel) = add_buttons(ui);
+                    rects = Some((save.rect, cancel.rect));
+                    ui.allocate_space(egui::vec2(10.0, 120.0));
+                });
+            });
+            out.textures_delta.clear();
+            output = Some(out);
+        }
+        let output = output.unwrap();
+        let (save, cancel) = rects.unwrap();
+        let offset = |text: &str, rect: egui::Rect| {
+            let y = output
+                .shapes
+                .iter()
+                .find_map(|s| text_center_y(&s.shape, text))
+                .unwrap();
+            y - rect.center().y
+        };
+        (
+            [offset("Save and Exit", save), offset("Cancel", cancel)],
+            [save.top() - row_top, cancel.top() - row_top],
+        )
+    }
+
+    #[test]
+    fn save_and_cancel_labels_are_vertically_centred_beside_a_taller_sibling() {
+        let (offsets, tops) = label_offsets(|ui| save_cancel_buttons(ui, true));
+        for offset in offsets {
+            assert!(offset.abs() < 1.0, "label is {offset} pt off centre");
+        }
+        for top in tops {
+            assert!(top.abs() < 1.0, "button starts {top} pt below the row top");
+        }
+    }
 
     #[test]
     fn readout_shows_the_zone_in_physical_pixels() {

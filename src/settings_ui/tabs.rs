@@ -10,6 +10,8 @@ const AUTO_APPLY_WIDTH: f32 = 100.0;
 const GAME_CURSOR_WIDTH: f32 = 110.0;
 const REMOVE_WIDTH: f32 = 70.0;
 const ROW_SPACING: f32 = 8.0;
+/// Height of one Games row: the icon plus the old grid row spacing.
+const ROW_HEIGHT: f32 = ICON_SIZE + ROW_SPACING;
 
 /// Stand-in for an exe whose icon couldn't be read: a rounded outline.
 fn paint_generic_icon(ui: &egui::Ui, rect: egui::Rect) {
@@ -51,57 +53,78 @@ impl SettingsApp<'_> {
         }
 
         let mut to_remove: Option<usize> = None;
-        let spacing = ui.spacing().item_spacing;
-        let name_width = (ui.available_width()
-            - ICON_SIZE
-            - AUTO_APPLY_WIDTH
-            - GAME_CURSOR_WIDTH
-            - REMOVE_WIDTH
-            - 4.0 * spacing.x)
-            .max(60.0);
+        let spacing = ui.spacing().item_spacing.x;
+        // The fixed columns sit flush right; the name column takes what is
+        // left, so a narrow window shortens the name (it truncates) instead of
+        // pushing "Remove" past the edge.
+        // Three controls, so two gaps between them.
+        let fixed_width = AUTO_APPLY_WIDTH + GAME_CURSOR_WIDTH + REMOVE_WIDTH + 2.0 * spacing;
+        let row_gap = ui.spacing().item_spacing.y;
         let ctx = ui.ctx().clone();
-        egui::Grid::new("games_table")
-            .striped(true)
-            .num_columns(5)
-            .spacing([spacing.x, ROW_SPACING])
-            .show(ui, |ui| {
-                for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
-                    let icon_rect = ui
-                        .allocate_exact_size(egui::Vec2::splat(ICON_SIZE), egui::Sense::hover())
-                        .0;
-                    match self.exe_icons.get(&ctx, &game.exe_path) {
-                        Some(texture) => {
-                            egui::Image::new((texture.id(), egui::Vec2::splat(ICON_SIZE)))
-                                .paint_at(ui, icon_rect);
-                        }
-                        None => paint_generic_icon(ui, icon_rect),
-                    }
+        for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
+            // One row is a full-width rect split into a left (icon, name) and a
+            // right (fixed columns) child, each centred vertically, so every
+            // control shares the row's centre line.
+            let (row, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), ROW_HEIGHT),
+                egui::Sense::hover(),
+            );
+            if index % 2 == 0 {
+                // Cover the gap the parent puts between rows so stripes are
+                // contiguous.
+                ui.painter().rect_filled(
+                    row.expand2(egui::vec2(0.0, row_gap / 2.0)),
+                    0.0,
+                    ui.visuals().faint_bg_color,
+                );
+            }
+            // The fixed columns stay flush right even in a window narrower than
+            // they are: then the name column is empty and the overflow is on
+            // the left, never past the right edge.
+            let split = row.right() - fixed_width;
+            let left =
+                egui::Rect::from_min_max(row.min, egui::pos2(split.max(row.left()), row.max.y));
+            let right = egui::Rect::from_min_max(egui::pos2(split, row.min.y), row.max);
 
-                    ui.scope(|ui| {
-                        ui.set_width(name_width);
-                        ui.add(egui::Label::new(&game.display_name).truncate())
-                            .on_hover_text(game.exe_path.display().to_string());
-                    });
-
-                    ui.scope(|ui| {
-                        ui.set_width(AUTO_APPLY_WIDTH);
-                        ui.checkbox(&mut game.auto_apply, "Auto-apply");
-                    });
-                    ui.scope(|ui| {
-                        ui.set_width(GAME_CURSOR_WIDTH);
-                        ui.checkbox(&mut game.game_cursor, "Game cursor");
-                    });
-
-                    if ui
-                        .add_sized([REMOVE_WIDTH, 0.0], egui::Button::new("Remove"))
-                        .clicked()
-                    {
-                        to_remove = Some(index);
-                    }
-                    ui.end_row();
+            let mut left_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(left)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            let icon_rect = left_ui
+                .allocate_exact_size(egui::Vec2::splat(ICON_SIZE), egui::Sense::hover())
+                .0;
+            match self.exe_icons.get(&ctx, &game.exe_path) {
+                Some(texture) => {
+                    egui::Image::new((texture.id(), egui::Vec2::splat(ICON_SIZE)))
+                        .paint_at(&left_ui, icon_rect);
                 }
-            });
+                None => paint_generic_icon(&left_ui, icon_rect),
+            }
+            left_ui
+                .add(egui::Label::new(&game.display_name).truncate())
+                .on_hover_text(game.exe_path.display().to_string());
 
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(right)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            right_ui.scope(|ui| {
+                ui.set_width(AUTO_APPLY_WIDTH);
+                ui.checkbox(&mut game.auto_apply, "Auto-apply");
+            });
+            right_ui.scope(|ui| {
+                ui.set_width(GAME_CURSOR_WIDTH);
+                ui.checkbox(&mut game.game_cursor, "Game cursor");
+            });
+            if right_ui
+                .add(egui::Button::new("Remove").min_size(egui::vec2(REMOVE_WIDTH, 0.0)))
+                .clicked()
+            {
+                to_remove = Some(index);
+            }
+        }
         if let Some(index) = to_remove {
             self.state.remove_tracked_game(index);
         }
@@ -191,5 +214,192 @@ impl SettingsApp<'_> {
             "Ask me (adds a tray item when an update is available)",
         );
         self.update_check_row(ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_store::{Config, TrackedGame};
+    use crate::settings_ui::SettingsState;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const LONG_NAME: &str = "An Extremely Long Game Title That Cannot Possibly Fit In The Name Column Of A Narrow Window";
+
+    /// Where text starting with `prefix` was painted: (left, right, vertical
+    /// centre).
+    fn text_rects(output: &egui::FullOutput, prefix: &str) -> Vec<(f32, f32, f32)> {
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, prefix, &mut found);
+        }
+        found
+    }
+
+    fn collect_text(shape: &egui::Shape, prefix: &str, found: &mut Vec<(f32, f32, f32)>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text().starts_with(prefix) => {
+                let rect = t.galley.rect.translate(t.pos.to_vec2());
+                found.push((rect.left(), rect.right(), rect.center().y));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, prefix, found)),
+            _ => {}
+        }
+    }
+
+    /// Rectangles filled with the faint stripe colour: (top, bottom).
+    fn stripes(output: &egui::FullOutput, faint: egui::Color32) -> Vec<(f32, f32)> {
+        fn walk(shape: &egui::Shape, faint: egui::Color32, found: &mut Vec<(f32, f32)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == faint => {
+                    found.push((r.rect.top(), r.rect.bottom()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, faint, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, faint, &mut found);
+        }
+        found
+    }
+
+    /// Runs the real Games section in a window `width` points wide and returns
+    /// the output of the last of a few frames, plus the right edge of the
+    /// scroll area's content (the real inset the rows must stay inside).
+    fn render_games(width: f32) -> (egui::FullOutput, f32) {
+        let mut config = Config::default();
+        for (name, cursor) in [
+            ("Last Epoch", true),
+            ("World of Warcraft", false),
+            (LONG_NAME, false),
+        ] {
+            config
+                .tracked_games
+                .push(TrackedGame::new_for_cursor_setting(
+                    std::path::PathBuf::from(format!("C:\\Games\\{name}.exe")),
+                    name.to_string(),
+                    cursor,
+                ));
+        }
+        let mut on_tick = |_: crate::settings_ui::TickContext| None;
+        let mut app = SettingsApp {
+            on_tick: &mut on_tick,
+            config_dir: std::path::PathBuf::new(),
+            state: SettingsState::from_config(&config),
+            monitor: crate::settings_ui::MonitorGeometry {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            exit: Rc::new(RefCell::new(None)),
+            baseline: Rc::new(RefCell::new(crate::settings_ui::save::Baseline {
+                config: config.clone(),
+                start_with_windows: false,
+            })),
+            applied_note: false,
+            apply_error: None,
+            pending_status_messages: Vec::new(),
+            keyboard_hook: None,
+            cursor_previews: None,
+            update_check: crate::settings_ui::UpdateCheck::Idle,
+            update_install: crate::settings_ui::UpdateInstall::Idle,
+            exe_icons: Default::default(),
+            window_chooser: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let mut output: Option<egui::FullOutput> = None;
+        let mut content_right = 0.0;
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                ..Default::default()
+            };
+            if let Some(previous) = output.as_mut() {
+                previous.textures_delta.clear();
+            }
+            output = Some(ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            content_right = ui.max_rect().right();
+                            app.games_section(ui);
+                        });
+                });
+            }));
+        }
+        let mut last = output.unwrap();
+        last.textures_delta.clear();
+        (last, content_right)
+    }
+
+    #[test]
+    fn remove_buttons_stay_inside_the_window_and_centred_with_their_row() {
+        // 300 is narrower than the fixed columns plus the icon.
+        for width in [640.0, 560.0, 300.0] {
+            let (output, content_right) = render_games(width);
+            let removes = text_rects(&output, "Remove");
+            let names = [
+                text_rects(&output, "Last Epoch")[0],
+                text_rects(&output, "World of Warcraft")[0],
+                text_rects(&output, "An Extremely")[0],
+            ];
+            let checks = text_rects(&output, "Auto-apply");
+            assert_eq!(removes.len(), 3, "{width}");
+            for (_, right, _) in &removes {
+                assert!(
+                    *right <= content_right,
+                    "Remove overflows at {width}: {right} > {content_right}"
+                );
+            }
+            for (remove, name) in removes.iter().zip(names) {
+                assert!(
+                    (remove.2 - name.2).abs() < 1.0,
+                    "{width}: {remove:?} vs {name:?}"
+                );
+            }
+            assert!((removes[0].2 - checks[0].2).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn a_long_game_name_is_truncated_before_the_checkboxes() {
+        let (output, _) = render_games(560.0);
+        let long = text_rects(&output, "An Extremely")[0];
+        let auto_apply = text_rects(&output, "Auto-apply")[2];
+        assert!(
+            long.1 <= auto_apply.0,
+            "name ends at {} but the checkbox label starts at {}",
+            long.1,
+            auto_apply.0
+        );
+    }
+
+    #[test]
+    fn row_stripes_are_contiguous() {
+        let (output, _) = render_games(640.0);
+        let faint = egui::Visuals::default().faint_bg_color;
+        let stripes = stripes(&output, faint);
+        assert_eq!(stripes.len(), 2, "rows 0 and 2 are striped");
+        let pitch =
+            text_rects(&output, "World of Warcraft")[0].2 - text_rects(&output, "Last Epoch")[0].2;
+        for (top, bottom) in &stripes {
+            assert!(
+                (bottom - top - pitch).abs() < 0.5,
+                "stripe is {} tall, row pitch is {pitch}",
+                bottom - top
+            );
+        }
+        assert!(
+            (stripes[1].0 - stripes[0].1 - pitch).abs() < 0.5,
+            "the unstriped row between them leaves a different gap"
+        );
     }
 }
