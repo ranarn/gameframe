@@ -2,7 +2,8 @@
 //! session and the exit the user chose.
 
 use super::{
-    Baseline, SettingsApp, SettingsState, SettingsUiError, UpdateCheck, UpdateInstall, persist_zone,
+    Baseline, SettingsApp, SettingsState, SettingsUiError, UpdateCheck, UpdateInstall,
+    persist_editor_outcome,
 };
 use crate::autostart;
 use crate::hotkeys::BindingReport;
@@ -59,36 +60,6 @@ fn settings_viewport(work_area: &MonitorGeometry, scale: f32) -> SettingsViewpor
             area_x + (area_width - width) / 2.0,
             area_y + (area_height - height - SETTINGS_WINDOW_CHROME).max(0.0) / 2.0,
         ],
-    }
-}
-
-/// The primary monitor's work area (the monitor minus the taskbar) in physical
-/// pixels, falling back to the full monitor if the query fails.
-///
-/// OS-facing -- not exercised by the automated tests.
-fn primary_work_area() -> MonitorGeometry {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
-
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    // Safety: `SPI_GETWORKAREA` writes one `RECT` through the pointer, which
-    // outlives the call.
-    let ok =
-        unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) };
-    if ok == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
-        log!("settings: SPI_GETWORKAREA failed; using the full monitor");
-        return crate::win32::primary_monitor_geometry();
-    }
-    MonitorGeometry {
-        x: rect.left,
-        y: rect.top,
-        width: rect.right - rect.left,
-        height: rect.bottom - rect.top,
     }
 }
 
@@ -219,6 +190,8 @@ pub fn run_settings_window(
                 };
                 let overlay = zone_overlay::run_zone_editor_overlay(
                     latest_state.zone,
+                    latest_state.hide_taskbar_on_apply,
+                    &latest_state.toggle_taskbar_autohide,
                     latest_state.taskbar_hide_mode,
                     &mut tick,
                 );
@@ -226,13 +199,26 @@ pub fn run_settings_window(
                     latest_state.apply_external_cursor_enabled(enabled);
                 }
                 match overlay {
-                    Ok(Some(zone)) => {
+                    Ok(outcome) => {
                         // Persist first, then apply: the Zone on disk (read by
                         // the drift and launch re-apply paths) must never
                         // disagree with the Zone the windows are placed in.
-                        match persist_zone(config_dir, Some(zone)) {
-                            Ok(_) => {
-                                latest_state.set_zone(zone);
+                        // The Zone and the hide-taskbar flag go in one write;
+                        // a Cancel (`None`) writes nothing.
+                        match persist_editor_outcome(config_dir, outcome) {
+                            Ok(None) => {}
+                            Ok(Some(result)) => {
+                                latest_state.apply_editor_result(result);
+                                // Both are on disk now: the Apply baseline
+                                // takes them too, so a later Apply neither
+                                // reverts the flag nor shows it as an
+                                // unapplied edit.
+                                {
+                                    let mut baseline = baseline.borrow_mut();
+                                    baseline.config.zone = Some(result.zone);
+                                    baseline.config.hide_taskbar_on_apply =
+                                        result.hide_taskbar_on_apply;
+                                }
                                 status_messages = reapply();
                             }
                             Err(e) => {
@@ -241,7 +227,6 @@ pub fn run_settings_window(
                             }
                         }
                     }
-                    Ok(None) => {}
                     Err(e) => log!("failed to open the zone editor overlay: {e}"),
                 }
                 // A Quit that arrived during the overlay ended it; do not
@@ -281,7 +266,10 @@ fn run_settings_frame(
 
     // Window geometry is not persisted, so the window opens centered in the
     // work area every time, sized in points via the monitor's scale factor.
-    let viewport = settings_viewport(&primary_work_area(), zone_overlay::primary_monitor_scale());
+    let viewport = settings_viewport(
+        &crate::win32::primary_work_area(),
+        zone_overlay::primary_monitor_scale(),
+    );
     let native_options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()

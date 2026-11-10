@@ -630,5 +630,13 @@ pub fn restore_all_for_exit() {
     taskbar_recovery::restore_on_exit();
 }
 
+/// Whether to warn that taskbar hiding is on but no hotkey can bring the
+/// taskbar back: `hide_on_apply` is set and `taskbar_binding` (the "Toggle
+/// taskbar auto-hide" binding string) is empty or only whitespace. Plain
+/// values, so both the Settings window and the zone editor can use it.
+pub fn taskbar_hotkey_warning(hide_on_apply: bool, taskbar_binding: &str) -> bool {
+    hide_on_apply && taskbar_binding.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests;

@@ -496,6 +496,40 @@ pub fn primary_monitor_geometry() -> MonitorGeometry {
     }
 }
 
+/// The primary monitor's work area (the monitor minus the taskbar) in physical
+/// pixels, falling back to the full monitor if the query fails.
+///
+/// OS-facing -- not exercised by the automated tests.
+pub fn primary_work_area() -> MonitorGeometry {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // Safety: `SPI_GETWORKAREA` writes one `RECT` through the pointer, which
+    // outlives the call.
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) };
+    if ok == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        // Polled every frame by the zone editor: log the first failure only.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log!("win32: SPI_GETWORKAREA failed; using the full monitor");
+        }
+        return primary_monitor_geometry();
+    }
+    MonitorGeometry {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

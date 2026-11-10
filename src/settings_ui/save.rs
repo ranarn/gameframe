@@ -7,6 +7,7 @@ use crate::placement;
 use crate::profile_store;
 use crate::profile_store::{Config, HotkeyBindings, TrackedGame, Zone};
 use crate::win32;
+use crate::zone_overlay::ZoneEditorResult;
 use std::path::{Path, PathBuf};
 
 /// The non-blocking status-line message shown for a tracked game whose live
@@ -54,6 +55,50 @@ pub(crate) fn persist_zone(
     // learn that the file changed.
     crate::settings_link::config_changed();
     Ok(saved)
+}
+
+/// The config to persist when the zone editor's Save and Exit lands: the
+/// on-disk `config` with the Zone and the "Hide taskbar when the Zone is
+/// applied" flag replaced together, everything else left as it is on disk.
+fn config_with_editor_result(mut config: Config, result: ZoneEditorResult) -> Config {
+    config.zone = Some(result.zone);
+    config.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
+    config
+}
+
+/// Persists the zone editor's outcome -- the Zone and the hide-taskbar flag --
+/// in a single config write (load, replace both, save), so the two can never
+/// be saved apart.
+///
+/// Returns the config as saved, like [`persist_zone`].
+pub(crate) fn persist_editor_result(
+    config_dir: &Path,
+    result: ZoneEditorResult,
+) -> Result<Config, SettingsUiError> {
+    let saved = profile_store::update(config_dir, |config| {
+        *config = config_with_editor_result(std::mem::take(config), result);
+        config.clone()
+    })
+    .map_err(SettingsUiError::Config)?;
+    // The tray process caches the config (and reads `hide_taskbar_on_apply`
+    // from it at apply time), so it must learn that the file changed.
+    crate::settings_link::config_changed();
+    Ok(saved)
+}
+
+/// Persists whatever the zone editor returned: a Save (Some) is written with
+/// [persist_editor_result] and handed back so the caller can adopt it; a
+/// Cancel or close (None) writes nothing. The one place that decides whether
+/// the editor's outcome touches the config, shared by the Settings and
+/// first-run paths.
+pub(crate) fn persist_editor_outcome(
+    config_dir: &Path,
+    outcome: Option<ZoneEditorResult>,
+) -> Result<Option<ZoneEditorResult>, SettingsUiError> {
+    match outcome {
+        Some(result) => persist_editor_result(config_dir, result).map(|_| Some(result)),
+        None => Ok(None),
+    }
 }
 
 /// Live re-applies the Zone on disk to every running tracked game in `games`
@@ -898,5 +943,115 @@ mod tests {
             "persist_zone must return the on-disk config the live re-apply reads"
         );
         assert!(!saved.hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn persist_editor_result_writes_the_zone_and_the_flag_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hotkeys: HotkeyBindings {
+                toggle_borderless: Some("Ctrl+B".to_string()),
+                ..HotkeyBindings::default()
+            },
+            hide_taskbar_on_apply: false,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
+        let zone = Zone {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+
+        let saved = persist_editor_result(
+            dir,
+            ZoneEditorResult {
+                zone,
+                hide_taskbar_on_apply: true,
+            },
+        )
+        .unwrap();
+
+        let reloaded = profile_store::load(dir).unwrap();
+        assert_eq!(reloaded.zone, Some(zone));
+        assert!(reloaded.hide_taskbar_on_apply);
+        assert_eq!(reloaded.hotkeys, config.hotkeys);
+        assert_eq!(saved, reloaded);
+    }
+
+    #[test]
+    fn persist_editor_result_can_turn_the_flag_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        profile_store::save(
+            dir,
+            &Config {
+                hide_taskbar_on_apply: true,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+
+        persist_editor_result(
+            dir,
+            ZoneEditorResult {
+                zone,
+                hide_taskbar_on_apply: false,
+            },
+        )
+        .unwrap();
+
+        assert!(!profile_store::load(dir).unwrap().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn a_cancelled_editor_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hide_taskbar_on_apply: true,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
+        let path = dir.join(profile_store::CONFIG_FILE_NAME);
+        let before = std::fs::read(&path).unwrap();
+
+        // What `run_zone_editor_overlay` returns for Cancel or a window close.
+        assert_eq!(persist_editor_outcome(dir, None).unwrap(), None);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_saved_editor_outcome_is_written_and_handed_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        profile_store::save(dir, &Config::default()).unwrap();
+        let result = ZoneEditorResult {
+            zone: Zone {
+                x: 5,
+                y: 6,
+                width: 700,
+                height: 400,
+            },
+            hide_taskbar_on_apply: true,
+        };
+
+        assert_eq!(
+            persist_editor_outcome(dir, Some(result)).unwrap(),
+            Some(result)
+        );
+
+        let reloaded = profile_store::load(dir).unwrap();
+        assert_eq!(reloaded.zone, Some(result.zone));
+        assert!(reloaded.hide_taskbar_on_apply);
     }
 }

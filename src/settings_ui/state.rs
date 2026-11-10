@@ -6,6 +6,7 @@ use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::profile_store::{
     Config, CursorSettings, HotkeyBindings, TaskbarHideMode, TrackedGame, UpdateMode, Zone,
 };
+use crate::taskbar::taskbar_hotkey_warning;
 
 /// The editable state backing the Settings window: the single optional
 /// [`Zone`], the three hotkey binding strings (empty = unbound) and the other
@@ -248,6 +249,13 @@ impl SettingsState {
         self.zone = Some(zone);
     }
 
+    /// Folds a saved zone-editor session in: the Zone and the "Hide taskbar
+    /// when the Zone is applied" checkbox take the values the editor saved.
+    pub fn apply_editor_result(&mut self, result: crate::zone_overlay::ZoneEditorResult) {
+        self.set_zone(result.zone);
+        self.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
+    }
+
     /// Clears the Zone entirely (back to "no zone set").
     pub fn clear_zone(&mut self) {
         self.zone = None;
@@ -373,14 +381,6 @@ impl SettingsState {
     pub fn missing_taskbar_hotkey_warning(&self) -> bool {
         taskbar_hotkey_warning(self.hide_taskbar_on_apply, &self.toggle_taskbar_autohide)
     }
-}
-
-/// Whether to warn that taskbar hiding is on but no hotkey can bring the
-/// taskbar back: `hide_on_apply` is set and `taskbar_binding` (the "Toggle
-/// taskbar auto-hide" binding string) is empty or only whitespace. Takes plain
-/// values so the zone editor, which has no [`SettingsState`], can reuse it.
-pub fn taskbar_hotkey_warning(hide_on_apply: bool, taskbar_binding: &str) -> bool {
-    hide_on_apply && taskbar_binding.trim().is_empty()
 }
 
 fn non_empty(value: &str) -> Option<String> {
