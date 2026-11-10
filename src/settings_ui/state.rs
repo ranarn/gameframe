@@ -6,6 +6,7 @@ use crate::hotkeys::{BindingOutcome, BindingReport, HotkeyAction};
 use crate::profile_store::{
     Config, CursorSettings, HotkeyBindings, TaskbarHideMode, TrackedGame, UpdateMode, Zone,
 };
+use crate::taskbar::taskbar_hotkey_warning;
 
 /// The editable state backing the Settings window: the single optional
 /// [`Zone`], the three hotkey binding strings (empty = unbound) and the other
@@ -248,6 +249,13 @@ impl SettingsState {
         self.zone = Some(zone);
     }
 
+    /// Folds a saved zone-editor session in: the Zone and the "Hide taskbar
+    /// when the Zone is applied" checkbox take the values the editor saved.
+    pub fn apply_editor_result(&mut self, result: crate::zone_overlay::ZoneEditorResult) {
+        self.set_zone(result.zone);
+        self.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
+    }
+
     /// Clears the Zone entirely (back to "no zone set").
     pub fn clear_zone(&mut self) {
         self.zone = None;
@@ -368,6 +376,11 @@ impl SettingsState {
             self.cancel_capture();
         }
     }
+
+    /// See [`taskbar_hotkey_warning`].
+    pub fn missing_taskbar_hotkey_warning(&self) -> bool {
+        taskbar_hotkey_warning(self.hide_taskbar_on_apply, &self.toggle_taskbar_autohide)
+    }
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -397,6 +410,20 @@ mod tests {
         let mut state = state;
         state.hide_taskbar_on_apply = false;
         assert!(!state.to_config().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn taskbar_hotkey_warning_fires_only_when_hiding_is_on_and_no_binding() {
+        assert!(taskbar_hotkey_warning(true, ""));
+        assert!(taskbar_hotkey_warning(true, "   "));
+        assert!(!taskbar_hotkey_warning(false, ""));
+        assert!(!taskbar_hotkey_warning(true, "Ctrl+Alt+T"));
+
+        let mut state = SettingsState::from_config(&Config::default());
+        state.hide_taskbar_on_apply = true;
+        assert!(state.missing_taskbar_hotkey_warning());
+        state.toggle_taskbar_autohide = "Ctrl+Alt+T".to_string();
+        assert!(!state.missing_taskbar_hotkey_warning());
     }
 
     #[test]

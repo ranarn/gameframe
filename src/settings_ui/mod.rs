@@ -22,12 +22,14 @@
 //! General sections).
 
 mod cursor;
+mod exe_icon;
 mod hotkeys;
 mod save;
 mod state;
 mod tabs;
 mod updates;
 mod window;
+mod window_chooser;
 mod zone;
 
 use cursor::*;
@@ -112,6 +114,17 @@ struct SettingsApp<'a> {
     state: SettingsState,
     monitor: MonitorGeometry,
     exit: Rc<RefCell<Option<SettingsExit>>>,
+    /// What the edits are compared against; moved by each successful Apply and
+    /// shared with [`run_settings_window`], which keeps it across the zone
+    /// editor's close-then-reopen.
+    baseline: Rc<RefCell<Baseline>>,
+    /// Whether the last Apply succeeded (shown as a note by the buttons until
+    /// the next edit).
+    applied_note: bool,
+    /// The status message the last failed Apply put in
+    /// [Self::pending_status_messages], so the next Apply can retire it
+    /// without touching the live re-apply messages.
+    apply_error: Option<String>,
     /// Zero or more non-blocking status messages from the most recent
     /// commit-triggered live re-apply attempt -- e.g.
     /// `save::live_apply_failure_message` for a tracked game whose window
@@ -135,6 +148,76 @@ struct SettingsApp<'a> {
     update_check: UpdateCheck,
     /// The "Install update" button's state, once a check found an update.
     update_install: UpdateInstall,
+    /// Games tab icons, extracted once per exe path.
+    exe_icons: exe_icon::ExeIcons,
+    /// The Games tab's "Apply to Window" button and its popup.
+    window_chooser: window_chooser::WindowChooser,
+}
+
+/// Size of the Save and Exit / Apply / Close buttons, in points.
+const BUTTON_WIDTH: f32 = 110.0;
+const BUTTON_HEIGHT: f32 = 32.0;
+/// Font size of the version label next to the buttons, in points.
+const VERSION_LABEL_SIZE: f32 = 14.0;
+
+impl SettingsApp<'_> {
+    /// Whether the edits differ from what the last Apply (or opening) left.
+    fn edited_since_apply(&self) -> bool {
+        let baseline = self.baseline.borrow();
+        self.state.to_config() != baseline.config
+            || self.state.start_with_windows != baseline.start_with_windows
+    }
+
+    /// Adds the games tracked on disk since Settings opened to the table (see
+    /// [`save::adopt_games_added_on_disk`]). A failed read is logged; the table
+    /// stays as it is.
+    fn refresh_tracked_games(&mut self, picked: &[std::path::PathBuf]) {
+        match crate::profile_store::load(&self.config_dir) {
+            Ok(on_disk) => save::adopt_games_added_on_disk(
+                &mut self.baseline.borrow_mut().config.tracked_games,
+                &mut self.state.tracked_games,
+                &on_disk.tracked_games,
+                picked,
+            ),
+            Err(e) => log!("couldn't refresh the tracked games: {e}"),
+        }
+    }
+
+    /// Apply: persists the edits (see [`apply_settings`]) and tells the tray
+    /// process to refresh the hotkeys and game cursor, with the window left
+    /// open. Returns whether it succeeded; a failure shows its notice on the
+    /// status line and leaves the baseline unchanged.
+    ///
+    /// Blocks the frame only for the config write and the autostart registry
+    /// write; the tray-side refresh is a fire-and-forget message.
+    fn apply(&mut self) -> bool {
+        let result = apply_settings(
+            &self.config_dir,
+            &mut self.baseline.borrow_mut(),
+            &mut self.state,
+            self.on_tick,
+            &mut |enabled| crate::autostart::set_enabled(enabled),
+        );
+        match result {
+            Ok(()) => {
+                if let Some(previous) = self.apply_error.take() {
+                    self.pending_status_messages.retain(|m| *m != previous);
+                }
+                self.applied_note = true;
+                true
+            }
+            Err(e) => {
+                log!("failed to apply the settings: {e}");
+                let notice = e.notice().to_string();
+                if let Some(previous) = self.apply_error.replace(notice.clone()) {
+                    self.pending_status_messages.retain(|m| *m != previous);
+                }
+                self.pending_status_messages.push(notice);
+                self.applied_note = false;
+                false
+            }
+        }
+    }
 }
 
 impl eframe::App for SettingsApp<'_> {
@@ -152,6 +235,12 @@ impl eframe::App for SettingsApp<'_> {
             self.state.apply_external_cursor_enabled(enabled);
         }
 
+        // The tray process handled a window picked in the Games tab: show the
+        // game it tracked without closing Settings.
+        if let Some(picked) = crate::settings_link::take_tracked_games_changed() {
+            self.refresh_tracked_games(&picked);
+        }
+
         // A Quit (installer/updater) closes Settings as Cancel does. Polled
         // here, not only via the window procedure's WM_CLOSE, so a Quit that
         // arrived before this window existed is not lost.
@@ -161,24 +250,37 @@ impl eframe::App for SettingsApp<'_> {
         ui.ctx()
             .request_repaint_after(crate::instance_channel::QUIT_POLL);
 
-        // Save/Cancel stay pinned below whichever tab is open.
+        // Save and Exit / Apply / Close stay pinned below whichever tab is
+        // open, laid out from the right; the version label sits on the left.
         egui::Panel::bottom("settings_buttons").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    *self.exit.borrow_mut() = Some(save_exit(&mut self.state, self.on_tick));
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.button("Cancel").clicked() {
-                    *self.exit.borrow_mut() = Some(SettingsExit::Cancelled);
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                ui.label(
+                    egui::RichText::new(crate::version::current_label())
+                        .weak()
+                        .size(VERSION_LABEL_SIZE),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(crate::version::current_label())
-                            .weak()
-                            .small(),
-                    );
+                    let size = egui::vec2(BUTTON_WIDTH, BUTTON_HEIGHT);
+                    let save_and_exit = egui::Button::new(
+                        egui::RichText::new("Save and Exit").color(egui::Color32::WHITE),
+                    )
+                    .fill(ui.visuals().selection.bg_fill)
+                    .min_size(size);
+                    if ui.add(save_and_exit).clicked() && self.apply() {
+                        *self.exit.borrow_mut() = Some(SettingsExit::Closed);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.add(egui::Button::new("Apply").min_size(size)).clicked() {
+                        self.apply();
+                    }
+                    if ui.add(egui::Button::new("Close").min_size(size)).clicked() {
+                        *self.exit.borrow_mut() = Some(SettingsExit::Closed);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if self.applied_note && !self.edited_since_apply() {
+                        ui.label(egui::RichText::new("Applied").weak());
+                    }
                 });
             });
             ui.add_space(2.0);

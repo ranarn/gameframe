@@ -27,6 +27,14 @@
 //! taskbar before the abort, and a kill is covered by the marker file
 //! restored at the next start (see [`crate::taskbar_recovery`]).
 //!
+//! The control box's taskbar control is a toggle bound to the "Hide taskbar
+//! when the Zone is applied" setting: it starts at the setting, hides/shows
+//! the taskbar live, and sets what the overlay covers -- the full monitor when
+//! ON, the work area when OFF so the taskbar stays visible and clickable. The
+//! Zone stays in physical screen pixels whichever it covers (the overlay's own
+//! origin moves). Save returns the Zone and the toggle value together
+//! ([`ZoneEditorResult`]).
+//!
 //! OS/GPU-facing: the overlay itself is not exercised by this crate's
 //! automated tests, for the same reason [`crate::settings_ui::run_settings_window`]
 //! isn't -- a headless/CI sandbox cannot provide a real GPU-backed window to
@@ -37,6 +45,7 @@
 
 use crate::profile_store::{TaskbarHideMode, Zone};
 use crate::region_calc::MonitorGeometry;
+use crate::taskbar::taskbar_hotkey_warning;
 use crate::win32;
 use crate::zone_editor::{
     Action, AppState, EditorState, Handle, Monitor, Point, SessionOutcome, Target, hit_test,
@@ -45,7 +54,7 @@ use crate::zone_editor::{
 use crate::zone_taskbar::{TaskbarRestoreGuard, TaskbarSession};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, POINT, SetLastError};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
@@ -67,6 +76,8 @@ const HANDLE_DRAW_PT: f32 = 28.0;
 /// bands extend half of this on each side of the outline, capped at a third
 /// of the Zone's width/height so a small Zone keeps a Move area.
 const HANDLE_HIT_PT: f32 = 40.0;
+/// Gap, in egui points, between the Save/Cancel buttons and the taskbar toggle.
+const TOGGLE_GAP_PT: f32 = 48.0;
 
 /// Reasons opening the zone-editor overlay can fail.
 #[derive(Debug)]
@@ -112,9 +123,11 @@ impl std::error::Error for ZoneOverlayError {
 /// tray process (see [`crate::settings_link`]).
 pub fn run_zone_editor_overlay(
     initial: Option<Zone>,
+    hide_taskbar_on_apply: bool,
+    taskbar_hotkey: &str,
     mode: TaskbarHideMode,
     on_tick: &mut dyn FnMut(),
-) -> Result<Option<Zone>, ZoneOverlayError> {
+) -> Result<Option<ZoneEditorResult>, ZoneOverlayError> {
     let monitor_geometry = crate::win32::primary_monitor_geometry();
     let monitor = Monitor {
         width: monitor_geometry.width,
@@ -136,6 +149,19 @@ pub fn run_zone_editor_overlay(
     // after a wgpu device-lost panic on sleep/resume or a monitor unplug.
     let _taskbar_restore_guard = TaskbarRestoreGuard::new(Rc::clone(&taskbar));
 
+    // The toggle starts at the setting: ON hides the taskbar right away
+    // (through the marked session, so the recovery marker rules hold). A
+    // locked session ignores this; a failed hide shows the error but the
+    // toggle stays at the setting. The toggle is the user's choice (what Save
+    // persists); the live hide is only a preview of it.
+    if hide_taskbar_on_apply {
+        taskbar.borrow_mut().toggle(mode);
+    }
+    let hide_now = overlay_hides_taskbar(&taskbar.borrow(), hide_taskbar_on_apply);
+    let bounds = overlay_bounds(hide_now, monitor_geometry, win32::primary_work_area);
+    let choice = Rc::new(Cell::new(hide_taskbar_on_apply));
+    let choice_for_app = Rc::clone(&choice);
+
     let state = match initial {
         Some(zone) => AppState::new_with_zone(monitor, zone),
         None => AppState::new(monitor),
@@ -145,7 +171,7 @@ pub fn run_zone_editor_overlay(
     let outcome_for_app = Rc::clone(&outcome);
 
     let scale = primary_monitor_scale();
-    let native_options = native_options(&monitor_geometry, scale);
+    let native_options = native_options(&bounds, scale);
 
     let run_result = eframe::run_native(
         ZONE_EDITOR_TITLE,
@@ -179,6 +205,10 @@ pub fn run_zone_editor_overlay(
                 hwnd,
                 taskbar,
                 taskbar_mode: mode,
+                hide_choice: choice_for_app,
+                taskbar_hotkey: taskbar_hotkey.to_string(),
+                monitor: monitor_geometry,
+                bounds,
                 on_tick,
             };
             app.strip_frame();
@@ -188,9 +218,65 @@ pub fn run_zone_editor_overlay(
 
     run_result.map_err(ZoneOverlayError::Window)?;
 
-    match outcome.borrow_mut().take() {
-        Some(SessionOutcome::Saved(zone)) => Ok(Some(zone)),
-        Some(SessionOutcome::Cancelled) | None => Ok(None),
+    let outcome = outcome.borrow_mut().take();
+    Ok(outcome.and_then(|o| ZoneEditorResult::from_outcome(o, choice.get())))
+}
+
+/// What a saved zone-editor session hands back: the Zone and the value of the
+/// "Hide taskbar when the Zone is applied" toggle, which the caller persists
+/// together (see `settings_ui::persist_editor_result`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneEditorResult {
+    pub zone: Zone,
+    pub hide_taskbar_on_apply: bool,
+}
+
+impl ZoneEditorResult {
+    /// The result of a finished session: `Some` only for a Save. Cancel (or an
+    /// unclean close) has nothing to persist.
+    pub fn from_outcome(outcome: SessionOutcome, hide_taskbar_on_apply: bool) -> Option<Self> {
+        match outcome {
+            SessionOutcome::Saved(zone) => Some(Self {
+                zone,
+                hide_taskbar_on_apply,
+            }),
+            SessionOutcome::Cancelled => None,
+        }
+    }
+}
+
+/// The screen rectangle the overlay covers, in physical pixels: the whole
+/// monitor while the taskbar is being hidden, the work area (monitor minus
+/// taskbar) while it is shown, so the taskbar stays visible and clickable.
+fn overlay_bounds(
+    hide_taskbar: bool,
+    monitor: MonitorGeometry,
+    work_area: impl FnOnce() -> MonitorGeometry,
+) -> MonitorGeometry {
+    if hide_taskbar { monitor } else { work_area() }
+}
+
+/// Whether the taskbar is out of the way, so the overlay may cover the full
+/// monitor: what the session has hidden, or -- when the taskbar was already
+/// hidden at open and the toggle is locked -- the setting the editor opened
+/// with. Not the persisted value: a failed hide leaves the taskbar visible
+/// while the user's choice stays ON.
+fn overlay_hides_taskbar(session: &TaskbarSession, locked_value: bool) -> bool {
+    if session.is_locked() {
+        locked_value
+    } else {
+        session.is_hidden()
+    }
+}
+
+/// `zone` (screen pixels) relative to the overlay's top-left corner `origin`,
+/// which moves when the overlay switches between the monitor and the work
+/// area.
+fn zone_in_overlay(zone: &Zone, origin: MonitorGeometry) -> Zone {
+    Zone {
+        x: zone.x - origin.x,
+        y: zone.y - origin.y,
+        ..*zone
     }
 }
 
@@ -332,6 +418,16 @@ struct OverlayApp<'a> {
     taskbar: Rc<RefCell<TaskbarSession>>,
     /// The configured technique for the toggle button's hide.
     taskbar_mode: TaskbarHideMode,
+    /// The user's choice for the setting: starts at the setting, flips on a
+    /// toggle click, and is what Save persists. Shared so it is readable
+    /// after the window closes.
+    hide_choice: Rc<Cell<bool>>,
+    /// The bound Toggle-taskbar-auto-hide hotkey ("" = none), for the warning.
+    taskbar_hotkey: String,
+    /// The full primary monitor, in screen pixels.
+    monitor: MonitorGeometry,
+    /// What the overlay window currently covers, in screen pixels.
+    bounds: MonitorGeometry,
 }
 
 impl eframe::App for OverlayApp<'_> {
@@ -348,6 +444,7 @@ impl eframe::App for OverlayApp<'_> {
         let _idle = crate::watchdog::IdleOnDrop;
         (self.on_tick)();
         self.strip_frame();
+        self.sync_bounds(ui.ctx());
         self.draw_dim_and_zone(ui);
         self.handle_draw_interaction(ui);
         self.handle_placed_interaction(ui);
@@ -380,6 +477,48 @@ impl OverlayApp<'_> {
         }
     }
 
+    /// Applies a toggle click: records the user's choice, then brings the
+    /// live taskbar state in line with it (a preview; a failed hide leaves the
+    /// choice as clicked and the session's error shown).
+    fn set_choice(&self, choice: bool) {
+        self.hide_choice.set(choice);
+        let mut taskbar = self.taskbar.borrow_mut();
+        if taskbar.is_hidden() != choice {
+            taskbar.toggle(self.taskbar_mode);
+        }
+    }
+
+    /// Keeps the overlay covering the full monitor (toggle ON) or the work
+    /// area (OFF), resizing the window live. Checked every frame: the work
+    /// area changes a moment after the taskbar is shown again, not when the
+    /// toggle is clicked.
+    fn sync_bounds(&mut self, ctx: &egui::Context) {
+        let hide = overlay_hides_taskbar(&self.taskbar.borrow(), self.hide_choice.get());
+        let want = overlay_bounds(hide, self.monitor, win32::primary_work_area);
+        if want == self.bounds {
+            return;
+        }
+        let scale = scale_of(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            pixels_to_points(want.x, scale),
+            pixels_to_points(want.y, scale),
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            pixels_to_points(want.width, scale),
+            pixels_to_points(want.height, scale),
+        )));
+        self.bounds = want;
+    }
+
+    /// A pointer position in the overlay (points) as a screen-pixel point.
+    fn screen_point(&self, pos: egui::Pos2, scale: f32) -> Point {
+        let p = point_from_points(pos.x, pos.y, scale);
+        Point {
+            x: p.x + self.bounds.x,
+            y: p.y + self.bounds.y,
+        }
+    }
+
     /// Dims the whole desktop, then draws the current/live zone as a
     /// brighter cutout with an outline, plus one colored square per resize
     /// handle. Deliberately plain styling.
@@ -407,8 +546,9 @@ impl OverlayApp<'_> {
         | EditorState::Resizing { live: zone, .. }
         | EditorState::Moving { live: zone, .. } = &self.state.editor
         {
+            let local = zone_in_overlay(zone, self.bounds);
             for handle in Handle::ALL {
-                let center = handle_center(zone, handle, scale);
+                let center = handle_center(&local, handle, scale);
                 let color = egui::Color32::from_rgb(80, 200, 255);
                 let size = handle_draw_size_pt(
                     pixels_to_points(zone.width, scale),
@@ -428,7 +568,7 @@ impl OverlayApp<'_> {
     fn live_rect(&self, scale: f32) -> Option<egui::Rect> {
         self.state
             .live_zone()
-            .map(|zone| rect_from_zone(&zone, scale))
+            .map(|zone| rect_from_zone(&zone_in_overlay(&zone, self.bounds), scale))
     }
 
     /// Whole-screen drag capture for the initial corner-to-corner draw
@@ -448,7 +588,7 @@ impl OverlayApp<'_> {
         let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
-        let point = point_from_points(pos.x, pos.y, scale_of(ui.ctx()));
+        let point = self.screen_point(pos, scale_of(ui.ctx()));
 
         if response.drag_started() {
             self.state.apply(Action::Start(point));
@@ -484,7 +624,7 @@ impl OverlayApp<'_> {
             EditorState::Moving { .. } => Some(Target::Move),
             _ => response
                 .hover_pos()
-                .and_then(|pos| hit_test(&zone, point_from_points(pos.x, pos.y, scale), grab_px)),
+                .and_then(|pos| hit_test(&zone, self.screen_point(pos, scale), grab_px)),
         };
         if let Some(target) = target {
             ctx.set_cursor_icon(cursor_for(target));
@@ -497,7 +637,7 @@ impl OverlayApp<'_> {
                 .input(|i| i.pointer.press_origin())
                 .or(response.interact_pointer_pos());
             let Some(press) = press else { return };
-            let press = point_from_points(press.x, press.y, scale);
+            let press = self.screen_point(press, scale);
             if let Some(action) = press_action(&zone, press, grab_px) {
                 self.state.apply(action);
             }
@@ -513,7 +653,7 @@ impl OverlayApp<'_> {
         if response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
                 self.state
-                    .apply(Action::Drag(point_from_points(pos.x, pos.y, scale)));
+                    .apply(Action::Drag(self.screen_point(pos, scale)));
             }
         } else if response.drag_stopped() {
             self.state.apply(Action::Commit);
@@ -539,9 +679,16 @@ impl OverlayApp<'_> {
                     .corner_radius(6.0)
                     .inner_margin(16.0)
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let save_button =
-                                control_button("Save", egui::Color32::from_rgb(34, 160, 60));
+                        let (locked, error) = {
+                            let taskbar = self.taskbar.borrow();
+                            (taskbar.is_locked(), taskbar.error().map(str::to_owned))
+                        };
+                        let hide = self.hide_choice.get();
+                        ui.horizontal_top(|ui| {
+                            let save_button = control_button(
+                                "Save and Exit",
+                                egui::Color32::from_rgb(34, 160, 60),
+                            );
                             if ui.add_enabled(can_save, save_button).clicked()
                                 && let Some(outcome) = self.state.apply(Action::Save)
                             {
@@ -554,21 +701,46 @@ impl OverlayApp<'_> {
                             {
                                 *self.outcome.borrow_mut() = Some(outcome);
                             }
+                            // A visible gap sets the taskbar toggle apart from
+                            // the Save/Cancel pair.
+                            ui.add_space(TOGGLE_GAP_PT);
+                            ui.vertical(|ui| {
+                                let toggle_text = format!(
+                                    "Hide taskbar when the Zone is applied: {}",
+                                    if hide { "ON" } else { "OFF" }
+                                );
+                                let fill = if hide {
+                                    egui::Color32::from_rgb(40, 110, 190)
+                                } else {
+                                    egui::Color32::from_gray(70)
+                                };
+                                if ui
+                                    .add_enabled(!locked, control_button(&toggle_text, fill))
+                                    .clicked()
+                                {
+                                    self.set_choice(!hide);
+                                }
+                                ui.label(
+                                    egui::RichText::new(if hide {
+                                        "Games placed in this Zone will hide the taskbar."
+                                    } else {
+                                        "The taskbar stays visible when games are placed in this Zone."
+                                    })
+                                    .color(egui::Color32::LIGHT_GRAY)
+                                    .size(16.0),
+                                );
+                                if taskbar_hotkey_warning(hide, &self.taskbar_hotkey) {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No hotkey set for Toggle taskbar auto-hide \u{2014} set one in Settings so you can always bring the taskbar back",
+                                        )
+                                        .color(egui::Color32::from_rgb(255, 200, 80))
+                                        .size(16.0),
+                                    );
+                                }
+                            });
                         });
-                        let (hidden, locked) = {
-                            let taskbar = self.taskbar.borrow();
-                            (taskbar.is_hidden(), taskbar.is_locked())
-                        };
-                        let toggle_text = if hidden {
-                            "Show taskbar"
-                        } else {
-                            "Hide taskbar"
-                        };
                         ui.vertical_centered(|ui| {
-                            let toggle = control_button(toggle_text, egui::Color32::from_gray(70));
-                            if ui.add_enabled(!locked, toggle).clicked() {
-                                self.taskbar.borrow_mut().toggle(self.taskbar_mode);
-                            }
                             if locked {
                                 ui.label(
                                     egui::RichText::new("The taskbar is already hidden")
@@ -576,7 +748,7 @@ impl OverlayApp<'_> {
                                         .size(16.0),
                                 );
                             }
-                            if let Some(error) = self.taskbar.borrow().error() {
+                            if let Some(error) = &error {
                                 ui.label(
                                     egui::RichText::new(error)
                                         .color(egui::Color32::from_rgb(255, 120, 100))
@@ -729,6 +901,74 @@ mod editor_ui_tests {
             panic!("save failed");
         };
         assert_eq!(live, format_zone_readout(Some(saved)));
+    }
+
+    const MONITOR: MonitorGeometry = MonitorGeometry {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
+    };
+    const WORK_AREA: MonitorGeometry = MonitorGeometry {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1040,
+    };
+
+    #[test]
+    fn overlay_covers_the_full_monitor_when_hiding_and_the_work_area_otherwise() {
+        assert_eq!(overlay_bounds(true, MONITOR, || WORK_AREA), MONITOR);
+        assert_eq!(overlay_bounds(false, MONITOR, || WORK_AREA), WORK_AREA);
+    }
+
+    #[test]
+    fn zone_keeps_its_screen_position_when_the_overlay_origin_moves() {
+        // A taskbar on the left: the work area starts 48 px in.
+        let origin = MonitorGeometry { x: 48, ..MONITOR };
+        let zone = Zone {
+            x: 100,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+        let local = zone_in_overlay(&zone, origin);
+        assert_eq!((local.x, local.y), (52, 20));
+        assert_eq!((local.width, local.height), (300, 200));
+        assert_eq!(zone_in_overlay(&zone, MONITOR), zone);
+    }
+
+    #[test]
+    fn only_a_save_yields_a_result_carrying_the_toggle_value() {
+        let zone = Zone {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert_eq!(
+            ZoneEditorResult::from_outcome(SessionOutcome::Saved(zone), true),
+            Some(ZoneEditorResult {
+                zone,
+                hide_taskbar_on_apply: true
+            })
+        );
+        assert_eq!(
+            ZoneEditorResult::from_outcome(SessionOutcome::Cancelled, true),
+            None
+        );
+    }
+
+    #[test]
+    fn overlay_hides_taskbar_follows_the_session_unless_locked() {
+        let open = TaskbarSession::new(false);
+        assert!(
+            !overlay_hides_taskbar(&open, true),
+            "unlocked: what the session hid"
+        );
+        let locked = TaskbarSession::new(true);
+        assert!(overlay_hides_taskbar(&locked, true));
+        assert!(!overlay_hides_taskbar(&locked, false));
     }
 
     #[test]

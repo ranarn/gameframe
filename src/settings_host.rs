@@ -348,18 +348,21 @@ impl<C: ProcessHandle> Drop for SettingsProcess<C> {
 /// forgets its cached config when the child wrote the file, and runs update
 /// events for the tray.
 ///
-/// Returns `true` when the child has exited (and `settings` is now `None`), so
-/// the caller can apply what Settings may have changed.
+/// Reports whether the child applied its settings (still open) and whether it
+/// has exited (and `settings` is now `None`), so the caller can apply what
+/// Settings may have changed.
 pub(crate) fn service_settings(
     tray: &Tray,
     config_dir: &Path,
     settings: &mut Option<SettingsProcess>,
     offered_update: &mut Option<UpdateInfo>,
-) -> bool {
+) -> SettingsService {
     let Some(process) = settings.as_mut() else {
-        return false;
+        return SettingsService::default();
     };
     let polled = process.poll();
+    let mut applied = false;
+    let mut games_changed = false;
     for msg in polled.messages {
         let reply = react_to_child_message(
             msg,
@@ -368,6 +371,8 @@ pub(crate) fn service_settings(
                 config_dir,
                 context: &mut process.context,
                 offered_update,
+                applied: &mut applied,
+                games_changed: &mut games_changed,
             },
         );
         if let Some(reply) = reply {
@@ -380,7 +385,22 @@ pub(crate) fn service_settings(
             log!("the Settings process ended with {:?}", polled.exit_code);
         }
     }
-    polled.exited
+    SettingsService {
+        applied,
+        games_changed,
+        exited: polled.exited,
+    }
+}
+
+/// What [`service_settings`] found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsService {
+    /// The child applied its settings since the last pass.
+    pub applied: bool,
+    /// A window picked in Settings was handled: a game may have been tracked.
+    pub games_changed: bool,
+    /// The child has exited.
+    pub exited: bool,
 }
 
 /// What the tray process does on a Settings child's behalf; the real one is
@@ -390,6 +410,9 @@ trait ChildEffects {
     fn set_context(&mut self, context: TickContext);
     /// The child wrote the config file: drop the cached copy.
     fn forget_config(&mut self);
+    /// The child applied its settings and keeps running: the hotkeys and the
+    /// game cursor must follow the saved config now, as they do on close.
+    fn settings_applied(&mut self);
     /// Live re-applies the saved Zone to the running tracked games and returns
     /// one status line per game that could not be repositioned.
     fn reapply_all(&mut self) -> Vec<String>;
@@ -399,6 +422,10 @@ trait ChildEffects {
     /// [`route_install_progress`]).
     fn start_install(&mut self, request: u64, info: UpdateInfo);
     fn notify(&mut self, text: &str);
+    /// Does what a click on the tray submenu's entry for `window` (an `HWND`)
+    /// does: tracks the game and applies the Zone, telling the user of a failure.
+    /// Returns the window's executable, when it could be read.
+    fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf>;
 }
 
 /// Applies one message of the Settings child through `effects`; `Some` is the
@@ -407,6 +434,7 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
     match msg {
         ChildMsg::Context(context) => effects.set_context(context),
         ChildMsg::ConfigChanged => effects.forget_config(),
+        ChildMsg::SettingsApplied => effects.settings_applied(),
         ChildMsg::ReapplyAll => {
             // The Zone was just saved by the child, behind this process's cache.
             effects.forget_config();
@@ -426,6 +454,11 @@ fn react_to_child_message(msg: ChildMsg, effects: &mut impl ChildEffects) -> Opt
             }
         }
         ChildMsg::Notify(text) => effects.notify(&text),
+        ChildMsg::ApplyToWindow(window) => {
+            let picked = effects.apply_to_window(window);
+            // Whether or not it worked: the child reloads and merges what is new.
+            return Some(ParentMsg::TrackedGamesChanged { picked });
+        }
     }
     None
 }
@@ -436,11 +469,18 @@ struct TrayEffects<'a> {
     config_dir: &'a Path,
     context: &'a mut TickContext,
     offered_update: &'a mut Option<UpdateInfo>,
+    applied: &'a mut bool,
+    /// Set when a window was picked in Settings: the game cursor must be reloaded.
+    games_changed: &'a mut bool,
 }
 
 impl ChildEffects for TrayEffects<'_> {
     fn set_context(&mut self, context: TickContext) {
         *self.context = context;
+    }
+
+    fn settings_applied(&mut self) {
+        *self.applied = true;
     }
 
     fn forget_config(&mut self) {
@@ -469,6 +509,15 @@ impl ChildEffects for TrayEffects<'_> {
 
     fn notify(&mut self, text: &str) {
         self.tray.notify(text);
+    }
+
+    fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf> {
+        crate::watchdog::step("settings process: apply to window");
+        // Read before the apply: the window may be gone after it.
+        let exe = crate::window_filter::exe_path_for_window(window as _);
+        crate::app::apply_picked_window(self.config_dir, window, self.tray);
+        *self.games_changed = true;
+        exe
     }
 }
 
@@ -798,6 +847,9 @@ mod tests {
         fn forget_config(&mut self) {
             self.calls.push("forget".into());
         }
+        fn settings_applied(&mut self) {
+            self.calls.push("applied".into());
+        }
         fn reapply_all(&mut self) -> Vec<String> {
             self.calls.push("reapply".into());
             self.answer.clone()
@@ -812,6 +864,10 @@ mod tests {
         }
         fn notify(&mut self, text: &str) {
             self.calls.push(format!("notify {text}"));
+        }
+        fn apply_to_window(&mut self, window: isize) -> Option<std::path::PathBuf> {
+            self.calls.push(format!("apply window {window}"));
+            Some("C:\\Games\\g.exe".into())
         }
     }
 
@@ -829,6 +885,14 @@ mod tests {
         assert_eq!(
             react(ChildMsg::ConfigChanged),
             (None, vec!["forget".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_apply_in_the_open_settings_window_reaches_the_tray_side_without_an_answer() {
+        assert_eq!(
+            react(ChildMsg::SettingsApplied),
+            (None, vec!["applied".to_string()])
         );
     }
 
@@ -858,6 +922,19 @@ mod tests {
         assert_eq!(
             react(ChildMsg::Notify("Hi".into())),
             (None, vec!["notify Hi".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_picked_window_is_applied_by_the_tray_side_and_the_child_is_told_to_reload() {
+        assert_eq!(
+            react(ChildMsg::ApplyToWindow(77)),
+            (
+                Some(ParentMsg::TrackedGamesChanged {
+                    picked: Some("C:\\Games\\g.exe".into())
+                }),
+                vec!["apply window 77".to_string()]
+            )
         );
     }
 

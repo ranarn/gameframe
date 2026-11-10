@@ -94,8 +94,8 @@ fn run_settings(config_dir: &Path, link: Option<&'static ChildLink>) -> i32 {
 /// The first-run Zone editor: saves the Zone itself, then exits with
 /// [`EXIT_ZONE_SAVED`] so the tray process can tell the user what comes next.
 fn run_zone_editor(config_dir: &Path) -> i32 {
-    let mode = match profile_store::load(config_dir) {
-        Ok(config) => config.taskbar_hide_mode,
+    let config = match profile_store::load(config_dir) {
+        Ok(config) => config,
         Err(e) => {
             log!("failed to load config for the zone editor: {e}");
             return 1;
@@ -105,17 +105,28 @@ fn run_zone_editor(config_dir: &Path) -> i32 {
     // the link only delivers a close request (through `quit_pending`).
     crate::watchdog::step("zone editor: opening window");
     crate::watchdog::idle();
-    match zone_overlay::run_zone_editor_overlay(None, mode, &mut || {
-        crate::watchdog::step("zone editor: frame loop");
-    }) {
-        Ok(Some(zone)) => match settings_ui::persist_zone(config_dir, Some(zone)) {
-            Ok(_) => EXIT_ZONE_SAVED,
+    let taskbar_hotkey = config
+        .hotkeys
+        .toggle_taskbar_autohide
+        .clone()
+        .unwrap_or_default();
+    match zone_overlay::run_zone_editor_overlay(
+        None,
+        config.hide_taskbar_on_apply,
+        &taskbar_hotkey,
+        config.taskbar_hide_mode,
+        &mut || {
+            crate::watchdog::step("zone editor: frame loop");
+        },
+    ) {
+        Ok(outcome) => match settings_ui::persist_editor_outcome(config_dir, outcome) {
+            Ok(Some(_)) => EXIT_ZONE_SAVED,
+            Ok(None) => 0,
             Err(e) => {
                 log!("failed to save the zone: {e}");
                 1
             }
         },
-        Ok(None) => 0,
         Err(e) => {
             log!("failed to open the zone editor overlay: {e}");
             1

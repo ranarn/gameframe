@@ -49,7 +49,7 @@ impl Trigger {
     /// Prefix of this trigger's log lines.
     fn label(self) -> &'static str {
         match self {
-            Trigger::Hotkey => "borderless toggle",
+            Trigger::Hotkey => "apply / restore Zone",
             Trigger::Tray => "apply to window",
             Trigger::AutoApply => "launch detection",
             Trigger::Drift => "drift re-apply",

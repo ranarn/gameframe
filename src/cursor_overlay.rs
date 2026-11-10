@@ -484,7 +484,7 @@ pub fn last_game_cursor() -> Option<Bitmap> {
 /// this works without touching the game. Handles both cursor kinds: 32-bit
 /// color with alpha (or without, using the AND mask) and old monochrome
 /// cursors (AND mask on top of XOR mask in one double-height bitmap).
-fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
+pub(crate) fn read_cursor_image(handle: HCURSOR) -> Option<Bitmap> {
     // SAFETY: all-zero bytes are a valid value of this plain C struct.
     let mut info: ICONINFO = unsafe { std::mem::zeroed() };
     // Safety: valid out-pointer; on success we own (and delete below) the

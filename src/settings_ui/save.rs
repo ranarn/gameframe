@@ -1,12 +1,14 @@
 //! Saving: merging the edits into the config on disk, persisting the Zone and
 //! the live re-apply to running games.
 
-use super::{SettingsExit, SettingsState, SettingsUiError, TickContext};
+use super::{SettingsState, SettingsUiError, TickContext};
+use crate::autostart::AutostartError;
 use crate::placement;
 use crate::profile_store;
 use crate::profile_store::{Config, HotkeyBindings, TrackedGame, Zone};
 use crate::win32;
-use std::path::Path;
+use crate::zone_overlay::ZoneEditorResult;
+use std::path::{Path, PathBuf};
 
 /// The non-blocking status-line message shown for a tracked game whose live
 /// re-apply attempt failed -- e.g. the window couldn't be
@@ -53,6 +55,50 @@ pub(crate) fn persist_zone(
     // learn that the file changed.
     crate::settings_link::config_changed();
     Ok(saved)
+}
+
+/// The config to persist when the zone editor's Save and Exit lands: the
+/// on-disk `config` with the Zone and the "Hide taskbar when the Zone is
+/// applied" flag replaced together, everything else left as it is on disk.
+fn config_with_editor_result(mut config: Config, result: ZoneEditorResult) -> Config {
+    config.zone = Some(result.zone);
+    config.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
+    config
+}
+
+/// Persists the zone editor's outcome -- the Zone and the hide-taskbar flag --
+/// in a single config write (load, replace both, save), so the two can never
+/// be saved apart.
+///
+/// Returns the config as saved, like [`persist_zone`].
+pub(crate) fn persist_editor_result(
+    config_dir: &Path,
+    result: ZoneEditorResult,
+) -> Result<Config, SettingsUiError> {
+    let saved = profile_store::update(config_dir, |config| {
+        *config = config_with_editor_result(std::mem::take(config), result);
+        config.clone()
+    })
+    .map_err(SettingsUiError::Config)?;
+    // The tray process caches the config (and reads `hide_taskbar_on_apply`
+    // from it at apply time), so it must learn that the file changed.
+    crate::settings_link::config_changed();
+    Ok(saved)
+}
+
+/// Persists whatever the zone editor returned: a Save (Some) is written with
+/// [persist_editor_result] and handed back so the caller can adopt it; a
+/// Cancel or close (None) writes nothing. The one place that decides whether
+/// the editor's outcome touches the config, shared by the Settings and
+/// first-run paths.
+pub(crate) fn persist_editor_outcome(
+    config_dir: &Path,
+    outcome: Option<ZoneEditorResult>,
+) -> Result<Option<ZoneEditorResult>, SettingsUiError> {
+    match outcome {
+        Some(result) => persist_editor_result(config_dir, result).map(|_| Some(result)),
+        None => Ok(None),
+    }
 }
 
 /// Live re-applies the Zone on disk to every running tracked game in `games`
@@ -218,21 +264,114 @@ fn merge_tracked_games(
     edited
 }
 
-/// Builds the Save result. Ticks once more first, so a game-cursor hotkey
+/// Shows the games tracked on disk since Settings opened in the visible list
+/// (`visible`, with the user's unsaved edits) while it is open: the same rule as
+/// [`merge_tracked_games`], so edits to existing rows survive and a game
+/// removed in Settings stays removed -- except the `picked` ones (executables
+/// of windows the user just chose in "Apply to Window", an explicit action):
+/// those reappear with their on-disk settings. A new game is also recorded in
+/// `baseline_games` (the baseline's tracked games): it is on disk already, so a
+/// later Apply writes nothing for it and Close leaves it alone, and neither
+/// duplicates nor drops it.
+pub(super) fn adopt_games_added_on_disk(
+    baseline_games: &mut Vec<TrackedGame>,
+    visible: &mut Vec<TrackedGame>,
+    on_disk: &[TrackedGame],
+    picked: &[PathBuf],
+) {
+    let shown = visible.len();
+    *visible = merge_tracked_games(baseline_games, std::mem::take(visible), on_disk);
+    baseline_games.extend(visible[shown..].iter().cloned());
+
+    for exe in picked {
+        if visible.iter().any(|g| &g.exe_path == exe) {
+            continue;
+        }
+        let Some(game) = on_disk.iter().find(|g| &g.exe_path == exe) else {
+            continue;
+        };
+        visible.push(game.clone());
+        match baseline_games.iter_mut().find(|g| &g.exe_path == exe) {
+            Some(known) => *known = game.clone(),
+            None => baseline_games.push(game.clone()),
+        }
+    }
+}
+
+/// What Settings compares the user's edits against: the config and the
+/// "Start with Windows" choice as of Settings opening or, later, its last
+/// successful Apply (see [`apply_settings`]).
+pub(super) struct Baseline {
+    pub(super) config: Config,
+    pub(super) start_with_windows: bool,
+}
+
+/// The edits an Apply writes.
+struct SavedEdits {
+    config: Config,
+    start_with_windows: bool,
+    cursor_seen: bool,
+}
+
+/// Snapshots the edits. Ticks once more first, so a game-cursor hotkey
 /// toggle that landed after this frame's tick (but before the click was
 /// handled) is adopted and not overwritten by the stale checkbox value.
-pub(super) fn save_exit(
+fn take_edits(
     state: &mut SettingsState,
     on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
-) -> SettingsExit {
+) -> SavedEdits {
     if let Some(enabled) = on_tick(state.tick_context()) {
         state.apply_external_cursor_enabled(enabled);
     }
-    SettingsExit::Saved(
-        state.to_config(),
-        state.start_with_windows,
-        state.cursor_enabled_seen,
-    )
+    SavedEdits {
+        config: state.to_config(),
+        start_with_windows: state.start_with_windows,
+        cursor_seen: state.cursor_enabled_seen,
+    }
+}
+
+/// Persists the edits in `state` (Apply, and the first half of Save and
+/// Exit); the window stays open. On success `baseline` becomes what was just
+/// applied, so a later Apply or Save and Exit writes only what changed since
+/// and Close discards only later edits. On failure `baseline` is unchanged.
+///
+/// Keeps what the tray and hotkeys changed on disk while Settings was open:
+/// the merge and the write run under the store's cross-process lock (the tray
+/// process writes the file too), and the read behind it always goes to the
+/// file. A failure is surfaced rather than retried unmerged outside that lock.
+/// `set_autostart` is only called on an actual change, so saving unrelated
+/// settings never re-points an existing entry at whichever exe happens to be
+/// running (e.g. a dev build).
+pub(super) fn apply_settings(
+    config_dir: &Path,
+    baseline: &mut Baseline,
+    state: &mut SettingsState,
+    on_tick: &mut dyn FnMut(TickContext) -> Option<bool>,
+    set_autostart: &mut dyn FnMut(bool) -> Result<(), AutostartError>,
+) -> Result<(), SettingsUiError> {
+    let edits = take_edits(state, on_tick);
+    let applied = edits.config.clone();
+    let saved = profile_store::update(config_dir, |on_disk| {
+        apply_saved_changes(&baseline.config, edits.config, edits.cursor_seen, on_disk);
+    })
+    .map_err(SettingsUiError::Config);
+    // Even after a failed write the tray process must not trust its cached copy.
+    crate::settings_link::config_changed();
+    saved?;
+    // The config is on disk: the tray refreshes its hotkeys and cursor even if the
+    // autostart write below fails.
+    crate::settings_link::settings_applied();
+    if edits.start_with_windows != baseline.start_with_windows {
+        set_autostart(edits.start_with_windows).map_err(SettingsUiError::Autostart)?;
+        // Re-sync the tray's "Start with Windows" check now that the registry holds the new value.
+        crate::settings_link::settings_applied();
+    }
+    // What was just applied is what Settings has now "seen" for the checkbox, or a
+    // later untick would equal the stale value and lose to the disk.
+    state.cursor_enabled_seen = applied.cursor.enabled;
+    baseline.config = applied;
+    baseline.start_with_windows = edits.start_with_windows;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -253,6 +392,103 @@ mod tests {
         let merged = merge_tracked_games(&opened, edited, &on_disk);
 
         assert_eq!(merged, vec![game("a.exe"), game("b.exe")]);
+    }
+
+    #[test]
+    fn a_game_added_on_disk_shows_up_and_unsaved_edits_to_other_rows_survive() {
+        let mut baseline = vec![game("a.exe")];
+        let mut edited_a = game("a.exe");
+        edited_a.auto_apply = !edited_a.auto_apply;
+        let mut visible = vec![edited_a.clone()];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe"), game("b.exe")],
+            &[],
+        );
+
+        assert_eq!(visible, vec![edited_a, game("b.exe")]);
+        assert_eq!(baseline, vec![game("a.exe"), game("b.exe")]);
+    }
+
+    #[test]
+    fn refreshing_twice_adds_a_game_once() {
+        let mut baseline = Vec::new();
+        let mut visible = Vec::new();
+        let on_disk = [game("b.exe")];
+
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+
+        assert_eq!(visible, vec![game("b.exe")]);
+        assert_eq!(baseline, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn a_refresh_leaves_a_game_the_user_removed_but_did_not_pick_removed() {
+        let mut baseline = vec![game("a.exe"), game("b.exe")];
+        let mut visible = vec![game("a.exe")];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe"), game("b.exe")],
+            &[],
+        );
+
+        assert_eq!(visible, vec![game("a.exe")]);
+    }
+
+    #[test]
+    fn a_game_removed_then_picked_again_reappears_and_the_next_apply_keeps_it() {
+        let mut baseline = vec![game("a.exe"), game("b.exe")];
+        let mut visible = vec![game("a.exe")];
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &on_disk,
+            &[PathBuf::from("b.exe")],
+        );
+
+        assert_eq!(visible, vec![game("a.exe"), game("b.exe")]);
+        assert_eq!(baseline, on_disk);
+        let merged = merge_tracked_games(&baseline, visible, &on_disk);
+        assert_eq!(merged, on_disk);
+    }
+
+    #[test]
+    fn picking_a_game_already_shown_keeps_the_users_edits_to_it() {
+        let mut edited_a = game("a.exe");
+        edited_a.auto_apply = !edited_a.auto_apply;
+        let mut baseline = vec![game("a.exe")];
+        let mut visible = vec![edited_a.clone()];
+
+        adopt_games_added_on_disk(
+            &mut baseline,
+            &mut visible,
+            &[game("a.exe")],
+            &[PathBuf::from("a.exe")],
+        );
+
+        assert_eq!(visible, vec![edited_a]);
+    }
+
+    #[test]
+    fn an_apply_after_a_refresh_neither_duplicates_nor_drops_the_new_game() {
+        let mut baseline = vec![game("a.exe")];
+        let mut visible = vec![game("a.exe")];
+        let on_disk = vec![game("a.exe"), game("b.exe")];
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+        let mut edited_a = visible[0].clone();
+        edited_a.game_cursor = !edited_a.game_cursor;
+        visible[0] = edited_a.clone();
+
+        let merged = merge_tracked_games(&baseline, visible, &on_disk);
+
+        assert_eq!(merged, vec![edited_a, game("b.exe")]);
     }
 
     #[test]
@@ -413,10 +649,8 @@ mod tests {
     fn a_cursor_toggle_adopted_from_the_tray_is_the_new_baseline() {
         let mut state = SettingsState::from_config(&Config::default());
         state.apply_external_cursor_enabled(true);
-        let SettingsExit::Saved(config, _, seen) = save_exit(&mut state, &mut |_| None) else {
-            panic!("save_exit must produce Saved");
-        };
-        assert!(seen && config.cursor.enabled);
+        let edits = take_edits(&mut state, &mut |_| None);
+        assert!(edits.cursor_seen && edits.config.cursor.enabled);
     }
 
     #[test]
@@ -429,10 +663,8 @@ mod tests {
             contexts.push(context);
             Some(true)
         };
-        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut on_tick) else {
-            panic!("save_exit must produce Saved");
-        };
-        assert!(config.cursor.enabled);
+        let edits = take_edits(&mut state, &mut on_tick);
+        assert!(edits.config.cursor.enabled);
         assert_eq!(contexts.len(), 1);
     }
 
@@ -440,10 +672,155 @@ mod tests {
     fn save_keeps_the_checkbox_when_the_final_tick_reports_nothing() {
         let mut state = SettingsState::from_config(&Config::default());
         state.cursor.enabled = true;
-        let SettingsExit::Saved(config, _, _) = save_exit(&mut state, &mut |_| None) else {
-            panic!("save_exit must produce Saved");
+        let edits = take_edits(&mut state, &mut |_| None);
+        assert!(edits.config.cursor.enabled);
+    }
+
+    /// A temp config dir holding `config`, and Settings opened on it.
+    fn open(config: &Config) -> (tempfile::TempDir, Baseline, SettingsState) {
+        let tmp = tempfile::tempdir().unwrap();
+        profile_store::save(tmp.path(), config).unwrap();
+        let baseline = Baseline {
+            config: config.clone(),
+            start_with_windows: false,
         };
-        assert!(config.cursor.enabled);
+        (tmp, baseline, SettingsState::from_config(config))
+    }
+
+    fn apply(
+        dir: &Path,
+        baseline: &mut Baseline,
+        state: &mut SettingsState,
+    ) -> Result<(), SettingsUiError> {
+        apply_settings(dir, baseline, state, &mut |_| None, &mut |_| Ok(()))
+    }
+
+    #[test]
+    fn apply_persists_the_edit_and_moves_the_baseline_to_what_was_applied() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.log_ui_hangs = !state.log_ui_hangs;
+
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+
+        let on_disk = profile_store::load(tmp.path()).unwrap();
+        assert_eq!(on_disk.log_ui_hangs, state.log_ui_hangs);
+        assert_eq!(baseline.config, state.to_config());
+    }
+
+    #[test]
+    fn close_after_apply_leaves_the_disk_at_the_applied_state_without_later_edits() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.log_ui_hangs = !state.log_ui_hangs;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+        let applied = state.to_config();
+
+        // An edit after the Apply, then Close: Close never writes, so what
+        // Settings shows when reopened is exactly the applied state.
+        state.cursor.size += 4;
+
+        let reopened = profile_store::load(tmp.path()).unwrap();
+        assert_eq!(reopened, applied);
+        assert_ne!(reopened, state.to_config());
+    }
+
+    #[test]
+    fn save_and_exit_after_apply_writes_only_what_changed_since_and_keeps_new_disk_games() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.log_ui_hangs = !state.log_ui_hangs;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+
+        // The tray changes a field Settings never touched and adds a game,
+        // then the user edits another field.
+        profile_store::update(tmp.path(), |config| {
+            config.hide_taskbar_on_apply = !config.hide_taskbar_on_apply;
+            config.log_ui_hangs = !config.log_ui_hangs;
+            config.tracked_games = vec![game("b.exe")];
+        })
+        .unwrap();
+        let tray_log_ui_hangs = profile_store::load(tmp.path()).unwrap().log_ui_hangs;
+        state.cursor.size += 4;
+
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+
+        let on_disk = profile_store::load(tmp.path()).unwrap();
+        assert_eq!(on_disk.cursor.size, state.cursor.size, "the new edit");
+        assert_eq!(
+            on_disk.log_ui_hangs, tray_log_ui_hangs,
+            "not re-written from the already applied edit"
+        );
+        assert_eq!(on_disk.tracked_games, vec![game("b.exe")]);
+    }
+
+    #[test]
+    fn a_cursor_checkbox_ticked_then_unticked_across_two_applies_ends_up_off_on_disk() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+
+        state.cursor.enabled = true;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+        assert!(profile_store::load(tmp.path()).unwrap().cursor.enabled);
+
+        state.cursor.enabled = false;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+        assert!(!profile_store::load(tmp.path()).unwrap().cursor.enabled);
+    }
+
+    #[test]
+    fn apply_touches_autostart_only_when_the_checkbox_changed_since_the_last_apply() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        let mut calls = Vec::new();
+        let mut set = |enabled| {
+            calls.push(enabled);
+            Ok(())
+        };
+
+        apply_settings(
+            tmp.path(),
+            &mut baseline,
+            &mut state,
+            &mut |_| None,
+            &mut set,
+        )
+        .unwrap();
+        state.start_with_windows = true;
+        apply_settings(
+            tmp.path(),
+            &mut baseline,
+            &mut state,
+            &mut |_| None,
+            &mut set,
+        )
+        .unwrap();
+        apply_settings(
+            tmp.path(),
+            &mut baseline,
+            &mut state,
+            &mut |_| None,
+            &mut set,
+        )
+        .unwrap();
+
+        assert_eq!(calls, vec![true]);
+        assert!(baseline.start_with_windows);
+    }
+
+    #[test]
+    fn a_failed_apply_leaves_the_baseline_unchanged() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        let before = baseline.config.clone();
+        state.log_ui_hangs = !state.log_ui_hangs;
+        state.start_with_windows = true;
+
+        let result = apply_settings(
+            tmp.path(),
+            &mut baseline,
+            &mut state,
+            &mut |_| None,
+            &mut |_| Err(AutostartError::CurrentExe(std::io::Error::other("exe"))),
+        );
+
+        assert!(matches!(result, Err(SettingsUiError::Autostart(_))));
+        assert_eq!(baseline.config, before);
+        assert!(!baseline.start_with_windows);
     }
 
     #[test]
@@ -566,5 +943,115 @@ mod tests {
             "persist_zone must return the on-disk config the live re-apply reads"
         );
         assert!(!saved.hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn persist_editor_result_writes_the_zone_and_the_flag_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hotkeys: HotkeyBindings {
+                toggle_borderless: Some("Ctrl+B".to_string()),
+                ..HotkeyBindings::default()
+            },
+            hide_taskbar_on_apply: false,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
+        let zone = Zone {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+
+        let saved = persist_editor_result(
+            dir,
+            ZoneEditorResult {
+                zone,
+                hide_taskbar_on_apply: true,
+            },
+        )
+        .unwrap();
+
+        let reloaded = profile_store::load(dir).unwrap();
+        assert_eq!(reloaded.zone, Some(zone));
+        assert!(reloaded.hide_taskbar_on_apply);
+        assert_eq!(reloaded.hotkeys, config.hotkeys);
+        assert_eq!(saved, reloaded);
+    }
+
+    #[test]
+    fn persist_editor_result_can_turn_the_flag_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        profile_store::save(
+            dir,
+            &Config {
+                hide_taskbar_on_apply: true,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let zone = Zone {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+
+        persist_editor_result(
+            dir,
+            ZoneEditorResult {
+                zone,
+                hide_taskbar_on_apply: false,
+            },
+        )
+        .unwrap();
+
+        assert!(!profile_store::load(dir).unwrap().hide_taskbar_on_apply);
+    }
+
+    #[test]
+    fn a_cancelled_editor_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let config = Config {
+            hide_taskbar_on_apply: true,
+            ..Config::default()
+        };
+        profile_store::save(dir, &config).unwrap();
+        let path = dir.join(profile_store::CONFIG_FILE_NAME);
+        let before = std::fs::read(&path).unwrap();
+
+        // What `run_zone_editor_overlay` returns for Cancel or a window close.
+        assert_eq!(persist_editor_outcome(dir, None).unwrap(), None);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_saved_editor_outcome_is_written_and_handed_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        profile_store::save(dir, &Config::default()).unwrap();
+        let result = ZoneEditorResult {
+            zone: Zone {
+                x: 5,
+                y: 6,
+                width: 700,
+                height: 400,
+            },
+            hide_taskbar_on_apply: true,
+        };
+
+        assert_eq!(
+            persist_editor_outcome(dir, Some(result)).unwrap(),
+            Some(result)
+        );
+
+        let reloaded = profile_store::load(dir).unwrap();
+        assert_eq!(reloaded.zone, Some(result.zone));
+        assert!(reloaded.hide_taskbar_on_apply);
     }
 }

@@ -33,7 +33,7 @@ pub enum HotkeyAction {
 impl HotkeyAction {
     fn label(self) -> &'static str {
         match self {
-            HotkeyAction::ToggleBorderless => "toggle borderless",
+            HotkeyAction::ToggleBorderless => "apply / restore Zone",
             HotkeyAction::ToggleTaskbarAutohide => "toggle taskbar auto-hide",
             HotkeyAction::ToggleGameCursor => "toggle game cursor",
         }
@@ -485,7 +485,7 @@ mod tests {
         let notice = new_failure_notice(&[], &now).unwrap();
 
         assert!(notice.contains("Ctrl+F4"));
-        assert!(notice.contains("toggle borderless"));
+        assert!(notice.contains("apply / restore Zone"));
         assert!(notice.contains("already in use by another program"));
     }
 

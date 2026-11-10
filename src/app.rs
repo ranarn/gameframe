@@ -70,6 +70,7 @@ use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::path::{Path, PathBuf};
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
     PM_REMOVE, PeekMessageW, PostQuitMessage, TranslateMessage, WM_QUIT,
@@ -393,14 +394,19 @@ fn run_event_loop(
         // The Settings child's messages, and its exit (which re-registers the
         // hotkeys it may have changed). First, so the window it reports is
         // current for the hotkey events below.
-        let child_exited = settings_host::service_settings(
+        let service = settings_host::service_settings(
             ctx.tray,
             ctx.config_dir,
             &mut state.settings,
             &mut state.offered_update,
         );
-        if child_exited {
+        // Apply (window stays open) and close refresh the same things.
+        if service.applied || service.exited {
             settings_closed(&ctx, &mut state);
+        } else if service.games_changed {
+            // A window picked in Settings may have become a tracked game: it gets
+            // the game cursor right away, as from the tray.
+            ctx.cursor_overlay.reload(ctx.config_dir);
         }
 
         crate::watchdog::step("event loop: second-launch commands");
@@ -583,10 +589,7 @@ fn drain_events(
     crate::watchdog::step("drain_events: tray menu events");
     while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(target_hwnd) = tray_ui::decode_window_item_id(event.id()) {
-            let outcome = placement::apply_zone(config_dir, target_hwnd, Trigger::Tray);
-            if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
-                tray.notify(&notice);
-            }
+            apply_picked_window(config_dir, target_hwnd as isize, tray);
             // A newly tracked game gets the game cursor right away.
             cursor_overlay.reload(config_dir);
             continue;
@@ -710,7 +713,7 @@ fn drain_events(
 /// user through `tray`, at most once per press).
 fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
     let Some(fg_hwnd) = win32::foreground_window() else {
-        log!("borderless toggle: no foreground window; ignoring");
+        log!("apply / restore Zone: no foreground window; ignoring");
         return false;
     };
 
@@ -719,7 +722,7 @@ fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
             Ok(()) => return false,
             Err(e) => {
                 if !e.is_access_denied() && !e.is_window_hung() {
-                    log!("borderless toggle failed: {e}");
+                    log!("apply / restore Zone failed: {e}");
                 }
                 if let Some(notice) = restore_failure_notice(&e) {
                     tray.notify(&notice);
@@ -740,7 +743,7 @@ fn handle_toggle_borderless(config_dir: &Path, tray: &Tray) -> bool {
     };
 
     if error.is_access_denied() {
-        log!("borderless toggle failed (access denied); requesting elevation");
+        log!("apply / restore Zone failed (access denied); requesting elevation");
         match win32::relaunch_elevated() {
             Ok(()) => return true,
             Err(relaunch_err) => {
@@ -900,6 +903,17 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
     Some(enabled)
 }
 
+/// What choosing a window in "Apply to Window" does, whether in the tray submenu
+/// or in Settings' Games tab: tracks its game and applies the Zone, telling the
+/// user why if that did not work. `window` is an `HWND`; one that has gone since
+/// it was listed is an ordinary failure of the apply.
+pub(crate) fn apply_picked_window(config_dir: &Path, window: isize, tray: &Tray) {
+    let outcome = placement::apply_zone(config_dir, window as HWND, Trigger::Tray);
+    if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
+        tray.notify(&notice);
+    }
+}
+
 /// Opens Settings (what the tray item and a second launch both do): starts the
 /// Settings child process, or brings the open one to the front. Returns at
 /// once; [`settings_host::service_settings`] follows the child from here.
@@ -926,7 +940,8 @@ fn show_settings(ctx: &Shared, state: &mut LoopState) {
     }
 }
 
-/// Applies what Settings may have changed, once its window has closed.
+/// Applies what Settings may have changed, once its window has closed or it
+/// applied its changes while staying open.
 fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     let Shared {
         tray,
@@ -934,11 +949,11 @@ fn settings_closed(ctx: &Shared, state: &mut LoopState) {
         cursor_overlay,
         ..
     } = *ctx;
-    crate::watchdog::step("settings: closed, re-registering hotkeys");
-    // The child wrote the config file (Save) behind this process's cache.
+    crate::watchdog::step("settings: applied or closed, re-registering hotkeys");
+    // The child wrote the config file behind this process's cache.
     profile_store::forget_cached(config_dir);
 
-    // Settings may have changed the hotkey bindings on disk (Save persists via
+    // Settings may have changed the hotkey bindings on disk (Apply persists via
     // `profile_store`) -- re-register from the freshly saved config so a newly
     // bound/changed/removed hotkey takes effect immediately, without requiring
     // a full app restart. The old `Hotkeys` must be dropped *before*
@@ -949,7 +964,7 @@ fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     drop(state.hotkeys.take());
     let previous_reports = std::mem::take(&mut state.hotkey_reports);
     (state.hotkeys, state.hotkey_reports) = register_hotkeys(config_dir);
-    // Right after Save, not only on reopening Settings: one notice for the
+    // Right after Apply, not only on reopening Settings: one notice for the
     // bindings that just started failing (not for ones already reported).
     if let Some(notice) =
         crate::hotkeys::new_failure_notice(&previous_reports, &state.hotkey_reports)

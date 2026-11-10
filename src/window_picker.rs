@@ -109,6 +109,28 @@ fn wake_loop(loop_thread: u32) {
     }
 }
 
+/// The windows the "Apply to Window" picker offers, likely games first. The one
+/// source of the list: the tray submenu's worker and Settings' Games tab button
+/// both call it. Blocking and slow (see the module docs): call it from a worker
+/// thread.
+pub(crate) fn list_entries(config_dir: &std::path::Path) -> Vec<PickerEntry> {
+    let tracked_exes = match crate::profile_store::load(config_dir) {
+        Ok(config) => config
+            .tracked_games
+            .into_iter()
+            .map(|game| game.exe_path)
+            .collect(),
+        Err(e) => {
+            log!("window picker: couldn't load the config: {e}");
+            Vec::new()
+        }
+    };
+    crate::win32::list_visible_windows(tracked_exes)
+        .into_iter()
+        .map(|(hwnd, title)| (hwnd as isize, title))
+        .collect()
+}
+
 /// The event loop's handle to the background picker refresh. Created on the
 /// loop thread.
 pub(crate) struct WindowPicker {
@@ -148,22 +170,7 @@ impl WindowPicker {
                 // timeout can still send a late, older list after its
                 // replacement's; the next hover refreshes it again.
                 let _guard = GateGuard(gate, ticket);
-                let tracked_exes = match crate::profile_store::load(&config_dir) {
-                    Ok(config) => config
-                        .tracked_games
-                        .into_iter()
-                        .map(|game| game.exe_path)
-                        .collect(),
-                    Err(e) => {
-                        log!("window picker: couldn't load the config: {e}");
-                        Vec::new()
-                    }
-                };
-                let entries: Vec<PickerEntry> = crate::win32::list_visible_windows(tracked_exes)
-                    .into_iter()
-                    .map(|(hwnd, title)| (hwnd as isize, title))
-                    .collect();
-                if sender.send(entries).is_ok() {
+                if sender.send(list_entries(&config_dir)).is_ok() {
                     wake_loop(loop_thread);
                 }
             });
