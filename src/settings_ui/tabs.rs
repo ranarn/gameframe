@@ -57,7 +57,9 @@ impl SettingsApp<'_> {
         // The fixed columns sit flush right; the name column takes what is
         // left, so a narrow window shortens the name (it truncates) instead of
         // pushing "Remove" past the edge.
-        let fixed_width = AUTO_APPLY_WIDTH + GAME_CURSOR_WIDTH + REMOVE_WIDTH + 3.0 * spacing;
+        // Three controls, so two gaps between them.
+        let fixed_width = AUTO_APPLY_WIDTH + GAME_CURSOR_WIDTH + REMOVE_WIDTH + 2.0 * spacing;
+        let row_gap = ui.spacing().item_spacing.y;
         let ctx = ui.ctx().clone();
         for (index, game) in self.state.tracked_games.iter_mut().enumerate() {
             // One row is a full-width rect split into a left (icon, name) and a
@@ -68,11 +70,20 @@ impl SettingsApp<'_> {
                 egui::Sense::hover(),
             );
             if index % 2 == 0 {
-                ui.painter()
-                    .rect_filled(row, 0.0, ui.visuals().faint_bg_color);
+                // Cover the gap the parent puts between rows so stripes are
+                // contiguous.
+                ui.painter().rect_filled(
+                    row.expand2(egui::vec2(0.0, row_gap / 2.0)),
+                    0.0,
+                    ui.visuals().faint_bg_color,
+                );
             }
-            let split = (row.right() - fixed_width).max(row.left());
-            let left = egui::Rect::from_min_max(row.min, egui::pos2(split, row.max.y));
+            // The fixed columns stay flush right even in a window narrower than
+            // they are: then the name column is empty and the overflow is on
+            // the left, never past the right edge.
+            let split = row.right() - fixed_width;
+            let left =
+                egui::Rect::from_min_max(row.min, egui::pos2(split.max(row.left()), row.max.y));
             let right = egui::Rect::from_min_max(egui::pos2(split, row.min.y), row.max);
 
             let mut left_ui = ui.new_child(
@@ -214,31 +225,57 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// Where a piece of text was painted: (left, right, vertical centre).
-    fn text_rects(output: &egui::FullOutput, text: &str) -> Vec<(f32, f32, f32)> {
+    const LONG_NAME: &str = "An Extremely Long Game Title That Cannot Possibly Fit In The Name Column Of A Narrow Window";
+
+    /// Where text starting with `prefix` was painted: (left, right, vertical
+    /// centre).
+    fn text_rects(output: &egui::FullOutput, prefix: &str) -> Vec<(f32, f32, f32)> {
         let mut found = Vec::new();
         for clipped in &output.shapes {
-            collect_text(&clipped.shape, text, &mut found);
+            collect_text(&clipped.shape, prefix, &mut found);
         }
         found
     }
 
-    fn collect_text(shape: &egui::Shape, text: &str, found: &mut Vec<(f32, f32, f32)>) {
+    fn collect_text(shape: &egui::Shape, prefix: &str, found: &mut Vec<(f32, f32, f32)>) {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == text => {
+            egui::Shape::Text(t) if t.galley.text().starts_with(prefix) => {
                 let rect = t.galley.rect.translate(t.pos.to_vec2());
                 found.push((rect.left(), rect.right(), rect.center().y));
             }
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, text, found)),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, prefix, found)),
             _ => {}
         }
     }
 
+    /// Rectangles filled with the faint stripe colour: (top, bottom).
+    fn stripes(output: &egui::FullOutput, faint: egui::Color32) -> Vec<(f32, f32)> {
+        fn walk(shape: &egui::Shape, faint: egui::Color32, found: &mut Vec<(f32, f32)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == faint => {
+                    found.push((r.rect.top(), r.rect.bottom()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, faint, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, faint, &mut found);
+        }
+        found
+    }
+
     /// Runs the real Games section in a window `width` points wide and returns
-    /// the output of the last of a few frames.
-    fn render_games(width: f32) -> egui::FullOutput {
+    /// the output of the last of a few frames, plus the right edge of the
+    /// scroll area's content (the real inset the rows must stay inside).
+    fn render_games(width: f32) -> (egui::FullOutput, f32) {
         let mut config = Config::default();
-        for (name, cursor) in [("Last Epoch", true), ("World of Warcraft", false)] {
+        for (name, cursor) in [
+            ("Last Epoch", true),
+            ("World of Warcraft", false),
+            (LONG_NAME, false),
+        ] {
             config
                 .tracked_games
                 .push(TrackedGame::new_for_cursor_setting(
@@ -275,6 +312,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         let mut output: Option<egui::FullOutput> = None;
+        let mut content_right = 0.0;
         for _ in 0..4 {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -290,31 +328,38 @@ mod tests {
                 egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| app.games_section(ui));
+                        .show(ui, |ui| {
+                            content_right = ui.max_rect().right();
+                            app.games_section(ui);
+                        });
                 });
             }));
         }
         let mut last = output.unwrap();
         last.textures_delta.clear();
-        last
+        (last, content_right)
     }
 
     #[test]
     fn remove_buttons_stay_inside_the_window_and_centred_with_their_row() {
-        for width in [640.0, 560.0] {
-            let output = render_games(width);
+        // 300 is narrower than the fixed columns plus the icon.
+        for width in [640.0, 560.0, 300.0] {
+            let (output, content_right) = render_games(width);
             let removes = text_rects(&output, "Remove");
-            let names = text_rects(&output, "Last Epoch");
-            let wow = text_rects(&output, "World of Warcraft");
+            let names = [
+                text_rects(&output, "Last Epoch")[0],
+                text_rects(&output, "World of Warcraft")[0],
+                text_rects(&output, "An Extremely")[0],
+            ];
             let checks = text_rects(&output, "Auto-apply");
-            assert_eq!(removes.len(), 2, "{width}");
+            assert_eq!(removes.len(), 3, "{width}");
             for (_, right, _) in &removes {
                 assert!(
-                    *right <= width - 8.0,
-                    "Remove overflows at {width}: {right}"
+                    *right <= content_right,
+                    "Remove overflows at {width}: {right} > {content_right}"
                 );
             }
-            for (remove, name) in removes.iter().zip([names[0], wow[0]]) {
+            for (remove, name) in removes.iter().zip(names) {
                 assert!(
                     (remove.2 - name.2).abs() < 1.0,
                     "{width}: {remove:?} vs {name:?}"
@@ -322,5 +367,39 @@ mod tests {
             }
             assert!((removes[0].2 - checks[0].2).abs() < 1.0);
         }
+    }
+
+    #[test]
+    fn a_long_game_name_is_truncated_before_the_checkboxes() {
+        let (output, _) = render_games(560.0);
+        let long = text_rects(&output, "An Extremely")[0];
+        let auto_apply = text_rects(&output, "Auto-apply")[2];
+        assert!(
+            long.1 <= auto_apply.0,
+            "name ends at {} but the checkbox label starts at {}",
+            long.1,
+            auto_apply.0
+        );
+    }
+
+    #[test]
+    fn row_stripes_are_contiguous() {
+        let (output, _) = render_games(640.0);
+        let faint = egui::Visuals::default().faint_bg_color;
+        let stripes = stripes(&output, faint);
+        assert_eq!(stripes.len(), 2, "rows 0 and 2 are striped");
+        let pitch =
+            text_rects(&output, "World of Warcraft")[0].2 - text_rects(&output, "Last Epoch")[0].2;
+        for (top, bottom) in &stripes {
+            assert!(
+                (bottom - top - pitch).abs() < 0.5,
+                "stripe is {} tall, row pitch is {pitch}",
+                bottom - top
+            );
+        }
+        assert!(
+            (stripes[1].0 - stripes[0].1 - pitch).abs() < 0.5,
+            "the unstriped row between them leaves a different gap"
+        );
     }
 }
