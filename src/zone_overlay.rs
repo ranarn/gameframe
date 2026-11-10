@@ -721,9 +721,11 @@ impl OverlayApp<'_> {
                                     self.set_choice(!hide);
                                 }
                                 ui.label(
-                                    egui::RichText::new(
-                                        "Games placed in this Zone will hide the taskbar",
-                                    )
+                                    egui::RichText::new(if hide {
+                                        "Games placed in this Zone will hide the taskbar."
+                                    } else {
+                                        "The taskbar stays visible when games are placed in this Zone."
+                                    })
                                     .color(egui::Color32::LIGHT_GRAY)
                                     .size(16.0),
                                 );
