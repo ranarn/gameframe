@@ -1138,10 +1138,7 @@ mod editor_ui_tests {
         });
         assert!(on && s.is_hidden());
         let off = commit_choice(&mut s, true, false, |s| {
-            s.toggle_with::<String>(
-                || panic!("must not hide"),
-                |_| Ok(()),
-            );
+            s.toggle_with::<String>(|| panic!("must not hide"), |_| Ok(()));
         });
         assert!(!off && !s.is_hidden());
     }
