@@ -624,6 +624,23 @@ mod tests {
     }
 
     #[test]
+    fn record_if_absent_ignores_a_bare_popup_that_lacks_the_minimize_box() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WS_POPUP;
+        let mut store = RestoreStore::new();
+
+        store.record_if_absent(
+            1,
+            RestoreState {
+                style: WS_POPUP,
+                ex_style: 0,
+                region: ORIGINAL,
+            },
+        );
+
+        assert_eq!(store.get(1), None);
+    }
+
+    #[test]
     fn a_hotkey_restore_suppresses_auto_apply_until_it_is_lifted() {
         let store = std::sync::Mutex::new(PlacedWindows::new());
         remembered(&store, 1);
