@@ -152,8 +152,9 @@ pub fn run_zone_editor_overlay(
     // The toggle starts at the setting: ON hides the taskbar right away
     // (through the marked session, so the recovery marker rules hold). A
     // locked session ignores this; a failed hide shows the error but the
-    // toggle stays at the setting. The toggle is the user's choice (what Save
-    // persists); the live hide is only a preview of it.
+    // toggle stays at the setting, deliberately: the toggle is the user's
+    // choice (what Save persists, so the setting survives a transient failure);
+    // the live hide is only a preview of it.
     if hide_taskbar_on_apply {
         taskbar.borrow_mut().toggle(mode);
     }
@@ -259,13 +260,38 @@ fn overlay_bounds(
 /// Whether the taskbar is out of the way, so the overlay may cover the full
 /// monitor: what the session has hidden, or -- when the taskbar was already
 /// hidden at open and the toggle is locked -- the setting the editor opened
-/// with. Not the persisted value: a failed hide leaves the taskbar visible
-/// while the user's choice stays ON.
+/// with. Not the persisted value: a failed open-time hide leaves the taskbar
+/// visible while the user's choice stays ON (a failed click-time toggle keeps
+/// the choice at the session's real state, see `commit_choice`).
 fn overlay_hides_taskbar(session: &TaskbarSession, locked_value: bool) -> bool {
     if session.is_locked() {
         locked_value
     } else {
         session.is_hidden()
+    }
+}
+
+/// The choice after a click requesting `requested`: runs `toggle` when the
+/// session's taskbar differs, and commits `requested` only if the session
+/// reached it. A failed toggle leaves `current` unchanged, so the choice,
+/// taskbar and overlay agree. A locked session never toggles and just records
+/// `requested` (unreachable from the UI, where the button is disabled).
+fn commit_choice(
+    session: &mut TaskbarSession,
+    current: bool,
+    requested: bool,
+    toggle: impl FnOnce(&mut TaskbarSession),
+) -> bool {
+    if session.is_locked() {
+        return requested;
+    }
+    if session.is_hidden() != requested {
+        toggle(session);
+    }
+    if session.is_hidden() == requested {
+        requested
+    } else {
+        current
     }
 }
 
@@ -477,15 +503,16 @@ impl OverlayApp<'_> {
         }
     }
 
-    /// Applies a toggle click: records the user's choice, then brings the
-    /// live taskbar state in line with it (a preview; a failed hide leaves the
-    /// choice as clicked and the session's error shown).
+    /// Applies a toggle click: brings the live taskbar state in line with the
+    /// request (a preview), then commits the choice only if the taskbar
+    /// reached it. A failure keeps the previous choice and the session's
+    /// error shown.
     fn set_choice(&self, choice: bool) {
-        self.hide_choice.set(choice);
         let mut taskbar = self.taskbar.borrow_mut();
-        if taskbar.is_hidden() != choice {
-            taskbar.toggle(self.taskbar_mode);
-        }
+        let committed = commit_choice(&mut taskbar, self.hide_choice.get(), choice, |s| {
+            s.toggle(self.taskbar_mode);
+        });
+        self.hide_choice.set(committed);
     }
 
     /// Keeps the overlay covering the full monitor (toggle ON) or the work
@@ -1048,6 +1075,72 @@ mod editor_ui_tests {
         let locked = TaskbarSession::new(true);
         assert!(overlay_hides_taskbar(&locked, true));
         assert!(!overlay_hides_taskbar(&locked, false));
+    }
+
+    fn hidden_session() -> TaskbarSession {
+        let mut s = TaskbarSession::new(false);
+        s.toggle_with::<String>(
+            || Ok(crate::win32::TaskbarHideRestore::FullyHidden),
+            |_| panic!("must not show"),
+        );
+        assert!(s.is_hidden());
+        s
+    }
+
+    #[test]
+    fn failed_show_keeps_the_choice_on_and_the_overlay_full_monitor() {
+        let mut s = hidden_session();
+        let choice = commit_choice(&mut s, true, false, |s| {
+            s.toggle_with(|| Err("x"), |_| Err("boom"));
+        });
+        assert!(choice, "choice stays ON");
+        assert!(s.is_hidden());
+        assert!(s.error().is_some());
+        let monitor = MonitorGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let bounds = overlay_bounds(overlay_hides_taskbar(&s, choice), monitor, || {
+            panic!("full monitor expected")
+        });
+        assert_eq!(bounds, monitor);
+    }
+
+    #[test]
+    fn failed_hide_keeps_the_choice_off() {
+        let mut s = TaskbarSession::new(false);
+        let choice = commit_choice(&mut s, false, true, |s| {
+            s.toggle_with(|| Err("boom"), |_| Ok(()));
+        });
+        assert!(!choice);
+        assert!(!s.is_hidden());
+        assert!(s.error().is_some());
+        assert!(!overlay_hides_taskbar(&s, choice));
+    }
+
+    #[test]
+    fn locked_session_returns_requested_without_toggling() {
+        let mut s = TaskbarSession::new(true);
+        let choice = commit_choice(&mut s, false, true, |_| panic!("must not toggle"));
+        assert!(choice);
+    }
+
+    #[test]
+    fn successful_toggles_commit_the_new_choice() {
+        let mut s = TaskbarSession::new(false);
+        let on = commit_choice(&mut s, false, true, |s| {
+            s.toggle_with::<String>(
+                || Ok(crate::win32::TaskbarHideRestore::FullyHidden),
+                |_| Ok(()),
+            );
+        });
+        assert!(on && s.is_hidden());
+        let off = commit_choice(&mut s, true, false, |s| {
+            s.toggle_with::<String>(|| panic!("must not hide"), |_| Ok(()));
+        });
+        assert!(!off && !s.is_hidden());
     }
 
     #[test]
