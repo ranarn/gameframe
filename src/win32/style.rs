@@ -38,7 +38,9 @@ const BORDERLESS_EX_STYLE_MASK: u32 = WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_E
 /// Removes the border/title-bar style bits from a raw `GWL_STYLE` value,
 /// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`,
 /// `WS_MAXIMIZE`) untouched. Pure bit manipulation -- no `HWND`
-/// involved.
+/// involved. This is the "is there a border left to restore" test (a bare
+/// popup counts as already borderless); the style GameFrame actually writes
+/// is [`borderless_style`], which also adds `WS_MINIMIZEBOX`.
 pub fn strip_border_style(style: u32) -> u32 {
     style & !BORDERLESS_STYLE_MASK
 }
@@ -46,7 +48,9 @@ pub fn strip_border_style(style: u32) -> u32 {
 /// The style GameFrame writes to a borderless window: [`strip_border_style`]
 /// plus `WS_MINIMIZEBOX`. Bare `WS_POPUP` games never had the minimize box, and
 /// on Windows 11 the taskbar button only minimizes/restores a window that has
-/// it. Without a caption the box draws nothing (see #265).
+/// it. Without a caption the box draws nothing (see #265). The foreground apply
+/// path has no fullscreen check, so a window in exclusive fullscreen gets the
+/// bit too; harmless, since it is invisible.
 pub fn borderless_style(style: u32) -> u32 {
     strip_border_style(style) | WS_MINIMIZEBOX
 }
@@ -317,6 +321,11 @@ pub(super) fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
 /// maximizes itself or re-adds an edge would otherwise be re-applied on every
 /// location event (a maximized window already differs by bounds). They are
 /// still handled whenever an apply does run.
+///
+/// Trade-off: a window GameFrame cannot restyle (e.g. an elevated game) or a
+/// game that keeps clearing `WS_MINIMIZEBOX` counts as drifted forever, so each
+/// location event triggers an apply that may fail at `set_window_style`. The
+/// drift re-apply rate limit and attempt cap bound this.
 pub fn window_drifted(current_region: Region, current_style: u32, target: Region) -> bool {
     current_region != target || borderless_style(current_style) != current_style
 }
