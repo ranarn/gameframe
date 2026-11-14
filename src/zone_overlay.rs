@@ -152,8 +152,9 @@ pub fn run_zone_editor_overlay(
     // The toggle starts at the setting: ON hides the taskbar right away
     // (through the marked session, so the recovery marker rules hold). A
     // locked session ignores this; a failed hide shows the error but the
-    // toggle stays at the setting. The toggle is the user's choice (what Save
-    // persists); the live hide is only a preview of it.
+    // toggle stays at the setting, deliberately: the toggle is the user's
+    // choice (what Save persists, so the setting survives a transient failure);
+    // the live hide is only a preview of it.
     if hide_taskbar_on_apply {
         taskbar.borrow_mut().toggle(mode);
     }
@@ -259,8 +260,9 @@ fn overlay_bounds(
 /// Whether the taskbar is out of the way, so the overlay may cover the full
 /// monitor: what the session has hidden, or -- when the taskbar was already
 /// hidden at open and the toggle is locked -- the setting the editor opened
-/// with. Not the persisted value: a failed hide leaves the taskbar visible
-/// while the user's choice stays ON.
+/// with. Not the persisted value: a failed open-time hide leaves the taskbar
+/// visible while the user's choice stays ON (a failed click-time toggle keeps
+/// the choice at the session's real state, see `commit_choice`).
 fn overlay_hides_taskbar(session: &TaskbarSession, locked_value: bool) -> bool {
     if session.is_locked() {
         locked_value
@@ -271,8 +273,9 @@ fn overlay_hides_taskbar(session: &TaskbarSession, locked_value: bool) -> bool {
 
 /// The choice after a click requesting `requested`: runs `toggle` when the
 /// session's taskbar differs, and commits `requested` only if the session
-/// reached it. A failed toggle (or a locked session, which never toggles)
-/// leaves `current` unchanged, so the choice, taskbar and overlay agree.
+/// reached it. A failed toggle leaves `current` unchanged, so the choice,
+/// taskbar and overlay agree. A locked session never toggles and just records
+/// `requested` (unreachable from the UI, where the button is disabled).
 fn commit_choice(
     session: &mut TaskbarSession,
     current: bool,
