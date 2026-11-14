@@ -208,12 +208,15 @@ pub fn run_settings_window(
                         match persist_editor_outcome(config_dir, outcome) {
                             Ok(None) => {}
                             Ok(Some(result)) => {
-                                latest_state.apply_editor_result(result);
                                 // Both are on disk now: the Apply baseline
                                 // takes them too, so a later Apply neither
                                 // reverts the flag nor shows it as an
                                 // unapplied edit.
-                                baseline.borrow_mut().adopt_editor_result(result);
+                                super::save::adopt_editor_save(
+                                    &mut latest_state,
+                                    &mut baseline.borrow_mut(),
+                                    result,
+                                );
                                 status_messages = reapply();
                             }
                             Err(e) => {

@@ -315,10 +315,21 @@ impl Baseline {
     /// Adopts a saved zone-editor session. The editor persisted the Zone and
     /// the hide-taskbar flag itself, so a later Apply neither reverts them nor
     /// shows them as unapplied edits.
-    pub(super) fn adopt_editor_result(&mut self, result: crate::zone_overlay::ZoneEditorResult) {
+    fn adopt_editor_result(&mut self, result: ZoneEditorResult) {
         self.config.zone = Some(result.zone);
         self.config.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
     }
+}
+
+/// Takes a saved zone-editor session into both the edits and the Apply
+/// baseline, so the editor's write is not an unapplied edit.
+pub(super) fn adopt_editor_save(
+    state: &mut SettingsState,
+    baseline: &mut Baseline,
+    result: ZoneEditorResult,
+) {
+    state.apply_editor_result(result);
+    baseline.adopt_editor_result(result);
 }
 
 /// The edits an Apply writes.
@@ -729,8 +740,7 @@ mod tests {
         apply(tmp.path(), &mut baseline, &mut state).unwrap();
         assert!(!baseline.differs_from(&state));
 
-        state.apply_editor_result(editor_result());
-        baseline.adopt_editor_result(editor_result());
+        adopt_editor_save(&mut state, &mut baseline, editor_result());
 
         assert!(!baseline.differs_from(&state));
     }
@@ -741,8 +751,7 @@ mod tests {
         state.log_ui_hangs = !state.log_ui_hangs;
         apply(tmp.path(), &mut baseline, &mut state).unwrap();
 
-        state.apply_editor_result(editor_result());
-        baseline.adopt_editor_result(editor_result());
+        adopt_editor_save(&mut state, &mut baseline, editor_result());
         state.log_ui_hangs = !state.log_ui_hangs;
 
         assert!(baseline.differs_from(&state));
