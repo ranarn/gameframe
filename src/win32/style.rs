@@ -15,19 +15,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SET_WINDOW_POS_FLAGS, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX,
     WINDOWPLACEMENT, WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_THICKFRAME,
 };
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
-/// resizable sizing border, and `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX`/`WS_SYSMENU`
-/// the title-bar buttons/system menu that have no purpose once the title bar
-/// is gone.
+/// resizable sizing border, and `WS_MAXIMIZEBOX` the maximize button, kept off
+/// so Win+Up etc. cannot maximize a placed window.
+/// `WS_MINIMIZEBOX` and `WS_SYSMENU` are deliberately *not* in the mask: the
+/// taskbar button stops minimizing/restoring a window without them (see #261).
 /// `WS_MAXIMIZE` is deliberately *not* in the mask: it is window state owned by
 /// `SW_RESTORE` ([`restore_maximized_window`]), and clearing it by hand on a
 /// still-maximized window would leave the OS state inconsistent.
-const BORDERLESS_STYLE_MASK: u32 =
-    WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+const BORDERLESS_STYLE_MASK: u32 = WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX;
 
 /// The extended-style edge bits removed to strip a window: the sunken client
 /// edge, the raised window edge and the dialog frame all draw a border that
@@ -323,7 +323,9 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::WS_MAXIMIZE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WS_MAXIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    };
 
     #[test]
     fn strip_border_style_removes_caption_and_thick_frame_bits() {
@@ -433,12 +435,30 @@ mod tests {
     }
 
     #[test]
-    fn strip_border_style_removes_the_system_menu_and_min_max_boxes() {
+    fn strip_border_style_keeps_the_system_menu_and_minimize_box_but_removes_maximize() {
         let style = WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
 
         let stripped = strip_border_style(style);
 
-        assert_eq!(stripped, 0);
+        assert_eq!(stripped, WS_SYSMENU | WS_MINIMIZEBOX);
+    }
+
+    // The taskbar button minimizes/restores via SC_MINIMIZE/SC_RESTORE, which
+    // needs these bits; a game re-adding only them is not drift.
+    #[test]
+    fn window_drifted_ignores_the_minimize_box_and_system_menu() {
+        let target = Region {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+
+        assert!(!window_drifted(
+            target,
+            WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX | WS_SYSMENU,
+            target
+        ));
     }
 
     #[test]
