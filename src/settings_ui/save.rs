@@ -359,7 +359,11 @@ fn take_edits(
 /// Persists the edits in `state` (Apply, and the first half of Save and
 /// Exit); the window stays open. On success `baseline` becomes what was just
 /// applied, so a later Apply or Save and Exit writes only what changed since
-/// and Close discards only later edits. On failure `baseline` is unchanged.
+/// and Close discards only later edits. If the config write fails, `baseline`
+/// is unchanged. If only the autostart write fails (a partial Apply), the
+/// config baseline still advances, since those fields are on disk, and only
+/// `start_with_windows` stays behind; the error is returned. After a partial
+/// Apply, Close can no longer discard the fields already written.
 ///
 /// Keeps what the tray and hotkeys changed on disk while Settings was open:
 /// the merge and the write run under the store's cross-process lock (the tray
@@ -387,16 +391,18 @@ pub(super) fn apply_settings(
     // The config is on disk: the tray refreshes its hotkeys and cursor even if the
     // autostart write below fails.
     crate::settings_link::settings_applied();
+    // What was just written is what Settings has now "seen" for the checkbox, or a
+    // later untick would equal the stale value and lose to the disk. The baseline
+    // advances now, before the autostart write, so a failure there cannot leave it
+    // behind the disk.
+    state.cursor_enabled_seen = applied.cursor.enabled;
+    baseline.config = applied;
     if edits.start_with_windows != baseline.start_with_windows {
         set_autostart(edits.start_with_windows).map_err(SettingsUiError::Autostart)?;
+        baseline.start_with_windows = edits.start_with_windows;
         // Re-sync the tray's "Start with Windows" check now that the registry holds the new value.
         crate::settings_link::settings_applied();
     }
-    // What was just applied is what Settings has now "seen" for the checkbox, or a
-    // later untick would equal the stale value and lose to the disk.
-    state.cursor_enabled_seen = applied.cursor.enabled;
-    baseline.config = applied;
-    baseline.start_with_windows = edits.start_with_windows;
     Ok(())
 }
 
@@ -866,23 +872,72 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_apply_leaves_the_baseline_unchanged() {
+    fn a_failed_config_write_leaves_the_baseline_unchanged() {
         let (tmp, mut baseline, mut state) = open(&Config::default());
         let before = baseline.config.clone();
-        state.log_ui_hangs = !state.log_ui_hangs;
+        let seen = state.cursor_enabled_seen;
+        state.cursor.enabled = !state.cursor.enabled;
         state.start_with_windows = true;
+        // A config dir that is really a file, so the write cannot succeed.
+        let not_a_dir = tmp.path().join("file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let mut autostart_calls = 0;
 
         let result = apply_settings(
-            tmp.path(),
+            &not_a_dir,
             &mut baseline,
             &mut state,
             &mut |_| None,
-            &mut |_| Err(AutostartError::CurrentExe(std::io::Error::other("exe"))),
+            &mut |_| {
+                autostart_calls += 1;
+                Ok(())
+            },
         );
 
-        assert!(matches!(result, Err(SettingsUiError::Autostart(_))));
+        assert!(matches!(result, Err(SettingsUiError::Config(_))));
         assert_eq!(baseline.config, before);
         assert!(!baseline.start_with_windows);
+        assert_eq!(state.cursor_enabled_seen, seen);
+        assert_eq!(autostart_calls, 0);
+    }
+
+    fn failing_autostart(
+        dir: &Path,
+        baseline: &mut Baseline,
+        state: &mut SettingsState,
+    ) -> Result<(), SettingsUiError> {
+        apply_settings(dir, baseline, state, &mut |_| None, &mut |_| {
+            Err(AutostartError::CurrentExe(std::io::Error::other("exe")))
+        })
+    }
+
+    #[test]
+    fn a_failed_autostart_write_still_advances_the_config_baseline() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.cursor.enabled = true;
+        state.log_ui_hangs = !state.log_ui_hangs;
+        state.start_with_windows = true;
+
+        let result = failing_autostart(tmp.path(), &mut baseline, &mut state);
+
+        assert!(matches!(result, Err(SettingsUiError::Autostart(_))));
+        assert_eq!(baseline.config, state.to_config());
+        assert!(state.cursor_enabled_seen);
+        assert!(!baseline.start_with_windows);
+        assert_eq!(profile_store::load(tmp.path()).unwrap(), baseline.config);
+    }
+
+    #[test]
+    fn unticking_the_cursor_after_a_partial_apply_reaches_the_disk() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.cursor.enabled = true;
+        state.start_with_windows = true;
+        failing_autostart(tmp.path(), &mut baseline, &mut state).unwrap_err();
+
+        state.cursor.enabled = false;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+
+        assert!(!profile_store::load(tmp.path()).unwrap().cursor.enabled);
     }
 
     #[test]
