@@ -1114,6 +1114,14 @@ mod editor_ui_tests {
         assert!(!choice);
         assert!(!s.is_hidden());
         assert!(s.error().is_some());
+        assert!(!overlay_hides_taskbar(&s, choice));
+    }
+
+    #[test]
+    fn locked_session_returns_requested_without_toggling() {
+        let mut s = TaskbarSession::new(true);
+        let choice = commit_choice(&mut s, false, true, |_| panic!("must not toggle"));
+        assert!(choice);
     }
 
     #[test]
