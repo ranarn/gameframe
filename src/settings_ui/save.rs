@@ -306,6 +306,21 @@ pub(super) struct Baseline {
     pub(super) start_with_windows: bool,
 }
 
+impl Baseline {
+    /// Whether `state` holds edits the baseline doesn't.
+    pub(super) fn differs_from(&self, state: &SettingsState) -> bool {
+        state.to_config() != self.config || state.start_with_windows != self.start_with_windows
+    }
+
+    /// Adopts a saved zone-editor session. The editor persisted the Zone and
+    /// the hide-taskbar flag itself, so a later Apply neither reverts them nor
+    /// shows them as unapplied edits.
+    pub(super) fn adopt_editor_result(&mut self, result: crate::zone_overlay::ZoneEditorResult) {
+        self.config.zone = Some(result.zone);
+        self.config.hide_taskbar_on_apply = result.hide_taskbar_on_apply;
+    }
+}
+
 /// The edits an Apply writes.
 struct SavedEdits {
     config: Config,
@@ -693,6 +708,44 @@ mod tests {
         state: &mut SettingsState,
     ) -> Result<(), SettingsUiError> {
         apply_settings(dir, baseline, state, &mut |_| None, &mut |_| Ok(()))
+    }
+
+    fn editor_result() -> ZoneEditorResult {
+        ZoneEditorResult {
+            zone: Zone {
+                x: 1,
+                y: 2,
+                width: 640,
+                height: 480,
+            },
+            hide_taskbar_on_apply: true,
+        }
+    }
+
+    #[test]
+    fn an_editor_save_after_apply_is_not_an_unapplied_edit() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.log_ui_hangs = !state.log_ui_hangs;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+        assert!(!baseline.differs_from(&state));
+
+        state.apply_editor_result(editor_result());
+        baseline.adopt_editor_result(editor_result());
+
+        assert!(!baseline.differs_from(&state));
+    }
+
+    #[test]
+    fn an_editor_save_plus_another_edit_is_still_an_unapplied_edit() {
+        let (tmp, mut baseline, mut state) = open(&Config::default());
+        state.log_ui_hangs = !state.log_ui_hangs;
+        apply(tmp.path(), &mut baseline, &mut state).unwrap();
+
+        state.apply_editor_result(editor_result());
+        baseline.adopt_editor_result(editor_result());
+        state.log_ui_hangs = !state.log_ui_hangs;
+
+        assert!(baseline.differs_from(&state));
     }
 
     #[test]

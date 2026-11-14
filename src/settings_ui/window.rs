@@ -213,12 +213,7 @@ pub fn run_settings_window(
                                 // takes them too, so a later Apply neither
                                 // reverts the flag nor shows it as an
                                 // unapplied edit.
-                                {
-                                    let mut baseline = baseline.borrow_mut();
-                                    baseline.config.zone = Some(result.zone);
-                                    baseline.config.hide_taskbar_on_apply =
-                                        result.hide_taskbar_on_apply;
-                                }
+                                baseline.borrow_mut().adopt_editor_result(result);
                                 status_messages = reapply();
                             }
                             Err(e) => {

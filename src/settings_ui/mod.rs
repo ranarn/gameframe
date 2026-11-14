@@ -163,9 +163,7 @@ const VERSION_LABEL_SIZE: f32 = 14.0;
 impl SettingsApp<'_> {
     /// Whether the edits differ from what the last Apply (or opening) left.
     fn edited_since_apply(&self) -> bool {
-        let baseline = self.baseline.borrow();
-        self.state.to_config() != baseline.config
-            || self.state.start_with_windows != baseline.start_with_windows
+        self.baseline.borrow().differs_from(&self.state)
     }
 
     /// Adds the games tracked on disk since Settings opened to the table (see
