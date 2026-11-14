@@ -396,6 +396,8 @@ pub(super) fn apply_settings(
     // advances now, before the autostart write, so a failure there cannot leave it
     // behind the disk.
     state.cursor_enabled_seen = applied.cursor.enabled;
+    // The baseline is the applied edits, not the merged disk state: the three-way
+    // merge then skips fields untouched since the last Apply, so tray changes survive.
     baseline.config = applied;
     if edits.start_with_windows != baseline.start_with_windows {
         set_autostart(edits.start_with_windows).map_err(SettingsUiError::Autostart)?;
@@ -878,7 +880,9 @@ mod tests {
         let seen = state.cursor_enabled_seen;
         state.cursor.enabled = !state.cursor.enabled;
         state.start_with_windows = true;
-        // A config dir that is really a file, so the write cannot succeed.
+        // A config dir that is really a file, so the write cannot succeed: on
+        // Windows (the target OS) creating the lock file or config inside a
+        // path that is a regular file fails with NotADirectory/access errors.
         let not_a_dir = tmp.path().join("file");
         std::fs::write(&not_a_dir, b"x").unwrap();
         let mut autostart_calls = 0;
