@@ -23,8 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// resizable sizing border, and `WS_MAXIMIZEBOX` the maximize button, kept off
 /// so Win+Up etc. cannot maximize a placed window.
 /// `WS_MINIMIZEBOX` and `WS_SYSMENU` are deliberately *not* in the mask: the
-/// taskbar button minimizes/restores via `SC_MINIMIZE`/`SC_RESTORE`, which
-/// Windows ignores for a window lacking them.
+/// taskbar button stops minimizing/restoring a window without them (see #261).
 /// `WS_MAXIMIZE` is deliberately *not* in the mask: it is window state owned by
 /// `SW_RESTORE` ([`restore_maximized_window`]), and clearing it by hand on a
 /// still-maximized window would leave the OS state inconsistent.
@@ -324,7 +323,9 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_MAXIMIZE, WS_MINIMIZEBOX, WS_SYSMENU};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WS_MAXIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    };
 
     #[test]
     fn strip_border_style_removes_caption_and_thick_frame_bits() {
@@ -455,7 +456,7 @@ mod tests {
 
         assert!(!window_drifted(
             target,
-            0x14000000 | WS_MINIMIZEBOX | WS_SYSMENU,
+            WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX | WS_SYSMENU,
             target
         ));
     }
