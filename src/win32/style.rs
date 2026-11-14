@@ -15,15 +15,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SET_WINDOW_POS_FLAGS, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX,
     WINDOWPLACEMENT, WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_THICKFRAME,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_THICKFRAME,
 };
 
 /// The style bits removed to strip a window's border for the borderless
 /// toggle: `WS_CAPTION` is the title bar itself, `WS_THICKFRAME` the
 /// resizable sizing border, and `WS_MAXIMIZEBOX` the maximize button, kept off
 /// so Win+Up etc. cannot maximize a placed window.
-/// `WS_MINIMIZEBOX` and `WS_SYSMENU` are deliberately *not* in the mask: the
-/// taskbar button stops minimizing/restoring a window without them (see #261).
+/// `WS_MINIMIZEBOX` and `WS_SYSMENU` are deliberately *not* in the mask, so a
+/// window that has them keeps them (see #261); a window that lacks the minimize
+/// box gets it added by [`borderless_style`] (see #265).
 /// `WS_MAXIMIZE` is deliberately *not* in the mask: it is window state owned by
 /// `SW_RESTORE` ([`restore_maximized_window`]), and clearing it by hand on a
 /// still-maximized window would leave the OS state inconsistent.
@@ -37,9 +38,21 @@ const BORDERLESS_EX_STYLE_MASK: u32 = WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_E
 /// Removes the border/title-bar style bits from a raw `GWL_STYLE` value,
 /// leaving every other bit (e.g. `WS_VISIBLE`, `WS_POPUP`, `WS_CHILD`,
 /// `WS_MAXIMIZE`) untouched. Pure bit manipulation -- no `HWND`
-/// involved.
+/// involved. This is the "is there a border left to restore" test (a bare
+/// popup counts as already borderless); the style GameFrame actually writes
+/// is [`borderless_style`], which also adds `WS_MINIMIZEBOX`.
 pub fn strip_border_style(style: u32) -> u32 {
     style & !BORDERLESS_STYLE_MASK
+}
+
+/// The style GameFrame writes to a borderless window: [`strip_border_style`]
+/// plus `WS_MINIMIZEBOX`. Bare `WS_POPUP` games never had the minimize box, and
+/// on Windows 11 the taskbar button only minimizes/restores a window that has
+/// it. Without a caption the box draws nothing (see #265). The foreground apply
+/// path has no fullscreen check, so a window in exclusive fullscreen gets the
+/// bit too; harmless, since it is invisible.
+pub fn borderless_style(style: u32) -> u32 {
+    strip_border_style(style) | WS_MINIMIZEBOX
 }
 
 /// Removes the border-drawing extended-style bits from a raw `GWL_EXSTYLE`
@@ -296,7 +309,9 @@ pub(super) fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
 
 /// Pure decision: has a window that was previously made borderless at
 /// `target` drifted from it? True if its bounds differ from `target`, or if
-/// any border/title-bar style bit (see [`strip_border_style`]) came back.
+/// any border/title-bar style bit (see [`strip_border_style`]) came back, or
+/// `WS_MINIMIZEBOX` is missing (see [`borderless_style`]) -- which also repairs
+/// windows placed by an older GameFrame that never added it.
 /// Used by the in-game-resize watcher so it only re-applies when the game
 /// actually changed the window -- which also keeps GameFrame's own
 /// `SetWindowPos` (which fires another location-change event) from looping.
@@ -306,8 +321,13 @@ pub(super) fn reset_corner_preference(hwnd: HWND) -> Result<(), Win32Error> {
 /// maximizes itself or re-adds an edge would otherwise be re-applied on every
 /// location event (a maximized window already differs by bounds). They are
 /// still handled whenever an apply does run.
+///
+/// Trade-off: a window GameFrame cannot restyle (e.g. an elevated game) or a
+/// game that keeps clearing `WS_MINIMIZEBOX` counts as drifted forever, so each
+/// location event triggers an apply that may fail at `set_window_style`. The
+/// drift re-apply rate limit and attempt cap bound this.
 pub fn window_drifted(current_region: Region, current_style: u32, target: Region) -> bool {
-    current_region != target || strip_border_style(current_style) != current_style
+    current_region != target || borderless_style(current_style) != current_style
 }
 
 /// Reads `hwnd`'s live bounds/style and reports [`window_drifted`] against
@@ -324,7 +344,7 @@ pub fn window_has_drifted(hwnd: HWND, target: Region) -> Result<bool, Win32Error
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        WS_MAXIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+        WS_MAXIMIZE, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
     };
 
     #[test]
@@ -379,7 +399,7 @@ mod tests {
             height: 1440,
         };
 
-        assert!(!window_drifted(target, 0x14000000, target));
+        assert!(!window_drifted(target, 0x14000000 | WS_MINIMIZEBOX, target));
     }
 
     #[test]
@@ -409,7 +429,11 @@ mod tests {
             height: 100,
         };
 
-        assert!(!window_drifted(target, 0x14000000 | WS_MAXIMIZE, target));
+        assert!(!window_drifted(
+            target,
+            0x14000000 | WS_MINIMIZEBOX | WS_MAXIMIZE,
+            target
+        ));
     }
 
     #[test]
@@ -443,10 +467,10 @@ mod tests {
         assert_eq!(stripped, WS_SYSMENU | WS_MINIMIZEBOX);
     }
 
-    // The taskbar button minimizes/restores via SC_MINIMIZE/SC_RESTORE, which
-    // needs these bits; a game re-adding only them is not drift.
+    // The taskbar button only minimizes a window with WS_MINIMIZEBOX; a bare
+    // popup in its zone must be re-applied to gain it (#265).
     #[test]
-    fn window_drifted_ignores_the_minimize_box_and_system_menu() {
+    fn window_drifted_is_true_for_a_bare_popup_missing_the_minimize_box() {
         let target = Region {
             x: 0,
             y: 0,
@@ -454,11 +478,36 @@ mod tests {
             height: 100,
         };
 
+        assert!(window_drifted(target, WS_POPUP | WS_VISIBLE, target));
         assert!(!window_drifted(
             target,
             WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX | WS_SYSMENU,
             target
         ));
+    }
+
+    #[test]
+    fn borderless_style_adds_the_minimize_box_to_a_bare_popup() {
+        assert_eq!(
+            borderless_style(WS_POPUP | WS_VISIBLE),
+            WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX
+        );
+    }
+
+    #[test]
+    fn borderless_style_strips_the_frame_but_keeps_menu_minimize_and_unrelated_bits() {
+        let style = WS_CAPTION
+            | WS_THICKFRAME
+            | WS_MAXIMIZEBOX
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZE
+            | WS_VISIBLE;
+
+        assert_eq!(
+            borderless_style(style),
+            WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZE | WS_VISIBLE
+        );
     }
 
     #[test]

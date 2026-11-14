@@ -1,10 +1,10 @@
 //! The two placement calls: strip a window into the Zone, and restore it.
 
 use super::{
-    PLACED_WINDOWS, RestoreState, Win32Error, disable_rounded_corners, get_restorable_region,
-    get_window_ex_style, get_window_region, get_window_style, is_maximized, is_window_hung_logged,
-    reset_corner_preference, restore_maximized_window, restore_with_store, set_window_ex_style,
-    set_window_region, set_window_style, strip_border_ex_style, strip_border_style,
+    PLACED_WINDOWS, RestoreState, Win32Error, borderless_style, disable_rounded_corners,
+    get_restorable_region, get_window_ex_style, get_window_region, get_window_style, is_maximized,
+    is_window_hung_logged, reset_corner_preference, restore_maximized_window, restore_with_store,
+    set_window_ex_style, set_window_region, set_window_style, strip_border_ex_style,
     unmark_applied_window, window_has_drifted, with_placed,
 };
 use crate::region_calc::Region;
@@ -110,7 +110,7 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
             get_window_region(hwnd)?,
         ),
     };
-    set_window_style(hwnd, strip_border_style(live_style))?;
+    set_window_style(hwnd, borderless_style(live_style))?;
     // Recorded once the style change succeeded (a no-op for a maximized
     // window, already recorded at its un-maximize), so a window GameFrame
     // could not change (e.g. an elevated game) never gets a restore entry; the
