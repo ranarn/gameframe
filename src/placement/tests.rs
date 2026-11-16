@@ -48,7 +48,7 @@ struct FakeOps {
     drift: DriftDecision,
     /// Relabels the placement call as `in_place`. The fake still returns the
     /// success result: the real in-place decision lives in
-    /// `win32::apply_borderless_to_window` (`decide_apply`), not here.
+    /// `win32::apply_borderless_to_window` (`plan_apply`), not here.
     in_place: bool,
     place_result: fn() -> Result<(), Win32Error>,
     taskbar_result: fn() -> Result<(), Win32Error>,
