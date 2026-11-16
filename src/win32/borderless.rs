@@ -257,7 +257,25 @@ mod tests {
         DisableCorners,
     }
 
-    /// Logs every call; fails the call named in `fail_at`. A style read gives
+    impl Call {
+        /// The name the `calls` log records; both style reads log `style`.
+        fn name(self) -> &'static str {
+            match self {
+                Call::RestorableRegion => "restorable_region",
+                Call::Region => "region",
+                Call::Style | Call::StyleAfterUnmaximize => "style",
+                Call::ExStyle => "ex_style",
+                Call::SetStyle => "set_style",
+                Call::SetExStyle => "set_ex_style",
+                Call::SetRegion => "set_region",
+                Call::DisableCorners => "disable_corners",
+            }
+        }
+    }
+
+    /// Logs every call; fails the call named in `fail_at`. `Call::Style` is only
+    /// the style read before `unmaximize`; the read after it is
+    /// `Call::StyleAfterUnmaximize`. A style read gives
     /// `PRE_STYLE` until `unmaximize`, then `POST_STYLE`; the un-maximize takes
     /// effect only if `takes_effect`.
     struct FakeOps {
@@ -289,8 +307,8 @@ mod tests {
             self
         }
 
-        fn log(&mut self, call: Call, name: &str, arg: String) -> Result<(), Win32Error> {
-            self.calls.push(format!("{name}{arg}"));
+        fn log(&mut self, call: Call, arg: String) -> Result<(), Win32Error> {
+            self.calls.push(format!("{}{arg}", call.name()));
             if self.fail_at == Some(call) {
                 Err(Win32Error::WindowHung)
             } else {
@@ -305,11 +323,11 @@ mod tests {
             self.maximized
         }
         fn restorable_region(&mut self) -> Result<Region, Win32Error> {
-            self.log(Call::RestorableRegion, "restorable_region", String::new())?;
+            self.log(Call::RestorableRegion, String::new())?;
             Ok(NORMAL)
         }
         fn region(&mut self) -> Result<Region, Win32Error> {
-            self.log(Call::Region, "region", String::new())?;
+            self.log(Call::Region, String::new())?;
             Ok(NORMAL)
         }
         fn style(&mut self) -> Result<u32, Win32Error> {
@@ -318,11 +336,11 @@ mod tests {
             } else {
                 Call::Style
             };
-            self.log(call, "style", String::new())?;
+            self.log(call, String::new())?;
             Ok(if self.restored { POST_STYLE } else { PRE_STYLE })
         }
         fn ex_style(&mut self) -> Result<u32, Win32Error> {
-            self.log(Call::ExStyle, "ex_style", String::new())?;
+            self.log(Call::ExStyle, String::new())?;
             Ok(EX_STYLE)
         }
         fn unmaximize(&mut self) {
@@ -334,16 +352,16 @@ mod tests {
             self.calls.push(format!("record({:#x})", state.style));
         }
         fn set_style(&mut self, style: u32) -> Result<(), Win32Error> {
-            self.log(Call::SetStyle, "set_style", format!("({style:#x})"))
+            self.log(Call::SetStyle, format!("({style:#x})"))
         }
         fn set_ex_style(&mut self, _: u32) -> Result<(), Win32Error> {
-            self.log(Call::SetExStyle, "set_ex_style", String::new())
+            self.log(Call::SetExStyle, String::new())
         }
         fn set_region(&mut self) -> Result<(), Win32Error> {
-            self.log(Call::SetRegion, "set_region", String::new())
+            self.log(Call::SetRegion, String::new())
         }
         fn disable_corners(&mut self) -> Result<(), Win32Error> {
-            self.log(Call::DisableCorners, "disable_corners", String::new())
+            self.log(Call::DisableCorners, String::new())
         }
     }
 
