@@ -229,13 +229,13 @@ mod tests {
                 return false;
             }
             let mut flags = USEROBJECTFLAGS::default();
-            let mut _needed = 0u32;
+            let mut needed = 0u32;
             let ok = GetUserObjectInformationW(
                 station,
                 UOI_FLAGS,
                 (&mut flags as *mut USEROBJECTFLAGS).cast(),
                 std::mem::size_of::<USEROBJECTFLAGS>() as u32,
-                &mut _needed,
+                &mut needed,
             );
             ok != 0 && flags.dwFlags & WSF_VISIBLE as u32 != 0
         }

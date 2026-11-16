@@ -47,7 +47,8 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3.27.0"
-# Test-only: the borderless tests query the window station (Cargo unifies features).
+# Only the borderless tests use this feature (to query the process window
+# station); Cargo adds it to the windows-sys build for test builds only.
 windows-sys = { version = "0.61.2", features = ["Win32_System_StationsAndDesktops"] }
 
 [lints.clippy]
