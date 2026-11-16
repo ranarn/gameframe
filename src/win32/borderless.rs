@@ -13,7 +13,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
 
 /// What one apply request does to a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApplyDecision {
+enum ApplyDecision {
     Apply,
     /// The window already has the stripped style and the Zone rect: no style
     /// or position call is made (the same check the drift path uses).
@@ -24,7 +24,7 @@ pub(crate) enum ApplyDecision {
 
 /// Pure decision for one apply request. A hung window wins over everything
 /// else, since even reading it back would be pointless.
-pub(crate) fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
+fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
     if hung {
         ApplyDecision::SkipHung
     } else if drifted {
@@ -242,13 +242,27 @@ mod tests {
         height: 4,
     };
 
+    /// An `ApplyOps` call a test can make fail. `StyleAfterUnmaximize` is the
+    /// style read once `unmaximize` has run.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Call {
+        RestorableRegion,
+        Region,
+        Style,
+        StyleAfterUnmaximize,
+        ExStyle,
+        SetStyle,
+        SetExStyle,
+        SetRegion,
+        DisableCorners,
+    }
+
     /// Logs every call; fails the call named in `fail_at`. A style read gives
     /// `PRE_STYLE` until `unmaximize`, then `POST_STYLE`; the un-maximize takes
     /// effect only if `takes_effect`.
     struct FakeOps {
         calls: Vec<String>,
-        fail_at: Option<&'static str>,
-        only_once_restored: bool,
+        fail_at: Option<Call>,
         maximized: bool,
         takes_effect: bool,
         restored: bool,
@@ -259,22 +273,14 @@ mod tests {
             FakeOps {
                 calls: Vec::new(),
                 fail_at: None,
-                only_once_restored: false,
                 maximized,
                 takes_effect: true,
                 restored: false,
             }
         }
 
-        fn failing(mut self, call: &'static str) -> Self {
+        fn failing(mut self, call: Call) -> Self {
             self.fail_at = Some(call);
-            self
-        }
-
-        /// Fails the call only after the un-maximize has run.
-        fn failing_once_restored(mut self, call: &'static str) -> Self {
-            self.fail_at = Some(call);
-            self.only_once_restored = true;
             self
         }
 
@@ -283,9 +289,9 @@ mod tests {
             self
         }
 
-        fn log(&mut self, name: &'static str, arg: String) -> Result<(), Win32Error> {
+        fn log(&mut self, call: Call, name: &str, arg: String) -> Result<(), Win32Error> {
             self.calls.push(format!("{name}{arg}"));
-            if self.fail_at == Some(name) && (!self.only_once_restored || self.restored) {
+            if self.fail_at == Some(call) {
                 Err(Win32Error::WindowHung)
             } else {
                 Ok(())
@@ -299,19 +305,24 @@ mod tests {
             self.maximized
         }
         fn restorable_region(&mut self) -> Result<Region, Win32Error> {
-            self.log("restorable_region", String::new())?;
+            self.log(Call::RestorableRegion, "restorable_region", String::new())?;
             Ok(NORMAL)
         }
         fn region(&mut self) -> Result<Region, Win32Error> {
-            self.log("region", String::new())?;
+            self.log(Call::Region, "region", String::new())?;
             Ok(NORMAL)
         }
         fn style(&mut self) -> Result<u32, Win32Error> {
-            self.log("style", String::new())?;
+            let call = if self.restored {
+                Call::StyleAfterUnmaximize
+            } else {
+                Call::Style
+            };
+            self.log(call, "style", String::new())?;
             Ok(if self.restored { POST_STYLE } else { PRE_STYLE })
         }
         fn ex_style(&mut self) -> Result<u32, Win32Error> {
-            self.log("ex_style", String::new())?;
+            self.log(Call::ExStyle, "ex_style", String::new())?;
             Ok(EX_STYLE)
         }
         fn unmaximize(&mut self) {
@@ -323,16 +334,16 @@ mod tests {
             self.calls.push(format!("record({:#x})", state.style));
         }
         fn set_style(&mut self, style: u32) -> Result<(), Win32Error> {
-            self.log("set_style", format!("({style:#x})"))
+            self.log(Call::SetStyle, "set_style", format!("({style:#x})"))
         }
         fn set_ex_style(&mut self, _: u32) -> Result<(), Win32Error> {
-            self.log("set_ex_style", String::new())
+            self.log(Call::SetExStyle, "set_ex_style", String::new())
         }
         fn set_region(&mut self) -> Result<(), Win32Error> {
-            self.log("set_region", String::new())
+            self.log(Call::SetRegion, "set_region", String::new())
         }
         fn disable_corners(&mut self) -> Result<(), Win32Error> {
-            self.log("disable_corners", String::new())
+            self.log(Call::DisableCorners, "disable_corners", String::new())
         }
     }
 
@@ -381,7 +392,7 @@ mod tests {
     #[test]
     fn a_failure_after_the_unmaximize_leaves_the_original_recorded() {
         let (result, calls) = apply(
-            FakeOps::new(true).failing_once_restored("style"),
+            FakeOps::new(true).failing(Call::StyleAfterUnmaximize),
             false,
             true,
         );
@@ -419,7 +430,11 @@ mod tests {
 
     #[test]
     fn a_failed_pre_restore_read_aborts_before_the_window_is_touched() {
-        let (result, calls) = apply(FakeOps::new(true).failing("restorable_region"), false, true);
+        let (result, calls) = apply(
+            FakeOps::new(true).failing(Call::RestorableRegion),
+            false,
+            true,
+        );
         assert!(result.is_err());
         assert!(!calls.iter().any(|c| c == "unmaximize"));
     }
