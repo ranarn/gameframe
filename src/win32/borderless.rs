@@ -273,11 +273,10 @@ mod tests {
         }
     }
 
-    /// Logs every call; fails the call named in `fail_at`. `Call::Style` is only
-    /// the style read before `unmaximize`; the read after it is
-    /// `Call::StyleAfterUnmaximize`. A style read gives
-    /// `PRE_STYLE` until `unmaximize`, then `POST_STYLE`; the un-maximize takes
-    /// effect only if `takes_effect`.
+    /// Logs every call; fails the call named in `fail_at`. A style read gives
+    /// `PRE_STYLE` until `unmaximize`, then `POST_STYLE`; `Call::Style` fails
+    /// only the read before it, `Call::StyleAfterUnmaximize` the read after.
+    /// The un-maximize takes effect only if `takes_effect`.
     struct FakeOps {
         calls: Vec<String>,
         fail_at: Option<Call>,
