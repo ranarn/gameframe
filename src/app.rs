@@ -908,6 +908,9 @@ fn handle_toggle_game_cursor(config_dir: &Path, cursor_overlay: &CursorOverlay) 
 /// user why if that did not work. `window` is an `HWND`; one that has gone since
 /// it was listed is an ordinary failure of the apply.
 pub(crate) fn apply_picked_window(config_dir: &Path, window: isize, tray: &Tray) {
+    // No eligibility re-check here, on purpose: the HWND comes from the Settings
+    // child's own window list, the same source and filtering as the tray submenu,
+    // so applying to it has the same exe and behavior as a submenu click.
     let outcome = placement::apply_zone(config_dir, window as HWND, Trigger::Tray);
     if let Some(notice) = placement::failure_notice(Trigger::Tray, &outcome) {
         tray.notify(&notice);
