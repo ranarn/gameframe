@@ -214,7 +214,8 @@ mod tests {
     /// Real top-level windows only behave as the tests expect there; a service
     /// or other non-interactive window station gets `false`. A failed query
     /// counts as not interactive. `windows-latest` CI has an interactive
-    /// desktop, so the real-window tests run there.
+    /// desktop, so the real-window tests run there. A skipped test reports as
+    /// passed; run with `--nocapture` to see the skip line.
     fn has_interactive_desktop() -> bool {
         use windows_sys::Win32::System::StationsAndDesktops::{
             GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
@@ -228,13 +229,13 @@ mod tests {
                 return false;
             }
             let mut flags = USEROBJECTFLAGS::default();
-            let mut needed = 0u32;
+            let mut _needed = 0u32;
             let ok = GetUserObjectInformationW(
                 station,
                 UOI_FLAGS,
                 (&mut flags as *mut USEROBJECTFLAGS).cast(),
                 std::mem::size_of::<USEROBJECTFLAGS>() as u32,
-                &mut needed,
+                &mut _needed,
             );
             ok != 0 && flags.dwFlags & WSF_VISIBLE as u32 != 0
         }

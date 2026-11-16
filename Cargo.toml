@@ -35,7 +35,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
-    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
@@ -48,6 +47,8 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3.27.0"
+# Test-only: the borderless tests query the window station (Cargo unifies features).
+windows-sys = { version = "0.61.2", features = ["Win32_System_StationsAndDesktops"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
