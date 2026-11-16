@@ -57,8 +57,8 @@ pub(crate) fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
 /// (`IsWindowVisible` stays `TRUE` for minimized windows), so a minimized
 /// window can legitimately reach this function.
 ///
-/// OS-facing: acts on the real window identified by `hwnd`. Not exercised by
-/// this crate's automated tests -- see module docs.
+/// OS-facing: acts on the real window identified by `hwnd`. The maximized-window
+/// paths are covered by tests that run it on real windows.
 pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(), Win32Error> {
     // Safety: `hwnd` is a live handle passed in by the caller; `IsIconic`
     // performs no writes.
@@ -91,21 +91,21 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         let style = get_window_style(hwnd)?;
         let ex_style = get_window_ex_style(hwnd)?;
         restore_maximized_window(hwnd);
-        // The un-maximize is the first mutation: record the original now, so
-        // a later failure cannot strand the window
-        // un-maximized with no way back. Only when it really took effect, so
-        // a window GameFrame cannot change (e.g. elevated) gets no entry.
+        // The un-maximize is the first mutation: record the original now, so a
+        // later failure cannot strand the window un-maximized with no way back.
+        // Only when it really took effect, so a window GameFrame cannot change
+        // (e.g. elevated) gets no entry.
         if !is_maximized(hwnd) {
             with_placed(|p| {
                 p.restore
                     .record_if_absent(hwnd as isize, RestoreState::new(style, ex_style, region));
             });
         }
-        // The style to write back is the one after the restore: the pre-restore
-        // read still carries `WS_MAXIMIZE`, and writing it would re-flag the
-        // un-maximized window as maximized (#274). Re-read rather than clear
-        // the bit by hand, so a restore that did not take effect keeps its
-        // real state. The recorded original above stays the pre-restore read.
+        // Write back the style as it is after the restore, so a window
+        // GameFrame un-maximized is not re-flagged `WS_MAXIMIZE`. Re-read
+        // rather than clear the bit by hand, so a restore that did not take
+        // effect keeps its real state. The recorded original above stays the
+        // pre-restore read.
         let style_now = get_window_style(hwnd)?;
         Some((style_now, ex_style, region))
     } else {
@@ -143,7 +143,7 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
 /// affect the press; see [`restore_with_store`].
 ///
 /// OS-facing: acts on the real window. Not exercised by this crate's
-/// automated tests -- see module docs.
+/// automated tests.
 pub fn restore_window(hwnd: HWND) -> Result<(), Win32Error> {
     // A minimized window's `GetWindowRect` reports its off-screen minimized
     // position, which would be written back as if it were real.
@@ -356,6 +356,7 @@ mod tests {
         assert!(moves > 0, "the window must receive the move messages");
         assert_eq!(get_window_region(w.hwnd).unwrap(), ZONE);
     }
+
     #[test]
     fn apply_is_skipped_for_a_hung_window_whatever_its_state() {
         assert_eq!(decide_apply(true, true), ApplyDecision::SkipHung);
