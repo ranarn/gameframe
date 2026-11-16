@@ -92,7 +92,7 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
         let ex_style = get_window_ex_style(hwnd)?;
         restore_maximized_window(hwnd);
         // The un-maximize is the first mutation: record the original now, so
-        // a later failure (or a SkipInPlace) cannot strand the window
+        // a later failure cannot strand the window
         // un-maximized with no way back. Only when it really took effect, so
         // a window GameFrame cannot change (e.g. elevated) gets no entry.
         if !is_maximized(hwnd) {
@@ -181,6 +181,108 @@ mod tests {
         assert_eq!(decide_apply(false, true), ApplyDecision::Apply);
     }
 
+    use std::cell::Cell;
+
+    thread_local! {
+        // Window messages reach the proc synchronously on the creating thread,
+        // so a per-thread counter keeps parallel tests apart.
+        static MOVES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    unsafe extern "system" fn counting_proc(
+        h: HWND,
+        m: u32,
+        w: windows_sys::Win32::Foundation::WPARAM,
+        l: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_WINDOWPOSCHANGED};
+        if m == WM_WINDOWPOSCHANGED {
+            MOVES.with(|c| c.set(c.get() + 1));
+        }
+        // Safety: forwards the message unchanged.
+        unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    /// A real popup window, destroyed and its class unregistered on drop so a
+    /// failed assertion in a test cannot leak either.
+    struct TestWindow {
+        hwnd: HWND,
+        class: Vec<u16>,
+    }
+
+    impl TestWindow {
+        /// A borderless popup flagged `WS_MAXIMIZE`, moved to `placed` if given.
+        fn maximized(class_name: &str, placed: Option<Region>) -> Self {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, RegisterClassW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
+                SetWindowPos, ShowWindow, WNDCLASSW, WS_POPUP, WS_VISIBLE,
+            };
+            let class: Vec<u16> = format!("{class_name}\0").encode_utf16().collect();
+            // Safety: all-zero is a valid WNDCLASSW; the fields set are valid.
+            let hwnd = unsafe {
+                let mut wc: WNDCLASSW = std::mem::zeroed();
+                wc.lpfnWndProc = Some(counting_proc);
+                wc.lpszClassName = class.as_ptr();
+                assert_ne!(RegisterClassW(&wc), 0, "class registration");
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    class.as_ptr(),
+                    WS_POPUP | WS_VISIBLE,
+                    100,
+                    100,
+                    400,
+                    300,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            // Built before the assert so a null handle still unregisters the class.
+            let window = TestWindow { hwnd, class };
+            assert!(!hwnd.is_null(), "test window must be created");
+            // Safety: `hwnd` is the live window created above.
+            unsafe {
+                ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                if let Some(r) = placed {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        r.x,
+                        r.y,
+                        r.width,
+                        r.height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            let style = get_window_style(hwnd).unwrap();
+            set_window_style(hwnd, borderless_style(style)).unwrap();
+            window
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, UnregisterClassW};
+            // Safety: the window and class created in `maximized`.
+            unsafe {
+                if !self.hwnd.is_null() {
+                    DestroyWindow(self.hwnd);
+                }
+                UnregisterClassW(self.class.as_ptr(), std::ptr::null_mut());
+            }
+        }
+    }
+
+    const ZONE: Region = Region {
+        x: 50,
+        y: 60,
+        width: 640,
+        height: 480,
+    };
+
     // Regression: a game that re-maximizes itself keeps `WS_MAXIMIZE`
     // while sitting exactly in the Zone. Applying on every focus switch
     // un-maximized it (snapping it to its normal rect) before the in-place
@@ -189,81 +291,47 @@ mod tests {
     // messages, which the un-maximize delivers synchronously.
     #[test]
     fn apply_leaves_a_maximized_window_already_in_the_zone_untouched() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SW_SHOWMAXIMIZED,
-            SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, UnregisterClassW, WNDCLASSW,
-            WM_WINDOWPOSCHANGED, WS_POPUP, WS_VISIBLE,
-        };
+        let w = TestWindow::maximized("GameFrameTestMaximizedInZone", Some(ZONE));
+        assert!(
+            is_maximized(w.hwnd),
+            "precondition: still flagged maximized"
+        );
+        assert_eq!(
+            get_window_region(w.hwnd).unwrap(),
+            ZONE,
+            "precondition: in the Zone"
+        );
+        let before = MOVES.with(Cell::get);
 
-        static MOVES: AtomicU32 = AtomicU32::new(0);
-        unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-            if m == WM_WINDOWPOSCHANGED {
-                MOVES.fetch_add(1, Ordering::SeqCst);
-            }
-            // Safety: forwards the message unchanged.
-            unsafe { DefWindowProcW(h, m, w, l) }
-        }
+        let result = apply_borderless_to_window(w.hwnd, ZONE);
 
-        let class: Vec<u16> = "GameFrameTestMaximizedInZone\0".encode_utf16().collect();
-        // Safety: all-zero is a valid WNDCLASSW; the fields set below are valid.
-        let hwnd = unsafe {
-            let mut wc: WNDCLASSW = std::mem::zeroed();
-            wc.lpfnWndProc = Some(proc);
-            wc.lpszClassName = class.as_ptr();
-            assert_ne!(RegisterClassW(&wc), 0, "class registration");
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                class.as_ptr(),
-                WS_POPUP | WS_VISIBLE,
-                100,
-                100,
-                400,
-                300,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        assert!(!hwnd.is_null(), "test window must be created");
-        let zone = Region {
-            x: 50,
-            y: 60,
-            width: 640,
-            height: 480,
-        };
-        // Safety: `hwnd` is the live window created above.
-        unsafe {
-            ShowWindow(hwnd, SW_SHOWMAXIMIZED);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                zone.x,
-                zone.y,
-                zone.width,
-                zone.height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-        let style = get_window_style(hwnd).unwrap();
-        set_window_style(hwnd, borderless_style(style)).unwrap();
-        assert!(is_maximized(hwnd), "precondition: still flagged maximized");
-        assert_eq!(get_window_region(hwnd).unwrap(), zone, "precondition: in the Zone");
-        let before = MOVES.load(Ordering::SeqCst);
-
-        let result = apply_borderless_to_window(hwnd, zone);
-
-        let moves = MOVES.load(Ordering::SeqCst) - before;
-        // Safety: the window and class created above.
-        unsafe {
-            DestroyWindow(hwnd);
-            UnregisterClassW(class.as_ptr(), std::ptr::null_mut());
-        }
+        let moves = MOVES.with(Cell::get) - before;
         assert!(result.is_ok(), "apply failed: {result:?}");
-        assert_eq!(moves, 0, "an in-place window must not be moved or un-maximized");
+        assert_eq!(
+            moves, 0,
+            "an in-place window must not be moved or un-maximized"
+        );
+    }
+
+    // A maximized window outside the Zone still has to be un-maximized and
+    // placed; the in-place shortcut must not swallow it.
+    #[test]
+    fn apply_unmaximizes_and_places_a_maximized_window_outside_the_zone() {
+        let w = TestWindow::maximized("GameFrameTestMaximizedOutsideZone", None);
+        assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
+        assert_ne!(
+            get_window_region(w.hwnd).unwrap(),
+            ZONE,
+            "precondition: not in the Zone"
+        );
+        let before = MOVES.with(Cell::get);
+
+        let result = apply_borderless_to_window(w.hwnd, ZONE);
+
+        let moves = MOVES.with(Cell::get) - before;
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert!(moves > 0, "the window must receive the move messages");
+        assert_eq!(get_window_region(w.hwnd).unwrap(), ZONE);
     }
     #[test]
     fn apply_is_skipped_for_a_hung_window_whatever_its_state() {
