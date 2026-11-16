@@ -233,6 +233,12 @@ impl eframe::App for SettingsApp<'_> {
             self.state.apply_external_cursor_enabled(enabled);
         }
 
+        // The tray process re-registered the hotkeys after an Apply: show which
+        // bindings fail now.
+        if let Some(reports) = crate::settings_link::take_hotkey_reports() {
+            self.state.set_hotkey_reports(&reports);
+        }
+
         // The tray process handled a window picked in the Games tab: show the
         // game it tracked without closing Settings.
         if let Some(picked) = crate::settings_link::take_tracked_games_changed() {

@@ -69,7 +69,8 @@ pub struct SettingsState {
     /// [`super::SettingsApp`] so it survives the "Edit Zone" close-and-reopen.
     pub tab: SettingsTab,
     /// Bindings that failed to register when GameFrame last registered its
-    /// hotkeys (see [`Self::set_hotkey_reports`]). Read through
+    /// hotkeys (see [`Self::set_hotkey_reports`]): set at Init and refreshed
+    /// after each Apply, when the tray process registers again. Read through
     /// [`Self::hotkey_failure`], which hides one once its binding was edited.
     hotkey_failures: Vec<BindingReport>,
     /// The `cursor.enabled` this session last saw on disk: what it opened with,
@@ -192,7 +193,7 @@ impl SettingsState {
 
     /// Why `field`'s binding failed to register, if it did and the binding is
     /// still the one that failed. Rebinding or clearing hides it: the new
-    /// combination is only tried (and the indicator settled) on Save.
+    /// combination is only tried on Apply, and the next report settles it.
     pub fn hotkey_failure(&self, field: HotkeyField) -> Option<&str> {
         self.hotkey_failures
             .iter()
@@ -1113,6 +1114,30 @@ mod tests {
         );
         assert_eq!(state.hotkey_failure(HotkeyField::ToggleBorderless), None);
         assert_eq!(state.hotkey_failure(HotkeyField::ToggleGameCursor), None);
+    }
+
+    #[test]
+    fn a_report_delivered_after_init_replaces_the_earlier_markers() {
+        let mut state = SettingsState::from_config(&Config::default());
+        state.toggle_borderless = "Ctrl+Alt+B".to_string();
+        state.toggle_taskbar_autohide = "Ctrl+Alt+T".to_string();
+        state.set_hotkey_reports(&[failed_report(HotkeyAction::ToggleBorderless, "Ctrl+Alt+B")]);
+
+        state.set_hotkey_reports(&[
+            BindingReport {
+                action: HotkeyAction::ToggleBorderless,
+                binding: "Ctrl+Alt+B".to_string(),
+                outcome: BindingOutcome::Registered,
+            },
+            failed_report(HotkeyAction::ToggleTaskbarAutohide, "Ctrl+Alt+T"),
+        ]);
+
+        assert_eq!(state.hotkey_failure(HotkeyField::ToggleBorderless), None);
+        assert!(
+            state
+                .hotkey_failure(HotkeyField::ToggleTaskbarAutohide)
+                .is_some()
+        );
     }
 
     #[test]

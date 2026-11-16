@@ -563,6 +563,17 @@ pub(crate) fn forward_install_progress(
     }
 }
 
+/// Tells an open Settings window the outcome of the hotkey registration the tray
+/// just redid after an Apply, so its failure markers stay current.
+pub(crate) fn send_hotkey_reports<C: ProcessHandle>(
+    settings: &mut Option<SettingsProcess<C>>,
+    reports: &[BindingReport],
+) {
+    if let Some(process) = settings.as_mut() {
+        process.send(&ParentMsg::HotkeyReports(reports.to_vec()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +674,33 @@ mod tests {
             sent,
             ended,
         }
+    }
+
+    #[test]
+    fn fresh_hotkey_reports_are_sent_to_the_open_settings_window() {
+        let rig = rig();
+        let reports = vec![BindingReport {
+            action: crate::hotkeys::HotkeyAction::ToggleBorderless,
+            binding: "Ctrl+F9".to_string(),
+            outcome: crate::hotkeys::BindingOutcome::Failed("in use".to_string()),
+        }];
+        let mut settings = Some(rig.process);
+
+        send_hotkey_reports(&mut settings, &reports);
+
+        let sent = rig.sent.wait_for("HotkeyReports");
+        let line = sent.lines().next().unwrap();
+        assert_eq!(
+            decode_line::<ParentMsg>(line),
+            Some(ParentMsg::HotkeyReports(reports))
+        );
+    }
+
+    #[test]
+    fn hotkey_reports_without_an_open_settings_window_are_dropped() {
+        let mut none: Option<SettingsProcess<FakeChild>> = None;
+        send_hotkey_reports(&mut none, &[]);
+        assert!(none.is_none());
     }
 
     #[test]

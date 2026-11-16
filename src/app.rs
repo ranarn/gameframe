@@ -974,6 +974,9 @@ fn settings_closed(ctx: &Shared, state: &mut LoopState) {
     {
         tray.notify(&notice);
     }
+    // An open window (Apply) replaces the reports it got at Init; a closed one
+    // is no longer there to tell.
+    settings_host::send_hotkey_reports(&mut state.settings, &state.hotkey_reports);
     sync_hang_watchdog(config_dir, false);
     cursor_overlay.reload(config_dir);
     tray.sync_start_with_windows_check();
