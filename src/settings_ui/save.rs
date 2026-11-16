@@ -278,7 +278,10 @@ fn merge_tracked_games(
 /// An empty `picked` means the tray could not read the picked window's
 /// executable (`TrackedGamesChanged { picked: None }`), so which game was
 /// re-tracked is unknown: any removed game whose on-disk entry differs from the
-/// baseline's is taken to be that one and re-added the same way.
+/// baseline's is taken to be that one and re-added the same way. Known
+/// trade-off: an unrelated on-disk change to a removed game (an external config
+/// edit) resurrects it too, and a re-track that leaves the entry identical to the
+/// baseline is not detected.
 pub(super) fn adopt_games_added_on_disk(
     baseline_games: &mut Vec<TrackedGame>,
     visible: &mut Vec<TrackedGame>,
