@@ -11,142 +11,45 @@ use crate::region_calc::Region;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
 
-/// One step of an apply request, in execution order. The reads are steps too:
-/// a failed read aborts before the window is touched, and the order of reads
-/// against writes is what the plan pins down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApplyStep {
-    /// Read the normal rect and both styles of a maximized window, before it
-    /// is un-maximized.
-    ReadPreRestore,
-    Unmaximize,
-    /// Record the pre-restore read as the window's [`RestoreState`], but only
-    /// if the un-maximize took effect (so a window GameFrame cannot change,
-    /// e.g. elevated, gets no entry). This is the first mutation, so a later
-    /// failure cannot strand the window un-maximized with no way back.
-    RecordPreRestoreIfUnmaximized,
-    /// Re-read the style after the un-maximize; this, not the pre-restore
-    /// read, is what gets written back (#274), so `WS_MAXIMIZE` is not re-added.
-    ReadPostRestoreStyle,
-    /// Read style, extended style and region of a window that was not maximized.
-    ReadLive,
-    SetStyle,
-    /// Backstop record of the live read once the style change succeeded, for
-    /// a window not recorded at its un-maximize. A no-op if already recorded.
-    RecordLive,
-    SetExStyle,
-    SetRegion,
-    DisableCorners,
-}
-
 /// What one apply request does to a window.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ApplyPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyDecision {
+    Apply,
+    /// The window already has the stripped style and the Zone rect: no style
+    /// or position call is made (the same check the drift path uses).
+    SkipInPlace,
     /// The window's thread is not responding: no call is made.
-    Hung,
-    /// The steps to run in order, stopping at the first failure.
-    Steps(Vec<ApplyStep>),
+    SkipHung,
 }
 
-/// Pure plan for one apply request from the observed facts. A hung window wins
-/// over everything else, since even reading it back would be pointless. A
-/// window already in place (not `drifted`) only gets the corner preference,
-/// before any un-maximize (#272): a game that re-maximizes itself keeps
-/// `WS_MAXIMIZE` while sitting exactly in the Zone.
-pub(crate) fn plan_apply(hung: bool, drifted: bool, maximized: bool) -> ApplyPlan {
-    use ApplyStep::*;
+/// Pure decision for one apply request. A hung window wins over everything
+/// else, since even reading it back would be pointless.
+pub(crate) fn decide_apply(hung: bool, drifted: bool) -> ApplyDecision {
     if hung {
-        return ApplyPlan::Hung;
-    }
-    if !drifted {
-        return ApplyPlan::Steps(vec![DisableCorners]);
-    }
-    let mut steps = if maximized {
-        vec![
-            ReadPreRestore,
-            Unmaximize,
-            RecordPreRestoreIfUnmaximized,
-            ReadPostRestoreStyle,
-        ]
+        ApplyDecision::SkipHung
+    } else if drifted {
+        ApplyDecision::Apply
     } else {
-        vec![ReadLive]
-    };
-    steps.extend([SetStyle, RecordLive, SetExStyle, SetRegion, DisableCorners]);
-    ApplyPlan::Steps(steps)
-}
-
-/// A window's style, extended style and region, as read at one point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Snapshot {
-    pub(crate) style: u32,
-    pub(crate) ex_style: u32,
-    pub(crate) region: Region,
-}
-
-/// Which read a [`Snapshot`] comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Source {
-    /// A maximized window: its normal rect, not the maximized one.
-    PreRestore,
-    /// The window as it is now.
-    Live,
-}
-
-/// The Win32 primitives [`run_steps`] calls. `run_steps` owns the values
-/// flowing between steps, so an implementation holds no state of its own.
-pub(crate) trait ApplyOps {
-    fn read(&self, source: Source) -> Result<Snapshot, Win32Error>;
-    fn read_style(&self) -> Result<u32, Win32Error>;
-    /// Un-maximizes; whether the window is no longer maximized afterwards.
-    fn unmaximize(&self) -> bool;
-    fn record(&self, snapshot: Snapshot);
-    fn set_style(&self, style: u32) -> Result<(), Win32Error>;
-    fn set_ex_style(&self, ex_style: u32) -> Result<(), Win32Error>;
-    fn set_region(&self) -> Result<(), Win32Error>;
-    fn disable_corners(&self) -> Result<(), Win32Error>;
-}
-
-/// Executes `steps` in order and stops at the first failing step. A plan that
-/// uses a value before the step producing it is an error, not a panic.
-pub(crate) fn run_steps(ops: &impl ApplyOps, steps: &[ApplyStep]) -> Result<(), Win32Error> {
-    let out_of_order = || Win32Error::Os(std::io::Error::other("apply steps out of order"));
-    let mut pre: Option<Snapshot> = None;
-    let mut live: Option<Snapshot> = None;
-    let mut unmaximized = false;
-    for step in steps {
-        match step {
-            ApplyStep::ReadPreRestore => {
-                pre = Some(ops.read(Source::PreRestore)?);
-                live = pre;
-            }
-            ApplyStep::Unmaximize => unmaximized = ops.unmaximize(),
-            ApplyStep::RecordPreRestoreIfUnmaximized => {
-                if unmaximized {
-                    ops.record(pre.ok_or_else(out_of_order)?);
-                }
-            }
-            ApplyStep::ReadPostRestoreStyle => {
-                // Re-read rather than clear the bit by hand, so a restore that
-                // did not take effect keeps its real state.
-                let style = ops.read_style()?;
-                live = Some(Snapshot {
-                    style,
-                    ..pre.ok_or_else(out_of_order)?
-                });
-            }
-            ApplyStep::ReadLive => live = Some(ops.read(Source::Live)?),
-            ApplyStep::SetStyle => {
-                ops.set_style(borderless_style(live.ok_or_else(out_of_order)?.style))?
-            }
-            ApplyStep::RecordLive => ops.record(live.ok_or_else(out_of_order)?),
-            ApplyStep::SetExStyle => ops.set_ex_style(strip_border_ex_style(
-                live.ok_or_else(out_of_order)?.ex_style,
-            ))?,
-            ApplyStep::SetRegion => ops.set_region()?,
-            ApplyStep::DisableCorners => ops.disable_corners()?,
-        }
+        ApplyDecision::SkipInPlace
     }
-    Ok(())
+}
+
+/// The Win32 primitives [`apply_with`] calls, so its order of calls can be
+/// tested against a fake.
+trait ApplyOps {
+    fn is_maximized(&mut self) -> bool;
+    /// The normal rect of a maximized window.
+    fn restorable_region(&mut self) -> Result<Region, Win32Error>;
+    fn region(&mut self) -> Result<Region, Win32Error>;
+    fn style(&mut self) -> Result<u32, Win32Error>;
+    fn ex_style(&mut self) -> Result<u32, Win32Error>;
+    fn unmaximize(&mut self);
+    /// Records the state unless the window already has one.
+    fn record(&mut self, state: RestoreState);
+    fn set_style(&mut self, style: u32) -> Result<(), Win32Error>;
+    fn set_ex_style(&mut self, ex_style: u32) -> Result<(), Win32Error>;
+    fn set_region(&mut self) -> Result<(), Win32Error>;
+    fn disable_corners(&mut self) -> Result<(), Win32Error>;
 }
 
 /// [`ApplyOps`] on a real window.
@@ -156,57 +59,86 @@ struct WindowOps {
 }
 
 impl ApplyOps for WindowOps {
-    fn read(&self, source: Source) -> Result<Snapshot, Win32Error> {
-        Ok(match source {
-            Source::PreRestore => {
-                let region = get_restorable_region(self.hwnd, true)?;
-                Snapshot {
-                    region,
-                    style: get_window_style(self.hwnd)?,
-                    ex_style: get_window_ex_style(self.hwnd)?,
-                }
-            }
-            Source::Live => Snapshot {
-                style: get_window_style(self.hwnd)?,
-                ex_style: get_window_ex_style(self.hwnd)?,
-                region: get_window_region(self.hwnd)?,
-            },
-        })
+    fn is_maximized(&mut self) -> bool {
+        is_maximized(self.hwnd)
     }
-
-    fn read_style(&self) -> Result<u32, Win32Error> {
+    fn restorable_region(&mut self) -> Result<Region, Win32Error> {
+        get_restorable_region(self.hwnd, true)
+    }
+    fn region(&mut self) -> Result<Region, Win32Error> {
+        get_window_region(self.hwnd)
+    }
+    fn style(&mut self) -> Result<u32, Win32Error> {
         get_window_style(self.hwnd)
     }
-
-    fn unmaximize(&self) -> bool {
+    fn ex_style(&mut self) -> Result<u32, Win32Error> {
+        get_window_ex_style(self.hwnd)
+    }
+    fn unmaximize(&mut self) {
         restore_maximized_window(self.hwnd);
-        !is_maximized(self.hwnd)
     }
-
-    fn record(&self, s: Snapshot) {
-        with_placed(|p| {
-            p.restore.record_if_absent(
-                self.hwnd as isize,
-                RestoreState::new(s.style, s.ex_style, s.region),
-            );
-        });
+    fn record(&mut self, state: RestoreState) {
+        with_placed(|p| p.restore.record_if_absent(self.hwnd as isize, state));
     }
-
-    fn set_style(&self, style: u32) -> Result<(), Win32Error> {
+    fn set_style(&mut self, style: u32) -> Result<(), Win32Error> {
         set_window_style(self.hwnd, style)
     }
-
-    fn set_ex_style(&self, ex_style: u32) -> Result<(), Win32Error> {
+    fn set_ex_style(&mut self, ex_style: u32) -> Result<(), Win32Error> {
         set_window_ex_style(self.hwnd, ex_style)
     }
-
-    fn set_region(&self) -> Result<(), Win32Error> {
+    fn set_region(&mut self) -> Result<(), Win32Error> {
         set_window_region(self.hwnd, self.target_region)
     }
-
-    fn disable_corners(&self) -> Result<(), Win32Error> {
+    fn disable_corners(&mut self) -> Result<(), Win32Error> {
         disable_rounded_corners(self.hwnd)
     }
+}
+
+/// The ordered body of [`apply_borderless_to_window`], given the observed
+/// `hung` and `drifted` facts.
+fn apply_with(ops: &mut impl ApplyOps, hung: bool, drifted: bool) -> Result<(), Win32Error> {
+    match decide_apply(hung, drifted) {
+        ApplyDecision::SkipHung => return Err(Win32Error::WindowHung),
+        // Already stripped and in place: no style or position call (every
+        // foreground switch lands here). The corner preference is only a DWM
+        // attribute write that does not wait on the game's thread, and a
+        // window first seen already in place still needs it.
+        ApplyDecision::SkipInPlace => return ops.disable_corners(),
+        ApplyDecision::Apply => {}
+    }
+    // A maximized window is un-maximized first (synchronously, behind the hung
+    // check) so the Zone rect is not overridden by the maximized state. Its
+    // normal rect and both styles are read before the restore, so a failed
+    // read aborts before the window is touched.
+    let (live_style, live_ex_style, live_region) = if ops.is_maximized() {
+        let region = ops.restorable_region()?;
+        let style = ops.style()?;
+        let ex_style = ops.ex_style()?;
+        ops.unmaximize();
+        // The un-maximize is the first mutation: record the original now, so a
+        // later failure cannot strand the window un-maximized with no way back.
+        // Only when it really took effect, so a window GameFrame cannot change
+        // (e.g. elevated) gets no entry.
+        if !ops.is_maximized() {
+            ops.record(RestoreState::new(style, ex_style, region));
+        }
+        // Write back the style as it is after the restore, so a window
+        // GameFrame un-maximized is not re-flagged `WS_MAXIMIZE` (#274).
+        // Re-read rather than clear the bit by hand, so a restore that did not
+        // take effect keeps its real state.
+        (ops.style()?, ex_style, region)
+    } else {
+        (ops.style()?, ops.ex_style()?, ops.region()?)
+    };
+    ops.set_style(borderless_style(live_style))?;
+    // Recorded once the style change succeeded (a no-op for a maximized
+    // window, already recorded at its un-maximize), so a window GameFrame
+    // could not change (e.g. an elevated game) never gets a restore entry; the
+    // remaining calls below can still fail with the original already safe.
+    ops.record(RestoreState::new(live_style, live_ex_style, live_region));
+    ops.set_ex_style(strip_border_ex_style(live_ex_style))?;
+    ops.set_region()?;
+    ops.disable_corners()
 }
 
 /// Strips a window's border and moves/resizes it to `target_region`: the one
@@ -242,22 +174,19 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
     }
 
     let hung = is_window_hung_logged(hwnd);
-    // The in-place decision comes first: un-maximizing a game that re-maximizes
-    // itself on every focus switch would snap it to its normal rect and back,
-    // making the game resize its swapchain twice. A hung window is not probed.
+    // The in-place decision comes first: a game that re-maximizes itself keeps
+    // `WS_MAXIMIZE` (not drift) while sitting exactly in the Zone, and
+    // un-maximizing it on every focus switch would snap it to its normal rect
+    // and back, making the game resize its swapchain twice (#272).
     let drifted = !hung && window_has_drifted(hwnd, target_region).unwrap_or(true);
-    // Only a window that will be applied is probed for its maximized state.
-    let maximized = !hung && drifted && is_maximized(hwnd);
-    match plan_apply(hung, drifted, maximized) {
-        ApplyPlan::Hung => Err(Win32Error::WindowHung),
-        ApplyPlan::Steps(steps) => run_steps(
-            &WindowOps {
-                hwnd,
-                target_region,
-            },
-            &steps,
-        ),
-    }
+    apply_with(
+        &mut WindowOps {
+            hwnd,
+            target_region,
+        },
+        hung,
+        drifted,
+    )
 }
 
 /// Restores `hwnd` to exactly the style/region remembered from its first strip
@@ -299,216 +228,200 @@ pub fn restore_window(hwnd: HWND) -> Result<(), Win32Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use windows_sys::Win32::UI::WindowsAndMessaging::WS_MAXIMIZE;
 
-    use ApplyStep::*;
-
-    fn steps(hung: bool, drifted: bool, maximized: bool) -> Vec<ApplyStep> {
-        match plan_apply(hung, drifted, maximized) {
-            ApplyPlan::Steps(s) => s,
-            ApplyPlan::Hung => panic!("expected steps"),
-        }
-    }
-
-    #[test]
-    fn a_hung_window_gets_no_steps_whatever_its_state() {
-        for drifted in [false, true] {
-            for maximized in [false, true] {
-                assert_eq!(plan_apply(true, drifted, maximized), ApplyPlan::Hung);
-            }
-        }
-    }
-
-    // #272: no un-maximize (or any read/write) for a window already in place.
-    #[test]
-    fn a_window_in_place_only_gets_the_corner_preference() {
-        assert_eq!(steps(false, false, false), vec![DisableCorners]);
-        assert_eq!(steps(false, false, true), vec![DisableCorners]);
-    }
-
-    #[test]
-    fn a_drifted_window_that_is_not_maximized_is_read_then_stripped() {
-        assert_eq!(
-            steps(false, true, false),
-            vec![
-                ReadLive,
-                SetStyle,
-                RecordLive,
-                SetExStyle,
-                SetRegion,
-                DisableCorners
-            ]
-        );
-    }
-
-    // Pins both #282 (the early record right after the un-maximize, before
-    // every later fallible step) and #274 (the style written comes from the
-    // post-restore re-read).
-    #[test]
-    fn a_drifted_maximized_window_is_unmaximized_and_recorded_before_the_strip() {
-        assert_eq!(
-            steps(false, true, true),
-            vec![
-                ReadPreRestore,
-                Unmaximize,
-                RecordPreRestoreIfUnmaximized,
-                ReadPostRestoreStyle,
-                SetStyle,
-                RecordLive,
-                SetExStyle,
-                SetRegion,
-                DisableCorners
-            ]
-        );
-    }
-
-    const PRE: Snapshot = Snapshot {
-        style: WS_MAXIMIZE | 0x1,
-        ex_style: 0x10,
-        region: Region {
-            x: 1,
-            y: 2,
-            width: 3,
-            height: 4,
-        },
-    };
+    const PRE_STYLE: u32 = WS_MAXIMIZE | 0x1;
     const POST_STYLE: u32 = 0x2;
+    /// What RestoreState::new keeps of PRE_STYLE: it drops WS_MAXIMIZE.
+    const PRE_RECORDED: u32 = PRE_STYLE & !WS_MAXIMIZE;
+    const EX_STYLE: u32 = 0x10;
+    const NORMAL: Region = Region {
+        x: 1,
+        y: 2,
+        width: 3,
+        height: 4,
+    };
 
-    /// Records the calls it gets, with the values passed; fails the call named
-    /// in `fail_at`, and reports `unmaximized` from `unmaximize`. Reads return
-    /// [`PRE`], except `read_style`, which returns the distinct [`POST_STYLE`].
+    /// Logs every call; fails the call named in `fail_at`. A style read gives
+    /// `PRE_STYLE` until `unmaximize`, then `POST_STYLE`; the un-maximize takes
+    /// effect only if `takes_effect`.
     struct FakeOps {
-        calls: RefCell<Vec<String>>,
+        calls: Vec<String>,
         fail_at: Option<&'static str>,
-        unmaximized: bool,
+        only_once_restored: bool,
+        maximized: bool,
+        takes_effect: bool,
+        restored: bool,
     }
 
     impl FakeOps {
-        fn new(fail_at: Option<&'static str>, unmaximized: bool) -> Self {
+        fn new(maximized: bool) -> Self {
             FakeOps {
-                calls: RefCell::new(Vec::new()),
-                fail_at,
-                unmaximized,
+                calls: Vec::new(),
+                fail_at: None,
+                only_once_restored: false,
+                maximized,
+                takes_effect: true,
+                restored: false,
             }
         }
 
-        fn step(&self, name: &str, arg: String) -> Result<(), Win32Error> {
-            self.calls.borrow_mut().push(format!("{name}{arg}"));
-            if self.fail_at == Some(name) {
+        fn failing(mut self, call: &'static str) -> Self {
+            self.fail_at = Some(call);
+            self
+        }
+
+        /// Fails the call only after the un-maximize has run.
+        fn failing_once_restored(mut self, call: &'static str) -> Self {
+            self.fail_at = Some(call);
+            self.only_once_restored = true;
+            self
+        }
+
+        fn ineffective(mut self) -> Self {
+            self.takes_effect = false;
+            self
+        }
+
+        fn log(&mut self, name: &'static str, arg: String) -> Result<(), Win32Error> {
+            self.calls.push(format!("{name}{arg}"));
+            if self.fail_at == Some(name) && (!self.only_once_restored || self.restored) {
                 Err(Win32Error::WindowHung)
             } else {
                 Ok(())
             }
         }
-
-        fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
-        }
     }
 
     impl ApplyOps for FakeOps {
-        fn read(&self, source: Source) -> Result<Snapshot, Win32Error> {
-            self.step("read", String::new())?;
-            assert_eq!(source, Source::PreRestore);
-            Ok(PRE)
+        fn is_maximized(&mut self) -> bool {
+            self.calls.push("is_maximized".into());
+            self.maximized
         }
-
-        fn read_style(&self) -> Result<u32, Win32Error> {
-            self.step("read_style", String::new())?;
-            Ok(POST_STYLE)
+        fn restorable_region(&mut self) -> Result<Region, Win32Error> {
+            self.log("restorable_region", String::new())?;
+            Ok(NORMAL)
         }
-
-        fn unmaximize(&self) -> bool {
-            self.calls.borrow_mut().push("unmaximize".into());
-            self.unmaximized
+        fn region(&mut self) -> Result<Region, Win32Error> {
+            self.log("region", String::new())?;
+            Ok(NORMAL)
         }
-
-        fn record(&self, s: Snapshot) {
-            self.calls
-                .borrow_mut()
-                .push(format!("record({:#x})", s.style));
+        fn style(&mut self) -> Result<u32, Win32Error> {
+            self.log("style", String::new())?;
+            Ok(if self.restored { POST_STYLE } else { PRE_STYLE })
         }
-
-        fn set_style(&self, style: u32) -> Result<(), Win32Error> {
-            self.step("set_style", format!("({style:#x})"))
+        fn ex_style(&mut self) -> Result<u32, Win32Error> {
+            self.log("ex_style", String::new())?;
+            Ok(EX_STYLE)
         }
-
-        fn set_ex_style(&self, _: u32) -> Result<(), Win32Error> {
-            self.step("set_ex_style", String::new())
+        fn unmaximize(&mut self) {
+            self.calls.push("unmaximize".into());
+            self.restored = true;
+            self.maximized = !self.takes_effect;
         }
-
-        fn set_region(&self) -> Result<(), Win32Error> {
-            self.step("set_region", String::new())
+        fn record(&mut self, state: RestoreState) {
+            self.calls.push(format!("record({:#x})", state.style));
         }
-
-        fn disable_corners(&self) -> Result<(), Win32Error> {
-            self.step("disable_corners", String::new())
+        fn set_style(&mut self, style: u32) -> Result<(), Win32Error> {
+            self.log("set_style", format!("({style:#x})"))
+        }
+        fn set_ex_style(&mut self, _: u32) -> Result<(), Win32Error> {
+            self.log("set_ex_style", String::new())
+        }
+        fn set_region(&mut self) -> Result<(), Win32Error> {
+            self.log("set_region", String::new())
+        }
+        fn disable_corners(&mut self) -> Result<(), Win32Error> {
+            self.log("disable_corners", String::new())
         }
     }
 
-    fn run(ops: &FakeOps) -> Result<(), Win32Error> {
-        run_steps(ops, &steps(false, true, true))
+    fn apply(mut ops: FakeOps, hung: bool, drifted: bool) -> (Result<(), Win32Error>, Vec<String>) {
+        let result = apply_with(&mut ops, hung, drifted);
+        (result, ops.calls)
     }
 
-    // #282: a failure in the step right after the un-maximize leaves the
-    // pre-restore state recorded (the executor stops at that failure).
     #[test]
-    fn a_failure_after_the_unmaximize_leaves_the_original_recorded() {
-        let ops = FakeOps::new(Some("read_style"), true);
-        assert!(run(&ops).is_err());
+    fn a_hung_window_gets_no_call() {
+        let (result, calls) = apply(FakeOps::new(true), true, true);
+        assert!(matches!(result, Err(Win32Error::WindowHung)));
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    // #272: no un-maximize (or any read/write) for a window already in place.
+    #[test]
+    fn a_window_in_place_only_gets_the_corner_preference() {
+        let (result, calls) = apply(FakeOps::new(true), false, false);
+        assert!(result.is_ok());
+        assert_eq!(calls, ["disable_corners"]);
+    }
+
+    #[test]
+    fn a_drifted_window_that_is_not_maximized_is_read_then_stripped() {
+        let (result, calls) = apply(FakeOps::new(false), false, true);
+        assert!(result.is_ok());
         assert_eq!(
-            ops.calls(),
+            calls,
             [
-                "read".to_string(),
-                "unmaximize".into(),
-                format!("record({:#x})", PRE.style),
-                "read_style".into()
+                "is_maximized".to_string(),
+                "style".into(),
+                "ex_style".into(),
+                "region".into(),
+                format!("set_style({:#x})", borderless_style(PRE_STYLE)),
+                format!("record({PRE_RECORDED:#x})"),
+                "set_ex_style".into(),
+                "set_region".into(),
+                "disable_corners".into(),
             ]
         );
     }
 
+    // #282: a failure in the first fallible call after the un-maximize leaves
+    // the original recorded.
     #[test]
-    fn an_unmaximize_that_did_not_take_effect_records_nothing_early() {
-        let ops = FakeOps::new(None, false);
-        assert!(run(&ops).is_ok());
-        let calls = ops.calls();
-        let at = calls.iter().position(|c| c == "unmaximize").unwrap();
-        assert_eq!(calls[at + 1], "read_style", "no record right after");
-        assert!(calls.iter().any(|c| c.starts_with("record")), "backstop");
-    }
-
-    #[test]
-    fn a_failed_pre_restore_read_aborts_before_the_window_is_touched() {
-        let ops = FakeOps::new(Some("read"), true);
-        assert!(run(&ops).is_err());
-        assert_eq!(ops.calls(), ["read"]);
-    }
-
-    #[test]
-    fn the_executor_stops_at_the_first_failing_step() {
-        let ops = FakeOps::new(Some("set_style"), true);
-        assert!(run(&ops).is_err());
-        let calls = ops.calls();
-        assert!(calls.last().unwrap().starts_with("set_style"));
-        assert!(!calls.iter().any(|c| c == "set_ex_style"));
+    fn a_failure_after_the_unmaximize_leaves_the_original_recorded() {
+        let (result, calls) = apply(
+            FakeOps::new(true).failing_once_restored("style"),
+            false,
+            true,
+        );
+        assert!(result.is_err());
+        // The post-restore re-read is the failing call; nothing after it runs.
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [format!("record({PRE_RECORDED:#x})"), "style".to_string()]
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("set_")));
     }
 
     // #274: the style written after an un-maximize is the post-restore
     // re-read, not the pre-restore style (which still has WS_MAXIMIZE).
     #[test]
-    fn the_executor_writes_the_post_restore_style() {
-        let ops = FakeOps::new(None, true);
-        assert!(run(&ops).is_ok());
+    fn the_style_written_after_an_unmaximize_is_the_post_restore_one() {
+        let (result, calls) = apply(FakeOps::new(true), false, true);
+        assert!(result.is_ok());
         let written = format!("set_style({:#x})", borderless_style(POST_STYLE));
-        assert!(ops.calls().contains(&written), "{:?}", ops.calls());
+        assert!(calls.contains(&written), "{calls:?}");
+        // The early record is the pre-restore original.
+        assert!(calls.contains(&format!("record({PRE_RECORDED:#x})")));
     }
 
     #[test]
-    fn a_plan_that_strips_before_reading_is_an_error_not_a_panic() {
-        let ops = FakeOps::new(None, true);
-        assert!(run_steps(&ops, &[SetStyle]).is_err());
-        assert!(ops.calls().is_empty());
+    fn an_unmaximize_that_did_not_take_effect_records_nothing_early() {
+        let (result, calls) = apply(FakeOps::new(true).ineffective(), false, true);
+        assert!(result.is_ok());
+        let records: Vec<_> = calls.iter().filter(|c| c.starts_with("record")).collect();
+        // Only the backstop, right after set_style, holding the post-restore style.
+        assert_eq!(records, [&format!("record({POST_STYLE:#x})")]);
+        let rec = calls.iter().position(|c| c.starts_with("record")).unwrap();
+        assert!(calls[rec - 1].starts_with("set_style"));
+    }
+
+    #[test]
+    fn a_failed_pre_restore_read_aborts_before_the_window_is_touched() {
+        let (result, calls) = apply(FakeOps::new(true).failing("restorable_region"), false, true);
+        assert!(result.is_err());
+        assert!(!calls.iter().any(|c| c == "unmaximize"));
     }
 
     use std::cell::Cell;
