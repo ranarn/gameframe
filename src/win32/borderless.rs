@@ -101,7 +101,13 @@ pub fn apply_borderless_to_window(hwnd: HWND, target_region: Region) -> Result<(
                     .record_if_absent(hwnd as isize, RestoreState::new(style, ex_style, region));
             });
         }
-        Some((style, ex_style, region))
+        // The style to write back is the one after the restore: the pre-restore
+        // read still carries `WS_MAXIMIZE`, and writing it would re-flag the
+        // un-maximized window as maximized (#274). Re-read rather than clear
+        // the bit by hand, so a restore that did not take effect keeps its
+        // real state. The recorded original above stays the pre-restore read.
+        let style_now = get_window_style(hwnd)?;
+        Some((style_now, ex_style, region))
     } else {
         None
     };
@@ -310,6 +316,23 @@ mod tests {
         assert_eq!(
             moves, 0,
             "an in-place window must not be moved or un-maximized"
+        );
+    }
+
+    // Regression (#274): the style read before the un-maximize carried
+    // `WS_MAXIMIZE`, and writing it back re-flagged the placed window as
+    // maximized.
+    #[test]
+    fn apply_does_not_leave_ws_maximize_on_a_window_it_unmaximized() {
+        let w = TestWindow::maximized("GameFrameTestMaximizeBitCleared", None);
+        assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
+
+        let result = apply_borderless_to_window(w.hwnd, ZONE);
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert!(
+            !is_maximized(w.hwnd),
+            "a placed window must not carry WS_MAXIMIZE"
         );
     }
 
