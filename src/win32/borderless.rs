@@ -210,8 +210,43 @@ mod tests {
         unsafe { DefWindowProcW(h, m, w, l) }
     }
 
+    /// Whether this process runs on an interactive (visible) window station.
+    /// Real top-level windows only behave as the tests expect there; a service
+    /// or other non-interactive window station gets `false`. A failed query
+    /// counts as not interactive. `windows-latest` CI has an interactive
+    /// desktop, so the real-window tests run there.
+    fn has_interactive_desktop() -> bool {
+        use windows_sys::Win32::System::StationsAndDesktops::{
+            GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::WSF_VISIBLE;
+        // Safety: the station handle is owned by the process (not closed); the
+        // buffer is a USEROBJECTFLAGS and its size is passed.
+        unsafe {
+            let station = GetProcessWindowStation();
+            if station.is_null() {
+                return false;
+            }
+            let mut flags = USEROBJECTFLAGS::default();
+            let mut needed = 0u32;
+            let ok = GetUserObjectInformationW(
+                station,
+                UOI_FLAGS,
+                (&mut flags as *mut USEROBJECTFLAGS).cast(),
+                std::mem::size_of::<USEROBJECTFLAGS>() as u32,
+                &mut needed,
+            );
+            ok != 0 && flags.dwFlags & WSF_VISIBLE as u32 != 0
+        }
+    }
+
     /// A real popup window, destroyed and its class unregistered on drop so a
     /// failed assertion in a test cannot leak either.
+    ///
+    /// These tests create, show and maximize real top-level windows, so they
+    /// need an interactive desktop (CI provides one on `windows-latest`). The
+    /// constructors return `None`, after printing why, when there is none;
+    /// tests then return early: `let Some(w) = ... else { return };`.
     struct TestWindow {
         hwnd: HWND,
         class: Vec<u16>,
@@ -233,16 +268,23 @@ mod tests {
 
     impl TestWindow {
         /// A borderless popup flagged `WS_MAXIMIZE`, moved to `placed` if given.
-        fn maximized(class_name: &str, placed: Option<Region>) -> Self {
+        fn maximized(class_name: &str, placed: Option<Region>) -> Option<Self> {
             Self::create(class_name, placed, Frame::Borderless)
         }
 
         /// A maximized window that keeps its normal border (caption and frame).
-        fn bordered_maximized(class_name: &str) -> Self {
+        fn bordered_maximized(class_name: &str) -> Option<Self> {
             Self::create(class_name, None, Frame::Bordered)
         }
 
-        fn create(class_name: &str, placed: Option<Region>, frame: Frame) -> Self {
+        /// `None` (with one line on stderr) when there is no interactive desktop.
+        fn create(class_name: &str, placed: Option<Region>, frame: Frame) -> Option<Self> {
+            if !has_interactive_desktop() {
+                eprintln!(
+                    "skipping {class_name}: no interactive desktop (window station not visible)"
+                );
+                return None;
+            }
             use windows_sys::Win32::UI::WindowsAndMessaging::{
                 CreateWindowExW, RegisterClassW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
                 SetWindowPos, ShowWindow, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
@@ -295,7 +337,7 @@ mod tests {
                 let style = get_window_style(hwnd).unwrap();
                 set_window_style(hwnd, borderless_style(style)).unwrap();
             }
-            window
+            Some(window)
         }
     }
 
@@ -329,7 +371,9 @@ mod tests {
     // messages, which the un-maximize delivers synchronously.
     #[test]
     fn apply_leaves_a_maximized_window_already_in_the_zone_untouched() {
-        let w = TestWindow::maximized("GameFrameTestMaximizedInZone", Some(ZONE));
+        let Some(w) = TestWindow::maximized("GameFrameTestMaximizedInZone", Some(ZONE)) else {
+            return;
+        };
         assert!(
             is_maximized(w.hwnd),
             "precondition: still flagged maximized"
@@ -356,7 +400,9 @@ mod tests {
     // maximized.
     #[test]
     fn apply_does_not_leave_ws_maximize_on_a_window_it_unmaximized() {
-        let w = TestWindow::maximized("GameFrameTestMaximizeBitCleared", None);
+        let Some(w) = TestWindow::maximized("GameFrameTestMaximizeBitCleared", None) else {
+            return;
+        };
         assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
 
         let result = apply_borderless_to_window(w.hwnd, ZONE);
@@ -372,7 +418,9 @@ mod tests {
     // placed; the in-place shortcut must not swallow it.
     #[test]
     fn apply_unmaximizes_and_places_a_maximized_window_outside_the_zone() {
-        let w = TestWindow::maximized("GameFrameTestMaximizedOutsideZone", None);
+        let Some(w) = TestWindow::maximized("GameFrameTestMaximizedOutsideZone", None) else {
+            return;
+        };
         assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
         assert_ne!(
             get_window_region(w.hwnd).unwrap(),
@@ -396,7 +444,9 @@ mod tests {
     #[test]
     fn apply_records_the_pre_apply_state_of_a_window_it_unmaximizes() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_THICKFRAME};
-        let w = TestWindow::bordered_maximized("GameFrameTestRecordsOriginal");
+        let Some(w) = TestWindow::bordered_maximized("GameFrameTestRecordsOriginal") else {
+            return;
+        };
         assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
         let original_style = get_window_style(w.hwnd).unwrap() & !WS_MAXIMIZE;
         let original_ex_style = get_window_ex_style(w.hwnd).unwrap();
