@@ -392,9 +392,7 @@ mod tests {
     // The record apply keeps for a window it un-maximizes must hold the
     // original bordered style (without `WS_MAXIMIZE`), the original extended
     // style and the normal rect: not the stripped borderless style, the
-    // maximized rect or the Zone. The pre- vs post-restore style needs no guard
-    // of its own: `RestoreState::new` strips `WS_MAXIMIZE`, the only bit they
-    // differ in.
+    // maximized rect or the Zone.
     #[test]
     fn apply_records_the_pre_apply_state_of_a_window_it_unmaximizes() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_THICKFRAME};
