@@ -243,10 +243,11 @@ fn merge_cursor_enabled(seen: bool, edited: bool, on_disk: bool) -> bool {
 /// A game in `opened` but missing from `edited` was removed by the user in
 /// Settings and stays removed; a game already in `edited` is never duplicated.
 ///
-/// Known limits: a game removed in Settings and then re-tracked through the
-/// tray while Settings is open is dropped again on Save (it is in `opened`, so
-/// it counts as removed), and per-game edits made on disk to a game already in
-/// `opened` lose to Settings' copy.
+/// Known limits: per-game edits made on disk to a game already in `opened`
+/// lose to Settings' copy, and a game removed in Settings counts as removed
+/// even if it is re-tracked on disk, unless [`adopt_games_added_on_disk`]
+/// re-adds it first (it does so for a pick, and for an unreadable pick when the
+/// on-disk entry changed since the baseline).
 ///
 /// Pure -- compares executable paths only.
 fn merge_tracked_games(
@@ -273,6 +274,14 @@ fn merge_tracked_games(
 /// `baseline_games` (the baseline's tracked games): it is on disk already, so a
 /// later Apply writes nothing for it and Close leaves it alone, and neither
 /// duplicates nor drops it.
+///
+/// An empty `picked` means the tray could not read the picked window's
+/// executable (`TrackedGamesChanged { picked: None }`), so which game was
+/// re-tracked is unknown: any removed game whose on-disk entry differs from the
+/// baseline's is taken to be that one and re-added the same way. Known
+/// trade-off: an unrelated on-disk change to a removed game (an external config
+/// edit) resurrects it too, and a re-track that leaves the entry identical to the
+/// baseline is not detected.
 pub(super) fn adopt_games_added_on_disk(
     baseline_games: &mut Vec<TrackedGame>,
     visible: &mut Vec<TrackedGame>,
@@ -282,6 +291,18 @@ pub(super) fn adopt_games_added_on_disk(
     let shown = visible.len();
     *visible = merge_tracked_games(baseline_games, std::mem::take(visible), on_disk);
     baseline_games.extend(visible[shown..].iter().cloned());
+
+    let changed_since_baseline: Vec<PathBuf>;
+    let picked = if picked.is_empty() {
+        changed_since_baseline = baseline_games
+            .iter()
+            .filter(|b| on_disk.iter().any(|d| d.exe_path == b.exe_path && d != *b))
+            .map(|b| b.exe_path.clone())
+            .collect();
+        &changed_since_baseline[..]
+    } else {
+        picked
+    };
 
     for exe in picked {
         if visible.iter().any(|g| &g.exe_path == exe) {
@@ -488,6 +509,22 @@ mod tests {
         );
 
         assert_eq!(visible, vec![game("a.exe"), game("b.exe")]);
+        assert_eq!(baseline, on_disk);
+        let merged = merge_tracked_games(&baseline, visible, &on_disk);
+        assert_eq!(merged, on_disk);
+    }
+
+    #[test]
+    fn an_unreadable_pick_re_adds_a_removed_game_retracked_on_disk_and_apply_keeps_it() {
+        let mut baseline = vec![game("a.exe"), game("b.exe")];
+        let mut visible = vec![game("a.exe")];
+        let mut retracked_b = game("b.exe");
+        retracked_b.auto_apply = !retracked_b.auto_apply;
+        let on_disk = vec![game("a.exe"), retracked_b];
+
+        adopt_games_added_on_disk(&mut baseline, &mut visible, &on_disk, &[]);
+
+        assert_eq!(visible, on_disk);
         assert_eq!(baseline, on_disk);
         let merged = merge_tracked_games(&baseline, visible, &on_disk);
         assert_eq!(merged, on_disk);
