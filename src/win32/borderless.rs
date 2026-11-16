@@ -176,6 +176,7 @@ pub fn restore_window(hwnd: HWND) -> Result<(), Win32Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WS_MAXIMIZE;
 
     #[test]
     fn apply_is_skipped_for_a_window_already_in_place() {
@@ -216,12 +217,39 @@ mod tests {
         class: Vec<u16>,
     }
 
+    /// Where `TestWindow` is created, before it is maximized: its normal rect.
+    const CREATED: Region = Region {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Frame {
+        Borderless,
+        Bordered,
+    }
+
     impl TestWindow {
         /// A borderless popup flagged `WS_MAXIMIZE`, moved to `placed` if given.
         fn maximized(class_name: &str, placed: Option<Region>) -> Self {
+            Self::create(class_name, placed, Frame::Borderless)
+        }
+
+        /// A maximized window that keeps its normal border (caption and frame).
+        fn bordered_maximized(class_name: &str) -> Self {
+            Self::create(class_name, None, Frame::Bordered)
+        }
+
+        fn create(class_name: &str, placed: Option<Region>, frame: Frame) -> Self {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
                 CreateWindowExW, RegisterClassW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
-                SetWindowPos, ShowWindow, WNDCLASSW, WS_POPUP, WS_VISIBLE,
+                SetWindowPos, ShowWindow, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+            };
+            let base = match frame {
+                Frame::Bordered => WS_OVERLAPPEDWINDOW,
+                Frame::Borderless => WS_POPUP,
             };
             let class: Vec<u16> = format!("{class_name}\0").encode_utf16().collect();
             // Safety: all-zero is a valid WNDCLASSW; the fields set are valid.
@@ -234,11 +262,11 @@ mod tests {
                     0,
                     class.as_ptr(),
                     class.as_ptr(),
-                    WS_POPUP | WS_VISIBLE,
-                    100,
-                    100,
-                    400,
-                    300,
+                    base | WS_VISIBLE,
+                    CREATED.x,
+                    CREATED.y,
+                    CREATED.width,
+                    CREATED.height,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -263,8 +291,10 @@ mod tests {
                     );
                 }
             }
-            let style = get_window_style(hwnd).unwrap();
-            set_window_style(hwnd, borderless_style(style)).unwrap();
+            if frame == Frame::Borderless {
+                let style = get_window_style(hwnd).unwrap();
+                set_window_style(hwnd, borderless_style(style)).unwrap();
+            }
             window
         }
     }
@@ -272,7 +302,9 @@ mod tests {
     impl Drop for TestWindow {
         fn drop(&mut self) {
             use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, UnregisterClassW};
-            // Safety: the window and class created in `maximized`.
+            // The store entry apply may have recorded, so a test never leaks it.
+            super::super::forget_window(self.hwnd);
+            // Safety: the window and class created in `create`.
             unsafe {
                 if !self.hwnd.is_null() {
                     DestroyWindow(self.hwnd);
@@ -355,6 +387,36 @@ mod tests {
         assert!(result.is_ok(), "apply failed: {result:?}");
         assert!(moves > 0, "the window must receive the move messages");
         assert_eq!(get_window_region(w.hwnd).unwrap(), ZONE);
+    }
+
+    // The record apply keeps for a window it un-maximizes must hold the
+    // original bordered style (without `WS_MAXIMIZE`), the original extended
+    // style and the normal rect: not the stripped borderless style, the
+    // maximized rect or the Zone. The pre- vs post-restore style needs no guard
+    // of its own: `RestoreState::new` strips `WS_MAXIMIZE`, the only bit they
+    // differ in.
+    #[test]
+    fn apply_records_the_pre_apply_state_of_a_window_it_unmaximizes() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_THICKFRAME};
+        let w = TestWindow::bordered_maximized("GameFrameTestRecordsOriginal");
+        assert!(is_maximized(w.hwnd), "precondition: flagged maximized");
+        let original_style = get_window_style(w.hwnd).unwrap() & !WS_MAXIMIZE;
+        let original_ex_style = get_window_ex_style(w.hwnd).unwrap();
+        assert_eq!(
+            original_style & (WS_CAPTION | WS_THICKFRAME),
+            WS_CAPTION | WS_THICKFRAME,
+            "precondition: bordered"
+        );
+        assert_ne!(CREATED, ZONE, "precondition: normal rect is not the Zone");
+
+        let result = apply_borderless_to_window(w.hwnd, ZONE);
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        let recorded = with_placed(|p| p.restore.get(w.hwnd as isize))
+            .expect("apply must record a restore state");
+        assert_eq!(recorded.style, original_style);
+        assert_eq!(recorded.ex_style, original_ex_style);
+        assert_eq!(recorded.region, CREATED);
     }
 
     #[test]

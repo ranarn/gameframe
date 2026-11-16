@@ -52,7 +52,7 @@ impl RestoreStore {
         }
     }
 
-    fn get(&self, window: isize) -> Option<RestoreState> {
+    pub(super) fn get(&self, window: isize) -> Option<RestoreState> {
         self.states.get(&window).copied()
     }
 
