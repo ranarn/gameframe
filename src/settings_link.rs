@@ -272,6 +272,20 @@ struct Inbox {
 }
 
 impl Inbox {
+    /// An empty inbox reading from `rx`.
+    fn new(rx: Receiver<ParentMsg>) -> Self {
+        Self {
+            rx,
+            cursor_enabled: None,
+            init: None,
+            install: Vec::new(),
+            pending_install: None,
+            last_context: None,
+            tracked_games_changed: None,
+            hotkey_reports: None,
+        }
+    }
+
     /// Files a message that nobody is waiting for specifically.
     fn file(&mut self, msg: ParentMsg) {
         match msg {
@@ -357,16 +371,7 @@ impl ChildLink {
         }
         Self {
             out: Mutex::new(Box::new(writer)),
-            inbox: Mutex::new(Inbox {
-                rx,
-                cursor_enabled: None,
-                init: None,
-                install: Vec::new(),
-                pending_install: None,
-                last_context: None,
-                tracked_games_changed: None,
-                hotkey_reports: None,
-            }),
+            inbox: Mutex::new(Inbox::new(rx)),
             next_request: AtomicU64::new(1),
         }
     }
@@ -704,16 +709,7 @@ mod tests {
     #[test]
     fn a_newer_hotkey_report_replaces_one_not_taken_yet() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut inbox = Inbox {
-            rx,
-            cursor_enabled: None,
-            init: None,
-            install: Vec::new(),
-            pending_install: None,
-            last_context: None,
-            tracked_games_changed: None,
-            hotkey_reports: None,
-        };
+        let mut inbox = Inbox::new(rx);
         inbox.file(ParentMsg::HotkeyReports(vec![BindingReport {
             action: HotkeyAction::ToggleBorderless,
             binding: "Ctrl+F9".to_string(),
@@ -743,16 +739,7 @@ mod tests {
     #[test]
     fn a_change_without_a_readable_exe_still_asks_for_a_reload() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut inbox = Inbox {
-            rx,
-            cursor_enabled: None,
-            init: None,
-            install: Vec::new(),
-            pending_install: None,
-            last_context: None,
-            tracked_games_changed: None,
-            hotkey_reports: None,
-        };
+        let mut inbox = Inbox::new(rx);
         inbox.file(ParentMsg::TrackedGamesChanged { picked: None });
         assert_eq!(inbox.tracked_games_changed, Some(Vec::new()));
     }
