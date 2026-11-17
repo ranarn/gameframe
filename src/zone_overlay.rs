@@ -288,8 +288,7 @@ fn commit_choice(
     if session.is_hidden() != requested {
         toggle(session);
     } else {
-        // Already in the requested state (e.g. a failed open-time hide, then
-        // OFF): no toggle will rewrite the error, so drop the stale one.
+        // No toggle will rewrite the error, so drop the stale one.
         session.clear_error();
     }
     if session.is_hidden() == requested {
@@ -1164,6 +1163,7 @@ mod editor_ui_tests {
             s.toggle_with(|| Err("x"), |_| Err("boom"));
         });
         assert!(cell.get());
+        assert!(s.error().is_some());
 
         // Success writes the click back.
         let mut s = TaskbarSession::new(false);
