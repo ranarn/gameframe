@@ -287,12 +287,26 @@ fn commit_choice(
     }
     if session.is_hidden() != requested {
         toggle(session);
+    } else {
+        // No toggle will rewrite the error, so drop the stale one.
+        session.clear_error();
     }
     if session.is_hidden() == requested {
         requested
     } else {
         current
     }
+}
+
+/// What `ZoneOverlay::set_choice` does: `commit_choice` with the stored choice
+/// as `current` and the click as `requested`, written back to `hide_choice`.
+fn apply_choice(
+    session: &mut TaskbarSession,
+    hide_choice: &Cell<bool>,
+    requested: bool,
+    toggle: impl FnOnce(&mut TaskbarSession),
+) {
+    hide_choice.set(commit_choice(session, hide_choice.get(), requested, toggle));
 }
 
 /// `zone` (screen pixels) relative to the overlay's top-left corner `origin`,
@@ -508,11 +522,12 @@ impl OverlayApp<'_> {
     /// reached it. A failure keeps the previous choice and the session's
     /// error shown.
     fn set_choice(&self, choice: bool) {
-        let mut taskbar = self.taskbar.borrow_mut();
-        let committed = commit_choice(&mut taskbar, self.hide_choice.get(), choice, |s| {
-            s.toggle(self.taskbar_mode);
-        });
-        self.hide_choice.set(committed);
+        apply_choice(
+            &mut self.taskbar.borrow_mut(),
+            &self.hide_choice,
+            choice,
+            |s| s.toggle(self.taskbar_mode),
+        );
     }
 
     /// Keeps the overlay covering the full monitor (toggle ON) or the work
@@ -1118,6 +1133,48 @@ mod editor_ui_tests {
         assert!(!s.is_hidden());
         assert!(s.error().is_some());
         assert!(!overlay_hides_taskbar(&s, choice));
+    }
+
+    #[test]
+    fn committing_off_after_a_failed_open_time_hide_clears_the_stale_error() {
+        let mut s = TaskbarSession::new(false);
+        s.toggle_with(|| Err("boom"), |_| Ok(()));
+        assert!(s.error().is_some());
+        let choice = commit_choice(&mut s, true, false, |_| panic!("must not toggle"));
+        assert!(!choice);
+        assert_eq!(s.error(), None);
+    }
+
+    #[test]
+    fn apply_choice_passes_stored_choice_as_current_and_click_as_requested() {
+        // Failed hide: choice must fall back to the stored `false`, not the click.
+        let mut s = TaskbarSession::new(false);
+        let cell = Cell::new(false);
+        apply_choice(&mut s, &cell, true, |s| {
+            s.toggle_with(|| Err("boom"), |_| Ok(()));
+        });
+        assert!(!cell.get());
+        assert!(s.error().is_some());
+
+        // Failed show: choice must fall back to the stored `true`.
+        let mut s = hidden_session();
+        let cell = Cell::new(true);
+        apply_choice(&mut s, &cell, false, |s| {
+            s.toggle_with(|| Err("x"), |_| Err("boom"));
+        });
+        assert!(cell.get());
+        assert!(s.error().is_some());
+
+        // Success writes the click back.
+        let mut s = TaskbarSession::new(false);
+        let cell = Cell::new(false);
+        apply_choice(&mut s, &cell, true, |s| {
+            s.toggle_with::<String>(
+                || Ok(crate::win32::TaskbarHideRestore::FullyHidden),
+                |_| Ok(()),
+            );
+        });
+        assert!(cell.get());
     }
 
     #[test]

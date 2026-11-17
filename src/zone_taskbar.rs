@@ -72,6 +72,12 @@ impl TaskbarSession {
         self.error.as_deref()
     }
 
+    /// Drops the last toggle failure: it no longer describes the session once
+    /// a choice is committed without a toggle.
+    pub(crate) fn clear_error(&mut self) {
+        self.error = None;
+    }
+
     /// Performs the toggle with the given OS actions: shows the taskbar with
     /// the captured restore when the session hid it, else hides it. Does
     /// nothing when locked. A failure leaves the state unchanged and is kept
