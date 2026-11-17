@@ -141,6 +141,9 @@ pub enum ParentMsg {
         hotkey_reports: Vec<BindingReport>,
         game_cursor: Option<Bitmap>,
     },
+    /// The hotkeys were registered again after a [`ChildMsg::SettingsApplied`]:
+    /// the fresh outcome per binding, replacing the one from [`Self::Init`].
+    HotkeyReports(Vec<BindingReport>),
     /// The game-cursor hotkey toggled `cursor.enabled` meanwhile.
     CursorEnabled(bool),
     /// The answer to [`ChildMsg::ReapplyAll`]: one status line per game that
@@ -264,9 +267,25 @@ struct Inbox {
     last_context: Option<TickContext>,
     /// A [`ParentMsg::TrackedGamesChanged`] not taken yet.
     tracked_games_changed: Option<Vec<std::path::PathBuf>>,
+    /// The latest [`ParentMsg::HotkeyReports`] not taken yet.
+    hotkey_reports: Option<Vec<BindingReport>>,
 }
 
 impl Inbox {
+    /// An empty inbox reading from `rx`.
+    fn new(rx: Receiver<ParentMsg>) -> Self {
+        Self {
+            rx,
+            cursor_enabled: None,
+            init: None,
+            install: Vec::new(),
+            pending_install: None,
+            last_context: None,
+            tracked_games_changed: None,
+            hotkey_reports: None,
+        }
+    }
+
     /// Files a message that nobody is waiting for specifically.
     fn file(&mut self, msg: ParentMsg) {
         match msg {
@@ -275,6 +294,7 @@ impl Inbox {
                 game_cursor,
             } => self.init = Some((hotkey_reports, game_cursor)),
             ParentMsg::CursorEnabled(enabled) => self.cursor_enabled = Some(enabled),
+            ParentMsg::HotkeyReports(reports) => self.hotkey_reports = Some(reports),
             ParentMsg::TrackedGamesChanged { picked } => {
                 self.tracked_games_changed
                     .get_or_insert_with(Vec::new)
@@ -351,15 +371,7 @@ impl ChildLink {
         }
         Self {
             out: Mutex::new(Box::new(writer)),
-            inbox: Mutex::new(Inbox {
-                rx,
-                cursor_enabled: None,
-                init: None,
-                install: Vec::new(),
-                pending_install: None,
-                last_context: None,
-                tracked_games_changed: None,
-            }),
+            inbox: Mutex::new(Inbox::new(rx)),
             next_request: AtomicU64::new(1),
         }
     }
@@ -463,6 +475,16 @@ impl ChildLink {
         std::mem::take(&mut inbox.tracked_games_changed)
     }
 
+    /// `Some` when the tray process re-registered the hotkeys since the last
+    /// call: the latest outcome per binding.
+    pub fn take_hotkey_reports(&self) -> Option<Vec<BindingReport>> {
+        let mut inbox = self.lock_inbox();
+        while let Ok(msg) = inbox.rx.try_recv() {
+            inbox.file(msg);
+        }
+        inbox.hotkey_reports.take()
+    }
+
     /// Asks the tray process to live re-apply the saved Zone and waits for its
     /// status lines. Empty if it does not answer in time.
     pub fn request_reapply(&self) -> Vec<String> {
@@ -529,6 +551,11 @@ pub fn request_apply_to_window(window: isize) {
 /// See [`ChildLink::take_tracked_games_changed`] (always `None` without a link).
 pub fn take_tracked_games_changed() -> Option<Vec<std::path::PathBuf>> {
     link().and_then(ChildLink::take_tracked_games_changed)
+}
+
+/// See [`ChildLink::take_hotkey_reports`] (always `None` without a link).
+pub fn take_hotkey_reports() -> Option<Vec<BindingReport>> {
+    link().and_then(ChildLink::take_hotkey_reports)
 }
 
 /// Tells the tray process Settings applied its changes (no-op without a link).
@@ -658,6 +685,41 @@ mod tests {
     }
 
     #[test]
+    fn fresh_hotkey_reports_round_trip_and_the_latest_is_taken_once() {
+        let reports = vec![BindingReport {
+            action: HotkeyAction::ToggleBorderless,
+            binding: "Ctrl+F9".to_string(),
+            outcome: BindingOutcome::Failed("in use".to_string()),
+        }];
+        let down = ParentMsg::HotkeyReports(reports.clone());
+        assert_eq!(decode_line::<ParentMsg>(&encode_line(&down)), Some(down));
+
+        let (link, mut to_child, _from_child, _closed) = linked_pair();
+        assert_eq!(link.take_hotkey_reports(), None);
+        write_msg(&mut to_child, &ParentMsg::HotkeyReports(reports.clone()));
+        let mut taken = None;
+        wait_until(|| {
+            taken = link.take_hotkey_reports();
+            taken.is_some()
+        });
+        assert_eq!(taken, Some(reports));
+        assert_eq!(link.take_hotkey_reports(), None, "taken once");
+    }
+
+    #[test]
+    fn a_newer_hotkey_report_replaces_one_not_taken_yet() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut inbox = Inbox::new(rx);
+        inbox.file(ParentMsg::HotkeyReports(vec![BindingReport {
+            action: HotkeyAction::ToggleBorderless,
+            binding: "Ctrl+F9".to_string(),
+            outcome: BindingOutcome::Registered,
+        }]));
+        inbox.file(ParentMsg::HotkeyReports(Vec::new()));
+        assert_eq!(inbox.hotkey_reports, Some(Vec::new()));
+    }
+
+    #[test]
     fn the_apply_to_window_messages_round_trip() {
         let up = ChildMsg::ApplyToWindow(0x0001_02F4);
         assert_eq!(decode_line::<ChildMsg>(&encode_line(&up)), Some(up));
@@ -677,15 +739,7 @@ mod tests {
     #[test]
     fn a_change_without_a_readable_exe_still_asks_for_a_reload() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut inbox = Inbox {
-            rx,
-            cursor_enabled: None,
-            init: None,
-            install: Vec::new(),
-            pending_install: None,
-            last_context: None,
-            tracked_games_changed: None,
-        };
+        let mut inbox = Inbox::new(rx);
         inbox.file(ParentMsg::TrackedGamesChanged { picked: None });
         assert_eq!(inbox.tracked_games_changed, Some(Vec::new()));
     }
