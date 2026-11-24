@@ -30,6 +30,14 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# Build-time only (psm's build script, via steamlocate -> pest); never linked
+# into the shipped binary, so cargo-about (ignore-build-dependencies) skips it.
+# Apache-2.0 WITH LLVM-exception is GPL-3.0 compatible. Scoped to this crate so
+# the allow list stays identical to about.toml's `accepted`.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 [licenses.private]
 # GameFrame itself (`publish = false`).
 ignore = true
